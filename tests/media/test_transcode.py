@@ -6,12 +6,14 @@ from pathlib import Path
 
 import pytest
 
+from video_demo.domain.manifest import SubtitleStream
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.process import ProcessResult
 from video_demo.media.transcode import (
     FFmpegTranscoder,
     NoAudioArtifact,
+    SubtitleLimits,
     TranscodeLimits,
 )
 
@@ -53,6 +55,7 @@ def _transcoder(
     *,
     available_bytes: int = 1024 * 1024,
     max_output_bytes: int = 1024,
+    subtitle_max_output_bytes: int = 256,
 ) -> FFmpegTranscoder:
     runtime = tmp_path / "runtime"
     return FFmpegTranscoder(
@@ -63,8 +66,71 @@ def _transcoder(
             max_output_bytes=max_output_bytes,
             required_free_bytes=128,
         ),
+        subtitle_limits=SubtitleLimits(max_output_bytes=subtitle_max_output_bytes),
         available_bytes=lambda _path: available_bytes,
     )
+
+
+def test_extract_subtitle_maps_absolute_stream_and_forces_webvtt(
+    tmp_path: Path,
+    source: Path,
+) -> None:
+    runner = WritingRunner(output=b"WEBVTT\n")
+    stream = SubtitleStream(
+        index=7,
+        codec_name="mov_text",
+        language="zh",
+        is_default=True,
+    )
+
+    artifact = _transcoder(tmp_path, runner).extract_subtitle(
+        source,
+        Path("runs/run_001"),
+        stream,
+    )
+
+    command = runner.calls[0]
+    assert command[command.index("-map") : command.index("-map") + 2] == ["-map", "0:7"]
+    assert command[command.index("-c:s") : command.index("-c:s") + 2] == [
+        "-c:s",
+        "webvtt",
+    ]
+    assert command[command.index("-f") : command.index("-f") + 2] == ["-f", "webvtt"]
+    assert command[-3:-1] == ["-fs", "256"]
+    assert artifact.relative_path == "runs/run_001/media/subtitles/7.vtt"
+    assert artifact.stream_index == 7
+    assert artifact.language == "zh"
+    assert artifact.codec_name == "mov_text"
+
+
+@pytest.mark.parametrize("linked_component", ["subtitles", "media"])
+def test_extract_subtitle_rejects_destination_parent_symlink(
+    tmp_path: Path,
+    source: Path,
+    linked_component: str,
+) -> None:
+    runtime = tmp_path / "runtime"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    media = runtime / "runs/run_001/media"
+    if linked_component == "media":
+        media.parent.mkdir(parents=True, exist_ok=True)
+        media.symlink_to(outside, target_is_directory=True)
+    else:
+        media.mkdir(parents=True, exist_ok=True)
+        (media / "subtitles").symlink_to(outside, target_is_directory=True)
+    runner = WritingRunner(output=b"must-not-write")
+
+    with pytest.raises(VideoDemoError) as raised:
+        _transcoder(tmp_path, runner).extract_subtitle(
+            source,
+            Path("runs/run_001"),
+            SubtitleStream(index=2, codec_name="ass", language="en"),
+        )
+
+    assert raised.value.code == ErrorCode.WORKSPACE_PATH_ESCAPE
+    assert runner.calls == []
+    assert not (outside / "2.vtt").exists()
 
 
 def test_extract_audio_builds_16khz_mono_pcm_command(

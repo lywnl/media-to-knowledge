@@ -39,6 +39,111 @@ def test_parse_valid_manifest_and_integer_millisecond_duration() -> None:
     assert result.warnings == ()
 
 
+def test_parse_preserves_text_and_bitmap_subtitle_metadata() -> None:
+    result = parse_ffprobe_payload(
+        _payload("embedded_text_subtitles.json"),
+        object_ref="obj_001",
+        source_sha256="a" * 64,
+        source_size_bytes=1024,
+        source_mime="video/mp4",
+        ffprobe_version="ffprobe version 7.1",
+        limits=ProbeLimits(),
+    )
+
+    assert [stream.model_dump(mode="json") for stream in result.manifest.subtitle_streams] == [
+        {
+            "index": 2,
+            "codec_name": "mov_text",
+            "language": "zh",
+            "is_default": True,
+            "is_forced": False,
+        },
+        {
+            "index": 3,
+            "codec_name": "ass",
+            "language": "en",
+            "is_default": False,
+            "is_forced": False,
+        },
+        {
+            "index": 4,
+            "codec_name": "hdmv_pgs_subtitle",
+            "language": "ja",
+            "is_default": False,
+            "is_forced": True,
+        },
+        {
+            "index": 5,
+            "codec_name": "webvtt",
+            "language": "und",
+            "is_default": False,
+            "is_forced": False,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("language_tag", "expected"),
+    [
+        ("zho", "zh"),
+        ("chi", "zh"),
+        ("eng", "en"),
+        ("jpn", "ja"),
+        ("kor", "ko"),
+        ("spa", "es"),
+        ("fra", "und"),
+        (None, "und"),
+    ],
+)
+def test_parse_normalizes_subtitle_language_tags(
+    language_tag: str | None,
+    expected: str,
+) -> None:
+    payload = _payload("embedded_text_subtitles.json")
+    subtitle = payload["streams"][2]
+    if language_tag is None:
+        subtitle.pop("tags", None)
+    else:
+        subtitle["tags"] = {"language": language_tag}
+
+    result = parse_ffprobe_payload(
+        payload,
+        object_ref="obj_001",
+        source_sha256="a" * 64,
+        source_size_bytes=1024,
+        source_mime="video/mp4",
+        ffprobe_version="ffprobe version 7.1",
+        limits=ProbeLimits(),
+    )
+
+    assert result.manifest.subtitle_streams[0].language == expected
+
+
+def test_parse_rejects_too_many_subtitle_streams() -> None:
+    payload = _payload("valid_mp4.json")
+    payload["streams"].extend(
+        {
+            "index": index + 2,
+            "codec_type": "subtitle",
+            "codec_name": "webvtt",
+        }
+        for index in range(33)
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        parse_ffprobe_payload(
+            payload,
+            object_ref="obj_001",
+            source_sha256="a" * 64,
+            source_size_bytes=1024,
+            source_mime="video/mp4",
+            ffprobe_version="ffprobe version 7.1",
+            limits=ProbeLimits(max_subtitle_streams=32),
+        )
+
+    assert raised.value.code == ErrorCode.VIDEO_STREAM_COUNT_EXCEEDED
+
+
 def test_parse_rotation_vfr_and_no_audio_warning() -> None:
     result = parse_ffprobe_payload(
         _payload("rotated_vfr_no_audio.json"),

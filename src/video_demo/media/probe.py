@@ -11,6 +11,7 @@ from video_demo.capabilities import resolve_workspace_binary
 from video_demo.domain.manifest import (
     AudioStream,
     Rational,
+    SubtitleStream,
     VideoAssetManifest,
     VideoStream,
 )
@@ -38,6 +39,7 @@ class ProbeLimits:
     max_frame_rate: float = 60.0
     max_video_streams: int = 1
     max_audio_streams: int = 16
+    max_subtitle_streams: int = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,12 +162,15 @@ def parse_ffprobe_payload(
     streams_payload = _list(root.get("streams"), "streams")
     video_payloads = [stream for stream in streams_payload if _type(stream) == "video"]
     audio_payloads = [stream for stream in streams_payload if _type(stream) == "audio"]
+    subtitle_payloads = [stream for stream in streams_payload if _type(stream) == "subtitle"]
     if not video_payloads:
         raise VideoDemoError(ErrorCode.VIDEO_STREAM_MISSING, "视频中没有可解码视频流")
     if len(video_payloads) > limits.max_video_streams:
         raise VideoDemoError(ErrorCode.VIDEO_STREAM_COUNT_EXCEEDED, "视频流数量超过限制")
     if len(audio_payloads) > limits.max_audio_streams:
         raise VideoDemoError(ErrorCode.VIDEO_STREAM_COUNT_EXCEEDED, "音频流数量超过限制")
+    if len(subtitle_payloads) > limits.max_subtitle_streams:
+        raise VideoDemoError(ErrorCode.VIDEO_STREAM_COUNT_EXCEEDED, "字幕流数量超过限制")
 
     duration_ms = _duration_ms(format_payload.get("duration"))
     if duration_ms > limits.max_duration_ms:
@@ -173,6 +178,9 @@ def parse_ffprobe_payload(
     video_stream = _video_stream(_object(video_payloads[0], "video_stream"), limits)
     audio_streams = tuple(
         _audio_stream(_object(stream, "audio_stream")) for stream in audio_payloads
+    )
+    subtitle_streams = tuple(
+        _subtitle_stream(_object(stream, "subtitle_stream")) for stream in subtitle_payloads
     )
     manifest = VideoAssetManifest(
         object_ref=object_ref,
@@ -182,6 +190,7 @@ def parse_ffprobe_payload(
         duration_ms=duration_ms,
         video_stream=video_stream,
         audio_streams=audio_streams,
+        subtitle_streams=subtitle_streams,
         format_name=_string(format_payload.get("format_name"), "format_name"),
         ffprobe_version=ffprobe_version,
     )
@@ -221,6 +230,48 @@ def _audio_stream(payload: dict[str, Any]) -> AudioStream:
         sample_rate_hz=_positive_int(payload.get("sample_rate"), "sample_rate"),
         channels=_positive_int(payload.get("channels"), "channels"),
     )
+
+
+_SUBTITLE_LANGUAGE_CODES = {
+    "zho": "zh",
+    "chi": "zh",
+    "eng": "en",
+    "jpn": "ja",
+    "kor": "ko",
+    "spa": "es",
+    "zh": "zh",
+    "en": "en",
+    "ja": "ja",
+    "ko": "ko",
+    "es": "es",
+}
+
+
+def _subtitle_stream(payload: dict[str, Any]) -> SubtitleStream:
+    tags = _object(payload.get("tags", {}), "subtitle_tags")
+    disposition = _object(payload.get("disposition", {}), "subtitle_disposition")
+    language_value = tags.get("language")
+    language = (
+        _SUBTITLE_LANGUAGE_CODES.get(language_value.strip().lower(), "und")
+        if isinstance(language_value, str)
+        else "und"
+    )
+    return SubtitleStream(
+        index=_non_negative_int(payload.get("index"), "index"),
+        codec_name=_string(payload.get("codec_name"), "codec_name"),
+        language=language,
+        is_default=_disposition_flag(disposition.get("default", 0), "default"),
+        is_forced=_disposition_flag(disposition.get("forced", 0), "forced"),
+    )
+
+
+def _disposition_flag(value: object, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    parsed = _integer(value, field)
+    if parsed not in (0, 1):
+        raise VideoDemoError(ErrorCode.VIDEO_PROBE_INVALID, f"{field} 必须是 0 或 1")
+    return bool(parsed)
 
 
 def _rotation(payload: dict[str, Any]) -> int:

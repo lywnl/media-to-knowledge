@@ -10,8 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from pydantic import Field, field_validator
+
 from video_demo.capabilities import resolve_workspace_binary
-from video_demo.domain.base import FrozenModel, Sha256
+from video_demo.domain.base import FrozenModel, LanguageCode, Sha256
+from video_demo.domain.manifest import SubtitleStream
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.process import ProcessResult, SafeProcessRunner
@@ -34,6 +37,15 @@ class TranscodeLimits:
     max_output_bytes: int = 4 * 1024 * 1024 * 1024
     required_free_bytes: int = 512 * 1024 * 1024
     timeout_seconds: int = 1_800
+
+
+@dataclass(frozen=True, slots=True)
+class SubtitleLimits:
+    max_output_bytes: int = 16 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if self.max_output_bytes < 1:
+            raise ValueError("字幕输出大小上限必须大于 0")
 
 
 class AudioArtifact(FrozenModel):
@@ -74,6 +86,23 @@ class AudioSliceArtifact(TimeRange):
     codec: str = "pcm_s16le"
 
 
+class SubtitleArtifact(FrozenModel):
+    relative_path: str = Field(min_length=1, max_length=1024)
+    sha256: Sha256
+    size_bytes: int = Field(gt=0)
+    stream_index: int = Field(ge=0)
+    language: LanguageCode
+    codec_name: str = Field(min_length=1, max_length=64)
+
+    @field_validator("relative_path")
+    @classmethod
+    def validate_relative_webvtt_path(cls, value: str) -> str:
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts or path.suffix.casefold() != ".vtt":
+            raise ValueError("字幕产物必须是安全的相对 WebVTT 路径")
+        return path.as_posix()
+
+
 class FFmpegTranscoder:
     def __init__(
         self,
@@ -82,12 +111,14 @@ class FFmpegTranscoder:
         runner: ProcessRunner,
         runtime_root: Path,
         limits: TranscodeLimits | None = None,
+        subtitle_limits: SubtitleLimits | None = None,
         available_bytes: Callable[[Path], int] | None = None,
     ) -> None:
         self._executable = executable
         self._runner = runner
         self._runtime_root = runtime_root.expanduser().resolve(strict=False)
         self._limits = limits or TranscodeLimits()
+        self._subtitle_limits = subtitle_limits or SubtitleLimits()
         self._available_bytes = available_bytes or self._disk_free_bytes
 
     @classmethod
@@ -113,6 +144,42 @@ class FFmpegTranscoder:
         if version.returncode != 0:
             raise VideoDemoError(ErrorCode.VIDEO_BINARY_PROBE_FAILED, "ffmpeg 版本探测失败")
         return cls(executable=executable, runner=runner, runtime_root=runtime_root)
+
+    def extract_subtitle(
+        self,
+        source: Path,
+        run_relative_root: Path,
+        stream: SubtitleStream,
+    ) -> SubtitleArtifact:
+        source = self._validate_source(source)
+        relative_path = (
+            run_relative_root / "media" / "subtitles" / f"{stream.index}.vtt"
+        )
+        final_path = self._destination_path(relative_path)
+        args = [
+            *self._base_args(source),
+            "-map",
+            f"0:{stream.index}",
+            "-vn",
+            "-an",
+            "-c:s",
+            "webvtt",
+            "-f",
+            "webvtt",
+        ]
+        size_bytes, sha256 = self._produce(
+            args,
+            final_path,
+            max_output_bytes=self._subtitle_limits.max_output_bytes,
+        )
+        return SubtitleArtifact(
+            relative_path=relative_path.as_posix(),
+            sha256=sha256,
+            size_bytes=size_bytes,
+            stream_index=stream.index,
+            language=stream.language,
+            codec_name=stream.codec_name,
+        )
 
     def extract_audio(
         self,
@@ -363,7 +430,18 @@ class FFmpegTranscoder:
             str(source),
         ]
 
-    def _produce(self, args_without_output: list[str], final_path: Path) -> tuple[int, str]:
+    def _produce(
+        self,
+        args_without_output: list[str],
+        final_path: Path,
+        *,
+        max_output_bytes: int | None = None,
+    ) -> tuple[int, str]:
+        output_limit = (
+            self._limits.max_output_bytes
+            if max_output_bytes is None
+            else max_output_bytes
+        )
         self._reject_destination_symlinks(final_path)
         self._require_disk_space(final_path.parent)
         temporary = final_path.with_name(
@@ -377,7 +455,7 @@ class FFmpegTranscoder:
                     *args_without_output,
                     "-y",
                     "-fs",
-                    str(self._limits.max_output_bytes),
+                    str(output_limit),
                     str(temporary),
                 ],
                 timeout_seconds=self._limits.timeout_seconds,
@@ -388,7 +466,7 @@ class FFmpegTranscoder:
             if not temporary.is_file() or temporary.stat().st_size == 0:
                 raise VideoDemoError(ErrorCode.VIDEO_OUTPUT_INVALID, "ffmpeg 未生成有效输出")
             size_bytes = temporary.stat().st_size
-            if size_bytes > self._limits.max_output_bytes:
+            if size_bytes > output_limit:
                 raise VideoDemoError(ErrorCode.VIDEO_OUTPUT_TOO_LARGE, "ffmpeg 输出超过限制")
             sha256 = _sha256_file(temporary)
             self._reject_destination_symlinks(final_path)

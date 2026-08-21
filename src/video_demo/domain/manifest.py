@@ -4,7 +4,7 @@ from typing import Literal, Self
 
 from pydantic import Field, model_validator
 
-from video_demo.domain.base import FrozenModel, Sha256, StableId
+from video_demo.domain.base import FrozenModel, LanguageCode, Sha256, StableId
 
 
 class Rational(FrozenModel):
@@ -40,6 +40,14 @@ class AudioStream(FrozenModel):
     channels: int = Field(gt=0, le=64)
 
 
+class SubtitleStream(FrozenModel):
+    index: int = Field(ge=0)
+    codec_name: str = Field(min_length=1, max_length=64)
+    language: LanguageCode = "und"
+    is_default: bool = False
+    is_forced: bool = False
+
+
 class VideoAssetManifest(FrozenModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     object_ref: StableId
@@ -49,6 +57,7 @@ class VideoAssetManifest(FrozenModel):
     duration_ms: int = Field(gt=0, le=1_800_000)
     video_stream: VideoStream
     audio_streams: tuple[AudioStream, ...] = ()
+    subtitle_streams: tuple[SubtitleStream, ...] = ()
     format_name: str = Field(min_length=1, max_length=128)
     ffprobe_version: str = Field(min_length=1, max_length=256)
 

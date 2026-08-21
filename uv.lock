@@ -2456,6 +2456,7 @@ dependencies = [
     { name = "python-multipart" },
     { name = "sqlalchemy" },
     { name = "uvicorn" },
+    { name = "webvtt-py" },
 ]
 
 [package.optional-dependencies]
@@ -2529,9 +2530,19 @@ requires-dist = [
     { name = "torchaudio", marker = "extra == 'speech'", specifier = ">=2.8,<2.9" },
     { name = "transformers", marker = "extra == 'speech'", specifier = ">=4.48,<5" },
     { name = "uvicorn", specifier = ">=0.34,<1" },
+    { name = "webvtt-py", specifier = ">=0.5.1,<0.6" },
     { name = "whisperx", marker = "extra == 'speech'", specifier = "==3.4.2" },
 ]
 provides-extras = ["dev", "speech", "vision", "audio-events", "evaluation"]
+
+[[package]]
+name = "webvtt-py"
+version = "0.5.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/f6/7c9c964681fb148e0293e6860108d378e09ccab2218f9063fd3eb87f840a/webvtt-py-0.5.1.tar.gz", hash = "sha256:2040dd325277ddadc1e0c6cc66cbc4a1d9b6b49b24c57a0c3364374c3e8a3dc1", size = 55128, upload-time = "2024-05-30T13:40:17.189Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f3/ed/aad7e0f5a462d679f7b4d2e0d8502c3096740c883b5bbed5103146480937/webvtt_py-0.5.1-py3-none-any.whl", hash = "sha256:9d517d286cfe7fc7825e9d4e2079647ce32f5678eb58e39ef544ffbb932610b7", size = 19802, upload-time = "2024-05-30T13:40:14.661Z" },
+]
 
 [[package]]
 name = "werkzeug"
