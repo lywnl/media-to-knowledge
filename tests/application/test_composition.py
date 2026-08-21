@@ -177,6 +177,7 @@ def test_production_pipeline_reuses_complete_orchestration_and_builds_retrieval_
             calls.append("SPEECH")
             assert _kwargs["is_cancel_requested"] is cancel
             return SpeechAnalysis(
+                transcript_source="ASR",
                 evidence=(
                     SpeechSegment(
                         evidence_id="asr_001",

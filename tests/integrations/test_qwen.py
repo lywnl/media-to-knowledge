@@ -13,7 +13,7 @@ import pytest
 from pydantic import SecretStr
 
 import video_demo.integrations.qwen as qwen_module
-from video_demo.domain.evidence import AlignedWord, SpeechSegment
+from video_demo.domain.evidence import AlignedWord, SpeechSegment, SubtitleCue
 from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
@@ -562,6 +562,50 @@ def test_demo_fallback_builds_deterministic_semantics_when_qwen_is_unavailable(
         )
     )
     assert summary.summary_zh == "Hello demo"
+
+
+def test_subtitle_is_projected_separately_and_preferred_by_demo_fallback(
+    tmp_path: Path,
+) -> None:
+    request = _segment_request(tmp_path, text="ASR 文本")
+    subtitle = SubtitleCue(
+        evidence_id="subtitle_001",
+        start_ms=100,
+        end_ms=400,
+        text="字幕文本",
+        language="zh",
+        stream_index=2,
+    )
+    mixed = request.model_copy(
+        update={
+            "timeline": build_timeline((*request.evidence, subtitle)),
+            "evidence": (*request.evidence, subtitle),
+        },
+    )
+    whole_request = WholeVideoUnderstandingRequest(
+        video=mixed.clip,
+        windows=(
+            WholeVideoWindowInput(
+                window_id="window_001",
+                start_ms=mixed.window.start_ms,
+                end_ms=mixed.window.end_ms,
+                timeline=mixed.timeline,
+                evidence=mixed.evidence,
+            ),
+        ),
+    )
+    projected = json.loads(
+        qwen_module.render_whole_video_evidence(whole_request).removeprefix(
+            "UNTRUSTED_WHOLE_VIDEO_EVIDENCE_JSON\n"
+        ),
+    )
+
+    assert projected["windows"][0]["evidence"]["subtitles"]["texts"] == [
+        "字幕文本"
+    ]
+    assert projected["windows"][0]["evidence"]["asr"]["texts"] == ["ASR 文本"]
+    assert qwen_module._fallback_segment_understanding(mixed).summary_zh == "字幕文本"
+    assert "字幕" in qwen_module.WHOLE_VIDEO_SYSTEM_INSTRUCTION
 
 
 def test_demo_fallback_builds_all_whole_video_windows_and_summary(

@@ -1035,6 +1035,7 @@ def _export_manifest_bytes(
         stage_metrics=source.stage_metrics,
         status=source.status,
         warnings=source.warnings,
+        transcript_source=source.transcript_source,
     )
     return _envelope_bytes(
         payload.model_dump(mode="json", exclude_computed_fields=True),

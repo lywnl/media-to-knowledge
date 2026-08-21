@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,8 @@ from video_demo.domain.manifest import AudioStream, Rational, VideoAssetManifest
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.probe import ProbeLimits
+from video_demo.media.subtitles import ParsedSubtitle
+from video_demo.media.transcode import SubtitleArtifact
 from video_demo.speech.alignment import AlignmentResult
 from video_demo.speech.asr import RawAsrSegment
 from video_demo.speech.language import LanguageIdentificationResult, LanguageSpan
@@ -38,6 +40,39 @@ def test_no_audio_skips_every_speech_component(tmp_path: Path) -> None:
     assert calls == []
     assert result.evidence == ()
     assert result.warnings == ("NO_AUDIO_TRACK",)
+    assert result.transcript_source == "NONE"
+
+
+def test_eligible_subtitle_skips_every_speech_component(tmp_path: Path) -> None:
+    component_factory_calls = 0
+
+    def component_factory(
+        _media: PreparedMedia,
+        _cancel: object,
+    ) -> SpeechComponents:
+        nonlocal component_factory_calls
+        component_factory_calls += 1
+        raise AssertionError("字幕命中时不得构造语音组件")
+
+    media = replace(
+        _media(tmp_path),
+        audio_path=None,
+        audio_sha256=None,
+        subtitle=_parsed_subtitle(),
+        warnings=("SUBTITLE_TRACK_REJECTED:3:INCOMPLETE",),
+    )
+    result = ProductionSpeechAnalyzer(component_factory).analyze(media)
+
+    assert result.transcript_source == "SUBTITLE"
+    assert result.evidence == _parsed_subtitle().cues
+    assert result.warnings == (
+        "SUBTITLE_TRACK_REJECTED:3:INCOMPLETE",
+        "TRANSCRIPT_SOURCE_SUBTITLE",
+    )
+    assert result.boundary_candidates == (
+        SpeechBoundaryCandidate(1_000, "sentence_end", 1.0),
+    )
+    assert component_factory_calls == 0
 
 
 def test_no_speech_still_runs_yamnet_and_skips_remaining_models(tmp_path: Path) -> None:
@@ -61,11 +96,20 @@ def test_no_speech_still_runs_yamnet_and_skips_remaining_models(tmp_path: Path) 
             )
 
     components = _components(calls, vad=Vad(), events=Events())
-    result = ProductionSpeechAnalyzer(lambda _media, _cancel: components).analyze(_media(tmp_path))
+    result = ProductionSpeechAnalyzer(lambda _media, _cancel: components).analyze(
+        replace(
+            _media(tmp_path),
+            warnings=("SUBTITLE_TRACK_REJECTED:2:INCOMPLETE",),
+        ),
+    )
 
     assert calls == ["vad", "yamnet"]
     assert result.evidence == (event,)
-    assert result.warnings == ("NO_SPEECH_DETECTED",)
+    assert result.warnings == (
+        "SUBTITLE_TRACK_REJECTED:2:INCOMPLETE",
+        "NO_SPEECH_DETECTED",
+    )
+    assert result.transcript_source == "ASR"
 
 
 def test_complete_chain_preserves_order_config_absolute_time_speakers_and_sorting(
@@ -158,9 +202,16 @@ def test_complete_chain_preserves_order_config_absolute_time_speakers_and_sortin
         slicer=Slicer(),  # type: ignore[arg-type]
     )
     result = ProductionSpeechAnalyzer(lambda _media, _cancel: components).analyze(
-        _media(
-            tmp_path,
-            config=PipelineRunConfig(language_hints=("en", "zh"), min_speakers=1, max_speakers=3),
+        replace(
+            _media(
+                tmp_path,
+                config=PipelineRunConfig(
+                    language_hints=("en", "zh"),
+                    min_speakers=1,
+                    max_speakers=3,
+                ),
+            ),
+            warnings=("SUBTITLE_TRACK_REJECTED:2:TIMELINE_INVALID",),
         )
     )
 
@@ -190,6 +241,8 @@ def test_complete_chain_preserves_order_config_absolute_time_speakers_and_sortin
     assigned_word = result.evidence[-1]
     assert isinstance(assigned_word, AlignedWord)
     assert assigned_word.speaker == "SPEAKER_01"
+    assert result.transcript_source == "ASR"
+    assert result.warnings == ("SUBTITLE_TRACK_REJECTED:2:TIMELINE_INVALID",)
 
 
 def test_speech_analysis_exports_deduplicated_hybrid_boundary_candidates(
@@ -461,6 +514,33 @@ def _event(start_ms: int, end_ms: int) -> AudioEvent:
         normalized_event="音乐",
         confidence=0.8,
         threshold_version="test-v1",
+    )
+
+
+def _parsed_subtitle() -> ParsedSubtitle:
+    from video_demo.domain.evidence import SubtitleCue
+
+    cue = SubtitleCue(
+        evidence_id="subtitle_001",
+        start_ms=0,
+        end_ms=1_000,
+        text="字幕正文",
+        language="zh",
+        stream_index=2,
+    )
+    artifact = SubtitleArtifact(
+        relative_path="runs/scope/run_001/media/subtitles/2.vtt",
+        sha256="c" * 64,
+        size_bytes=32,
+        stream_index=2,
+        language="zh",
+        codec_name="mov_text",
+    )
+    return ParsedSubtitle(
+        artifact=artifact,
+        cues=(cue,),
+        normalized_char_count=4,
+        timeline_span_ratio=1.0,
     )
 
 

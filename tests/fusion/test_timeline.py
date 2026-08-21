@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from video_demo.domain.evidence import AudioEvent, SpeechSegment, TimelineEvidence
+from video_demo.domain.evidence import AudioEvent, SpeechSegment, SubtitleCue, TimelineEvidence
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.fusion.timeline import build_timeline, validate_timeline
 
@@ -61,6 +61,21 @@ def test_timeline_orders_half_open_ranges_deterministically() -> None:
     timeline = build_timeline((later, earlier))
 
     assert [(item.start_ms, item.end_ms) for item in timeline] == [(0, 400), (400, 800)]
+
+
+def test_timeline_accepts_subtitle_cues_without_treating_them_as_asr() -> None:
+    subtitle = SubtitleCue(
+        evidence_id="subtitle_001",
+        start_ms=0,
+        end_ms=400,
+        text="字幕正文",
+        language="zh",
+        stream_index=2,
+    )
+
+    timeline = build_timeline((subtitle,))
+
+    assert timeline[0].evidence_refs == ("subtitle_001",)
 
 
 def test_timeline_rejects_same_id_with_different_content() -> None:

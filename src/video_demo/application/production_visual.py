@@ -28,6 +28,7 @@ from video_demo.domain.evidence import (
     OcrEvidence,
     SceneBoundary,
     SpeechSegment,
+    SubtitleCue,
 )
 from video_demo.domain.manifest import Rational
 from video_demo.domain.run import TimeRange
@@ -54,7 +55,7 @@ from video_demo.visual.windows import (
 _OCR_LANGUAGES = frozenset({"zh", "en", "ja", "ko", "es"})
 _MAX_KEYFRAMES_PER_VIDEO = 30
 _SPACE_AND_PUNCTUATION = re.compile(r"[^\w\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
-_EMPTY_SPEECH_ANALYSIS = SpeechAnalysis()
+_EMPTY_SPEECH_ANALYSIS = SpeechAnalysis(transcript_source="NONE")
 
 
 class ClipClient(Protocol):
@@ -574,7 +575,7 @@ def _ocr_language(
         (
             item
             for item in speech.evidence
-            if isinstance(item, (SpeechSegment, AlignedWord))
+            if isinstance(item, (SubtitleCue, SpeechSegment, AlignedWord))
             and item.start_ms <= timestamp_ms < item.end_ms
         ),
         key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),

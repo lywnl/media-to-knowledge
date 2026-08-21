@@ -225,6 +225,7 @@ def _fake_worker_factory(app: FastAPI, calls: list[str]):
                 evidence=evidence,
                 stage_metrics={"RESULT": 1},
                 status=RunStatus.SUCCEEDED,
+                transcript_source="ASR",
                 fence=ResultWriteFence(
                     job_pk=claimed.id,
                     worker_id=claimed.worker_id,

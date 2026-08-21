@@ -15,7 +15,7 @@ from sqlalchemy import select
 
 from video_demo.domain.evidence import EvidenceItem, KeyframeEvidence
 from video_demo.domain.result import VideoUnderstandingResult, validate_evidence_references
-from video_demo.domain.result_artifact import ResultArtifactPayload
+from video_demo.domain.result_artifact import ResultArtifactPayload, TranscriptSource
 from video_demo.domain.run import RunStatus
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
@@ -87,6 +87,7 @@ class ResultQueryService:
         evidence: tuple[EvidenceItem, ...],
         stage_metrics: dict[str, int],
         status: RunStatus,
+        transcript_source: TranscriptSource,
         fence: ResultWriteFence,
         warnings: tuple[str, ...] = (),
     ) -> None:
@@ -103,6 +104,7 @@ class ResultQueryService:
             stage_metrics=stage_metrics,
             status=status.value,
             warnings=warnings,
+            transcript_source=transcript_source,
         ).model_dump(mode="json", exclude_computed_fields=True)
         payload_digest = hashlib.sha256(
             json.dumps(

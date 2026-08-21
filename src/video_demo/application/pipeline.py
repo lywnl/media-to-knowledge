@@ -18,6 +18,7 @@ from video_demo.domain.result import (
     VideoUnderstandingResult,
     validate_evidence_references,
 )
+from video_demo.domain.result_artifact import TranscriptSource
 from video_demo.domain.run import RunStatus, TimeRange
 from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
 from video_demo.errors import ErrorCode, VideoDemoError
@@ -36,6 +37,7 @@ from video_demo.integrations.video_port import (
     WholeVideoWindowInput,
 )
 from video_demo.media.probe import ProbeLimits, SupportedMime
+from video_demo.media.subtitles import ParsedSubtitle
 from video_demo.persistence.database import Database
 from video_demo.persistence.models import RunStatusValue
 from video_demo.persistence.repositories import ClaimedJob, JobRepository, Scope
@@ -107,6 +109,7 @@ class PreparedMedia:
     proxy_size_bytes: int
     audio_path: Path | None
     audio_sha256: str | None
+    subtitle: ParsedSubtitle | None = None
     warnings: tuple[str, ...] = ()
 
 
@@ -119,6 +122,7 @@ class SpeechBoundaryCandidate:
 
 @dataclass(frozen=True, slots=True)
 class SpeechAnalysis:
+    transcript_source: TranscriptSource
     evidence: tuple[EvidenceItem, ...] = ()
     warnings: tuple[str, ...] = ()
     boundary_candidates: tuple[SpeechBoundaryCandidate, ...] = ()
@@ -157,6 +161,7 @@ class PipelineOutcome:
     evidence: tuple[EvidenceItem, ...]
     warnings: tuple[str, ...]
     stage_metrics: tuple[StageMetric, ...]
+    transcript_source: TranscriptSource
 
 
 class AssetRegistrar(Protocol):
@@ -306,6 +311,7 @@ class VideoUnderstandingPipeline:
             evidence=tuple(evidence),
             warnings=warnings,
             stage_metrics=tuple(metrics),
+            transcript_source=speech.transcript_source,
         )
 
     def _understanding_warnings(self) -> tuple[str, ...]:
@@ -548,6 +554,7 @@ class PipelineJobHandler:
                 },
                 status=outcome.status,
                 warnings=outcome.warnings,
+                transcript_source=outcome.transcript_source,
                 fence=ResultWriteFence(
                     job_pk=job.id,
                     worker_id=job.worker_id,

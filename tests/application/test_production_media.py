@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 
@@ -14,10 +15,21 @@ from video_demo.application.production_media import (
 )
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
-from video_demo.domain.manifest import AudioStream, Rational, VideoAssetManifest, VideoStream
-from video_demo.errors import VideoDemoError
+from video_demo.domain.manifest import (
+    AudioStream,
+    Rational,
+    SubtitleStream,
+    VideoAssetManifest,
+    VideoStream,
+)
+from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.probe import ProbeResult
-from video_demo.media.transcode import AudioArtifact, NoAudioArtifact, ProxyVideoArtifact
+from video_demo.media.transcode import (
+    AudioArtifact,
+    NoAudioArtifact,
+    ProxyVideoArtifact,
+    SubtitleArtifact,
+)
 from video_demo.persistence.database import Database
 from video_demo.persistence.repositories import Scope
 from video_demo.storage.object_store import LocalVideoObjectStore
@@ -153,7 +165,149 @@ def test_production_transcoder_generates_scoped_proxy_and_explicit_no_audio_warn
     assert prepared.proxy_size_bytes == len(_MP4)
     assert prepared.audio_path is None
     assert prepared.audio_sha256 is None
+    assert prepared.subtitle is None
     assert prepared.warnings == ("NO_AUDIO_TRACK",)
+
+
+def test_complete_text_subtitle_is_selected_before_audio_extraction(tmp_path: Path) -> None:
+    runtime_root, probed = _probed_media(
+        tmp_path,
+        has_audio=True,
+        subtitle_streams=(SubtitleStream(index=2, codec_name="mov_text", language="zh"),),
+        duration_ms=30_000,
+        language_hints=("zh",),
+    )
+    client = _RecordingTranscoder(runtime_root, subtitle_payloads={2: _complete_vtt()})
+
+    prepared = ProductionMediaTranscoder(
+        runtime_root,
+        lambda _cancel: client,
+    ).transcode(probed)
+
+    assert client.extract_subtitle_calls == [2]
+    assert client.extract_audio_calls == []
+    assert prepared.subtitle is not None
+    assert prepared.subtitle.artifact.stream_index == 2
+    assert prepared.audio_path is None
+    assert prepared.audio_sha256 is None
+
+
+def test_incomplete_text_subtitle_falls_back_to_audio(tmp_path: Path) -> None:
+    runtime_root, probed = _probed_media(
+        tmp_path,
+        has_audio=True,
+        subtitle_streams=(SubtitleStream(index=2, codec_name="mov_text", language="zh"),),
+        duration_ms=30_000,
+        language_hints=("zh",),
+    )
+    client = _RecordingTranscoder(
+        runtime_root,
+        subtitle_payloads={
+            2: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n太短\n",
+        },
+    )
+
+    prepared = ProductionMediaTranscoder(
+        runtime_root,
+        lambda _cancel: client,
+    ).transcode(probed)
+
+    assert client.extract_subtitle_calls == [2]
+    assert client.extract_audio_calls == [True]
+    assert prepared.subtitle is None
+    assert prepared.audio_path is not None
+    assert prepared.warnings == ("SUBTITLE_TRACK_REJECTED:2:INCOMPLETE",)
+
+
+def test_rejected_first_subtitle_continues_to_second_complete_track(tmp_path: Path) -> None:
+    runtime_root, probed = _probed_media(
+        tmp_path,
+        has_audio=True,
+        subtitle_streams=(
+            SubtitleStream(index=2, codec_name="mov_text", language="zh", is_default=True),
+            SubtitleStream(index=3, codec_name="ass", language="en"),
+        ),
+        duration_ms=30_000,
+        language_hints=("zh", "en"),
+    )
+    client = _RecordingTranscoder(
+        runtime_root,
+        subtitle_payloads={
+            2: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n太短\n",
+            3: _complete_vtt(),
+        },
+    )
+
+    prepared = ProductionMediaTranscoder(
+        runtime_root,
+        lambda _cancel: client,
+    ).transcode(probed)
+
+    assert client.extract_subtitle_calls == [2, 3]
+    assert client.extract_audio_calls == []
+    assert prepared.subtitle is not None
+    assert prepared.subtitle.artifact.stream_index == 3
+    assert prepared.warnings == ("SUBTITLE_TRACK_REJECTED:2:INCOMPLETE",)
+
+
+def test_subtitle_decode_failure_continues_to_next_track(tmp_path: Path) -> None:
+    runtime_root, probed = _probed_media(
+        tmp_path,
+        has_audio=True,
+        subtitle_streams=(
+            SubtitleStream(index=2, codec_name="mov_text", language="zh"),
+            SubtitleStream(index=3, codec_name="ass", language="en"),
+        ),
+        duration_ms=30_000,
+    )
+    client = _RecordingTranscoder(
+        runtime_root,
+        subtitle_payloads={3: _complete_vtt()},
+        subtitle_errors={2: ErrorCode.VIDEO_PROCESS_FAILED},
+    )
+
+    prepared = ProductionMediaTranscoder(
+        runtime_root,
+        lambda _cancel: client,
+    ).transcode(probed)
+
+    assert client.extract_subtitle_calls == [2, 3]
+    assert client.extract_audio_calls == []
+    assert prepared.subtitle is not None
+    assert prepared.warnings == ("SUBTITLE_TRACK_REJECTED:2:DECODE_FAILED",)
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        ErrorCode.JOB_CANCELLED,
+        ErrorCode.VIDEO_PROCESS_TIMEOUT,
+        ErrorCode.WORKSPACE_PATH_ESCAPE,
+    ],
+)
+def test_non_degradable_subtitle_failure_aborts_before_audio(
+    tmp_path: Path,
+    error_code: ErrorCode,
+) -> None:
+    runtime_root, probed = _probed_media(
+        tmp_path,
+        has_audio=True,
+        subtitle_streams=(SubtitleStream(index=2, codec_name="mov_text", language="zh"),),
+        duration_ms=30_000,
+    )
+    client = _RecordingTranscoder(
+        runtime_root,
+        subtitle_errors={2: error_code},
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        ProductionMediaTranscoder(
+            runtime_root,
+            lambda _cancel: client,
+        ).transcode(probed)
+
+    assert raised.value.code == error_code
+    assert client.extract_audio_calls == []
 
 
 @pytest.mark.parametrize("mutation", ["empty", "fake_mp4", "wrong_size", "too_large"])
@@ -228,13 +382,18 @@ def _registered(
     )
 
 
-def _manifest(*, has_audio: bool) -> VideoAssetManifest:
+def _manifest(
+    *,
+    has_audio: bool,
+    subtitle_streams: tuple[SubtitleStream, ...] = (),
+    duration_ms: int = 1_000,
+) -> VideoAssetManifest:
     return VideoAssetManifest(
         object_ref="obj_001",
         source_sha256="a" * 64,
         source_size_bytes=6,
         source_mime="video/mp4",
-        duration_ms=1_000,
+        duration_ms=duration_ms,
         video_stream=VideoStream(
             index=0,
             codec_name="h264",
@@ -247,6 +406,121 @@ def _manifest(*, has_audio: bool) -> VideoAssetManifest:
         )
         if has_audio
         else (),
+        subtitle_streams=subtitle_streams,
         format_name="mov,mp4",
         ffprobe_version="ffprobe test",
+    )
+
+
+def _probed_media(
+    tmp_path: Path,
+    *,
+    has_audio: bool,
+    subtitle_streams: tuple[SubtitleStream, ...],
+    duration_ms: int,
+    language_hints: tuple[str, ...] = (),
+) -> tuple[Path, object]:
+    from video_demo.application.pipeline import PipelineRunConfig
+
+    runtime_root = tmp_path / "runtime"
+    source = runtime_root / "runs/scope/run_001/input/source.mp4"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+    registered = _registered(source)
+    registered = replace(
+        registered,
+        config=PipelineRunConfig(language_hints=language_hints),
+    )
+    probed = ProductionAssetProbe(
+        lambda: _StaticProbeClient(
+            _manifest(
+                has_audio=has_audio,
+                subtitle_streams=subtitle_streams,
+                duration_ms=duration_ms,
+            ),
+        ),
+    ).probe(registered)
+    return runtime_root, probed
+
+
+class _RecordingTranscoder:
+    def __init__(
+        self,
+        runtime_root: Path,
+        *,
+        subtitle_payloads: dict[int, str] | None = None,
+        subtitle_errors: dict[int, ErrorCode] | None = None,
+    ) -> None:
+        self._runtime_root = runtime_root
+        self._subtitle_payloads = subtitle_payloads or {}
+        self._subtitle_errors = subtitle_errors or {}
+        self.extract_subtitle_calls: list[int] = []
+        self.extract_audio_calls: list[bool] = []
+
+    def create_proxy(self, _path: Path, root: Path) -> ProxyVideoArtifact:
+        relative = root / "media/proxy.mp4"
+        output = self._runtime_root / relative
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(_MP4)
+        return ProxyVideoArtifact(
+            relative_path=relative.as_posix(),
+            sha256=hashlib.sha256(_MP4).hexdigest(),
+            size_bytes=len(_MP4),
+            max_edge=1280,
+            normalized_start_ms=0,
+        )
+
+    def extract_subtitle(
+        self,
+        _path: Path,
+        root: Path,
+        stream: SubtitleStream,
+    ) -> SubtitleArtifact:
+        self.extract_subtitle_calls.append(stream.index)
+        if stream.index in self._subtitle_errors:
+            raise VideoDemoError(self._subtitle_errors[stream.index], "稳定测试错误")
+        payload = self._subtitle_payloads[stream.index].encode("utf-8")
+        relative = root / "media/subtitles" / f"{stream.index}.vtt"
+        output = self._runtime_root / relative
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(payload)
+        return SubtitleArtifact(
+            relative_path=relative.as_posix(),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            size_bytes=len(payload),
+            stream_index=stream.index,
+            language=stream.language,
+            codec_name=stream.codec_name,
+        )
+
+    def extract_audio(
+        self,
+        _path: Path,
+        root: Path,
+        *,
+        has_audio: bool,
+    ) -> AudioArtifact | NoAudioArtifact:
+        self.extract_audio_calls.append(has_audio)
+        if not has_audio:
+            return NoAudioArtifact(warning_code="NO_AUDIO_TRACK")
+        payload = b"wav"
+        relative = root / "media/audio.wav"
+        output = self._runtime_root / relative
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(payload)
+        return AudioArtifact(
+            relative_path=relative.as_posix(),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            size_bytes=len(payload),
+            sample_rate_hz=16_000,
+            channels=1,
+            codec="pcm_s16le",
+        )
+
+
+def _complete_vtt() -> str:
+    return (
+        "WEBVTT\n\n"
+        "00:00:00.000 --> 00:00:30.000\n"
+        "这是一条覆盖完整视频并且字符数量足够的有效字幕文本内容\n"
     )

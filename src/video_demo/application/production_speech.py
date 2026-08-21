@@ -111,8 +111,25 @@ class ProductionSpeechAnalyzer:
         *,
         is_cancel_requested: Callable[[], bool] = lambda: False,
     ) -> SpeechAnalysis:
+        if media.subtitle is not None:
+            return SpeechAnalysis(
+                transcript_source="SUBTITLE",
+                evidence=media.subtitle.cues,
+                warnings=tuple(
+                    dict.fromkeys((*media.warnings, "TRANSCRIPT_SOURCE_SUBTITLE"))
+                ),
+                boundary_candidates=tuple(
+                    SpeechBoundaryCandidate(cue.end_ms, "sentence_end", 1.0)
+                    for cue in media.subtitle.cues
+                    if 0 < cue.end_ms < media.source.duration_ms
+                ),
+            )
         if media.audio_path is None:
-            return SpeechAnalysis(evidence=(), warnings=("NO_AUDIO_TRACK",))
+            return SpeechAnalysis(
+                transcript_source="NONE",
+                evidence=(),
+                warnings=tuple(dict.fromkeys((*media.warnings, "NO_AUDIO_TRACK"))),
+            )
         try:
             components = self._component_factory(media, is_cancel_requested)
             return self._run(
@@ -152,8 +169,13 @@ class ProductionSpeechAnalyzer:
         if not vad.speech:
             audio_events = components.audio_events.detect(audio, duration_ms=duration_ms)
             return SpeechAnalysis(
+                transcript_source="ASR",
                 evidence=_sort_evidence(audio_events),
-                warnings=tuple(dict.fromkeys((*vad.warnings, "NO_SPEECH_DETECTED"))),
+                warnings=tuple(
+                    dict.fromkeys(
+                        (*media.warnings, *vad.warnings, "NO_SPEECH_DETECTED")
+                    )
+                ),
                 boundary_candidates=_boundary_candidates(
                     duration_ms,
                     silence=vad.long_silence_boundaries_ms,
@@ -198,9 +220,17 @@ class ProductionSpeechAnalyzer:
             *audio_events,
         )
         return SpeechAnalysis(
+            transcript_source="ASR",
             evidence=_sort_evidence(evidence),
             warnings=tuple(
-                dict.fromkeys((*vad.warnings, *alignment.warning_codes, *speaker_warnings))
+                dict.fromkeys(
+                    (
+                        *media.warnings,
+                        *vad.warnings,
+                        *alignment.warning_codes,
+                        *speaker_warnings,
+                    )
+                )
             ),
             boundary_candidates=_boundary_candidates(
                 duration_ms,

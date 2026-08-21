@@ -135,6 +135,7 @@ def _write_prediction(tmp_path: Path) -> tuple[Path, EvaluationSample]:
                     "stage_metrics": {"RESULT": 1},
                     "status": "SUCCEEDED",
                     "warnings": [],
+                    "transcript_source": "ASR",
                 },
             }
         ),
@@ -191,6 +192,7 @@ def _replace_with_atomic_production_manifest(index: Path) -> None:
         stage_metrics={"RESULT": 1},
         status="SUCCEEDED",
         warnings=(),
+        transcript_source="ASR",
     )
     receipt = AtomicArtifactStore(root).write_json(
         relative,
@@ -398,7 +400,10 @@ def test_verified_prediction_rejects_manifest_missing_production_fields(tmp_path
     assert raised.value.code == ErrorCode.EVALUATION_ARTIFACT_INVALID
 
 
-@pytest.mark.parametrize("field", ["result", "evidence", "stage_metrics", "status", "warnings"])
+@pytest.mark.parametrize(
+    "field",
+    ["result", "evidence", "stage_metrics", "status", "warnings", "transcript_source"],
+)
 def test_verified_prediction_rejects_each_missing_manifest_payload_field(
     field: str,
     tmp_path: Path,

@@ -10,13 +10,20 @@ import pytest
 from sqlalchemy.orm import Session
 
 from video_demo.application.queries import ResultQueryService, ResultWriteFence
-from video_demo.domain.evidence import KeyframeEvidence, SpeechSegment
+from video_demo.domain.evidence import (
+    EvidenceItem,
+    KeyframeEvidence,
+    SceneBoundary,
+    SpeechSegment,
+    SubtitleCue,
+)
 from video_demo.domain.result import (
     SummaryChapter,
     VideoSegment,
     VideoSummary,
     VideoUnderstandingResult,
 )
+from video_demo.domain.result_artifact import TranscriptSource
 from video_demo.domain.run import RunStatus
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
@@ -66,6 +73,39 @@ def _result(evidence_refs: tuple[str, ...] = ("asr_001",)) -> VideoUnderstanding
         asset_sha256="a" * 64,
         segments=(segment,),
         summary=summary,
+    )
+
+
+def _speech_fixture() -> SpeechSegment:
+    return SpeechSegment(
+        evidence_id="asr_001",
+        start_ms=0,
+        end_ms=1_000,
+        text="Hello",
+        language="en",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+
+
+def _subtitle_fixture() -> SubtitleCue:
+    return SubtitleCue(
+        evidence_id="subtitle_001",
+        start_ms=0,
+        end_ms=1_000,
+        text="字幕正文",
+        language="zh",
+        stream_index=2,
+    )
+
+
+def _scene_fixture() -> SceneBoundary:
+    return SceneBoundary(
+        evidence_id="scene_001",
+        start_ms=0,
+        end_ms=1_000,
+        transition="candidate",
+        score=0.8,
     )
 
 
@@ -140,6 +180,7 @@ def test_result_bundle_persists_segments_summary_evidence_and_status(
         evidence=(speech,),
         stage_metrics={"RESULT": 12},
         status=RunStatus.PARTIAL_SUCCEEDED,
+        transcript_source="ASR",
         fence=_claim_fence(runtime_root),
         warnings=("WINDOW_FAILED",),
     )
@@ -149,6 +190,56 @@ def test_result_bundle_persists_segments_summary_evidence_and_status(
     assert page.items == (speech,)
     assert page.next_cursor is None
     assert service.get_run_metadata(scope, "run_001").status == RunStatus.PARTIAL_SUCCEEDED
+
+
+@pytest.mark.parametrize(
+    ("transcript_source", "evidence"),
+    [
+        ("SUBTITLE", (_scene_fixture(),)),
+        ("SUBTITLE", (_speech_fixture(),)),
+        ("ASR", (_subtitle_fixture(),)),
+        ("NONE", (_speech_fixture(),)),
+    ],
+)
+def test_result_bundle_rejects_transcript_source_evidence_mismatch(
+    result_service: tuple[ResultQueryService, Scope, Path],
+    transcript_source: TranscriptSource,
+    evidence: tuple[EvidenceItem, ...],
+) -> None:
+    service, scope, runtime_root = result_service
+    result = _result((evidence[0].evidence_id,))
+
+    with pytest.raises(ValueError):
+        service.persist(
+            scope,
+            result,
+            evidence=evidence,
+            stage_metrics={},
+            status=RunStatus.SUCCEEDED,
+            transcript_source=transcript_source,
+            fence=_claim_fence(runtime_root),
+        )
+
+
+def test_result_bundle_persists_verified_subtitle_source(
+    result_service: tuple[ResultQueryService, Scope, Path],
+) -> None:
+    service, scope, runtime_root = result_service
+    subtitle = _subtitle_fixture()
+
+    service.persist(
+        scope,
+        _result((subtitle.evidence_id,)),
+        evidence=(subtitle,),
+        stage_metrics={"RESULT": 1},
+        status=RunStatus.SUCCEEDED,
+        transcript_source="SUBTITLE",
+        fence=_claim_fence(runtime_root),
+    )
+
+    bundle = service._read_bundle(scope, "run_001")
+    assert bundle["transcript_source"] == "SUBTITLE"
+    assert bundle["evidence"][0]["evidence_type"] == "SUBTITLE_CUE"  # type: ignore[index]
 
 
 def test_evidence_cursor_is_stable_and_filter_aware(
@@ -173,6 +264,7 @@ def test_evidence_cursor_is_stable_and_filter_aware(
         evidence=evidence,
         stage_metrics={},
         status=RunStatus.SUCCEEDED,
+        transcript_source="ASR",
         fence=_claim_fence(runtime_root),
     )
 
@@ -223,6 +315,7 @@ def test_keyframe_bytes_are_digest_checked_and_return_correct_mime(
         evidence=(keyframe,),
         stage_metrics={},
         status=RunStatus.SUCCEEDED,
+        transcript_source="NONE",
         fence=_claim_fence(runtime_root),
     )
 
@@ -259,6 +352,7 @@ def test_keyframe_path_cannot_escape_to_another_run(
         evidence=(keyframe,),
         stage_metrics={},
         status=RunStatus.SUCCEEDED,
+        transcript_source="NONE",
         fence=_claim_fence(runtime_root),
     )
 
@@ -288,6 +382,7 @@ def test_invalid_asset_digest_cannot_overwrite_existing_result_bundle(
         evidence=(speech,),
         stage_metrics={},
         status=RunStatus.SUCCEEDED,
+        transcript_source="ASR",
         fence=fence,
     )
     valid_result = service.get_result(scope, "run_001")
@@ -300,6 +395,7 @@ def test_invalid_asset_digest_cannot_overwrite_existing_result_bundle(
             evidence=(speech,),
             stage_metrics={},
             status=RunStatus.SUCCEEDED,
+            transcript_source="ASR",
             fence=fence,
         )
 
@@ -331,6 +427,7 @@ def test_evidence_persistence_has_explicit_count_limit(
             evidence=evidence,
             stage_metrics={},
             status=RunStatus.SUCCEEDED,
+            transcript_source="ASR",
             fence=_claim_fence(runtime_root),
         )
 
@@ -359,6 +456,7 @@ def test_evidence_cursor_rejects_tampering_and_filter_reuse(
         evidence=evidence,
         stage_metrics={},
         status=RunStatus.SUCCEEDED,
+        transcript_source="ASR",
         fence=_claim_fence(runtime_root),
     )
     cursor = service.get_evidence(scope, "run_001", limit=1).next_cursor
@@ -416,6 +514,7 @@ def test_stale_worker_fence_cannot_publish_result(
             evidence=(speech,),
             stage_metrics={},
             status=RunStatus.SUCCEEDED,
+            transcript_source="ASR",
             fence=ResultWriteFence(
                 job_pk=first.id,
                 worker_id=first.worker_id,
@@ -483,6 +582,7 @@ def test_same_fence_can_publish_only_one_result_bundle(
                 evidence=(speech,),
                 stage_metrics={"RESULT": 1},
                 status=RunStatus.SUCCEEDED,
+                transcript_source="ASR",
                 fence=fence,
             )
         except BaseException as error:
@@ -523,6 +623,7 @@ def test_result_publish_rejects_runtime_none_fence_before_writing_bundle(
             evidence=(speech,),
             stage_metrics={},
             status=RunStatus.SUCCEEDED,
+            transcript_source="ASR",
             fence=cast(ResultWriteFence, None),
         )
 
@@ -590,6 +691,7 @@ def test_result_publish_fence_must_belong_to_target_scope_and_run(
             evidence=(speech,),
             stage_metrics={},
             status=RunStatus.SUCCEEDED,
+            transcript_source="ASR",
             fence=ResultWriteFence(
                 job_pk=source_job.id,
                 worker_id=source_job.worker_id,
@@ -660,6 +762,7 @@ def test_cancellation_after_bundle_write_rolls_back_and_removes_unpublished_bund
             evidence=(speech,),
             stage_metrics={},
             status=RunStatus.SUCCEEDED,
+            transcript_source="ASR",
             fence=ResultWriteFence(
                 job_pk=claimed.id,
                 worker_id=claimed.worker_id,
@@ -694,6 +797,7 @@ def test_late_cancellation_cannot_overwrite_published_success(
         evidence=(speech,),
         stage_metrics={},
         status=RunStatus.SUCCEEDED,
+        transcript_source="ASR",
         fence=ResultWriteFence(
             job_pk=claimed.id,
             worker_id=claimed.worker_id,
@@ -747,6 +851,7 @@ def test_stale_cancel_reader_cannot_overwrite_published_success(
             evidence=(speech,),
             stage_metrics={},
             status=RunStatus.SUCCEEDED,
+            transcript_source="ASR",
             fence=ResultWriteFence(
                 job_pk=claimed.id,
                 worker_id=claimed.worker_id,

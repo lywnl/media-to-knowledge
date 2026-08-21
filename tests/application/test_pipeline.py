@@ -122,10 +122,11 @@ class FakeSpeech:
     ) -> SpeechAnalysis:
         self._calls.append("SPEECH")
         if media.audio_path is None:
-            return SpeechAnalysis(warnings=("NO_AUDIO_STREAM",))
+            return SpeechAnalysis(transcript_source="NONE", warnings=("NO_AUDIO_STREAM",))
         if not self._has_speech:
-            return SpeechAnalysis(warnings=("NO_SPEECH_DETECTED",))
+            return SpeechAnalysis(transcript_source="ASR", warnings=("NO_SPEECH_DETECTED",))
         return SpeechAnalysis(
+            transcript_source="ASR",
             evidence=(
                 SpeechSegment(
                     evidence_id="asr_001",
@@ -521,7 +522,10 @@ def test_scene_prepare_runs_in_parallel_with_speech_and_finalize_receives_real_s
             speech_started.set()
             assert prepare_started.wait(timeout=1), "visual.prepare 未与语音并行进入"
             speech_finished.set()
-            return SpeechAnalysis(boundary_candidates=(expected_boundary,))
+            return SpeechAnalysis(
+                transcript_source="ASR",
+                boundary_candidates=(expected_boundary,),
+            )
 
     class Visual:
         def prepare(
@@ -642,7 +646,7 @@ def test_cancellation_before_parallel_submission_starts_no_audio_visual_work(
     class Speech:
         def analyze(self, _media: PreparedMedia, **_kwargs: object) -> SpeechAnalysis:
             branch_calls.append("SPEECH")
-            return SpeechAnalysis()
+            return SpeechAnalysis(transcript_source="NONE")
 
     class Visual:
         def prepare(
@@ -683,7 +687,7 @@ def test_cancellation_after_parallel_join_prevents_visual_finalize(
     class Speech:
         def analyze(self, _media: PreparedMedia, **_kwargs: object) -> SpeechAnalysis:
             speech_finished.set()
-            return SpeechAnalysis()
+            return SpeechAnalysis(transcript_source="NONE")
 
     class Visual(FakeVisual):
         def prepare(

@@ -30,6 +30,7 @@ from video_demo.domain.evidence import (
     SceneBoundary,
     SpeakerTurn,
     SpeechSegment,
+    SubtitleCue,
 )
 from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
 from video_demo.domain.run import TimeRange
@@ -925,6 +926,11 @@ class DemoFallbackVideoUnderstanding:
 def _fallback_segment_understanding(
     request: SegmentUnderstandingRequest,
 ) -> SegmentUnderstanding:
+    subtitle_items = tuple(
+        item
+        for item in request.evidence
+        if isinstance(item, SubtitleCue) and item.text.strip()
+    )
     speech_items = tuple(
         item
         for item in request.evidence
@@ -935,8 +941,10 @@ def _fallback_segment_understanding(
         for item in request.evidence
         if isinstance(item, AlignedWord) and item.text.strip()
     )
-    spoken_items: tuple[SpeechSegment | AlignedWord, ...] = (
-        speech_items if speech_items else aligned_items
+    spoken_items: tuple[SubtitleCue | SpeechSegment | AlignedWord, ...] = (
+        subtitle_items
+        if subtitle_items
+        else (speech_items if speech_items else aligned_items)
     )
     spoken_values = tuple(
         _truncate_local_semantic_text(item.text, 160)
@@ -970,7 +978,7 @@ def _fallback_segment_understanding(
         dict.fromkeys(
             item.language
             for item in request.evidence
-            if isinstance(item, (SpeechSegment, AlignedWord, OcrEvidence))
+            if isinstance(item, (SubtitleCue, SpeechSegment, AlignedWord, OcrEvidence))
         )
     )
     keywords = tuple(dict.fromkeys(text_values))

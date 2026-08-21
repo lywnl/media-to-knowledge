@@ -395,6 +395,7 @@ def _outcome() -> PipelineOutcome:
     )
     return PipelineOutcome(
         status=RunStatus.SUCCEEDED,
+        transcript_source="ASR",
         result=VideoUnderstandingResult(
             run_id="run_001",
             asset_sha256="a" * 64,

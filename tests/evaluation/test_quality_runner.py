@@ -446,6 +446,7 @@ def _materialize_fixture(
                             "stage_metrics": {"RESULT": 1},
                             "status": prediction.index.terminal_status,
                             "warnings": list(prediction.run.warning_codes),
+                            "transcript_source": "ASR",
                         },
                     },
                     ensure_ascii=False,

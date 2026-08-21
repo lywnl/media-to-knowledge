@@ -14,13 +14,22 @@ from video_demo.application.pipeline import (
     ProbedAsset,
     RegisteredAsset,
 )
+from video_demo.domain.manifest import SubtitleStream
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.probe import FFprobeClient, ProbeLimits, ProbeResult, SupportedMime
+from video_demo.media.subtitles import (
+    ParsedSubtitle,
+    SubtitleTrackRejected,
+    is_subtitle_eligible,
+    parse_webvtt,
+    rank_text_subtitle_streams,
+)
 from video_demo.media.transcode import (
     AudioArtifact,
     FFmpegTranscoder,
     NoAudioArtifact,
     ProxyVideoArtifact,
+    SubtitleArtifact,
 )
 from video_demo.persistence.database import Database
 from video_demo.persistence.repositories import VideoObjectRepository, VideoRunRepository
@@ -55,6 +64,13 @@ class TranscodeClient(Protocol):
         *,
         has_audio: bool,
     ) -> AudioArtifact | NoAudioArtifact: ...
+
+    def extract_subtitle(
+        self,
+        source: Path,
+        run_relative_root: Path,
+        stream: SubtitleStream,
+    ) -> SubtitleArtifact: ...
 
 
 class ProductionAssetRegistrar:
@@ -167,23 +183,28 @@ class ProductionMediaTranscoder:
             max_size_bytes=self._max_proxy_bytes,
             message="代理视频必须位于当前运行目录内",
         )
-        audio = client.extract_audio(
-            asset.source_path,
-            asset.run_relative_root,
-            has_audio=bool(probed.manifest.audio_streams),
-        )
         warnings = list(probed.warnings)
-        if isinstance(audio, NoAudioArtifact):
-            warnings.append(audio.warning_code)
+        subtitle = self._select_subtitle(client, probed, warnings)
+        if subtitle is not None:
             audio_path = None
             audio_sha256 = None
         else:
-            audio_path = self._verified_run_artifact(
+            audio = client.extract_audio(
+                asset.source_path,
                 asset.run_relative_root,
-                audio.relative_path,
-                audio.sha256,
+                has_audio=bool(probed.manifest.audio_streams),
             )
-            audio_sha256 = audio.sha256
+            if isinstance(audio, NoAudioArtifact):
+                warnings.append(audio.warning_code)
+                audio_path = None
+                audio_sha256 = None
+            else:
+                audio_path = self._verified_run_artifact(
+                    asset.run_relative_root,
+                    audio.relative_path,
+                    audio.sha256,
+                )
+                audio_sha256 = audio.sha256
         return PreparedMedia(
             source=probed,
             proxy_path=proxy_path,
@@ -191,8 +212,50 @@ class ProductionMediaTranscoder:
             proxy_size_bytes=proxy.size_bytes,
             audio_path=audio_path,
             audio_sha256=audio_sha256,
+            subtitle=subtitle,
             warnings=tuple(dict.fromkeys(warnings)),
         )
+
+    def _select_subtitle(
+        self,
+        client: TranscodeClient,
+        probed: ProbedAsset,
+        warnings: list[str],
+    ) -> ParsedSubtitle | None:
+        asset = probed.asset
+        candidates = rank_text_subtitle_streams(
+            probed.manifest.subtitle_streams,
+            asset.config.language_hints,
+        )
+        for stream in candidates:
+            try:
+                artifact = client.extract_subtitle(
+                    asset.source_path,
+                    asset.run_relative_root,
+                    stream,
+                )
+                parsed = parse_webvtt(
+                    self._runtime_root,
+                    asset.run_relative_root,
+                    artifact,
+                    duration_ms=probed.duration_ms,
+                )
+            except SubtitleTrackRejected as error:
+                warnings.append(
+                    f"SUBTITLE_TRACK_REJECTED:{stream.index}:{error.reason}"
+                )
+                continue
+            except VideoDemoError as error:
+                if error.code != ErrorCode.VIDEO_PROCESS_FAILED:
+                    raise
+                warnings.append(
+                    f"SUBTITLE_TRACK_REJECTED:{stream.index}:DECODE_FAILED"
+                )
+                continue
+            if is_subtitle_eligible(parsed, duration_ms=probed.duration_ms):
+                return parsed
+            warnings.append(f"SUBTITLE_TRACK_REJECTED:{stream.index}:INCOMPLETE")
+        return None
 
     def _verified_run_artifact(
         self,

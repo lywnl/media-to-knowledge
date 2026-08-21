@@ -31,6 +31,7 @@ from video_demo.domain.evidence import (
     OcrLine,
     SceneBoundary,
     SpeechSegment,
+    SubtitleCue,
 )
 from video_demo.domain.manifest import Rational, VideoAssetManifest, VideoStream
 from video_demo.domain.run import TimeRange
@@ -175,7 +176,7 @@ def test_complete_visual_chain_returns_merged_windows_without_creating_clips(
         ),
     )
 
-    result = analyzer.analyze(media, speech=SpeechAnalysis())
+    result = analyzer.analyze(media, speech=SpeechAnalysis(transcript_source="NONE"))
 
     assert calls == ["scene", "frames", "ocr:zh", "ocr:zh"]
     assert result.clips == ()
@@ -228,6 +229,7 @@ def test_visual_chain_evenly_limits_keyframes_and_ocr_to_thirty(tmp_path: Path) 
             return _ocr("页面")
 
     speech = SpeechAnalysis(
+        transcript_source="ASR",
         boundary_candidates=tuple(
             SpeechBoundaryCandidate(timestamp_ms=timestamp_ms, source="silence")
             for timestamp_ms in range(2_000, duration_ms, 2_000)
@@ -340,7 +342,11 @@ def test_visual_preparation_rejects_replaced_scenes_before_finalization_componen
     )
 
     with pytest.raises(VideoDemoError) as raised:
-        analyzer.finalize(media, replaced, speech=SpeechAnalysis())
+        analyzer.finalize(
+            media,
+            replaced,
+            speech=SpeechAnalysis(transcript_source="NONE"),
+        )
 
     assert raised.value.code == ErrorCode.VISUAL_RESULT_INVALID
     assert isinstance(preparation, VisualPreparation)
@@ -385,7 +391,7 @@ def test_visual_preparation_binds_every_media_and_tolerance_field(
         analyzer.finalize(
             media,
             replace(preparation, **{field: value}),
-            speech=SpeechAnalysis(),
+            speech=SpeechAnalysis(transcript_source="NONE"),
         )
 
     assert raised.value.code == ErrorCode.VISUAL_RESULT_INVALID
@@ -428,7 +434,11 @@ def test_visual_preparation_cannot_be_reused_for_another_run(
     preparation = analyzer.prepare(first)
 
     with pytest.raises(VideoDemoError) as raised:
-        analyzer.finalize(second, preparation, speech=SpeechAnalysis())
+        analyzer.finalize(
+            second,
+            preparation,
+            speech=SpeechAnalysis(transcript_source="NONE"),
+        )
 
     assert raised.value.code == ErrorCode.VISUAL_RESULT_INVALID
     assert factory_calls == ["factory"]
@@ -482,6 +492,7 @@ def test_speech_candidates_build_hybrid_windows_but_scene_alone_does_not(
             )
 
     speech = SpeechAnalysis(
+        transcript_source="ASR",
         boundary_candidates=(
             SpeechBoundaryCandidate(timestamp_ms=10_000, source="silence", score=1.0),
         ),
@@ -561,6 +572,7 @@ def test_ocr_language_selection_and_warnings(
     media = _media(tmp_path, duration_ms=4_000, language_hints=hints)
     languages: list[str] = []
     speech = SpeechAnalysis(
+        transcript_source="ASR",
             evidence=(
                 (
                     SpeechSegment(
@@ -612,6 +624,29 @@ def test_ocr_language_selection_and_warnings(
     assert languages == ([] if expected_language is None else [expected_language])
     if warning is not None:
         assert warning in result.warnings
+
+
+def test_ocr_language_can_follow_subtitle_cue(tmp_path: Path) -> None:
+    from video_demo.application.production_visual import _ocr_language
+
+    media = _media(tmp_path, duration_ms=4_000, language_hints=("en",))
+    subtitle = SubtitleCue(
+        evidence_id="subtitle_001",
+        start_ms=0,
+        end_ms=4_000,
+        text="字幕正文",
+        language="ja",
+        stream_index=2,
+    )
+
+    language, warning = _ocr_language(
+        2_000,
+        SpeechAnalysis(transcript_source="SUBTITLE", evidence=(subtitle,)),
+        media,
+    )
+
+    assert language == "ja"
+    assert warning is None
 
 
 @pytest.mark.parametrize(

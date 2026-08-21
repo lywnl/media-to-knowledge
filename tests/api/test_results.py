@@ -157,6 +157,7 @@ def _persist_ready_result(
         evidence=(speech, keyframe),
         stage_metrics={"RESULT": 4},
         status=RunStatus.SUCCEEDED,
+        transcript_source="ASR",
         fence=ResultWriteFence(
             job_pk=claimed.id,
             worker_id=claimed.worker_id,
@@ -253,6 +254,7 @@ def _fake_production_pipeline(
             **_kwargs: object,
         ) -> SpeechAnalysis:
             return SpeechAnalysis(
+                transcript_source="ASR",
                 evidence=(
                     SpeechSegment(
                         evidence_id="asr_001",
