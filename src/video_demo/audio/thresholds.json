@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0.0",
+  "threshold_version": "eval-unvalidated-v1",
+  "default_threshold": 0.5,
+  "class_thresholds": {
+    "Music": 0.6,
+    "Applause": 0.5,
+    "Laughter": 0.5,
+    "Alarm": 0.5,
+    "Siren": 0.5
+  },
+  "excluded_classes": [
+    "Speech",
+    "Child speech, kid speaking",
+    "Conversation",
+    "Narration, monologue"
+  ],
+  "normalized_classes": {
+    "Music": "音乐",
+    "Applause": "掌声",
+    "Laughter": "笑声",
+    "Alarm": "警报",
+    "Siren": "警笛"
+  },
+  "merge_gap_ms": 500,
+  "calibration_dataset_sha256": null
+}
