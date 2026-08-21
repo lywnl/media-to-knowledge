@@ -57,6 +57,9 @@ class RecognizerPort(Protocol):
         self,
         audio_slice: Path,
         language_span: LanguageSpan,
+        *,
+        hotwords: tuple[str, ...] = (),
+        core_context: str | None = None,
     ) -> tuple[RawAsrSegment, ...]: ...
 
 
@@ -288,7 +291,12 @@ class ProductionSpeechAnalyzer:
                 f"asr_{language_span.evidence_id}",
                 language_span,
             )
-            raw_segments = components.recognizer.transcribe_slice(audio_slice, language_span)
+            raw_segments = components.recognizer.transcribe_slice(
+                audio_slice,
+                language_span,
+                hotwords=media.source.asset.config.hotwords,
+                core_context=media.source.asset.config.core_context,
+            )
             segments.extend(build_speech_segments(language_span, raw_segments))
         return AsrSnapshotPayload(
             language_spans=languages.spans,

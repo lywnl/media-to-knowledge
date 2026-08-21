@@ -6,9 +6,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, ValidationError, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from video_demo.domain.base import FrozenModel, Sha256, StableId
+from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
 from video_demo.errors import ErrorCode, VideoDemoError
 
 ValidationLanguage = Literal["zh", "en", "ja", "ko", "es"]
@@ -22,6 +23,27 @@ class EvaluationSample(FrozenModel):
     media_sha256: Sha256
     annotations_relative_path: str = Field(min_length=1, max_length=1024)
     annotations_sha256: Sha256
+    hotwords: tuple[str, ...] = ()
+    core_context: str | None = None
+    pair_id: StableId | None = None
+    hint_variant: Literal["NONE", "CORRECT", "INCORRECT"] | None = None
+    pair_reference_sha256: Sha256 | None = None
+
+    @field_validator("hotwords", mode="before")
+    @classmethod
+    def normalize_sample_hotwords(cls, value: object) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("热词必须是数组")
+        return normalize_hotwords(value)
+
+    @field_validator("core_context", mode="before")
+    @classmethod
+    def normalize_sample_core_context(cls, value: object) -> str | None:
+        if value is not None and not isinstance(value, str):
+            raise ValueError("核心上下文必须是字符串")
+        return normalize_core_context(value)
 
     @model_validator(mode="after")
     def validate_relative_paths(self) -> EvaluationSample:
@@ -29,6 +51,13 @@ class EvaluationSample(FrozenModel):
             path = Path(value)
             if path.is_absolute() or ".." in path.parts:
                 raise ValueError("评测路径必须是无穿越的相对路径")
+        paired = self.hint_variant in {"NONE", "CORRECT"}
+        if paired != (self.pair_id is not None and self.pair_reference_sha256 is not None):
+            raise ValueError("NONE/CORRECT 样本必须同时绑定配对 ID 和参考摘要")
+        if self.hint_variant == "INCORRECT" and (
+            self.pair_id is not None or self.pair_reference_sha256 is not None
+        ):
+            raise ValueError("INCORRECT 样本不得进入效果配对")
         return self
 
 
@@ -40,6 +69,26 @@ class EvaluationDataset(FrozenModel):
     runtime_root: Path = Field(exclude=True)
     workspace_root: Path = Field(exclude=True)
     source_path: Path | None = Field(default=None, exclude=True)
+
+    @model_validator(mode="after")
+    def validate_hint_pairs(self) -> EvaluationDataset:
+        groups: dict[str, list[EvaluationSample]] = {}
+        for sample in self.samples:
+            if sample.pair_id is not None:
+                groups.setdefault(sample.pair_id, []).append(sample)
+        for samples in groups.values():
+            if len(samples) != 2 or {sample.hint_variant for sample in samples} != {
+                "NONE",
+                "CORRECT",
+            }:
+                raise ValueError("提示效果配对必须恰好包含 NONE/CORRECT 两个样本")
+            if len({sample.language for sample in samples}) != 1:
+                raise ValueError("提示效果配对语言必须一致")
+            if len({sample.media_sha256 for sample in samples}) != 1:
+                raise ValueError("提示效果配对媒体摘要必须一致")
+            if len({sample.pair_reference_sha256 for sample in samples}) != 1:
+                raise ValueError("提示效果配对参考摘要必须一致")
+        return self
 
     @classmethod
     def load(
@@ -72,7 +121,7 @@ class EvaluationDataset(FrozenModel):
                 workspace_root=workspace_root.resolve(strict=True),
                 source_path=path.resolve(strict=True),
             )
-        except ValidationError:
+        except (ValidationError, ValueError):
             raise VideoDemoError(
                 ErrorCode.EVALUATION_DATASET_INVALID,
                 "评测集 Manifest 不能为空",

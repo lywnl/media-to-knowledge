@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -130,6 +131,15 @@ class EvaluationAnnotation(FrozenModel):
     supported_facts: tuple[SupportedFact, ...] = Field(min_length=1)
     key_fact_ids: tuple[StableId, ...] = Field(min_length=1)
     known_people: tuple[KnownPerson, ...] = ()
+    terms: tuple[str, ...] = ()
+
+    @field_validator("terms")
+    @classmethod
+    def reject_blank_or_duplicate_terms(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(" ".join(term.split()) for term in value)
+        if any(not term for term in normalized) or len(normalized) != len(set(normalized)):
+            raise ValueError("明确标注术语不得为空或重复")
+        return normalized
 
     @model_validator(mode="after")
     def validate_annotation_references(self) -> Self:
@@ -225,6 +235,24 @@ class VerifiedAnnotation(FrozenModel):
     sha256: Sha256
 
 
+def pair_reference_sha256(annotation: EvaluationAnnotation) -> str:
+    """计算忽略样本 ID 的规范参考摘要，供 NONE/CORRECT 配对绑定。"""
+
+    payload = annotation.model_dump(
+        mode="json",
+        exclude={"sample_id"},
+        exclude_computed_fields=True,
+    )
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class ValidatedEvaluationPackage(FrozenModel):
     dataset: EvaluationDataset
     authorization: AuthorizationFile
@@ -288,6 +316,11 @@ def load_evaluation_package(
                 or hashlib.sha256(annotation_bytes).hexdigest() != sample.annotations_sha256
             ):
                 raise ValueError("样本和标注绑定不匹配")
+            if (
+                sample.pair_reference_sha256 is not None
+                and pair_reference_sha256(annotation) != sample.pair_reference_sha256
+            ):
+                raise ValueError("配对参考摘要与规范标注不匹配")
             media_path = _safe_relative_file(
                 dataset.eval_root,
                 sample.media_relative_path,

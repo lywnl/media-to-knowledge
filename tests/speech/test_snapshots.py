@@ -6,11 +6,16 @@ from pydantic import ValidationError
 from video_demo.domain.evidence import SpeechSegment, SubtitleCue
 from video_demo.domain.run import ModelIdentity
 from video_demo.speech.snapshots import (
+    AsrSnapshotPayload,
     SpeechAnalysisSnapshotPayload,
     SpeechFingerprintInputs,
     asr_fingerprint,
     speech_fingerprint,
 )
+
+
+def test_asr_snapshot_uses_hint_enabled_behavior_contract() -> None:
+    assert AsrSnapshotPayload.model_fields["schema_version"].default == "1.1.0"
 
 
 def test_asr_fingerprint_changes_only_with_asr_inputs() -> None:

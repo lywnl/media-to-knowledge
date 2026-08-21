@@ -168,6 +168,48 @@ def test_faster_whisper_adapter_disables_second_vad_and_translation(tmp_path: Pa
     assert captured[0]["vad_filter"] is False
     assert captured[0]["word_timestamps"] is False
     assert captured[0]["condition_on_previous_text"] is False
+    assert captured[0]["hotwords"] is None
+    assert captured[0]["initial_prompt"] is None
+
+
+def test_faster_whisper_adapter_maps_hints_without_rewriting_model_output(
+    tmp_path: Path,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    class Backend:
+        def transcribe(self, audio: Path, **kwargs: object) -> tuple[object, object]:
+            captured.append({"audio": audio, **kwargs})
+
+            class Segment:
+                start = 0.0
+                end = 1.0
+                text = "模型实际输出"
+                avg_logprob = -0.2
+                no_speech_prob = 0.1
+
+            return iter((Segment(),)), object()
+
+    language_span = LanguageSpan(
+        evidence_id="lid_hint",
+        start_ms=0,
+        end_ms=2_000,
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+
+    result = FasterWhisperAdapter(Backend()).transcribe_slice(
+        tmp_path / "slice.wav",
+        language_span,
+        hotwords=("Milvus", "WhisperX"),
+        core_context="这是向量检索课程。",
+    )
+
+    assert captured[0]["hotwords"] == "Milvus WhisperX"
+    assert captured[0]["initial_prompt"] == "这是向量检索课程。"
+    assert captured[0]["condition_on_previous_text"] is False
+    assert tuple(item.text for item in result) == ("模型实际输出",)
 
 
 def test_faster_whisper_model_is_downloaded_flat_then_loaded_offline(tmp_path: Path) -> None:

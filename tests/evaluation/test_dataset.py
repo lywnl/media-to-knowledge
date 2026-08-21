@@ -7,7 +7,147 @@ from pathlib import Path
 import pytest
 
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.evaluation.dataset import EvaluationDataset
+from video_demo.evaluation.dataset import EvaluationDataset, EvaluationSample
+
+
+def test_evaluation_sample_normalizes_optional_speech_hints() -> None:
+    sample = EvaluationSample(
+        sample_id="sample_001",
+        language="zh",
+        authorization_id="auth_001",
+        media_relative_path="media/sample.mp4",
+        media_sha256="a" * 64,
+        annotations_relative_path="annotations/sample.json",
+        annotations_sha256="b" * 64,
+        hotwords=("  Milvus  ", "WhisperX"),
+        core_context="  向量   检索课程  ",
+    )
+
+    assert sample.hotwords == ("Milvus", "WhisperX")
+    assert sample.core_context == "向量 检索课程"
+    assert sample.pair_id is None
+    assert sample.pair_reference_sha256 is None
+
+
+def test_evaluation_sample_keeps_legacy_manifest_defaults() -> None:
+    sample = EvaluationSample(
+        sample_id="sample_legacy",
+        language="zh",
+        authorization_id="auth_001",
+        media_relative_path="media/sample.mp4",
+        media_sha256="a" * 64,
+        annotations_relative_path="annotations/sample.json",
+        annotations_sha256="b" * 64,
+    )
+
+    assert sample.hotwords == ()
+    assert sample.core_context is None
+    assert sample.pair_id is None
+    assert sample.hint_variant is None
+    assert sample.pair_reference_sha256 is None
+
+
+def test_evaluation_dataset_accepts_exact_none_correct_pair(tmp_path: Path) -> None:
+    manifest = _eval_root(tmp_path) / "dataset.jsonl"
+    reference_sha = "c" * 64
+    base = {
+        "language": "zh",
+        "authorization_id": "auth_001",
+        "media_relative_path": "media/sample.mp4",
+        "media_sha256": "a" * 64,
+        "pair_id": "pair_001",
+        "pair_reference_sha256": reference_sha,
+    }
+    rows = (
+        {
+            **base,
+            "sample_id": "sample_none",
+            "annotations_relative_path": "annotations/none.json",
+            "annotations_sha256": "d" * 64,
+            "hint_variant": "NONE",
+        },
+        {
+            **base,
+            "sample_id": "sample_correct",
+            "annotations_relative_path": "annotations/correct.json",
+            "annotations_sha256": "e" * 64,
+            "hotwords": ["Milvus"],
+            "hint_variant": "CORRECT",
+        },
+    )
+    manifest.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows),
+        encoding="utf-8",
+    )
+
+    dataset = _load_dataset(manifest, tmp_path)
+
+    assert tuple(sample.hint_variant for sample in dataset.samples) == (
+        "NONE",
+        "CORRECT",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_correct",
+        "duplicate_none",
+        "language_mismatch",
+        "media_mismatch",
+        "reference_mismatch",
+    ),
+)
+def test_evaluation_dataset_rejects_invalid_hint_pair(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    manifest = _eval_root(tmp_path) / "dataset.jsonl"
+    base = {
+        "language": "zh",
+        "authorization_id": "auth_001",
+        "media_relative_path": "media/sample.mp4",
+        "media_sha256": "a" * 64,
+        "pair_id": "pair_001",
+        "pair_reference_sha256": "c" * 64,
+    }
+    rows = [
+        {
+            **base,
+            "sample_id": "sample_none",
+            "annotations_relative_path": "annotations/none.json",
+            "annotations_sha256": "d" * 64,
+            "hint_variant": "NONE",
+        },
+        {
+            **base,
+            "sample_id": "sample_correct",
+            "annotations_relative_path": "annotations/correct.json",
+            "annotations_sha256": "e" * 64,
+            "hotwords": ["Milvus"],
+            "hint_variant": "CORRECT",
+        },
+    ]
+    if mutation == "missing_correct":
+        rows.pop()
+    elif mutation == "duplicate_none":
+        rows[1]["hint_variant"] = "NONE"
+        rows[1].pop("hotwords")
+    elif mutation == "language_mismatch":
+        rows[1]["language"] = "en"
+    elif mutation == "media_mismatch":
+        rows[1]["media_sha256"] = "f" * 64
+    else:
+        rows[1]["pair_reference_sha256"] = "f" * 64
+    manifest.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        _load_dataset(manifest, tmp_path)
+
+    assert raised.value.code == ErrorCode.EVALUATION_DATASET_INVALID
 
 
 def _runtime_root(tmp_path: Path) -> Path:

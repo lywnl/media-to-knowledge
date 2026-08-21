@@ -325,13 +325,7 @@ class PredictionRunner:
             created = client.post(
                 f"/api/kb/knowledge-bases/{self._knowledge_base_id}/video-understanding-runs",
                 headers=self._scope_headers,
-                json={
-                    "object_ref": object_ref,
-                    "idempotency_key": idempotency,
-                    "language_hints": [sample.language],
-                    "min_speakers": None,
-                    "max_speakers": None,
-                },
+                json=_create_run_request(sample, object_ref, idempotency),
             )
             _require_status(created, 202)
             created_payload = created.json()
@@ -1137,6 +1131,22 @@ def _mime_for_path(path: Path) -> str:
 
 def _idempotency_key(evaluation_run_id: str, sample_id: str) -> str:
     return f"eval-{_sha256_text(f'{evaluation_run_id}:{sample_id}')[:40]}"
+
+
+def _create_run_request(
+    sample: EvaluationSample,
+    object_ref: str,
+    idempotency_key: str,
+) -> dict[str, object]:
+    return {
+        "object_ref": object_ref,
+        "idempotency_key": idempotency_key,
+        "language_hints": [sample.language],
+        "min_speakers": None,
+        "max_speakers": None,
+        "hotwords": list(sample.hotwords),
+        "core_context": sample.core_context,
+    }
 
 
 def _require_status(response: Any, expected: int) -> None:

@@ -175,9 +175,22 @@ def test_complete_chain_preserves_order_config_absolute_time_speakers_and_sortin
 
     class Recognizer:
         def transcribe_slice(
-            self, audio_slice: Path, language_span: LanguageSpan
+            self,
+            audio_slice: Path,
+            language_span: LanguageSpan,
+            *,
+            hotwords: tuple[str, ...] = (),
+            core_context: str | None = None,
         ) -> tuple[RawAsrSegment, ...]:
-            calls.append(("asr", audio_slice.name, language_span.language))
+            calls.append(
+                (
+                    "asr",
+                    audio_slice.name,
+                    language_span.language,
+                    hotwords,
+                    core_context,
+                )
+            )
             return (RawAsrSegment(100, 1_500, " hello ", 0.9),)
 
     class Aligner:
@@ -213,6 +226,8 @@ def test_complete_chain_preserves_order_config_absolute_time_speakers_and_sortin
                     language_hints=("en", "zh"),
                     min_speakers=1,
                     max_speakers=3,
+                    hotwords=("Milvus", "WhisperX"),
+                    core_context="这是向量检索课程。",
                 ),
             ),
             warnings=("SUBTITLE_TRACK_REJECTED:2:TIMELINE_INVALID",),
@@ -232,7 +247,13 @@ def test_complete_chain_preserves_order_config_absolute_time_speakers_and_sortin
     )
     assert calls[2] == ("lid", ("en", "zh"), (local_speech,))
     assert calls[3] == ("slice", Path("runs/scope/run_001"), "asr_lid_001", 1_000, 3_000)
-    assert calls[4] == ("asr", "asr_lid_001.wav", "en")
+    assert calls[4] == (
+        "asr",
+        "asr_lid_001.wav",
+        "en",
+        ("Milvus", "WhisperX"),
+        "这是向量检索课程。",
+    )
     assert calls[5][0:2] == ("align", "audio.wav")  # type: ignore[index]
     assert calls[6] == ("diarize", 1, 3)
     assert calls[7] == "yamnet"
@@ -319,6 +340,115 @@ def test_speech_analysis_exports_deduplicated_hybrid_boundary_candidates(
         SpeechBoundaryCandidate(2_000, "silence", 1.0),
         SpeechBoundaryCandidate(2_000, "speaker_change", 1.0),
     )
+
+
+def test_every_asr_slice_receives_same_hints_without_passing_them_to_lid(
+    tmp_path: Path,
+) -> None:
+    speech = SpeechInterval(
+        evidence_id="vad_hints",
+        start_ms=0,
+        end_ms=4_000,
+        confidence=0.9,
+    )
+    languages = (
+        LanguageSpan(
+            evidence_id="lid_hint_zh",
+            start_ms=0,
+            end_ms=2_000,
+            language="zh",
+            confidence=0.9,
+            is_fully_evaluated_language=True,
+        ),
+        LanguageSpan(
+            evidence_id="lid_hint_en",
+            start_ms=2_000,
+            end_ms=4_000,
+            language="en",
+            confidence=0.9,
+            is_fully_evaluated_language=True,
+        ),
+    )
+    lid_calls: list[tuple[str, ...]] = []
+    asr_calls: list[tuple[tuple[str, ...], str | None]] = []
+
+    class Vad:
+        def detect(self, _audio: Path, *, duration_ms: int) -> VadResult:
+            return VadResult(speech=(speech,), silence=(), long_silence_boundaries_ms=())
+
+    class Lid:
+        def identify(
+            self,
+            _audio: Path,
+            _speech: object,
+            hints: tuple[str, ...],
+        ) -> LanguageIdentificationResult:
+            lid_calls.append(hints)
+            return LanguageIdentificationResult(spans=languages, change_boundaries_ms=(2_000,))
+
+    class Recognizer:
+        def transcribe_slice(
+            self,
+            _audio: Path,
+            _language: LanguageSpan,
+            *,
+            hotwords: tuple[str, ...] = (),
+            core_context: str | None = None,
+        ) -> tuple[RawAsrSegment, ...]:
+            asr_calls.append((hotwords, core_context))
+            return (RawAsrSegment(0, 1_000, "模型输出", 0.9),)
+
+    class Slicer:
+        def create(
+            self,
+            _audio: Path,
+            _root: Path,
+            slice_id: str,
+            _range: TimeRange,
+        ) -> Path:
+            output = tmp_path / f"{slice_id}.wav"
+            output.write_bytes(b"wav")
+            return output
+
+    class Empty:
+        def align(self, _audio: Path, segments: object) -> AlignmentResult:
+            return AlignmentResult(
+                words=(),
+                preserved_segments=tuple(segments),  # type: ignore[arg-type]
+                warning_codes=(),
+            )
+
+        def diarize(self, _audio: Path, **_kwargs: object) -> tuple[SpeakerTurn, ...]:
+            return ()
+
+        def detect(self, _audio: Path, *, duration_ms: int) -> tuple[AudioEvent, ...]:
+            return ()
+
+    components = SpeechComponents(
+        vad=Vad(),  # type: ignore[arg-type]
+        language_identifier=Lid(),  # type: ignore[arg-type]
+        recognizer=Recognizer(),  # type: ignore[arg-type]
+        aligner=Empty(),  # type: ignore[arg-type]
+        diarizer=Empty(),  # type: ignore[arg-type]
+        audio_events=Empty(),  # type: ignore[arg-type]
+        slicer=Slicer(),  # type: ignore[arg-type]
+    )
+    config = PipelineRunConfig(
+        language_hints=("zh",),
+        hotwords=("Milvus", "WhisperX"),
+        core_context="这是向量检索课程。",
+    )
+
+    result = _analyzer(tmp_path, lambda _media, _cancel: components).analyze(
+        _media(tmp_path, config=config)
+    )
+
+    assert result.transcript_source == "ASR"
+    assert lid_calls == [("zh",)]
+    assert asr_calls == [
+        (("Milvus", "WhisperX"), "这是向量检索课程。"),
+        (("Milvus", "WhisperX"), "这是向量检索课程。"),
+    ]
 
 
 def test_alignment_unavailable_preserves_segment_without_fabricating_word(tmp_path: Path) -> None:
@@ -474,7 +604,12 @@ def test_alignment_failure_retry_reuses_asr_snapshot(tmp_path: Path) -> None:
             return LanguageIdentificationResult(spans=(language,), change_boundaries_ms=())
 
     class Recognizer:
-        def transcribe_slice(self, _audio: Path, _language: LanguageSpan) -> object:
+        def transcribe_slice(
+            self,
+            _audio: Path,
+            _language: LanguageSpan,
+            **_kwargs: object,
+        ) -> object:
             calls["recognizer"] += 1
             return (RawAsrSegment(0, 1_000, segment.text, segment.confidence),)
 
@@ -610,7 +745,12 @@ def _successful_components(
             return path
 
     class Recognizer:
-        def transcribe_slice(self, _audio: Path, _language: LanguageSpan) -> object:
+        def transcribe_slice(
+            self,
+            _audio: Path,
+            _language: LanguageSpan,
+            **_kwargs: object,
+        ) -> object:
             return (RawAsrSegment(0, 1_000, segment.text, segment.confidence),)
 
     class Events:

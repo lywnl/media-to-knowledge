@@ -8,6 +8,7 @@ from unittest.mock import patch
 from video_demo.evaluation.dataset import EvaluationSample
 from video_demo.evaluation.prediction_runner import (
     PredictionRunReport,
+    _create_run_request,
     _persist_failed_prediction,
     _prediction_index_path,
 )
@@ -106,6 +107,30 @@ def test_prediction_index_path_points_to_index_json_not_run_snapshot() -> None:
     assert _prediction_index_path(Path("/runtime/eval"), "eval_001", "sample_001") == (
         Path("/runtime/eval/predictions/eval_001/sample_001/index.json")
     )
+
+
+def test_prediction_request_forwards_sample_speech_hints() -> None:
+    sample = EvaluationSample(
+        sample_id="sample_001",
+        language="zh",
+        authorization_id="auth_001",
+        media_relative_path="media/sample.mp4",
+        media_sha256="a" * 64,
+        annotations_relative_path="annotations/sample.json",
+        annotations_sha256="b" * 64,
+        hotwords=("Milvus", "WhisperX"),
+        core_context="这是向量检索课程。",
+    )
+
+    assert _create_run_request(sample, "obj_001", "idem_001") == {
+        "object_ref": "obj_001",
+        "idempotency_key": "idem_001",
+        "language_hints": ["zh"],
+        "min_speakers": None,
+        "max_speakers": None,
+        "hotwords": ["Milvus", "WhisperX"],
+        "core_context": "这是向量检索课程。",
+    }
 
 
 def test_failed_prediction_is_persisted_and_reverified_with_actual_terminal_status(

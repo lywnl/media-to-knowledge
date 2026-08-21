@@ -25,7 +25,7 @@ _DOWNSTREAM_COMPONENTS = frozenset({"whisperx", "pyannote", "yamnet"})
 
 
 class AsrSnapshotPayload(FrozenModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     language_spans: tuple[LanguageSpan, ...]
     segments: tuple[SpeechSegment, ...]
     vad_warnings: tuple[str, ...]

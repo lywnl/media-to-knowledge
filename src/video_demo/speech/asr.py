@@ -57,6 +57,9 @@ class FasterWhisperAdapter:
         self,
         audio_slice: Path,
         language_span: LanguageSpan,
+        *,
+        hotwords: tuple[str, ...] = (),
+        core_context: str | None = None,
     ) -> tuple[RawAsrSegment, ...]:
         language = None if language_span.language == "und" else language_span.language
         segments, _info = self._backend.transcribe(
@@ -67,6 +70,8 @@ class FasterWhisperAdapter:
             vad_filter=False,
             word_timestamps=False,
             condition_on_previous_text=False,
+            hotwords=" ".join(hotwords) or None,
+            initial_prompt=core_context or None,
         )
         try:
             return tuple(

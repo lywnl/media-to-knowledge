@@ -14,6 +14,7 @@ from video_demo.evaluation.annotations import (
     VerifiedAnnotation,
     load_evaluation_package,
     load_semantic_judgment,
+    pair_reference_sha256,
 )
 from video_demo.evaluation.predictions import VerifiedPrediction
 
@@ -134,6 +135,27 @@ def test_annotation_contract_rejects_unknown_key_fact() -> None:
 
     with pytest.raises(ValueError, match="关键事实"):
         EvaluationAnnotation.model_validate(payload)
+
+
+def test_annotation_terms_are_explicit_and_part_of_pair_reference() -> None:
+    first = EvaluationAnnotation.model_validate(
+        {**_annotation("a" * 64), "sample_id": "sample_none", "terms": ["Milvus"]}
+    )
+    second = first.model_copy(update={"sample_id": "sample_correct"})
+
+    assert first.terms == ("Milvus",)
+    assert pair_reference_sha256(first) == pair_reference_sha256(second)
+    assert pair_reference_sha256(first) != pair_reference_sha256(
+        second.model_copy(update={"reference_text": "另一份参考文本"})
+    )
+
+
+def test_annotation_rejects_blank_or_duplicate_terms() -> None:
+    for terms in (("",), ("Milvus", "Milvus")):
+        with pytest.raises(ValueError, match="术语"):
+            EvaluationAnnotation.model_validate(
+                {**_annotation("a" * 64), "terms": terms}
+            )
 
 
 def _authorization_record() -> dict[str, object]:

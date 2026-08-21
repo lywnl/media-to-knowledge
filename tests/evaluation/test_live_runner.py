@@ -2045,7 +2045,12 @@ def test_default_production_local_models_execute_complete_five_language_sequence
             return SimpleNamespace(speech=(object(),))
 
     class Recognizer:
-        def transcribe_slice(self, _audio: Path, _span: object) -> tuple[RawAsrSegment, ...]:
+        def transcribe_slice(
+            self,
+            _audio: Path,
+            _span: object,
+            **_kwargs: object,
+        ) -> tuple[RawAsrSegment, ...]:
             return (
                 RawAsrSegment(
                     start_ms=0,
