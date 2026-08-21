@@ -4,6 +4,8 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from video_demo.application.pipeline import (
     PipelineContext,
     PipelineJobHandler,
@@ -279,8 +281,17 @@ def test_cancellation_after_pipeline_result_closes_job_and_run_without_bundle(
     assert list(runtime_root.rglob("bundle-*.json")) == []
 
 
+@pytest.mark.parametrize(
+    "retryable_code",
+    (
+        ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
+        ErrorCode.SPEECH_SUBPROCESS_TIMEOUT,
+        ErrorCode.SPEECH_SUBPROCESS_CRASHED,
+    ),
+)
 def test_worker_failure_cleanup_is_noop_when_cancel_wins_after_pipeline_retry(
     tmp_path: Path,
+    retryable_code: ErrorCode,
 ) -> None:
     runtime_root = tmp_path / ".codex" / "video-rag-demo"
     runtime_root.mkdir(parents=True)
@@ -312,7 +323,7 @@ def test_worker_failure_cleanup_is_noop_when_cancel_wins_after_pipeline_retry(
     class Pipeline:
         def run(self, _context: PipelineContext) -> PipelineOutcome:
             raise VideoDemoError(
-                ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
+                retryable_code,
                 "依赖暂时不可用",
             )
 

@@ -7,7 +7,6 @@ import re
 import time
 from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
@@ -32,19 +31,13 @@ from video_demo.application.production_media import (
     build_ffmpeg_factory,
     build_ffprobe_factory,
 )
-from video_demo.application.production_speech import (
-    ComponentFactory,
-    ProductionSpeechAnalyzer,
-    SpeechComponents,
-    VerifiedAudioSlicer,
-)
+from video_demo.application.production_speech import ComponentFactory
 from video_demo.application.production_visual import (
     LazyBaiduOcrClient,
     ProductionVisualAnalyzer,
     VisualComponents,
 )
 from video_demo.application.queries import ResultQueryService
-from video_demo.audio.yamnet import NativeYamnetBackend, NativeYamnetDetector
 from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel, Sha256
 from video_demo.domain.run import ModelIdentity
@@ -57,12 +50,17 @@ from video_demo.integrations.oss import (
 from video_demo.integrations.qwen import DemoFallbackVideoUnderstanding, QwenVideoClient
 from video_demo.integrations.video_port import WholeVideoUnderstandingPort
 from video_demo.persistence.database import Database
-from video_demo.speech.alignment import NativeWhisperXBackend, WhisperXAligner
-from video_demo.speech.asr import FasterWhisperAdapter, NativeFasterWhisperBackend
-from video_demo.speech.diarization import NativePyannoteBackend, PyannoteDiarizer
-from video_demo.speech.language import FasterWhisperLanguageDetector, SegmentLanguageIdentifier
+from video_demo.speech.isolated import IsolatedSpeechAnalyzer
+from video_demo.speech.runtime import ProductionSpeechModels
+from video_demo.speech.runtime import (
+    build_speech_component_factory as _build_speech_component_factory,
+)
+from video_demo.speech.runtime import build_speech_models as _build_speech_models
 from video_demo.speech.snapshots import SpeechFingerprintInputs
-from video_demo.speech.vad import NativeSileroBackend, SileroVadAdapter
+from video_demo.speech.subprocess_protocol import (
+    SpeechRuntimeConfig,
+    SpeechSubprocessCredentials,
+)
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.object_store import LocalVideoObjectStore
 from video_demo.storage.snapshots import SnapshotStore
@@ -88,18 +86,6 @@ class ProductionModelIdentityReport(FrozenModel):
     schema_version: Literal["1.0.0"]
     models: tuple[ModelIdentity, ...]
     settings_fingerprint: Sha256
-
-
-@dataclass(frozen=True, slots=True)
-class ProductionSpeechModels:
-    """由生产流水线和 live 诊断共同复用的生命周期级语音模型。"""
-
-    vad: SileroVadAdapter
-    language_identifier: SegmentLanguageIdentifier
-    recognizer: FasterWhisperAdapter
-    aligner: WhisperXAligner
-    diarizer: PyannoteDiarizer
-    audio_events: NativeYamnetDetector
 
 
 class ProductionDiagnosticComponents:
@@ -352,6 +338,7 @@ def _settings_fingerprint(settings: Settings) -> str:
             "whisper_compute_type": settings.whisper_compute_type,
             "max_video_bytes": settings.max_video_bytes,
             "demo_degraded_mode": settings.demo_degraded_mode,
+            "speech_subprocess_timeout_seconds": settings.speech_subprocess_timeout_seconds,
         },
         "model_cache": {
             "root": _workspace_relative(settings, model_root),
@@ -428,6 +415,7 @@ def build_production_pipeline(
     """组装工作区内安全媒体工具与延迟验证配置的 Qwen Adapter。"""
 
     assert settings.runtime_root is not None
+    ffmpeg = settings.ffmpeg_path or settings.runtime_root / "tools" / "ffmpeg"
     ffprobe = settings.ffprobe_path or settings.runtime_root / "tools" / "ffprobe"
     qwen_configured = _has_complete_qwen_configuration(settings)
     if qwen_configured and not settings.has_complete_oss_configuration():
@@ -437,14 +425,34 @@ def build_production_pipeline(
         )
     oss_host = _configured_oss_host(settings) if qwen_configured else None
     with ExitStack() as pending_resources:
-        diagnostics = build_production_diagnostic_components(
-            settings,
+        ffmpeg_factory = build_ffmpeg_factory(
+            settings.workspace_root,
+            settings.runtime_root,
+            ffmpeg,
+        )
+        visual_factory = _build_visual_component_factory(settings, ffmpeg_factory)
+        pending_resources.callback(visual_factory.http_client.close)
+        qwen_http_client = httpx.Client()
+        pending_resources.callback(qwen_http_client.close)
+
+        def qwen_api_key_provider() -> SecretStr | None:
+            return settings.qwen_api_key
+
+        qwen = QwenVideoClient(
+            qwen_http_client,
+            base_url=settings.qwen_base_url,
+            api_key=None,
+            api_key_provider=qwen_api_key_provider,
+            model_id=settings.qwen_model_id,
+            allowed_video_root=settings.runtime_root,
+            max_video_bytes=settings.qwen_max_video_bytes,
+            max_video_duration_ms=settings.qwen_max_video_duration_ms,
+            timeout_seconds=settings.qwen_timeout_seconds,
             allowed_remote_video_hosts=(
                 frozenset({oss_host}) if oss_host is not None else None
             ),
         )
-        pending_resources.callback(diagnostics.close)
-        understanding: WholeVideoUnderstandingPort = diagnostics.qwen_client
+        understanding: WholeVideoUnderstandingPort = qwen
         if qwen_configured:
             assert settings.oss_endpoint is not None
             assert settings.oss_bucket is not None
@@ -453,7 +461,7 @@ def build_production_pipeline(
             understanding = PublishedVideoUnderstanding(
                 understanding,
                 OssTemporaryVideoPublisher(
-                    diagnostics.qwen_http_client,
+                    qwen_http_client,
                     endpoint=settings.oss_endpoint,
                     bucket=settings.oss_bucket,
                     access_key_id=settings.oss_access_key_id,
@@ -470,22 +478,29 @@ def build_production_pipeline(
             ProductionAssetProbe(build_ffprobe_factory(settings.workspace_root, ffprobe)),
             ProductionMediaTranscoder(
                 settings.runtime_root,
-                diagnostics.ffmpeg_factory,
+                ffmpeg_factory,
                 max_proxy_bytes=settings.max_video_bytes,
             ),
-            ProductionSpeechAnalyzer(
-                diagnostics.speech_component_factory,
+            IsolatedSpeechAnalyzer(
+                workspace_root=settings.workspace_root,
+                runtime_root=settings.runtime_root,
                 snapshot_store=SnapshotStore(AtomicArtifactStore(settings.runtime_root)),
+                artifact_store=AtomicArtifactStore(settings.runtime_root),
                 fingerprint_inputs=_speech_fingerprint_inputs(settings),
+                speech_runtime=_speech_runtime_config(settings, ffmpeg),
+                credentials=SpeechSubprocessCredentials(
+                    huggingface_token=settings.huggingface_token,
+                ),
+                timeout_seconds=settings.speech_subprocess_timeout_seconds,
                 allow_speaker_fallback=settings.demo_degraded_mode,
             ),
             ProductionVisualAnalyzer(
                 settings.runtime_root,
-                diagnostics.visual_component_factory,
+                visual_factory,
                 max_video_bytes=settings.max_video_bytes,
             ),
             understanding,
-            owned_resources=(diagnostics,),
+            owned_resources=(visual_factory.http_client, qwen_http_client),
         )
         pending_resources.pop_all()
     return pipeline
@@ -508,75 +523,6 @@ def _configured_oss_host(settings: Settings) -> str:
     return oss_remote_host(settings.oss_endpoint, settings.oss_bucket)
 
 
-def _build_speech_component_factory(
-    settings: Settings,
-    ffmpeg_factory: object,
-    *,
-    models: ProductionSpeechModels | None = None,
-) -> ComponentFactory:
-    assert settings.runtime_root is not None
-    runtime_root = settings.runtime_root
-    active_models = models or _build_speech_models(settings)
-
-    def build(
-        media: PreparedMedia,
-        is_cancel_requested: Callable[[], bool],
-    ) -> SpeechComponents:
-        from video_demo.application.production_media import TranscodeClient
-
-        factory = cast(Callable[[Callable[[], bool]], TranscodeClient], ffmpeg_factory)
-        ffmpeg_client = factory(is_cancel_requested)
-        return SpeechComponents(
-            vad=active_models.vad,
-            language_identifier=active_models.language_identifier,
-            recognizer=active_models.recognizer,
-            aligner=active_models.aligner,
-            diarizer=active_models.diarizer,
-            audio_events=active_models.audio_events,
-            slicer=VerifiedAudioSlicer(
-                runtime_root,
-                ffmpeg_client,  # type: ignore[arg-type]
-                media.source.duration_ms,
-            ),
-        )
-
-    return build
-
-
-def _build_speech_models(settings: Settings) -> ProductionSpeechModels:
-    assert settings.runtime_root is not None
-    model_root = settings.runtime_root / "models"
-    thresholds_path = settings.workspace_root / "src/video_demo/audio/thresholds.json"
-    faster_backend = NativeFasterWhisperBackend(
-        model_root,
-        device=settings.inference_device,
-        compute_type=settings.whisper_compute_type,
-    )
-
-    def token_provider() -> str | None:
-        if settings.huggingface_token is None:
-            return None
-        return settings.huggingface_token.get_secret_value()
-
-    yamnet_backend = NativeYamnetBackend(model_root / "yamnet/saved_model")
-    return ProductionSpeechModels(
-        vad=SileroVadAdapter(NativeSileroBackend()),
-        language_identifier=SegmentLanguageIdentifier(
-            FasterWhisperLanguageDetector(faster_backend),
-        ),
-        recognizer=FasterWhisperAdapter(faster_backend),
-        aligner=WhisperXAligner(NativeWhisperXBackend(), model_root),
-        diarizer=PyannoteDiarizer(
-            NativePyannoteBackend(token_provider, model_root=model_root),
-        ),
-        audio_events=NativeYamnetDetector(
-            backend_factory=lambda: yamnet_backend,
-            class_map_path=model_root / "yamnet/yamnet_class_map.csv",
-            thresholds_path=thresholds_path,
-        ),
-    )
-
-
 def _speech_fingerprint_inputs(settings: Settings) -> SpeechFingerprintInputs:
     assert settings.runtime_root is not None
     report = build_production_model_identity_report(settings)
@@ -595,6 +541,22 @@ def _speech_fingerprint_inputs(settings: Settings) -> SpeechFingerprintInputs:
         yamnet_thresholds_sha256=_optional_file_sha256(
             settings.workspace_root / "src/video_demo/audio/thresholds.json"
         ),
+    )
+
+
+def _speech_runtime_config(settings: Settings, ffmpeg: Path) -> SpeechRuntimeConfig:
+    inputs = _speech_fingerprint_inputs(settings)
+    return SpeechRuntimeConfig(
+        inference_device=settings.inference_device,
+        whisper_compute_type=settings.whisper_compute_type,
+        model_identities=inputs.model_identities,
+        yamnet_class_map_sha256=inputs.yamnet_class_map_sha256,
+        yamnet_thresholds_sha256=inputs.yamnet_thresholds_sha256,
+        vad_threshold=inputs.vad_threshold,
+        vad_merge_gap_ms=inputs.vad_merge_gap_ms,
+        lid_threshold=inputs.lid_threshold,
+        asr_beam_size=inputs.asr_beam_size,
+        ffmpeg_relative_path=ffmpeg.relative_to(settings.workspace_root).as_posix(),
     )
 
 

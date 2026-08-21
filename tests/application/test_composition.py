@@ -29,7 +29,6 @@ from video_demo.application.production_media import (
     ProductionAssetRegistrar,
     ProductionMediaTranscoder,
 )
-from video_demo.application.production_speech import ProductionSpeechAnalyzer
 from video_demo.application.production_visual import ProductionVisualAnalyzer
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
@@ -341,11 +340,38 @@ def test_worker_builds_real_production_media_adapters(
         assert isinstance(pipeline.registrar, ProductionAssetRegistrar)
         assert isinstance(pipeline.probe, ProductionAssetProbe)
         assert isinstance(pipeline.transcoder, ProductionMediaTranscoder)
-        assert isinstance(pipeline.speech_analyzer, ProductionSpeechAnalyzer)
+        from video_demo.speech.isolated import IsolatedSpeechAnalyzer
+
+        assert isinstance(pipeline.speech_analyzer, IsolatedSpeechAnalyzer)
         assert isinstance(pipeline.visual_analyzer, ProductionVisualAnalyzer)
         assert isinstance(pipeline.understanding, QwenVideoClient)
     finally:
         pipeline.close()
+
+
+def test_production_pipeline_does_not_construct_in_process_speech_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import video_demo.application.composition as composition
+
+    settings = Settings(workspace_root=tmp_path)
+    assert settings.runtime_root is not None
+    settings.runtime_root.mkdir(parents=True)
+    database = Database(f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}")
+    database.create_schema()
+    object_store = LocalVideoObjectStore(settings.runtime_root, max_video_bytes=1024)
+    monkeypatch.setattr(
+        composition,
+        "_build_speech_models",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("生产父进程不得构造重语音模型")
+        ),
+    )
+
+    pipeline = composition.build_production_pipeline(settings, database, object_store)
+
+    pipeline.close()
 
 
 def test_strict_production_pipeline_rejects_configured_qwen_without_oss(
@@ -973,7 +999,7 @@ def test_build_worker_transfers_pipeline_to_successful_worker_owner(
     assert closes == ["close"]
 
 
-def test_production_pipeline_consumes_public_diagnostic_builder(
+def test_production_pipeline_builds_lightweight_dependencies_without_diagnostics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -984,52 +1010,23 @@ def test_production_pipeline_consumes_public_diagnostic_builder(
     settings.runtime_root.mkdir(parents=True)
     database = Database(f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}")
     object_store = LocalVideoObjectStore(settings.runtime_root, max_video_bytes=1024)
-    closes: list[str] = []
-
-    def ffmpeg_factory(_cancel: object) -> object:
-        return object()
-
-    def speech_factory(_media: object, _cancel: object) -> object:
-        raise AssertionError("组合测试不得执行语音任务")
-
-    def visual_factory(_media: object, _cancel: object) -> object:
-        raise AssertionError("组合测试不得执行视觉任务")
-
-    diagnostics = SimpleNamespace(
-        ffmpeg_factory=ffmpeg_factory,
-        speech_component_factory=speech_factory,
-        visual_component_factory=visual_factory,
-        qwen_client=object(),
-        close=lambda: closes.append("diagnostics"),
-    )
-    calls: list[Settings] = []
-
-    def build_diagnostics(
-        received: Settings,
-        *,
-        allowed_remote_video_hosts: frozenset[str] | None = None,
-    ) -> object:
-        assert allowed_remote_video_hosts is None
-        calls.append(received)
-        return diagnostics
-
     monkeypatch.setattr(
         composition,
         "build_production_diagnostic_components",
-        build_diagnostics,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("生产组合根不得构造完整诊断组件")
+        ),
     )
 
     pipeline = composition.build_production_pipeline(settings, database, object_store)
     try:
-        assert calls == [settings]
-        assert pipeline.speech_analyzer._component_factory is speech_factory  # type: ignore[attr-defined]
-        assert pipeline.visual_analyzer._component_factory is visual_factory  # type: ignore[attr-defined]
-        assert pipeline.understanding is diagnostics.qwen_client
+        from video_demo.speech.isolated import IsolatedSpeechAnalyzer
+
+        assert isinstance(pipeline.speech_analyzer, IsolatedSpeechAnalyzer)
+        assert isinstance(pipeline.visual_analyzer, ProductionVisualAnalyzer)
     finally:
         pipeline.close()
         pipeline.close()
-
-    assert closes == ["diagnostics"]
 
 
 def test_diagnostic_builder_keeps_all_secrets_lazy_until_adapter_call(
@@ -1105,7 +1102,9 @@ def test_diagnostic_builder_keeps_all_secrets_lazy_until_adapter_call(
         lambda *_args: lambda _cancel: object(),
     )
     monkeypatch.setattr(composition, "LazyBaiduOcrClient", LazyBaidu)
-    monkeypatch.setattr(composition, "NativePyannoteBackend", PyannoteBackend)
+    import video_demo.speech.runtime as speech_runtime
+
+    monkeypatch.setattr(speech_runtime, "NativePyannoteBackend", PyannoteBackend)
 
     diagnostics = build_production_diagnostic_components(settings)
     try:

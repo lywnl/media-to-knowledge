@@ -21,7 +21,7 @@ from video_demo.domain.result import (
 from video_demo.domain.result_artifact import TranscriptSource
 from video_demo.domain.run import RunStatus, TimeRange
 from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
-from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.errors import ErrorCode, VideoDemoError, is_retryable_error_code
 from video_demo.fusion.merge import (
     BoundaryPoint,
     WindowUnderstanding,
@@ -612,7 +612,7 @@ class PipelineJobHandler:
                 )
                 return
             if (
-                error.code == ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
+                is_retryable_error_code(error.code)
                 and job.attempt_count < job.max_attempts
             ):
                 status = RunStatusValue.PENDING
@@ -626,6 +626,6 @@ class PipelineJobHandler:
                 job.id,
                 job.worker_id,
                 error_code=error.code,
-                retryable=error.code == ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
+                retryable=is_retryable_error_code(error.code),
                 attempt_count=job.attempt_count,
             )

@@ -3,11 +3,46 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.process import SafeProcessRunner
+
+
+def test_safe_process_runner_uses_explicit_environment_without_inheriting_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import video_demo.media.process as process_module
+
+    captured: dict[str, object] = {}
+
+    class Process:
+        stdout = SimpleNamespace(close=lambda: None)
+        stderr = SimpleNamespace(close=lambda: None)
+
+        def wait(self) -> int:
+            return 0
+
+    def popen(_args: object, **kwargs: object) -> Process:
+        captured.update(kwargs)
+        return Process()
+
+    monkeypatch.setattr(process_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        SafeProcessRunner,
+        "_collect_output",
+        lambda *_args: (b"", b""),
+    )
+
+    SafeProcessRunner().run(
+        [sys.executable, "-c", "pass"],
+        timeout_seconds=5,
+        env={"PYTHONUTF8": "1"},
+    )
+
+    assert captured["env"] == {"PYTHONUTF8": "1"}
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fd 继承契约仅适用于 POSIX")

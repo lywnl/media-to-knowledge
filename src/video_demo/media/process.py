@@ -5,7 +5,7 @@ import selectors
 import signal
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +46,7 @@ class SafeProcessRunner:
         timeout_seconds: int,
         pass_fds: tuple[int, ...] = (),
         output_paths: tuple[Path, ...] = (),
+        env: Mapping[str, str] | None = None,
     ) -> ProcessResult:
         if (
             not args
@@ -56,6 +57,18 @@ class SafeProcessRunner:
             or len(pass_fds) != len(set(pass_fds))
             or not isinstance(output_paths, tuple)
             or any(not isinstance(path, Path) for path in output_paths)
+            or (
+                env is not None
+                and any(
+                    not isinstance(key, str)
+                    or not key
+                    or "=" in key
+                    or "\x00" in key
+                    or not isinstance(value, str)
+                    or "\x00" in value
+                    for key, value in env.items()
+                )
+            )
         ):
             raise VideoDemoError(ErrorCode.VIDEO_PROCESS_FAILED, "子进程参数必须是非空字符串数组")
         self._verify_output_paths(output_paths)
@@ -86,6 +99,7 @@ class SafeProcessRunner:
                     bufsize=0,
                     start_new_session=True,
                     pass_fds=pass_fds,
+                    env=dict(env) if env is not None else None,
                 )
             else:
                 process = subprocess.Popen(
@@ -96,6 +110,7 @@ class SafeProcessRunner:
                     shell=False,
                     bufsize=0,
                     start_new_session=os.name == "posix",
+                    env=dict(env) if env is not None else None,
                 )
         except OSError as error:
             raise VideoDemoError(ErrorCode.VIDEO_PROCESS_FAILED, "媒体子进程无法启动") from error

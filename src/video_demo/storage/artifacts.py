@@ -11,7 +11,11 @@ from pydantic import Field
 
 from video_demo.domain.base import FrozenModel, Sha256
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.storage.workspace import atomic_replace, safe_runtime_path
+from video_demo.storage.workspace import (
+    atomic_replace,
+    reject_symlink_components,
+    safe_runtime_path,
+)
 
 
 class ArtifactReceipt(FrozenModel):
@@ -54,8 +58,18 @@ class AtomicArtifactStore:
         *,
         schema_version: str,
         upstream_sha256: str,
+        file_mode: int | None = None,
+        exclusive: bool = False,
     ) -> ArtifactReceipt:
+        if file_mode is not None and not 0 <= file_mode <= 0o777:
+            raise ValueError("文件权限模式非法")
         destination = safe_runtime_path(self.runtime_root, relative_path)
+        if file_mode is not None:
+            destination = reject_symlink_components(
+                self.runtime_root,
+                destination,
+                message="私有产物路径不能包含符号链接",
+            )
         encoded = canonical_artifact_envelope_bytes(
             payload,
             schema_version,
@@ -65,11 +79,27 @@ class AtomicArtifactStore:
         temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
         destination.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with temporary.open("xb") as output:
-                output.write(encoded)
-                output.flush()
-                os.fsync(output.fileno())
-            atomic_replace(temporary, destination)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            creation_mode = file_mode if file_mode is not None else 0o666
+            descriptor = os.open(temporary, flags, creation_mode)
+            try:
+                if file_mode is not None:
+                    os.fchmod(descriptor, file_mode)
+                with os.fdopen(descriptor, "wb") as output:
+                    descriptor = -1
+                    output.write(encoded)
+                    output.flush()
+                    os.fsync(output.fileno())
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            if exclusive:
+                os.link(temporary, destination, follow_symlinks=False)
+                temporary.unlink()
+            else:
+                atomic_replace(temporary, destination)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
@@ -127,7 +157,11 @@ class AtomicArtifactStore:
     def discard(self, receipt: ArtifactReceipt) -> bool:
         """仅删除摘要仍与本次写入一致的未发布产物。"""
 
-        artifact = safe_runtime_path(self.runtime_root, Path(receipt.relative_path))
+        artifact = reject_symlink_components(
+            self.runtime_root,
+            self.runtime_root / receipt.relative_path,
+            message="待删除产物路径不能包含符号链接",
+        )
         if artifact.is_symlink() or not artifact.is_file():
             return False
         if hashlib.sha256(artifact.read_bytes()).hexdigest() != receipt.sha256:

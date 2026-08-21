@@ -6,11 +6,17 @@ from threading import Event
 
 import pytest
 
-from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.errors import ErrorCode, VideoDemoError, is_retryable_error_code
 from video_demo.persistence.database import Database
 from video_demo.persistence.models import JobStatus
 from video_demo.persistence.repositories import JobRepository, Scope
 from video_demo.worker.runtime import ReliableWorker
+
+
+def test_speech_subprocess_crash_and_timeout_are_retryable() -> None:
+    assert is_retryable_error_code(ErrorCode.SPEECH_SUBPROCESS_CRASHED)
+    assert is_retryable_error_code(ErrorCode.SPEECH_SUBPROCESS_TIMEOUT)
+    assert not is_retryable_error_code(ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID)
 
 
 @pytest.fixture
@@ -136,11 +142,23 @@ def test_cancelled_job_is_not_executed(database: Database, scope: Scope) -> None
         assert job.status == JobStatus.CANCELLED
 
 
-def test_retryable_failure_stops_after_max_attempts(database: Database, scope: Scope) -> None:
+@pytest.mark.parametrize(
+    "retryable_code",
+    (
+        ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
+        ErrorCode.SPEECH_SUBPROCESS_TIMEOUT,
+        ErrorCode.SPEECH_SUBPROCESS_CRASHED,
+    ),
+)
+def test_retryable_failure_stops_after_max_attempts(
+    database: Database,
+    scope: Scope,
+    retryable_code: ErrorCode,
+) -> None:
     _enqueue(database, scope, max_attempts=2)
 
     def fail(_job: object) -> None:
-        raise VideoDemoError(ErrorCode.DEPENDENCY_TEMPORARY_FAILURE, "依赖暂时不可用")
+        raise VideoDemoError(retryable_code, "依赖暂时不可用")
 
     now = TEST_NOW
     worker = ReliableWorker(database, "worker-a", fail, clock=lambda: now)
@@ -153,7 +171,7 @@ def test_retryable_failure_stops_after_max_attempts(database: Database, scope: S
         assert job is not None
         assert job.status == JobStatus.FAILED
         assert job.attempt_count == 2
-        assert job.error_code == ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
+        assert job.error_code == retryable_code
 
 
 def test_successful_worker_marks_job_succeeded(database: Database, scope: Scope) -> None:

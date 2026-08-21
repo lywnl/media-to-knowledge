@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     whisper_compute_type: Literal["int8", "float16", "float32"] = "int8"
     worker_concurrency: int = Field(default=1, ge=1, le=4)
     process_timeout_seconds: int = Field(default=600, ge=1, le=86_400)
+    speech_subprocess_timeout_seconds: int = Field(default=1_800, ge=1, le=7_200)
     max_video_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
     # 仅供本地演示显式开启；默认保持严格外部依赖失败语义。
     demo_degraded_mode: bool = False

@@ -4,7 +4,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from threading import Event, Thread
 
-from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.errors import ErrorCode, VideoDemoError, is_retryable_error_code
 from video_demo.persistence.database import Database
 from video_demo.persistence.repositories import ClaimedJob, JobRepository
 
@@ -157,7 +157,7 @@ class ReliableWorker:
         return errors[0] if errors else None
 
     def _record_failure(self, job: ClaimedJob, error: VideoDemoError) -> None:
-        retryable = error.code == ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
+        retryable = is_retryable_error_code(error.code)
         with self._database.session() as session:
             JobRepository(session).mark_failed(
                 job.id,
