@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from itertools import pairwise
+from typing import Literal
 
-from pydantic import TypeAdapter
+from pydantic import Field, TypeAdapter, field_validator, model_validator
 
-from video_demo.domain.base import FrozenModel, StableId
+from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.domain.evidence import (
     AlignedWord,
     AudioEvent,
@@ -16,8 +18,10 @@ from video_demo.domain.evidence import (
     OcrEvidence,
     SceneBoundary,
     SpeakerTurn,
+    SubtitleCue,
 )
 from video_demo.domain.result import VideoUnderstandingResult, validate_evidence_references
+from video_demo.domain.result_artifact import TranscriptSource
 from video_demo.errors import VideoDemoError
 from video_demo.evaluation.annotations import (
     EvaluationAnnotation,
@@ -26,7 +30,7 @@ from video_demo.evaluation.annotations import (
     VerifiedAnnotation,
     reverify_evaluation_package,
 )
-from video_demo.evaluation.dataset import ValidationLanguage
+from video_demo.evaluation.dataset import EvaluationSample, ValidationLanguage
 from video_demo.evaluation.metrics import (
     EditCounts,
     MatchCounts,
@@ -62,19 +66,140 @@ _LANGUAGE_METRICS: Mapping[ValidationLanguage, str] = {
     "es": "es_wer",
 }
 _EVIDENCE_ADAPTER = TypeAdapter(tuple[EvidenceItem, ...])
+_NotRunMetric = Literal[
+    "audio_event_macro_f1",
+    "der_non_overlap",
+    "der_overlap",
+    "speaker_count_accuracy",
+    "word_time_p90_ms",
+]
+_SUBTITLE_NOT_RUN_METRICS: tuple[_NotRunMetric, ...] = (
+    "audio_event_macro_f1",
+    "der_non_overlap",
+    "der_overlap",
+    "speaker_count_accuracy",
+    "word_time_p90_ms",
+)
 
 
 class SampleQualityDetail(FrozenModel):
     sample_id: StableId
     language: ValidationLanguage
     prediction_status: str
+    transcript_source: TranscriptSource | None
     metric_inputs: dict[str, int | float]
+    not_run_metrics: tuple[_NotRunMetric, ...] = ()
     failure_code: str | None
+
+    @field_validator("not_run_metrics")
+    @classmethod
+    def require_sorted_unique_not_run_metrics(
+        cls,
+        value: tuple[_NotRunMetric, ...],
+    ) -> tuple[_NotRunMetric, ...]:
+        if value != tuple(sorted(set(value))):
+            raise ValueError("逐样本不适用指标必须排序且不重复")
+        return value
+
+    @model_validator(mode="after")
+    def reject_not_run_metric_inputs(self) -> SampleQualityDetail:
+        conflicting_inputs = {
+            "audio_event_macro_f1": "audio_event_macro_f1",
+            "speaker_count_accuracy": "speaker_count_accuracy",
+            "word_time_p90_ms": "word_time_match_count",
+        }
+        if any(
+            input_name in self.metric_inputs
+            for metric_name, input_name in conflicting_inputs.items()
+            if metric_name in self.not_run_metrics
+        ):
+            raise ValueError("逐样本不适用指标不得携带伪造输入")
+        return self
+
+
+class HintPairEffect(FrozenModel):
+    pair_id: StableId
+    language: ValidationLanguage
+    none_sample_id: StableId
+    correct_sample_id: StableId
+    metric_name: Literal["CER", "WER"]
+    term_count: int = Field(gt=0)
+    none_term_recall: float = Field(ge=0, le=1)
+    correct_term_recall: float = Field(ge=0, le=1)
+    term_recall_delta: float = Field(ge=-1, le=1)
+    none_text_error_rate: float = Field(ge=0)
+    correct_text_error_rate: float = Field(ge=0)
+    text_error_rate_delta: float
+
+    @model_validator(mode="after")
+    def validate_deltas(self) -> HintPairEffect:
+        if abs(
+            self.term_recall_delta
+            - (self.correct_term_recall - self.none_term_recall)
+        ) > 1e-12:
+            raise ValueError("术语召回差值与两端结果不一致")
+        if abs(
+            self.text_error_rate_delta
+            - (self.correct_text_error_rate - self.none_text_error_rate)
+        ) > 1e-12:
+            raise ValueError("文本错误率差值与两端结果不一致")
+        return self
+
+
+HintPairExclusion = Literal[
+    "PREDICTION_NOT_SUCCESSFUL",
+    "TERMS_EMPTY",
+    "TRANSCRIPT_SOURCE_NOT_ASR",
+]
+
+
+class HintEffectReport(FrozenModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    evaluation_run_id: StableId
+    status: Literal["RUN", "NOT_RUN"]
+    dataset_sha256: Sha256
+    authorization_sha256: Sha256
+    prediction_index_sha256: Sha256
+    candidate_pair_count: int = Field(ge=0)
+    eligible_pair_count: int = Field(ge=0)
+    excluded_pair_counts: dict[HintPairExclusion, int]
+    pairs: tuple[HintPairEffect, ...]
+    not_run_reason: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @field_validator("excluded_pair_counts")
+    @classmethod
+    def reject_empty_or_nonpositive_exclusion_counts(
+        cls,
+        value: dict[HintPairExclusion, int],
+    ) -> dict[HintPairExclusion, int]:
+        if any(count <= 0 for count in value.values()):
+            raise ValueError("提示配对排除计数必须为正整数")
+        return dict(sorted(value.items()))
+
+    @model_validator(mode="after")
+    def validate_report_contract(self) -> HintEffectReport:
+        if self.eligible_pair_count != len(self.pairs):
+            raise ValueError("合格提示配对计数与明细不一致")
+        if self.candidate_pair_count != self.eligible_pair_count + sum(
+            self.excluded_pair_counts.values()
+        ):
+            raise ValueError("候选提示配对计数未闭合")
+        if tuple(pair.pair_id for pair in self.pairs) != tuple(
+            sorted(pair.pair_id for pair in self.pairs)
+        ):
+            raise ValueError("提示配对明细必须按配对 ID 排序")
+        if self.status == "RUN":
+            if not self.pairs or self.not_run_reason is not None:
+                raise ValueError("已运行提示报告必须包含配对且不得有未运行原因")
+        elif self.pairs or self.not_run_reason is None:
+            raise ValueError("未运行提示报告不得包含配对且必须有原因")
+        return self
 
 
 class QualityScoreArtifacts(FrozenModel):
     report: BoundQualityReport
     sample_details: tuple[SampleQualityDetail, ...]
+    hint_effect_report: HintEffectReport
 
 
 def score_quality(
@@ -108,6 +233,18 @@ def score_quality(
         )
     )
     observations = accumulators.observations()
+    prediction_index_sha256 = _canonical_digest(
+        [prediction.index_sha256 for prediction in ordered_predictions]
+    )
+    hint_effect_report = _build_hint_effect_report(
+        samples=verified_package.dataset.samples,
+        annotations=ordered_annotations,
+        predictions=ordered_predictions,
+        evaluation_run_id=evaluation_run_id,
+        dataset_sha256=verified_package.dataset_sha256,
+        authorization_sha256=verified_package.authorization_sha256,
+        prediction_index_sha256=prediction_index_sha256,
+    )
     failure_code: str | None = None
     if not judgments:
         reason = "尚未提供人工语义审阅"
@@ -136,9 +273,7 @@ def score_quality(
         evaluation_run_id=evaluation_run_id,
         dataset_sha256=verified_package.dataset_sha256,
         authorization_sha256=verified_package.authorization_sha256,
-        prediction_index_sha256=_canonical_digest(
-            [prediction.index_sha256 for prediction in ordered_predictions]
-        ),
+        prediction_index_sha256=prediction_index_sha256,
         judgment_index_sha256=_canonical_digest(
             []
             if ordered_judgments is None
@@ -149,7 +284,11 @@ def score_quality(
         ),
         durability_report_sha256=None,
     )
-    return QualityScoreArtifacts(report=report, sample_details=details)
+    return QualityScoreArtifacts(
+        report=report,
+        sample_details=details,
+        hint_effect_report=hint_effect_report,
+    )
 
 
 class _Accumulators:
@@ -187,9 +326,13 @@ class _Accumulators:
         observations["ocr_accuracy"] = _accuracy_observation(
             self.ocr_errors, self.ocr_units, "没有 OCR 参考字符"
         )
-        observations["audio_event_macro_f1"] = MetricObservation(
-            value=sum(match_counts_f1(counts) for counts in self.audio_counts.values())
-            / len(self.audio_counts)
+        observations["audio_event_macro_f1"] = (
+            MetricObservation(
+                value=sum(match_counts_f1(counts) for counts in self.audio_counts.values())
+                / len(self.audio_counts)
+            )
+            if self.audio_counts
+            else MetricObservation(value=None, not_run_reason="没有适用的音频事件样本")
         )
         observations["scene_f1"] = MetricObservation(
             value=match_counts_f1(self.scene_counts)
@@ -216,10 +359,11 @@ def _score_sample(
 ) -> SampleQualityDetail:
     annotation = verified_annotation.annotation
     accumulators.attempted_results += 1
+    transcript_source = prediction.index.transcript_source
     aligned_words = tuple(
         item for item in prediction.evidence if isinstance(item, AlignedWord)
     )
-    hypothesis_text = " ".join(item.text for item in aligned_words)
+    hypothesis_text = _transcript_text(prediction, aligned_words)
     counts = (
         character_edit_counts(hypothesis_text, annotation.reference_text)
         if annotation.language in _CER_LANGUAGES
@@ -231,15 +375,17 @@ def _score_sample(
         previous.errors + counts.errors,
         previous.reference_units + counts.reference_units,
     )
-    word_time_errors = aligned_word_time_errors_ms(
-        reference=tuple(
-            (word.text, word.start_ms, word.end_ms) for word in annotation.words
-        ),
-        hypothesis=tuple(
-            (word.text, word.start_ms, word.end_ms) for word in aligned_words
-        ),
-    )
-    accumulators.word_times.extend(word_time_errors)
+    word_time_errors: tuple[int, ...] = ()
+    if transcript_source != "SUBTITLE":
+        word_time_errors = aligned_word_time_errors_ms(
+            reference=tuple(
+                (word.text, word.start_ms, word.end_ms) for word in annotation.words
+            ),
+            hypothesis=tuple(
+                (word.text, word.start_ms, word.end_ms) for word in aligned_words
+            ),
+        )
+        accumulators.word_times.extend(word_time_errors)
 
     speaker_turns = tuple(
         item for item in prediction.evidence if isinstance(item, SpeakerTurn)
@@ -252,12 +398,13 @@ def _score_sample(
         for turn in speaker_turns
         for speaker in {turn.speaker, *turn.overlap_speakers}
     )
-    der_counts = diarization_counts_by_overlap(
-        reference=reference_turns, hypothesis=hypothesis_turns
-    )
-    for index, counts_for_partition in enumerate(der_counts):
-        accumulators.der_errors[index] += counts_for_partition.error_speaker_ms
-        accumulators.der_units[index] += counts_for_partition.reference_speaker_ms
+    if transcript_source != "SUBTITLE":
+        der_counts = diarization_counts_by_overlap(
+            reference=reference_turns, hypothesis=hypothesis_turns
+        )
+        for index, counts_for_partition in enumerate(der_counts):
+            accumulators.der_errors[index] += counts_for_partition.error_speaker_ms
+            accumulators.der_units[index] += counts_for_partition.reference_speaker_ms
 
     reference_ocr = "".join(
         line
@@ -276,18 +423,20 @@ def _score_sample(
     accumulators.ocr_errors += ocr_counts.errors
     accumulators.ocr_units += ocr_counts.reference_units
 
-    audio_reference = _event_intervals(annotation)
-    audio_hypothesis = _predicted_event_intervals(prediction)
-    audio_counts = event_match_counts(
-        reference=audio_reference,
-        hypothesis=audio_hypothesis,
-        tolerance_ms=AUDIO_EVENT_TOLERANCE_MS,
-    )
-    for label, counts_for_label in audio_counts.items():
-        accumulators.audio_counts[label] = _sum_match_counts(
-            accumulators.audio_counts.get(label, MatchCounts(0, 0, 0)),
-            counts_for_label,
+    audio_counts: dict[str, MatchCounts] = {}
+    if transcript_source != "SUBTITLE":
+        audio_reference = _event_intervals(annotation)
+        audio_hypothesis = _predicted_event_intervals(prediction)
+        audio_counts = event_match_counts(
+            reference=audio_reference,
+            hypothesis=audio_hypothesis,
+            tolerance_ms=AUDIO_EVENT_TOLERANCE_MS,
         )
+        for label, counts_for_label in audio_counts.items():
+            accumulators.audio_counts[label] = _sum_match_counts(
+                accumulators.audio_counts.get(label, MatchCounts(0, 0, 0)),
+                counts_for_label,
+            )
     scene_counts = boundary_match_counts(
         reference_ms=annotation.scene_boundaries_ms,
         hypothesis_ms=tuple(
@@ -312,10 +461,6 @@ def _score_sample(
     accumulators.semantic_boundary_counts = _sum_match_counts(
         accumulators.semantic_boundary_counts, semantic_counts
     )
-    audio_score = (
-        sum(match_counts_f1(counts_for_label) for counts_for_label in audio_counts.values())
-        / len(audio_counts)
-    )
     scene_score = match_counts_f1(scene_counts)
     semantic_score = match_counts_f1(semantic_counts)
 
@@ -331,26 +476,211 @@ def _score_sample(
             if speaker != "SPEAKER_UNKNOWN"
         }
     )
-    diagnostics = {
+    diagnostics: dict[str, int | float] = {
         "text_errors": counts.errors,
         "text_reference_units": counts.reference_units,
-        "word_time_match_count": len(word_time_errors),
-        "speaker_count_accuracy": float(reference_speaker_count == predicted_speaker_count),
         "unknown_evidence_count": unknown_count,
         "schema_time_valid": float(is_valid),
         "ocr_errors": ocr_counts.errors,
         "ocr_reference_units": ocr_counts.reference_units,
-        "audio_event_macro_f1": audio_score,
         "scene_f1": scene_score,
         "semantic_boundary_f1": semantic_score,
     }
+    not_run_metrics: tuple[_NotRunMetric, ...] = ()
+    if transcript_source == "SUBTITLE":
+        not_run_metrics = _SUBTITLE_NOT_RUN_METRICS
+    else:
+        diagnostics.update(
+            word_time_match_count=len(word_time_errors),
+            speaker_count_accuracy=float(
+                reference_speaker_count == predicted_speaker_count
+            ),
+            audio_event_macro_f1=(
+                sum(
+                    match_counts_f1(counts_for_label)
+                    for counts_for_label in audio_counts.values()
+                )
+                / len(audio_counts)
+            ),
+        )
     return SampleQualityDetail(
         sample_id=annotation.sample_id,
         language=annotation.language,
         prediction_status=prediction.index.terminal_status,
+        transcript_source=transcript_source,
         metric_inputs=diagnostics,
+        not_run_metrics=not_run_metrics,
         failure_code=prediction.index.failure_code,
     )
+
+
+def _transcript_text(
+    prediction: VerifiedPrediction,
+    aligned_words: tuple[AlignedWord, ...],
+) -> str:
+    if prediction.index.transcript_source != "SUBTITLE":
+        return " ".join(item.text for item in aligned_words)
+    cues = sorted(
+        (item for item in prediction.evidence if isinstance(item, SubtitleCue)),
+        key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),
+    )
+    return " ".join(cue.text for cue in cues)
+
+
+def _build_hint_effect_report(
+    *,
+    samples: tuple[EvaluationSample, ...],
+    annotations: tuple[VerifiedAnnotation, ...],
+    predictions: tuple[VerifiedPrediction, ...],
+    evaluation_run_id: str,
+    dataset_sha256: str,
+    authorization_sha256: str,
+    prediction_index_sha256: str,
+) -> HintEffectReport:
+    sample_by_id = {sample.sample_id: sample for sample in samples}
+    annotation_by_id = {
+        item.annotation.sample_id: item.annotation for item in annotations
+    }
+    prediction_by_id = {
+        prediction.index.sample_id: prediction for prediction in predictions
+    }
+    pair_ids = sorted(
+        {sample.pair_id for sample in samples if sample.pair_id is not None}
+    )
+    pairs: list[HintPairEffect] = []
+    exclusions: dict[HintPairExclusion, int] = defaultdict(int)
+    for pair_id in pair_ids:
+        pair_samples = tuple(
+            sample for sample in samples if sample.pair_id == pair_id
+        )
+        by_variant = {sample.hint_variant: sample for sample in pair_samples}
+        none_sample = by_variant["NONE"]
+        correct_sample = by_variant["CORRECT"]
+        none_prediction = prediction_by_id[none_sample.sample_id]
+        correct_prediction = prediction_by_id[correct_sample.sample_id]
+        if any(
+            prediction.index.terminal_status
+            not in {"SUCCEEDED", "PARTIAL_SUCCEEDED"}
+            for prediction in (none_prediction, correct_prediction)
+        ):
+            exclusions["PREDICTION_NOT_SUCCESSFUL"] += 1
+            continue
+        if any(
+            prediction.index.transcript_source != "ASR"
+            for prediction in (none_prediction, correct_prediction)
+        ):
+            exclusions["TRANSCRIPT_SOURCE_NOT_ASR"] += 1
+            continue
+        annotation = annotation_by_id[none_sample.sample_id]
+        if not annotation.terms:
+            exclusions["TERMS_EMPTY"] += 1
+            continue
+        correct_annotation = annotation_by_id[correct_sample.sample_id]
+        if correct_annotation.terms != annotation.terms:
+            raise ValueError("提示配对的明确术语不一致")
+        pairs.append(
+            _score_hint_pair(
+                pair_id=pair_id,
+                none_sample=sample_by_id[none_sample.sample_id],
+                correct_sample=sample_by_id[correct_sample.sample_id],
+                annotation=annotation,
+                none_prediction=none_prediction,
+                correct_prediction=correct_prediction,
+            )
+        )
+    not_run_reason: str | None = None
+    status: Literal["RUN", "NOT_RUN"] = "RUN"
+    if not pairs:
+        status = "NOT_RUN"
+        not_run_reason = (
+            "数据集没有 NONE/CORRECT 提示效果配对"
+            if not pair_ids
+            else "没有同时满足成功、ASR 来源和明确术语的提示效果配对"
+        )
+    return HintEffectReport(
+        evaluation_run_id=evaluation_run_id,
+        status=status,
+        dataset_sha256=dataset_sha256,
+        authorization_sha256=authorization_sha256,
+        prediction_index_sha256=prediction_index_sha256,
+        candidate_pair_count=len(pair_ids),
+        eligible_pair_count=len(pairs),
+        excluded_pair_counts=dict(exclusions),
+        pairs=tuple(pairs),
+        not_run_reason=not_run_reason,
+    )
+
+
+def _score_hint_pair(
+    *,
+    pair_id: str,
+    none_sample: EvaluationSample,
+    correct_sample: EvaluationSample,
+    annotation: EvaluationAnnotation,
+    none_prediction: VerifiedPrediction,
+    correct_prediction: VerifiedPrediction,
+) -> HintPairEffect:
+    none_text = _prediction_transcript_text(none_prediction)
+    correct_text = _prediction_transcript_text(correct_prediction)
+    none_counts = _text_edit_counts(
+        none_text,
+        annotation.reference_text,
+        annotation.language,
+    )
+    correct_counts = _text_edit_counts(
+        correct_text,
+        annotation.reference_text,
+        annotation.language,
+    )
+    none_recall = _exact_term_recall(none_text, annotation.terms)
+    correct_recall = _exact_term_recall(correct_text, annotation.terms)
+    none_error_rate = none_counts.errors / none_counts.reference_units
+    correct_error_rate = correct_counts.errors / correct_counts.reference_units
+    return HintPairEffect(
+        pair_id=pair_id,
+        language=annotation.language,
+        none_sample_id=none_sample.sample_id,
+        correct_sample_id=correct_sample.sample_id,
+        metric_name="CER" if annotation.language in _CER_LANGUAGES else "WER",
+        term_count=len(annotation.terms),
+        none_term_recall=none_recall,
+        correct_term_recall=correct_recall,
+        term_recall_delta=correct_recall - none_recall,
+        none_text_error_rate=none_error_rate,
+        correct_text_error_rate=correct_error_rate,
+        text_error_rate_delta=correct_error_rate - none_error_rate,
+    )
+
+
+def _prediction_transcript_text(prediction: VerifiedPrediction) -> str:
+    aligned_words = tuple(
+        item for item in prediction.evidence if isinstance(item, AlignedWord)
+    )
+    return _transcript_text(prediction, aligned_words)
+
+
+def _text_edit_counts(
+    hypothesis: str,
+    reference: str,
+    language: ValidationLanguage,
+) -> EditCounts:
+    return (
+        character_edit_counts(hypothesis, reference)
+        if language in _CER_LANGUAGES
+        else word_edit_counts(hypothesis, reference)
+    )
+
+
+def _exact_term_recall(hypothesis: str, terms: tuple[str, ...]) -> float:
+    normalized_hypothesis = _normalize_hint_text(hypothesis)
+    matches = sum(
+        _normalize_hint_text(term) in normalized_hypothesis for term in terms
+    )
+    return matches / len(terms)
+
+
+def _normalize_hint_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
 
 def _ordered_predictions(

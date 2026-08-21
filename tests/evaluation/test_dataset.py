@@ -88,6 +88,47 @@ def test_evaluation_dataset_accepts_exact_none_correct_pair(tmp_path: Path) -> N
     )
 
 
+@pytest.mark.parametrize("hint_field", ["hotwords", "core_context"])
+def test_none_hint_variant_rejects_any_speech_hint(hint_field: str) -> None:
+    payload: dict[str, object] = {
+        "sample_id": "sample_none",
+        "language": "zh",
+        "authorization_id": "auth_001",
+        "media_relative_path": "media/sample.mp4",
+        "media_sha256": "a" * 64,
+        "annotations_relative_path": "annotations/none.json",
+        "annotations_sha256": "b" * 64,
+        "pair_id": "pair_001",
+        "pair_reference_sha256": "c" * 64,
+        "hint_variant": "NONE",
+        hint_field: ["Milvus"] if hint_field == "hotwords" else "向量检索课程",
+    }
+
+    with pytest.raises(ValueError, match="NONE"):
+        EvaluationSample.model_validate(payload)
+
+
+@pytest.mark.parametrize("hint_variant", ["CORRECT", "INCORRECT"])
+def test_prompted_hint_variant_requires_at_least_one_speech_hint(
+    hint_variant: str,
+) -> None:
+    payload: dict[str, object] = {
+        "sample_id": "sample_prompted",
+        "language": "zh",
+        "authorization_id": "auth_001",
+        "media_relative_path": "media/sample.mp4",
+        "media_sha256": "a" * 64,
+        "annotations_relative_path": "annotations/prompted.json",
+        "annotations_sha256": "b" * 64,
+        "hint_variant": hint_variant,
+    }
+    if hint_variant == "CORRECT":
+        payload.update(pair_id="pair_001", pair_reference_sha256="c" * 64)
+
+    with pytest.raises(ValueError, match="提示"):
+        EvaluationSample.model_validate(payload)
+
+
 @pytest.mark.parametrize(
     "mutation",
     (

@@ -24,7 +24,7 @@ from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.domain.evidence import EvidenceItem, KeyframeEvidence
 from video_demo.domain.result import VideoUnderstandingResult
-from video_demo.domain.result_artifact import ResultArtifactPayload
+from video_demo.domain.result_artifact import ResultArtifactPayload, TranscriptSource
 from video_demo.domain.run import ModelIdentity
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.evaluation.annotations import (
@@ -42,6 +42,7 @@ from video_demo.evaluation.predictions import (
 )
 from video_demo.evaluation.quality_runner import score_quality
 from video_demo.evaluation.report import BoundQualityReport, GateStatus
+from video_demo.implementation import prediction_implementation_files
 from video_demo.persistence.repositories import Scope, VideoRunRepository
 from video_demo.storage.workspace import safe_runtime_path, validate_path_component
 
@@ -58,20 +59,6 @@ _DEFAULT_SCOPE_HEADERS = {
     "X-Tenant-Id": "evaluation",
     "X-Application-Id": "video-demo",
 }
-_IMPLEMENTATION_FILES = (
-    Path("src/video_demo/evaluation/prediction_runner.py"),
-    Path("src/video_demo/evaluation/predictions.py"),
-    Path("src/video_demo/evaluation/quality_runner.py"),
-    Path("src/video_demo/application/composition.py"),
-    Path("src/video_demo/application/pipeline.py"),
-    Path("src/video_demo/application/queries.py"),
-    Path("src/video_demo/api/app.py"),
-    Path("src/video_demo/api/objects.py"),
-    Path("src/video_demo/api/runs.py"),
-    Path("src/video_demo/api/jobs.py"),
-)
-
-
 class PredictionRunReport(FrozenModel):
     schema_version: str = Field(pattern=r"^1\.0\.0$")
     evaluation_run_id: StableId
@@ -409,6 +396,7 @@ class PredictionRunner:
                 _warning_codes_from_payload(run_payload),
                 run_payload,
                 models,
+                transcript_source=artifact_payload.transcript_source,
                 manifest_bytes=export_manifest_bytes,
             )
             return _load_index_prediction(
@@ -730,7 +718,7 @@ def _persist_failed_prediction(
     _atomic_write_bytes(eval_root / run_relative, run_bytes)
     finished_at = datetime.now(UTC)
     prediction = EvaluationPrediction(
-        schema_version="1.0.0",
+        schema_version="1.1.0",
         evaluation_run_id=evaluation_run_id,
         sample_id=sample.sample_id,
         media_sha256=sample.media_sha256,
@@ -846,6 +834,12 @@ def score_prediction_run(
                 separators=(",", ":"),
             ).encode("utf-8"),
         )
+        _atomic_write_bytes(
+            safe_eval_root / "reports" / evaluation_run_id / "hint-effect.json",
+            artifacts.hint_effect_report.model_dump_json(exclude_none=True).encode(
+                "utf-8"
+            ),
+        )
         return artifacts.report
     except (OSError, ValueError, ValidationError, KeyError, StopIteration, VideoDemoError):
         raise VideoDemoError(ErrorCode.EVALUATION_ARTIFACT_INVALID, "预测或质量产物非法") from None
@@ -862,6 +856,7 @@ def _write_sample_prediction(
     run_payload: dict[str, object],
     models: tuple[ModelIdentity, ...],
     *,
+    transcript_source: TranscriptSource,
     manifest_bytes: bytes,
 ) -> None:
     directory = eval_root / "predictions" / evaluation_run_id / sample.sample_id
@@ -891,7 +886,7 @@ def _write_sample_prediction(
     _atomic_write_bytes(directory / "evidence.jsonl", evidence_bytes)
     _atomic_write_bytes(directory / "artifact-manifest.json", manifest_bytes)
     index = EvaluationPrediction(
-        schema_version="1.0.0",
+        schema_version="1.1.0",
         evaluation_run_id=evaluation_run_id,
         sample_id=sample.sample_id,
         media_sha256=sample.media_sha256,
@@ -906,6 +901,7 @@ def _write_sample_prediction(
         evidence_sha256=_sha256_bytes(evidence_bytes),
         artifact_manifest_relative_path=manifest_relative,
         artifact_manifest_sha256=_sha256_bytes(manifest_bytes),
+        transcript_source=transcript_source,
         started_at=datetime.now(UTC),
         finished_at=datetime.now(UTC),
     )
@@ -1077,7 +1073,7 @@ def _implementation_sha256(workspace_root: Path | None) -> str:
     if workspace_root is None:
         raise VideoDemoError(ErrorCode.EVALUATION_ARTIFACT_INVALID, "预测缺少工作区来源")
     entries: list[dict[str, str]] = []
-    for relative in _IMPLEMENTATION_FILES:
+    for relative in prediction_implementation_files(workspace_root):
         path = workspace_root / relative
         if not path.is_file():
             raise VideoDemoError(ErrorCode.EVALUATION_ARTIFACT_INVALID, "预测实现文件缺失")

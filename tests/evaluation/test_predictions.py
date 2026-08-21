@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from video_demo.domain.evidence import EvidenceItem
 from video_demo.domain.result import VideoUnderstandingResult
@@ -13,7 +13,7 @@ from video_demo.domain.result_artifact import ResultArtifactPayload
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.evaluation.annotations import VerifiedAnnotation, load_semantic_judgment
 from video_demo.evaluation.dataset import EvaluationSample
-from video_demo.evaluation.predictions import load_verified_prediction
+from video_demo.evaluation.predictions import EvaluationPrediction, load_verified_prediction
 from video_demo.storage.artifacts import AtomicArtifactStore
 
 _EVIDENCE_ADAPTER = TypeAdapter(tuple[EvidenceItem, ...])
@@ -145,7 +145,7 @@ def _write_prediction(tmp_path: Path) -> tuple[Path, EvaluationSample]:
     index.write_text(
         json.dumps(
             {
-                "schema_version": "1.0.0",
+                "schema_version": "1.1.0",
                 "evaluation_run_id": "eval_001",
                 "sample_id": "sample_001",
                 "media_sha256": media_sha256,
@@ -163,6 +163,7 @@ def _write_prediction(tmp_path: Path) -> tuple[Path, EvaluationSample]:
                 ),
                 "artifact_manifest_sha256": _digest(manifest),
                 "failure_code": None,
+                "transcript_source": "ASR",
                 "started_at": "2026-08-18T00:00:00Z",
                 "finished_at": "2026-08-18T00:00:01Z",
             }
@@ -223,6 +224,60 @@ def test_verified_prediction_reparses_production_artifacts_and_derives_stable_cl
         "VIDEO_SUMMARY",
     ]
     assert prediction.result is not None
+
+
+@pytest.mark.parametrize("mutation", ["legacy_schema", "missing_source"])
+def test_prediction_index_rejects_legacy_schema_or_missing_transcript_source(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    index, sample = _write_prediction(tmp_path)
+    payload = json.loads(index.read_text(encoding="utf-8"))
+    if mutation == "legacy_schema":
+        payload["schema_version"] = "1.0.0"
+    else:
+        payload.pop("transcript_source")
+    index.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(VideoDemoError) as raised:
+        load_verified_prediction(index, **_prediction_kwargs(tmp_path), sample=sample)
+
+    assert raised.value.code == ErrorCode.EVALUATION_ARTIFACT_INVALID
+    assert raised.value.__cause__ is None
+
+
+def test_failed_prediction_contract_rejects_transcript_source() -> None:
+    with pytest.raises(ValidationError):
+        EvaluationPrediction(
+            schema_version="1.1.0",
+            evaluation_run_id="eval_001",
+            sample_id="sample_001",
+            media_sha256="a" * 64,
+            run_id="run_001",
+            job_id="job_001",
+            terminal_status="FAILED",
+            run_relative_path="predictions/eval_001/sample_001/run.json",
+            run_sha256="b" * 64,
+            failure_code="PIPELINE_FAILED",
+            transcript_source="ASR",
+            started_at="2026-08-18T00:00:00Z",
+            finished_at="2026-08-18T00:00:01Z",
+        )
+
+
+def test_verified_prediction_rejects_index_and_manifest_transcript_source_mismatch(
+    tmp_path: Path,
+) -> None:
+    index, sample = _write_prediction(tmp_path)
+    payload = json.loads(index.read_text(encoding="utf-8"))
+    payload["transcript_source"] = "SUBTITLE"
+    index.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(VideoDemoError) as raised:
+        load_verified_prediction(index, **_prediction_kwargs(tmp_path), sample=sample)
+
+    assert raised.value.code == ErrorCode.EVALUATION_ARTIFACT_INVALID
+    assert raised.value.__cause__ is None
 
 
 @pytest.mark.parametrize("mutation", ["word", "ocr", "event", "summary", "claims", "run"])

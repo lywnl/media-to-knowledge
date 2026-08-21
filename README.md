@@ -2,16 +2,30 @@
 
 这是一个独立的 Python 3.11 + FastAPI 视频理解 Demo。目标是对独立视频执行音频、画面和多模态理解，输出带证据引用的 `VIDEO_SEGMENT`、`VIDEO_SUMMARY`、`retrieval_text` 和 `retrieval_hash`。
 
-当前状态：Demo 主链已完成。上传、可靠 Worker、ffprobe/FFmpeg、VAD/ASR、WhisperX 中文对齐、镜头/关键帧、百度 OCR、确定性融合、结构化结果、`retrieval_text`、证据分页和关键帧查询均已接通。生产 Qwen 链路使用私有 OSS 完整视频签名 URL：完整代理视频只上传一次，`qwen3-vl-flash` 只发起一次全片请求；模型返回按时间排序的粗粒度视觉语义和全片摘要，程序再映射到本地冻结的精确窗口和证据。实施账本见[计划](./.codex/plans/2026-08-17-video-understanding-retrieval-text-implementation.md)。
+当前状态：Demo 主链已完成。上传、可靠 Worker、ffprobe/FFmpeg、字幕优先与 ASR 兜底、WhisperX 中文对齐、镜头/关键帧、百度 OCR、确定性融合、结构化结果、`retrieval_text`、证据分页和关键帧查询均已接通。生产 Qwen 链路使用私有 OSS 完整视频签名 URL：完整代理视频只上传一次，`qwen3-vl-flash` 只发起一次全片请求；模型返回按时间排序的粗粒度视觉语义和全片摘要，程序再映射到本地冻结的精确窗口和证据。实施账本见[计划](./.codex/plans/2026-08-17-video-understanding-retrieval-text-implementation.md)。
 
 提交时必须准确区分两类结论：
 
 - Demo 产品链与机器一致性 smoke：已通过。详见[双视频产品链报告](./.codex/reports/two-video-demo-chain-20260821.md)和[双视频质量 smoke](./.codex/reports/two-video-quality-smoke-20260821.md)。
-- 正式五语质量、pyannote 说话人分离和 M1 两段耐久：仍为 `NOT_RUN` 或外部前置条件不足，不能用中文 Demo 代替。Qwen 公网完整视频视觉理解已真实通过；同一个完整公网 URL 不保证按 `start_ms/end_ms` 截取片段，因此不能冒充精确片段输入。综合验证见[报告](./.codex/reports/qwen-visual-understanding-20260821.md)，公网 URL 对账见[对账报告](./.codex/reports/qwen-remote-url-reconciliation-20260821.md)。
+- 正式五语质量、pyannote 说话人分析和 M1 两段耐久：仍为 `NOT_RUN` 或外部前置条件不足，不能用中文 Demo 代替。Qwen 公网完整视频视觉理解已真实通过；同一个完整公网 URL 不保证按 `start_ms/end_ms` 截取片段，因此不能冒充精确片段输入。综合验证见[报告](./.codex/reports/qwen-visual-understanding-20260821.md)，公网 URL 对账见[对账报告](./.codex/reports/qwen-remote-url-reconciliation-20260821.md)。
 
 `示例视频.mp4` 的 921,484 毫秒全片已完成一次真实本地产品链，产生 601 条 ASR、5,743 条对齐词、329 个关键帧、329 条 OCR 和 128 个场景证据；首次运行因旧 Qwen 细窗口协议降级。修复后的严格 Qwen 与融合验收复用了该次运行的 47,881,184 字节完整代理和已落库证据，没有重新执行约 53 分钟的本地 ASR/OCR。最新严格验收用唯一对象键完成一次 OSS PUT 上传、一次 Qwen 全片请求、32 个细窗口合法映射和 10 个融合检索片段；每个窗口都绑定该窗口的全部本地证据，首段 `retrieval_text` 为 975 字符，全部检索哈希重算一致。融合片段数会随 Qwen 返回的粗语义分组变化，不是固定协议。当前尚未再次从上传接口启动并持久化一条全新 Run。报告见[全片严格验收](./.codex/reports/qwen-production-full-video-validation-20260821.json)。
 
 Qwen 的视觉职责与证据边界：完整视频视觉报告可识别人物、场景、账号页、软件界面、关键事件和画面文字；模型观察可能误读账号名、数字或字幕。原始可定位画面文字仍以百度 OCR 证据为权威，语音以 ASR/WhisperX 为权威。需要精确片段视觉理解时，必须传实际派生短片（本地 clip/Data URI 或该短片自己的公网 URL），不得只给完整视频 URL 再依赖时间字段让供应商自动 seek。
+
+## 视频转文本策略
+
+视频文本解析按“内嵌文本字幕优先、ASR 兜底”执行：`ffprobe` 先发现容器内字幕流，系统只把 `subrip`、`ass`、`ssa`、`webvtt` 和 `mov_text` 当作可解析文本字幕。候选字幕经 UTF-8 解析、大小和 cue 数量限制、时间轴及启发式完整性检查后，以独立的 `SUBTITLE_CUE` 证据输出；命中时不生成 `audio.wav`，也不启动 VAD、faster-whisper、WhisperX、pyannote 或 YAMNet。
+
+PGS、DVD Subtitle 等位图字幕和直接烧录在画面里的字幕当前不做 OCR，存在音轨时自动提取 WAV 并进入 ASR，不能把“探测到字幕轨”误解为“字幕文本已识别”。字幕完整性门槛只用于决定是否启用 ASR，是工程启发式，不是字幕准确率或完整性的认证；字幕不合格、解码失败或缺失时会自动兜底，不需要重新创建 Run。
+
+ASR 是自动语音识别，即把音频中的语音转成文本，不是人声分离，也不负责区分谁在说话。faster-whisper 负责转写，WhisperX 负责词级时间对齐，pyannote 负责说话人日志化/说话人分析，YAMNet 负责音频事件。字幕路径不会运行词级对齐、说话人分析或音频事件识别，因此对应质量指标记为“不适用（`NOT_RUN`）”；这不代表模型零错误，也不能把字幕 cue 伪装成 ASR 词时间或置信度。
+
+创建 Run 时可提供热词和核心上下文。热词用于提高人名、术语和产品名的识别概率，核心上下文用于提供视频主题先验；它们分别映射到 faster-whisper 的 `hotwords` 和 `initial_prompt`，只影响 ASR 兜底，不会改写已提取字幕，也不会传给语言探测。两者都是识别偏置而不是强制替换规则，错误提示可能降低准确率。
+
+需要 ASR 的 Run 在受监督的一次性子进程中加载重语音模型，以隔离原生崩溃和内存故障，但每次真正执行 ASR 都有模型冷启动成本。字幕命中、完整语音快照命中或 ASR 快照命中会跳过相应加载；快照只服务同一 Run 的失败重试，保证已成功的 ASR 不被无意义重复执行，不是跨视频或跨 Run 的全局缓存。
+
+质量评测会单独生成提示效果伴随报告，只比较同一授权媒体的 `NONE/CORRECT` 成对 ASR 结果，并报告术语召回率及 CER/WER 差值。它不进入现有发布硬门槛；失败预测、空术语、任一端不是 ASR 或没有合格配对时均为 `NOT_RUN`。字幕命中不能证明热词或核心上下文有效。
 
 ## Qwen 的私有 OSS 全片中转
 

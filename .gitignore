@@ -16,6 +16,8 @@ runtime/
 .codex/reports/
 .codex/research/
 .codex/tmp/
+.codex/hint-debug/
+.codex/pytest-*/
 
 # 设计和实施状态是项目交付物，保留在版本控制范围内。
 !.codex/specs/

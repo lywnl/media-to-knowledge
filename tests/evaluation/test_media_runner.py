@@ -3161,6 +3161,7 @@ def test_task4_source_enforces_configured_size_limit_and_cleans_part(
     "changed_path",
     (
         Path("src/video_demo/application/production_visual.py"),
+        Path("src/video_demo/config.py"),
         Path("src/video_demo/evaluation/real_media_execution.py"),
         Path("src/video_demo/evaluation/real_media_source.py"),
         Path("src/video_demo/media/process.py"),
@@ -3180,6 +3181,12 @@ def test_task4_direct_execution_dependencies_are_bound_into_implementation_diges
     copied_source = tmp_path / changed_path
     copied_source.write_bytes(copied_source.read_bytes() + b"\n")
     assert _unpatched_implementation_digest(tmp_path) != before
+
+
+def test_real_media_digest_does_not_claim_subtitle_or_speech_execution() -> None:
+    # real_media_execution 只复用 pipeline 的四个无行为数据类；它不执行字幕选择。
+    assert Path("src/video_demo/media/subtitles.py") not in _REAL_MEDIA_IMPLEMENTATION_FILES
+    assert Path("src/video_demo/speech/isolated.py") not in _REAL_MEDIA_IMPLEMENTATION_FILES
 
 
 @pytest.mark.parametrize(

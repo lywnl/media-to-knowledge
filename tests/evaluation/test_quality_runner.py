@@ -16,6 +16,7 @@ from video_demo.domain.evidence import (
     OcrLine,
     SceneBoundary,
     SpeakerTurn,
+    SubtitleCue,
 )
 from video_demo.domain.result import VideoSegment, VideoSummary, VideoUnderstandingResult
 from video_demo.domain.run import ModelIdentity
@@ -34,6 +35,7 @@ from video_demo.evaluation.annotations import (
     ValidatedEvaluationPackage,
     VerifiedAnnotation,
     load_evaluation_package,
+    pair_reference_sha256,
 )
 from video_demo.evaluation.dataset import EvaluationDataset, EvaluationSample
 from video_demo.evaluation.predictions import (
@@ -177,7 +179,7 @@ def _successful_prediction(
     )
     return VerifiedPrediction(
         index=EvaluationPrediction(
-            schema_version="1.0.0",
+            schema_version="1.1.0",
             evaluation_run_id=run_id,
             sample_id=sample_id,
             media_sha256=_SHA,
@@ -192,6 +194,7 @@ def _successful_prediction(
             evidence_sha256=_hash(f"evidence-{sample_id}"),
             artifact_manifest_relative_path=f"predictions/{sample_id}/manifest.json",
             artifact_manifest_sha256=_hash(f"manifest-{sample_id}"),
+            transcript_source="ASR",
             started_at=_NOW,
             finished_at=_NOW,
         ),
@@ -215,7 +218,7 @@ def _successful_prediction(
 def _failed_prediction(sample_id: str, *, run_id: str = "eval_001") -> VerifiedPrediction:
     return VerifiedPrediction(
         index=EvaluationPrediction(
-            schema_version="1.0.0",
+            schema_version="1.1.0",
             evaluation_run_id=run_id,
             sample_id=sample_id,
             media_sha256=_SHA,
@@ -243,6 +246,69 @@ def _failed_prediction(sample_id: str, *, run_id: str = "eval_001") -> VerifiedP
         claims=(),
         artifact_manifest_sha256=None,
         eval_root=Path("."),
+    )
+
+
+def _subtitle_prediction(
+    sample_id: str,
+    language: str,
+    cues: tuple[tuple[int, int, str, str], ...],
+) -> VerifiedPrediction:
+    base = _successful_prediction(sample_id, language, ("占位",))
+    subtitle_cues = tuple(
+        SubtitleCue(
+            evidence_id=evidence_id,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            text=text,
+            language=language,
+            stream_index=2,
+        )
+        for start_ms, end_ms, evidence_id, text in cues
+    )
+    visual_evidence = tuple(
+        item
+        for item in base.evidence
+        if isinstance(item, (OcrEvidence, SceneBoundary))
+    )
+    segments = (
+        base.result.segments[0].model_copy(
+            update={"evidence_refs": (subtitle_cues[0].evidence_id,)}
+        ),
+        base.result.segments[1],
+    )
+    result = base.result.model_copy(update={"segments": segments})
+    return base.model_copy(
+        update={
+            "index": base.index.model_copy(update={"transcript_source": "SUBTITLE"}),
+            "result": result,
+            "evidence": (*subtitle_cues, *visual_evidence),
+        }
+    )
+
+
+def _none_prediction(sample_id: str, language: str) -> VerifiedPrediction:
+    base = _successful_prediction(sample_id, language, ("占位",))
+    visual_evidence = tuple(
+        item
+        for item in base.evidence
+        if isinstance(item, (OcrEvidence, SceneBoundary))
+    )
+    first_visual_id = visual_evidence[0].evidence_id
+    result = base.result.model_copy(
+        update={
+            "segments": tuple(
+                segment.model_copy(update={"evidence_refs": (first_visual_id,)})
+                for segment in base.result.segments
+            )
+        }
+    )
+    return base.model_copy(
+        update={
+            "index": base.index.model_copy(update={"transcript_source": "NONE"}),
+            "result": result,
+            "evidence": visual_evidence,
+        }
     )
 
 
@@ -446,7 +512,7 @@ def _materialize_fixture(
                             "stage_metrics": {"RESULT": 1},
                             "status": prediction.index.terminal_status,
                             "warnings": list(prediction.run.warning_codes),
-                            "transcript_source": "ASR",
+                            "transcript_source": prediction.index.transcript_source,
                         },
                     },
                     ensure_ascii=False,
@@ -520,6 +586,115 @@ def _score(
     return score_quality(package, predictions, judgments, evaluation_run_id="eval_001")
 
 
+def _hint_effect_fixture(
+    tmp_path: Path,
+    *,
+    exclusion: str | None = None,
+) -> tuple[ValidatedEvaluationPackage, tuple[VerifiedPrediction, ...]]:
+    pair_specs = (
+        (
+            "pair_b_zh",
+            "zh",
+            "向量 数据库",
+            ("向量 数据库",),
+            ("向量", "数据湖"),
+            ("向量", "数据库"),
+        ),
+        (
+            "pair_a_en",
+            "en",
+            "Milvus DB course",
+            ("Milvus   DB",),
+            ("milvus", "da", "course"),
+            ("MILVUS", "db", "course"),
+        ),
+    )
+    samples: list[EvaluationSample] = []
+    annotations: list[VerifiedAnnotation] = []
+    predictions: list[VerifiedPrediction] = []
+    for pair_index, (
+        pair_id,
+        language,
+        reference_text,
+        original_terms,
+        none_words,
+        correct_words,
+    ) in enumerate(pair_specs):
+        terms = () if exclusion == "TERMS_EMPTY" and pair_index == 0 else original_terms
+        source_annotation = _annotation(
+            f"{pair_id}_none", language, reference_text
+        ).annotation
+        base = source_annotation.model_copy(update={"terms": terms})
+        # model_copy 不执行字段校验，因此显式从 JSON 重新解析，冻结术语规范化契约。
+        base = EvaluationAnnotation.model_validate_json(
+            base.model_dump_json(exclude_computed_fields=True)
+        )
+        reference_sha = pair_reference_sha256(base)
+        for variant, predicted_words in (("NONE", none_words), ("CORRECT", correct_words)):
+            sample_id = f"{pair_id}_{variant.lower()}"
+            annotation = base.model_copy(update={"sample_id": sample_id})
+            verified = VerifiedAnnotation(
+                annotation=annotation,
+                sha256=_hash(f"annotation-{sample_id}"),
+            )
+            annotations.append(verified)
+            samples.append(
+                EvaluationSample(
+                    sample_id=sample_id,
+                    language=language,
+                    authorization_id="auth_001",
+                    media_relative_path=f"media/{sample_id}.mp4",
+                    media_sha256=_SHA,
+                    annotations_relative_path=f"annotations/{sample_id}.json",
+                    annotations_sha256=verified.sha256,
+                    hotwords=(
+                        original_terms
+                        if variant == "CORRECT" and original_terms
+                        else ()
+                    ),
+                    pair_id=pair_id,
+                    hint_variant=variant,
+                    pair_reference_sha256=reference_sha,
+                )
+            )
+            prediction = _successful_prediction(sample_id, language, predicted_words)
+            if pair_index == 0 and variant == "CORRECT":
+                if exclusion == "PREDICTION_NOT_SUCCESSFUL":
+                    prediction = _failed_prediction(sample_id)
+                elif exclusion == "TRANSCRIPT_SOURCE_NOT_ASR":
+                    prediction = _subtitle_prediction(
+                        sample_id,
+                        language,
+                        ((0, 900, f"subtitle_{sample_id}", " ".join(predicted_words)),),
+                    )
+            predictions.append(prediction)
+    package = ValidatedEvaluationPackage(
+        dataset=EvaluationDataset(
+            samples=tuple(samples),
+            eval_root=Path("."),
+            runtime_root=Path("."),
+            workspace_root=Path("."),
+        ),
+        authorization=AuthorizationFile(
+            schema_version="1.0.0",
+            records=(
+                AuthorizationRecord(
+                    schema_version="1.0.0",
+                    authorization_id="auth_001",
+                    source_category="OWNED",
+                    allowed_purposes=("VIDEO_QUALITY_EVALUATION",),
+                    confirmed_at=_NOW,
+                    media_sha256=(_SHA,),
+                ),
+            ),
+        ),
+        annotations=tuple(annotations),
+        dataset_sha256=_hash("hint-dataset"),
+        authorization_sha256=_hash("hint-authorization"),
+    )
+    return _materialize_fixture(tmp_path, package, tuple(predictions))
+
+
 def test_score_quality_micro_averages_languages_and_counts_failed_schema_denominator(
     tmp_path: Path,
 ) -> None:
@@ -565,6 +740,173 @@ def test_score_quality_uses_alignment_der_diagnostics_nfkc_and_fixed_tolerances(
         "judgments",
         "evaluation_run_id",
     )
+
+
+def test_subtitle_sample_uses_sorted_cues_and_marks_unexecuted_metrics_not_run() -> None:
+    from video_demo.evaluation import quality_runner
+
+    annotation = _annotation("sample_subtitle", "en", "vector database")
+    prediction = _subtitle_prediction(
+        "sample_subtitle",
+        "en",
+        (
+            (500, 900, "subtitle_002", "database"),
+            (0, 400, "subtitle_001", "vector"),
+        ),
+    )
+    accumulators = quality_runner._Accumulators()
+
+    detail = quality_runner._score_sample(annotation, prediction, accumulators)
+    observations = accumulators.observations()
+
+    assert observations["en_wer"].value == 0
+    assert detail.transcript_source == "SUBTITLE"
+    assert detail.not_run_metrics == (
+        "audio_event_macro_f1",
+        "der_non_overlap",
+        "der_overlap",
+        "speaker_count_accuracy",
+        "word_time_p90_ms",
+    )
+    assert {
+        "audio_event_macro_f1",
+        "speaker_count_accuracy",
+        "word_time_match_count",
+    }.isdisjoint(detail.metric_inputs)
+    for name in (
+        "audio_event_macro_f1",
+        "der_non_overlap",
+        "der_overlap",
+        "word_time_p90_ms",
+    ):
+        assert observations[name].value is None
+
+
+def test_hint_effect_report_uses_bound_pairs_and_normalized_exact_terms(
+    tmp_path: Path,
+) -> None:
+    from video_demo.evaluation.thresholds import QUALITY_THRESHOLDS
+
+    package, predictions = _hint_effect_fixture(tmp_path)
+
+    artifacts = _score(package, predictions)
+    report = artifacts.hint_effect_report
+
+    assert report.status == "RUN"
+    assert report.candidate_pair_count == 2
+    assert report.eligible_pair_count == 2
+    assert report.excluded_pair_counts == {}
+    assert [pair.pair_id for pair in report.pairs] == ["pair_a_en", "pair_b_zh"]
+    english, chinese = report.pairs
+    assert english.metric_name == "WER"
+    assert english.none_term_recall == 0
+    assert english.correct_term_recall == 1
+    assert english.term_recall_delta == 1
+    assert english.none_text_error_rate == pytest.approx(1 / 3)
+    assert english.correct_text_error_rate == 0
+    assert english.text_error_rate_delta == pytest.approx(-1 / 3)
+    assert chinese.metric_name == "CER"
+    assert chinese.none_term_recall == 0
+    assert chinese.correct_term_recall == 1
+    assert chinese.none_text_error_rate == pytest.approx(1 / 5)
+    assert chinese.correct_text_error_rate == 0
+    assert not any(name.startswith("hint_") for name in QUALITY_THRESHOLDS)
+    assert not any(
+        metric.name.startswith("hint_") for metric in artifacts.report.metrics
+    )
+
+
+def test_hint_effect_report_not_run_without_candidate_pairs(tmp_path: Path) -> None:
+    package, predictions = _fixture(tmp_path)
+
+    report = _score(package, predictions).hint_effect_report
+
+    assert report.status == "NOT_RUN"
+    assert report.candidate_pair_count == 0
+    assert report.eligible_pair_count == 0
+    assert report.excluded_pair_counts == {}
+    assert report.pairs == ()
+    assert report.not_run_reason == "数据集没有 NONE/CORRECT 提示效果配对"
+
+
+@pytest.mark.parametrize(
+    "exclusion",
+    [
+        "PREDICTION_NOT_SUCCESSFUL",
+        "TERMS_EMPTY",
+        "TRANSCRIPT_SOURCE_NOT_ASR",
+    ],
+)
+def test_hint_effect_report_counts_stable_pair_exclusions(
+    exclusion: str,
+    tmp_path: Path,
+) -> None:
+    package, predictions = _hint_effect_fixture(tmp_path, exclusion=exclusion)
+
+    report = _score(package, predictions).hint_effect_report
+
+    assert report.status == "RUN"
+    assert report.candidate_pair_count == 2
+    assert report.eligible_pair_count == 1
+    assert report.excluded_pair_counts == {exclusion: 1}
+    assert len(report.pairs) == 1
+
+
+def test_mixed_quality_metrics_only_exclude_subtitle_samples() -> None:
+    from video_demo.evaluation import quality_runner
+
+    asr_annotation = _annotation("sample_asr", "en", "one two")
+    asr_prediction = _successful_prediction("sample_asr", "en", ("one", "two"))
+    subtitle_annotation = _annotation("sample_subtitle", "en", "vector database")
+    subtitle_prediction = _subtitle_prediction(
+        "sample_subtitle",
+        "en",
+        (
+            (0, 400, "subtitle_001", "vector"),
+            (500, 900, "subtitle_002", "database"),
+        ),
+    )
+    asr_only = quality_runner._Accumulators()
+    mixed = quality_runner._Accumulators()
+
+    quality_runner._score_sample(asr_annotation, asr_prediction, asr_only)
+    quality_runner._score_sample(subtitle_annotation, subtitle_prediction, mixed)
+    quality_runner._score_sample(asr_annotation, asr_prediction, mixed)
+
+    asr_observations = asr_only.observations()
+    mixed_observations = mixed.observations()
+    for name in (
+        "audio_event_macro_f1",
+        "der_non_overlap",
+        "der_overlap",
+        "word_time_p90_ms",
+    ):
+        assert mixed_observations[name] == asr_observations[name]
+
+
+@pytest.mark.parametrize(
+    ("prediction", "expected_source"),
+    [
+        (_failed_prediction("sample_failed_scope"), None),
+        (_none_prediction("sample_none_scope", "en"), "NONE"),
+    ],
+)
+def test_failed_and_none_samples_keep_existing_metric_denominators(
+    prediction: VerifiedPrediction,
+    expected_source: str | None,
+) -> None:
+    from video_demo.evaluation import quality_runner
+
+    annotation = _annotation(prediction.index.sample_id, "en", "lost term")
+    accumulators = quality_runner._Accumulators()
+
+    detail = quality_runner._score_sample(annotation, prediction, accumulators)
+
+    assert detail.transcript_source == expected_source
+    assert detail.not_run_metrics == ()
+    assert accumulators.text_counts["en_wer"].reference_units == 2
+    assert sum(accumulators.der_units) > 0
+    assert accumulators.audio_counts
 
 
 def test_semantic_metrics_only_come_from_bound_complete_reviews(tmp_path: Path) -> None:

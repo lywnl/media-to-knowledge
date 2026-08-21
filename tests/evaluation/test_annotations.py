@@ -151,7 +151,7 @@ def test_annotation_terms_are_explicit_and_part_of_pair_reference() -> None:
 
 
 def test_annotation_rejects_blank_or_duplicate_terms() -> None:
-    for terms in (("",), ("Milvus", "Milvus")):
+    for terms in (("",), ("Milvus", "Milvus"), ("Ｍilvus", "milvus")):
         with pytest.raises(ValueError, match="术语"):
             EvaluationAnnotation.model_validate(
                 {**_annotation("a" * 64), "terms": terms}
@@ -376,7 +376,7 @@ def _prediction_for_judgment(eval_root: Path) -> VerifiedPrediction:
 
     return VerifiedPrediction(
         index=EvaluationPrediction(
-            schema_version="1.0.0",
+            schema_version="1.1.0",
             evaluation_run_id="eval_001",
             sample_id="sample_001",
             media_sha256="a" * 64,

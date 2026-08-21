@@ -58,6 +58,11 @@ class EvaluationSample(FrozenModel):
             self.pair_id is not None or self.pair_reference_sha256 is not None
         ):
             raise ValueError("INCORRECT 样本不得进入效果配对")
+        has_speech_hint = bool(self.hotwords) or self.core_context is not None
+        if self.hint_variant == "NONE" and has_speech_hint:
+            raise ValueError("NONE 对照样本不得携带语音提示")
+        if self.hint_variant in {"CORRECT", "INCORRECT"} and not has_speech_hint:
+            raise ValueError("有提示变体必须至少提供热词或核心上下文")
         return self
 
 

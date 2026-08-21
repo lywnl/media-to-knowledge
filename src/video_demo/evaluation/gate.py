@@ -75,6 +75,7 @@ from video_demo.evaluation.evidence import (
 )
 from video_demo.evaluation.evidence import CommandTrace as CommandTrace
 from video_demo.evaluation.report import GateStatus, QualityReport
+from video_demo.implementation import implementation_import_closure
 
 REQUIRED_FAILURE_SCENARIOS: tuple[str, ...] = (
     "corrupted_media",
@@ -104,46 +105,53 @@ REQUIRED_FAILURE_SCENARIOS: tuple[str, ...] = (
     "prompt_injection",
 )
 
-_REAL_MEDIA_IMPLEMENTATION_FILES: tuple[Path, ...] = (
-    Path("src/video_demo/application/production_visual.py"),
+_IMPLEMENTATION_REFERENCE_ROOT = Path(__file__).resolve().parents[3]
+_GATE_VERIFIER_LEAF = frozenset({Path("src/video_demo/evaluation/gate.py")})
+_REAL_MEDIA_IMPLEMENTATION_FILES: tuple[Path, ...] = implementation_import_closure(
+    _IMPLEMENTATION_REFERENCE_ROOT,
+    (
     Path("src/video_demo/evaluation/media_runner.py"),
     Path("src/video_demo/evaluation/real_media_execution.py"),
     Path("src/video_demo/evaluation/real_media_source.py"),
-    Path("src/video_demo/media/probe.py"),
-    Path("src/video_demo/media/process.py"),
-    Path("src/video_demo/media/transcode.py"),
-    Path("src/video_demo/visual/keyframes.py"),
-    Path("src/video_demo/visual/scenes.py"),
-    Path("src/video_demo/evaluation/evidence.py"),
-    Path("src/video_demo/evaluation/gate.py"),
+    ),
+    leaf_files=_GATE_VERIFIER_LEAF
+    | frozenset(
+        {Path("src/video_demo/application/pipeline.py")}
+    ),
 )
 
-_LIVE_IMPLEMENTATION_FILES: tuple[Path, ...] = (
-    Path("src/video_demo/evaluation/live_runner.py"),
-    Path("src/video_demo/application/composition.py"),
-    Path("src/video_demo/application/production_speech.py"),
-    Path("src/video_demo/application/production_visual.py"),
-    Path("src/video_demo/integrations/baidu_ocr.py"),
-    Path("src/video_demo/integrations/qwen.py"),
-    Path("src/video_demo/speech/vad.py"),
-    Path("src/video_demo/speech/asr.py"),
-    Path("src/video_demo/speech/alignment.py"),
-    Path("src/video_demo/speech/diarization.py"),
-    Path("src/video_demo/audio/yamnet.py"),
-    Path("src/video_demo/evaluation/evidence.py"),
-    Path("src/video_demo/evaluation/gate.py"),
+_LIVE_ONLY_PRODUCTION_ISOLATION_FILES = frozenset(
+    {
+        Path("src/video_demo/speech/isolated.py"),
+        Path("src/video_demo/speech/snapshots.py"),
+        Path("src/video_demo/speech/subprocess_main.py"),
+        Path("src/video_demo/speech/subprocess_protocol.py"),
+        Path("src/video_demo/storage/artifacts.py"),
+        Path("src/video_demo/storage/snapshots.py"),
+        Path("src/video_demo/worker/runtime.py"),
+    }
+)
+_LIVE_IMPLEMENTATION_FILES: tuple[Path, ...] = implementation_import_closure(
+    _IMPLEMENTATION_REFERENCE_ROOT,
+    (Path("src/video_demo/evaluation/live_runner.py"),),
+    extra_files=(
+        Path("pyproject.toml"),
+        Path("uv.lock"),
+        Path("src/video_demo/audio/thresholds.json"),
+    ),
+    excluded_files=_LIVE_ONLY_PRODUCTION_ISOLATION_FILES,
+    leaf_files=_GATE_VERIFIER_LEAF,
 )
 
-_DURABILITY_IMPLEMENTATION_FILES: tuple[Path, ...] = (
-    Path("src/video_demo/evaluation/durability.py"),
-    Path("src/video_demo/evaluation/evidence.py"),
-    Path("src/video_demo/evaluation/gate.py"),
-    Path("src/video_demo/evaluation/prediction_runner.py"),
-    Path("src/video_demo/evaluation/live_runner.py"),
-    Path("src/video_demo/application/composition.py"),
-    Path("src/video_demo/application/queries.py"),
-    Path("src/video_demo/media/probe.py"),
-    Path("src/video_demo/media/process.py"),
+_DURABILITY_IMPLEMENTATION_FILES: tuple[Path, ...] = implementation_import_closure(
+    _IMPLEMENTATION_REFERENCE_ROOT,
+    (Path("src/video_demo/evaluation/durability.py"),),
+    extra_files=(
+        Path("pyproject.toml"),
+        Path("uv.lock"),
+        Path("src/video_demo/audio/thresholds.json"),
+    ),
+    leaf_files=_GATE_VERIFIER_LEAF,
 )
 
 FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {

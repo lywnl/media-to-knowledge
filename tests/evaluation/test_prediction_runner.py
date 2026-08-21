@@ -1,18 +1,69 @@
 from __future__ import annotations
 
+import shutil
 import warnings
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from video_demo.evaluation.dataset import EvaluationSample
 from video_demo.evaluation.prediction_runner import (
     PredictionRunReport,
     _create_run_request,
+    _implementation_sha256,
     _persist_failed_prediction,
     _prediction_index_path,
 )
 from video_demo.evaluation.report import GateStatus
+
+
+@pytest.mark.parametrize(
+    "changed_path",
+    (
+        Path("src/video_demo/media/subtitles.py"),
+        Path("src/video_demo/speech/isolated.py"),
+        Path("src/video_demo/evaluation/quality_runner.py"),
+        Path("src/video_demo/audio/thresholds.json"),
+        Path("pyproject.toml"),
+        Path("uv.lock"),
+    ),
+)
+def test_prediction_digest_covers_complete_backend_implementation(
+    tmp_path: Path,
+    changed_path: Path,
+) -> None:
+    from video_demo.implementation import prediction_implementation_files
+
+    project_root = Path(__file__).parents[2]
+    implementation_files = prediction_implementation_files(project_root)
+    assert changed_path in implementation_files
+    for relative in implementation_files:
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(project_root / relative, destination)
+
+    before = _implementation_sha256(tmp_path)
+    copied_source = tmp_path / changed_path
+    copied_source.write_bytes(copied_source.read_bytes() + b"\n")
+
+    assert _implementation_sha256(tmp_path) != before
+
+
+def test_prediction_implementation_files_reject_source_symlink(tmp_path: Path) -> None:
+    from video_demo.implementation import prediction_implementation_files
+
+    source_root = tmp_path / "src/video_demo"
+    source_root.mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (tmp_path / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    target = tmp_path / "linked-source.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    (source_root / "linked.py").symlink_to(target)
+
+    with pytest.raises(ValueError, match="符号链接"):
+        prediction_implementation_files(tmp_path)
 
 
 def test_prediction_run_report_binds_run_and_prediction_digest() -> None:

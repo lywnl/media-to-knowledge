@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,7 @@ from video_demo.evaluation.annotations import (
 from video_demo.evaluation.dataset import EvaluationSample
 from video_demo.evaluation.final_runner import cleanup_evaluation_run
 from video_demo.evaluation.prediction_runner import PredictionRunner
+from video_demo.implementation import prediction_implementation_files
 from video_demo.persistence.models import VideoAssetModel
 from video_demo.persistence.repositories import JobRepository, Scope, VideoRunRepository
 
@@ -43,18 +45,7 @@ def _write_runner_package(
 ) -> tuple[Path, ValidatedEvaluationPackage]:
     import shutil
 
-    for relative in (
-        Path("src/video_demo/evaluation/prediction_runner.py"),
-        Path("src/video_demo/evaluation/predictions.py"),
-        Path("src/video_demo/evaluation/quality_runner.py"),
-        Path("src/video_demo/application/composition.py"),
-        Path("src/video_demo/application/pipeline.py"),
-        Path("src/video_demo/application/queries.py"),
-        Path("src/video_demo/api/app.py"),
-        Path("src/video_demo/api/objects.py"),
-        Path("src/video_demo/api/runs.py"),
-        Path("src/video_demo/api/jobs.py"),
-    ):
+    for relative in prediction_implementation_files(Path.cwd()):
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(Path.cwd() / relative, destination)
@@ -274,6 +265,12 @@ def test_prediction_runner_drives_api_worker_queries_and_model_free_score(
         fromlist=["score_prediction_run"],
     ).score_prediction_run("eval_001", eval_root=runtime_root / "eval")
     assert quality.evaluation_run_id == "eval_001"
+    report_root = runtime_root / "eval" / "reports" / "eval_001"
+    assert (report_root / "quality.json").is_file()
+    assert (report_root / "quality-details.json").is_file()
+    hint_effect = json.loads((report_root / "hint-effect.json").read_text(encoding="utf-8"))
+    assert hint_effect["status"] == "NOT_RUN"
+    assert hint_effect["candidate_pair_count"] == 0
     assert calls == ["run_once", "close"]
     scope = Scope("evaluation", "video-demo", "evaluation")
     scope_key = app.state.container.result_query_service.scope_key(scope)

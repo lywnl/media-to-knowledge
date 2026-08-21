@@ -11,7 +11,7 @@ from pydantic import Field, TypeAdapter, ValidationError, field_validator, model
 from video_demo.domain.base import FrozenModel, Sha256, StableId, stable_identifier
 from video_demo.domain.evidence import EvidenceItem
 from video_demo.domain.result import VideoUnderstandingResult, validate_evidence_references
-from video_demo.domain.result_artifact import ResultArtifactPayload
+from video_demo.domain.result_artifact import ResultArtifactPayload, TranscriptSource
 from video_demo.domain.run import ModelIdentity
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.evaluation.dataset import (
@@ -46,7 +46,7 @@ class PredictionRunSnapshot(FrozenModel):
 
 
 class EvaluationPrediction(FrozenModel):
-    schema_version: Literal["1.0.0"]
+    schema_version: Literal["1.1.0"]
     evaluation_run_id: StableId
     sample_id: StableId
     media_sha256: Sha256
@@ -62,6 +62,7 @@ class EvaluationPrediction(FrozenModel):
     artifact_manifest_relative_path: str | None = Field(default=None, max_length=1024)
     artifact_manifest_sha256: Sha256 | None = None
     failure_code: str | None = Field(default=None, min_length=3, max_length=128)
+    transcript_source: TranscriptSource | None = None
     started_at: datetime
     finished_at: datetime
 
@@ -95,9 +96,17 @@ class EvaluationPrediction(FrozenModel):
             self.artifact_manifest_sha256,
         )
         if self.terminal_status in _TERMINAL_SUCCESS:
-            if any(field is None for field in artifact_fields) or self.failure_code is not None:
+            if (
+                any(field is None for field in artifact_fields)
+                or self.failure_code is not None
+                or self.transcript_source is None
+            ):
                 raise ValueError("成功预测必须完整绑定生产产物且不得有失败码")
-        elif any(field is not None for field in artifact_fields) or self.failure_code is None:
+        elif (
+            any(field is not None for field in artifact_fields)
+            or self.failure_code is None
+            or self.transcript_source is not None
+        ):
             raise ValueError("失败预测不得携带成功产物且必须有失败码")
         return self
 
@@ -324,6 +333,8 @@ def _validate_manifest(
         raise ValueError("生产产物 Manifest 内容与导出产物不一致")
     if payload.warnings != run.warning_codes:
         raise ValueError("生产产物 Manifest 警告与运行快照不匹配")
+    if payload.transcript_source != index.transcript_source:
+        raise ValueError("生产产物 Manifest 文本来源与预测索引不匹配")
 
 
 def _extract_claims(result: VideoUnderstandingResult) -> tuple[PredictionClaim, ...]:

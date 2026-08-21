@@ -137,7 +137,12 @@ class EvaluationAnnotation(FrozenModel):
     @classmethod
     def reject_blank_or_duplicate_terms(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         normalized = tuple(" ".join(term.split()) for term in value)
-        if any(not term for term in normalized) or len(normalized) != len(set(normalized)):
+        comparison_keys = tuple(
+            unicodedata.normalize("NFKC", term).casefold() for term in normalized
+        )
+        if any(not term for term in normalized) or len(comparison_keys) != len(
+            set(comparison_keys)
+        ):
             raise ValueError("明确标注术语不得为空或重复")
         return normalized
 

@@ -91,7 +91,7 @@ def test_segment_instruction_requires_visual_observation_instead_of_only_summari
     assert isinstance(messages, list)
     instruction = messages[0]["content"]
     assert isinstance(instruction, str)
-    assert "不得只改写 ASR 或 OCR" in instruction
+    assert "不得只改写字幕、ASR 或 OCR" in instruction
     assert "画面显示" in instruction
     assert "语音提到" in instruction
     assert "entities" in instruction

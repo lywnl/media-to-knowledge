@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import subprocess
+import sys
 import traceback
 from pathlib import Path
 from xml.etree import ElementTree
@@ -61,6 +62,31 @@ from video_demo.evaluation.thresholds import QUALITY_THRESHOLDS
 
 def test_gate_keeps_legacy_evidence_model_imports() -> None:
     assert gate_module.CommandTrace.__module__ == "video_demo.evaluation.evidence"
+
+
+def test_evaluation_package_keeps_public_exports_lazy() -> None:
+    script = """
+import json
+import sys
+import video_demo.evaluation as package
+before = sorted(name for name in sys.modules if name.endswith(('live_runner', 'media_runner')))
+evidence_module = package.EvidenceStore.__module__
+live_module = package.LiveValidationRunner.__module__
+print(json.dumps({'before': before, 'evidence': evidence_module, 'live': live_module}))
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "before": [],
+        "evidence": "video_demo.evaluation.evidence",
+        "live": "video_demo.evaluation.live_runner",
+    }
 
 
 def test_strict_no_indexing_runner_can_form_pass_and_binds_current_inputs(
@@ -404,6 +430,33 @@ def test_current_live_implementation_digest_rejects_missing_required_source(
 ) -> None:
     with pytest.raises(ValueError, match="实现文件"):
         gate_module._current_live_implementation_sha256(tmp_path)
+
+
+def test_live_implementation_digest_covers_in_process_speech_runtime(
+    tmp_path: Path,
+) -> None:
+    changed_path = Path("src/video_demo/speech/runtime.py")
+    assert changed_path in gate_module._LIVE_IMPLEMENTATION_FILES
+    project_root = Path(__file__).parents[2]
+    for relative_path in gate_module._LIVE_IMPLEMENTATION_FILES:
+        destination = tmp_path / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(project_root / relative_path, destination)
+
+    before = gate_module._current_live_implementation_sha256(tmp_path)
+    copied_source = tmp_path / changed_path
+    copied_source.write_bytes(copied_source.read_bytes() + b"\n")
+
+    assert gate_module._current_live_implementation_sha256(tmp_path) != before
+
+
+def test_live_implementation_digest_excludes_production_subprocess_chain() -> None:
+    assert Path("src/video_demo/speech/isolated.py") not in (
+        gate_module._LIVE_IMPLEMENTATION_FILES
+    )
+    assert Path("src/video_demo/speech/subprocess_main.py") not in (
+        gate_module._LIVE_IMPLEMENTATION_FILES
+    )
 
 
 def _live_annotation(

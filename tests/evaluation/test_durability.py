@@ -38,6 +38,18 @@ def _copy_durability_implementation(tmp_path: Path) -> None:
         shutil.copy2(project_root / relative, target)
 
 
+def test_durability_implementation_digest_covers_subtitle_first_pipeline(
+    tmp_path: Path,
+) -> None:
+    changed_path = Path("src/video_demo/media/subtitles.py")
+    assert changed_path in gate_module._DURABILITY_IMPLEMENTATION_FILES
+    before = gate_module._current_durability_implementation_sha256(tmp_path)
+    copied_source = tmp_path / changed_path
+    copied_source.write_bytes(copied_source.read_bytes() + b"\n")
+
+    assert gate_module._current_durability_implementation_sha256(tmp_path) != before
+
+
 class ConstantSampler:
     """受控测试专用采样器，避免伪造 psutil 的内部接口。"""
 
