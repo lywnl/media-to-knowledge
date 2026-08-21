@@ -19,6 +19,7 @@ from video_demo.domain.result import (
     validate_evidence_references,
 )
 from video_demo.domain.run import RunStatus, TimeRange
+from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.fusion.merge import (
     BoundaryPoint,
@@ -68,6 +69,8 @@ class PipelineRunConfig(FrozenModel):
     language_hints: tuple[LanguageCode, ...] = ()
     min_speakers: int | None = Field(default=None, ge=1, le=10)
     max_speakers: int | None = Field(default=None, ge=1, le=10)
+    hotwords: tuple[str, ...] = ()
+    core_context: str | None = None
 
     @model_validator(mode="after")
     def validate_speaker_range(self) -> Self:
@@ -79,6 +82,8 @@ class PipelineRunConfig(FrozenModel):
             and self.min_speakers > self.max_speakers
         ):
             raise ValueError("min_speakers 不得大于 max_speakers")
+        object.__setattr__(self, "hotwords", normalize_hotwords(self.hotwords))
+        object.__setattr__(self, "core_context", normalize_core_context(self.core_context))
         return self
 
 

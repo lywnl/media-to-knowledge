@@ -6,7 +6,7 @@ import math
 import pytest
 from pydantic import ValidationError
 
-from video_demo.domain.evidence import AlignedWord, SpeechSegment
+from video_demo.domain.evidence import AlignedWord, SpeechSegment, SubtitleCue
 from video_demo.domain.result import (
     SegmentUnderstanding,
     VideoSegment,
@@ -61,6 +61,43 @@ def test_speech_segment_keeps_original_text_and_language() -> None:
 
     assert segment.text == "Hello world"
     assert segment.language == "en"
+
+
+def test_subtitle_cue_preserves_source_without_fabricating_asr_fields() -> None:
+    cue = SubtitleCue(
+        evidence_id="subtitle_001",
+        start_ms=0,
+        end_ms=1_000,
+        text="字幕正文",
+        language="zh",
+        stream_index=2,
+    )
+
+    assert cue.evidence_type == "SUBTITLE_CUE"
+    assert cue.text == "字幕正文"
+    assert cue.stream_index == 2
+    assert "confidence" not in cue.model_dump()
+
+
+def test_subtitle_cue_rejects_invalid_stream_or_empty_text() -> None:
+    with pytest.raises(ValidationError):
+        SubtitleCue(
+            evidence_id="subtitle_001",
+            start_ms=0,
+            end_ms=1_000,
+            text="",
+            language="zh",
+            stream_index=2,
+        )
+    with pytest.raises(ValidationError):
+        SubtitleCue(
+            evidence_id="subtitle_001",
+            start_ms=0,
+            end_ms=1_000,
+            text="字幕正文",
+            language="zh",
+            stream_index=-1,
+        )
 
 
 def test_qwen_segment_understanding_cannot_supply_time_fields() -> None:

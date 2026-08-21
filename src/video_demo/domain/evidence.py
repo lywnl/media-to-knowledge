@@ -34,6 +34,13 @@ class SpeechSegment(TimedEvidence):
     is_fully_evaluated_language: bool
 
 
+class SubtitleCue(TimedEvidence):
+    evidence_type: Literal["SUBTITLE_CUE"] = "SUBTITLE_CUE"
+    text: str = Field(min_length=1, max_length=4000)
+    language: LanguageCode
+    stream_index: int = Field(ge=0)
+
+
 class AlignedWord(TimedEvidence):
     evidence_type: Literal["ALIGNED_WORD"] = "ALIGNED_WORD"
     text: str = Field(min_length=1)
@@ -132,6 +139,7 @@ class TimelineEvidence(TimeRange):
 
 EvidenceItem: TypeAlias = (
     SpeechSegment
+    | SubtitleCue
     | AlignedWord
     | SpeakerTurn
     | AudioEvent

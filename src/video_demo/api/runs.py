@@ -48,6 +48,8 @@ def create_video_run(
             language_hints=payload.language_hints,
             min_speakers=payload.min_speakers,
             max_speakers=payload.max_speakers,
+            hotwords=payload.hotwords,
+            core_context=payload.core_context,
         ),
     )
 

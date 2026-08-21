@@ -3,6 +3,9 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
+from pydantic import ValidationError
+
+from video_demo.application.pipeline import PipelineRunConfig
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.models import (
@@ -52,7 +55,17 @@ class RunService:
         language_hints: tuple[str, ...],
         min_speakers: int | None,
         max_speakers: int | None,
+        hotwords: tuple[str, ...] = (),
+        core_context: str | None = None,
     ) -> RunView:
+        config = PipelineRunConfig(
+            language_hints=language_hints,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            hotwords=hotwords,
+            core_context=core_context,
+        )
+        config_snapshot = config.model_dump(mode="json")
         with self._database.session() as session:
             object_model = VideoObjectRepository(session).get_ready(scope, object_ref)
             if object_model is None:
@@ -61,7 +74,10 @@ class RunService:
             runs = VideoRunRepository(session)
             existing = runs.get_by_idempotency(scope, idempotency_key)
             if existing is not None:
-                if existing.object_ref != object_ref:
+                if existing.object_ref != object_ref or not self._same_config(
+                    existing.config_snapshot,
+                    config,
+                ):
                     raise VideoDemoError(
                         ErrorCode.IDEMPOTENCY_CONFLICT,
                         "幂等键已用于另一个视频对象",
@@ -84,11 +100,7 @@ class RunService:
                 asset_id=asset.asset_id,
                 object_ref=object_ref,
                 idempotency_key=idempotency_key,
-                config_snapshot={
-                    "language_hints": list(language_hints),
-                    "min_speakers": min_speakers,
-                    "max_speakers": max_speakers,
-                },
+                config_snapshot=config_snapshot,
             )
             JobRepository(session).enqueue_video_run(
                 scope=scope,
@@ -96,6 +108,14 @@ class RunService:
                 run_id=run_id,
             )
             return _run_view(run, job_id)
+
+    @staticmethod
+    def _same_config(snapshot: dict[str, object], expected: PipelineRunConfig) -> bool:
+        try:
+            existing = PipelineRunConfig.model_validate(snapshot)
+        except ValidationError:
+            return False
+        return existing == expected
 
     def get(self, scope: Scope, run_id: str) -> RunView:
         with self._database.session() as session:

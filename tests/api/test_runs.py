@@ -56,6 +56,66 @@ def test_create_run_returns_202_and_is_idempotent(
     assert first.json()["job_id"].startswith("job_")
 
 
+def test_create_run_accepts_bounded_hotwords_and_core_context(
+    client: TestClient,
+    scope_headers: dict[str, str],
+    mp4_content: bytes,
+) -> None:
+    object_ref = _upload(client, scope_headers, mp4_content)
+    payload = _create_payload(object_ref)
+    payload.update(
+        {
+            "hotwords": ["  Milvus  ", "WhisperX"],
+            "core_context": "  这是一个   视频检索系统的技术讲解。  ",
+        }
+    )
+
+    response = client.post(
+        "/api/kb/knowledge-bases/kb-a/video-understanding-runs",
+        headers=scope_headers,
+        json=payload,
+    )
+
+    assert response.status_code == 202
+
+
+def test_same_idempotency_key_rejects_changed_speech_hints(
+    client: TestClient,
+    scope_headers: dict[str, str],
+    mp4_content: bytes,
+) -> None:
+    object_ref = _upload(client, scope_headers, mp4_content)
+    runs_url = "/api/kb/knowledge-bases/kb-a/video-understanding-runs"
+    first = {**_create_payload(object_ref), "hotwords": ["Milvus"]}
+    second = {**_create_payload(object_ref), "hotwords": ["MySQL"]}
+
+    assert client.post(runs_url, headers=scope_headers, json=first).status_code == 202
+    response = client.post(runs_url, headers=scope_headers, json=second)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_create_run_rejects_invalid_speech_hints(
+    client: TestClient,
+    scope_headers: dict[str, str],
+    mp4_content: bytes,
+) -> None:
+    object_ref = _upload(client, scope_headers, mp4_content)
+    runs_url = "/api/kb/knowledge-bases/kb-a/video-understanding-runs"
+    invalid_payloads = (
+        {**_create_payload(object_ref), "hotwords": ["Milvus", " Milvus "]},
+        {**_create_payload(object_ref), "hotwords": ["x" * 65]},
+        {**_create_payload(object_ref), "hotwords": ["术语\n注入"]},
+        {**_create_payload(object_ref), "core_context": "上下文\x00注入"},
+    )
+
+    for index, payload in enumerate(invalid_payloads):
+        payload["idempotency_key"] = f"invalid-speech-hint-{index:04d}"
+        response = client.post(runs_url, headers=scope_headers, json=payload)
+        assert response.status_code == 422
+
+
 def test_create_run_rejects_invalid_idempotency_language_and_speaker_range(
     client: TestClient,
     scope_headers: dict[str, str],

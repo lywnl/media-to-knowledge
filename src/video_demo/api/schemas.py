@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from video_demo.domain.base import LanguageCode, Probability, StableId
 from video_demo.domain.evidence import BoundingBox, SpeakerId
 from video_demo.domain.run import TimeRange
+from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
 
 
 class ApiModel(BaseModel):
@@ -29,6 +30,8 @@ class CreateRunRequest(ApiModel):
     language_hints: tuple[Literal["zh", "en", "ja", "ko", "es"], ...] = ()
     min_speakers: int | None = Field(default=None, ge=1, le=10)
     max_speakers: int | None = Field(default=None, ge=1, le=10)
+    hotwords: tuple[str, ...] = Field(default=(), max_length=50)
+    core_context: str | None = Field(default=None, max_length=1000)
 
     @model_validator(mode="after")
     def validate_speaker_range(self) -> Self:
@@ -40,6 +43,8 @@ class CreateRunRequest(ApiModel):
             raise ValueError("min_speakers 不能大于 max_speakers")
         if len(self.language_hints) != len(set(self.language_hints)):
             raise ValueError("language_hints 不得重复")
+        self.hotwords = normalize_hotwords(self.hotwords)
+        self.core_context = normalize_core_context(self.core_context)
         return self
 
 
@@ -81,6 +86,13 @@ class PublicSpeechSegment(PublicTimedEvidence):
     language: LanguageCode
     confidence: Probability
     is_fully_evaluated_language: bool
+
+
+class PublicSubtitleCue(PublicTimedEvidence):
+    evidence_type: Literal["SUBTITLE_CUE"] = "SUBTITLE_CUE"
+    text: str
+    language: LanguageCode
+    stream_index: int = Field(ge=0)
 
 
 class PublicAlignedWord(PublicTimedEvidence):
@@ -139,6 +151,7 @@ class PublicOcrEvidence(PublicTimedEvidence):
 
 PublicEvidence = Annotated[
     PublicSpeechSegment
+    | PublicSubtitleCue
     | PublicAlignedWord
     | PublicSpeakerTurn
     | PublicAudioEvent
