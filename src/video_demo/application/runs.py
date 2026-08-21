@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
+
+from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.persistence.database import Database
+from video_demo.persistence.models import (
+    JobModel,
+    JobStatus,
+    RunStatusValue,
+    VideoUnderstandingRunModel,
+)
+from video_demo.persistence.repositories import (
+    JobRepository,
+    Scope,
+    VideoObjectRepository,
+    VideoRunRepository,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RunView:
+    run_id: str
+    job_id: str
+    status: RunStatusValue
+    current_stage: str
+    warning_codes: tuple[str, ...]
+    error_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class JobView:
+    job_id: str
+    resource_id: str
+    status: JobStatus
+    attempt_count: int
+    max_attempts: int
+    error_code: str | None
+
+
+class RunService:
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def create(
+        self,
+        *,
+        scope: Scope,
+        object_ref: str,
+        idempotency_key: str,
+        language_hints: tuple[str, ...],
+        min_speakers: int | None,
+        max_speakers: int | None,
+    ) -> RunView:
+        with self._database.session() as session:
+            object_model = VideoObjectRepository(session).get_ready(scope, object_ref)
+            if object_model is None:
+                raise VideoDemoError(ErrorCode.VIDEO_OBJECT_NOT_FOUND, "视频对象不存在")
+
+            runs = VideoRunRepository(session)
+            existing = runs.get_by_idempotency(scope, idempotency_key)
+            if existing is not None:
+                if existing.object_ref != object_ref:
+                    raise VideoDemoError(
+                        ErrorCode.IDEMPOTENCY_CONFLICT,
+                        "幂等键已用于另一个视频对象",
+                    )
+                job = JobRepository(session).get_by_resource(scope, existing.run_id)
+                assert job is not None
+                return _run_view(existing, job.job_id)
+
+            asset = runs.get_or_create_asset(
+                scope=scope,
+                asset_id=f"asset_{uuid.uuid4().hex}",
+                object_ref=object_ref,
+                source_sha256=object_model.sha256,
+            )
+            run_id = f"run_{uuid.uuid4().hex}"
+            job_id = f"job_{uuid.uuid4().hex}"
+            run = runs.add(
+                scope=scope,
+                run_id=run_id,
+                asset_id=asset.asset_id,
+                object_ref=object_ref,
+                idempotency_key=idempotency_key,
+                config_snapshot={
+                    "language_hints": list(language_hints),
+                    "min_speakers": min_speakers,
+                    "max_speakers": max_speakers,
+                },
+            )
+            JobRepository(session).enqueue_video_run(
+                scope=scope,
+                job_id=job_id,
+                run_id=run_id,
+            )
+            return _run_view(run, job_id)
+
+    def get(self, scope: Scope, run_id: str) -> RunView:
+        with self._database.session() as session:
+            run = VideoRunRepository(session).get(scope, run_id)
+            if run is None:
+                raise VideoDemoError(ErrorCode.VIDEO_RUN_NOT_FOUND, "视频理解运行不存在")
+            job = JobRepository(session).get_by_resource(scope, run_id)
+            assert job is not None
+            return _run_view(run, job.job_id)
+
+    def require_result_ready(self, scope: Scope, run_id: str) -> RunView:
+        view = self.get(scope, run_id)
+        if view.status not in (RunStatusValue.SUCCEEDED, RunStatusValue.PARTIAL_SUCCEEDED):
+            raise VideoDemoError(ErrorCode.VIDEO_RESULT_NOT_READY, "视频理解结果尚未就绪")
+        return view
+
+    def get_job(self, scope: Scope, job_id: str) -> JobView:
+        with self._database.session() as session:
+            job = JobRepository(session).get(scope, job_id)
+            if job is None:
+                raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "任务不存在")
+            return _job_view(job)
+
+    def cancel_job(self, scope: Scope, job_id: str) -> JobView:
+        with self._database.session() as session:
+            repository = JobRepository(session)
+            if not repository.request_cancel(scope, job_id):
+                raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "任务不存在")
+            job = repository.get(scope, job_id)
+            assert job is not None
+            return _job_view(job)
+
+    def retry_job(self, scope: Scope, job_id: str) -> JobView:
+        with self._database.session() as session:
+            return _job_view(JobRepository(session).retry(scope, job_id))
+
+
+def _run_view(run: VideoUnderstandingRunModel, job_id: str) -> RunView:
+    return RunView(
+        run_id=run.run_id,
+        job_id=job_id,
+        status=run.status,
+        current_stage=run.current_stage,
+        warning_codes=tuple(run.warning_codes),
+        error_code=run.error_code,
+    )
+
+
+def _job_view(job: JobModel) -> JobView:
+    return JobView(
+        job_id=job.job_id,
+        resource_id=job.resource_id,
+        status=job.status,
+        attempt_count=job.attempt_count,
+        max_attempts=job.max_attempts,
+        error_code=job.error_code,
+    )
