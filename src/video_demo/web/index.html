@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="选择本地视频，查看后端生成的视频理解结果。">
+    <title>本地视频理解</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="page-shell">
+      <header class="page-header">
+        <p class="eyebrow">VIDEO UNDERSTANDING</p>
+        <h1>看懂一段视频，<br><span>从选择文件开始。</span></h1>
+        <p class="header-description">选择一个本地视频，交给后端完成语音、画面和内容理解。</p>
+        <p class="worker-note">
+          <svg aria-hidden="true" viewBox="0 0 24 24">
+            <path d="M12 8v4m0 4h.01M10.3 3.7 2.8 17a2 2 0 0 0 1.7 3h15a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z"/>
+          </svg>
+          开始前，请确认 API 与 Worker 已同时运行。
+        </p>
+      </header>
+
+      <section class="panel upload-panel" aria-labelledby="upload-title">
+        <div class="section-heading">
+          <span class="step-number" aria-hidden="true">01</span>
+          <div>
+            <h2 id="upload-title">选择视频</h2>
+            <p>支持后端已接受的 MP4、MOV、MKV 和 WebM 视频。</p>
+          </div>
+        </div>
+        <form id="upload-form" novalidate>
+          <div class="file-control">
+            <label class="file-button" for="video-file">
+              <svg aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5"/>
+              </svg>
+              选择本地视频
+            </label>
+            <input id="video-file" name="video-file" type="file" accept=".mp4,.mov,.mkv,.webm">
+            <p id="file-detail">尚未选择文件</p>
+          </div>
+          <button id="submit-button" class="primary-button" type="submit">
+            <span>开始处理</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="m9 18 6-6-6-6"/>
+            </svg>
+          </button>
+        </form>
+      </section>
+
+      <section id="status-panel" class="panel" aria-labelledby="status-title" hidden>
+        <div class="section-heading">
+          <span class="step-number" aria-hidden="true">02</span>
+          <div>
+            <h2 id="status-title">处理状态</h2>
+            <p id="status-message" role="status">等待开始</p>
+          </div>
+        </div>
+        <div class="process-track" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+        </div>
+        <p id="status-detail" class="status-detail"></p>
+      </section>
+
+      <p id="error-message" class="error-message" aria-live="polite" hidden></p>
+
+      <section id="result-panel" class="panel" aria-labelledby="result-title" hidden>
+        <div class="section-heading">
+          <span class="step-number" aria-hidden="true">03</span>
+          <div>
+            <h2 id="result-title">处理结果</h2>
+            <p>后端返回的摘要与分段理解内容。</p>
+          </div>
+        </div>
+        <div id="result-content"></div>
+      </section>
+    </main>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
