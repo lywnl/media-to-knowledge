@@ -1,0 +1,21 @@
+{
+  "log_id": 987654321,
+  "direction": 0,
+  "words_result_num": 1,
+  "words_result": [
+    {
+      "words": "[REDACTED]",
+      "location": {
+        "left": 12,
+        "top": 24,
+        "width": 160,
+        "height": 32
+      },
+      "probability": {
+        "variance": 0.0003,
+        "average": 0.97,
+        "min": 0.91
+      }
+    }
+  ]
+}
