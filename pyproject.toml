@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "video-understanding-demo"
+version = "0.1.0"
+description = "独立视频理解到 retrieval_text 的 FastAPI Demo"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "video-demo contributors" }]
+dependencies = [
+  "alembic>=1.14,<2",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "python-multipart>=0.0.20,<1",
+  "sqlalchemy>=2.0.36,<2.1",
+  "uvicorn>=0.34,<1",
+]
+
+[project.scripts]
+video-demo-worker = "video_demo.worker_main:main"
+video-demo-eval = "video_demo.evaluation.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "httpx2>=2.10,<3",
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.9,<1",
+]
+speech = [
+  "faster-whisper>=1.2,<2",
+  "huggingface-hub>=0.28,<1",
+  "numpy>=2.2.2,<2.3",
+  "pyannote.audio>=4,<5",
+  "requests>=2.32,<3",
+  "silero-vad>=5.1,<7",
+  "torch>=2.8,<2.9",
+  "torchaudio>=2.8,<2.9",
+  "transformers>=4.48,<5",
+  "whisperx==3.4.2",
+]
+vision = [
+  "opencv-python-headless>=4.10,<5",
+  "pillow>=11,<13",
+  "scenedetect[opencv]>=0.6.5,<0.7",
+]
+audio-events = [
+  "setuptools>=80.9,<82",
+  "tensorflow>=2.20,<2.21",
+  "tensorflow-hub>=0.16,<1",
+]
+evaluation = [
+  "jiwer>=3.1,<5",
+  "psutil>=6.1,<8",
+  "pyannote.metrics>=4,<5",
+  "rapidfuzz>=3.11,<4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/video_demo"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "integration: 需要本地二进制、模型或外部服务的集成测试",
+  "quality: 需要授权评测集的真实质量测试",
+  "performance: 需要耐久样本的 M1 性能测试",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = [".codex"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+allowed-confusables = ["：", "；", "，", "×"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["pydantic_settings.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["cv2", "cv2.*", "scenedetect", "scenedetect.*"]
+ignore_missing_imports = true
