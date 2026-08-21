@@ -1,0 +1,16 @@
+.DS_Store
+.env
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.py[cod]
+runtime/
+
+# 模型、媒体、运行产物和真实评测素材不得进入 Git。
+.codex/video-rag-demo/
+
+# 设计和实施状态是项目交付物，保留在版本控制范围内。
+!.codex/specs/
+!.codex/plans/
