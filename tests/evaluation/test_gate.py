@@ -1599,12 +1599,13 @@ def _write_pyannote_live_report(
     baidu_raw = BaiduLiveRawReport.model_validate_json(
         (runtime_root / "eval/reports/run-live/raw.json").read_bytes()
     )
-    model = ModelIdentity(
-        component="pyannote",
-        provider="local",
-        model_id="pyannote/speaker-diarization-community-1",
-        device=device,
-    )
+    model = next(
+        item
+        for item in build_production_model_identity_report(
+            Settings(workspace_root=tmp_path)
+        ).models
+        if item.component == "pyannote"
+    ).model_copy(update={"device": device})
     summary = LiveExecutionSummary(
         schema_version="1.0.0",
         component="pyannote",
@@ -1722,6 +1723,8 @@ def _local_model_identity(
     *,
     device: str = "cpu",
 ) -> ModelIdentity:
+    from importlib.metadata import version
+
     model_id = {
         "silero_vad": "silero-vad",
         "faster_whisper": "large-v3",
@@ -1733,6 +1736,14 @@ def _local_model_identity(
         provider="local",
         model_id=model_id,
         device=device,
+        revision=version(
+            {
+                "silero_vad": "silero-vad",
+                "faster_whisper": "faster-whisper",
+                "whisperx": "whisperx",
+                "yamnet": "tensorflow-hub",
+            }[component]
+        ),
     )
 
 

@@ -21,6 +21,26 @@ class ArtifactReceipt(FrozenModel):
     upstream_sha256: Sha256
 
 
+def canonical_artifact_envelope_bytes(
+    payload: dict[str, Any] | list[Any],
+    schema_version: str,
+    upstream_sha256: str,
+) -> bytes:
+    """按阶段产物唯一规范编码 envelope。"""
+
+    return json.dumps(
+        {
+            "schema_version": schema_version,
+            "upstream_sha256": upstream_sha256,
+            "payload": payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 class AtomicArtifactStore:
     """将阶段 JSON 以规范 UTF-8 和原子替换方式写入运行目录。"""
 
@@ -36,18 +56,11 @@ class AtomicArtifactStore:
         upstream_sha256: str,
     ) -> ArtifactReceipt:
         destination = safe_runtime_path(self.runtime_root, relative_path)
-        envelope = {
-            "schema_version": schema_version,
-            "upstream_sha256": upstream_sha256,
-            "payload": payload,
-        }
-        encoded = json.dumps(
-            envelope,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        encoded = canonical_artifact_envelope_bytes(
+            payload,
+            schema_version,
+            upstream_sha256,
+        )
         digest = hashlib.sha256(encoded).hexdigest()
         temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -68,10 +81,29 @@ class AtomicArtifactStore:
         )
 
     def read_verified_json(self, receipt: ArtifactReceipt) -> dict[str, Any] | list[Any]:
+        return self.read_verified_json_limited(receipt)
+
+    def read_verified_json_limited(
+        self,
+        receipt: ArtifactReceipt,
+        *,
+        max_bytes: int | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        if max_bytes is not None and max_bytes < 1:
+            raise ValueError("阶段产物读取上限必须大于 0")
         artifact = safe_runtime_path(self.runtime_root, Path(receipt.relative_path))
         if artifact.is_symlink() or not artifact.is_file():
             raise VideoDemoError(ErrorCode.ARTIFACT_NOT_FOUND, "阶段产物不存在")
-        encoded = artifact.read_bytes()
+        if max_bytes is None:
+            encoded = artifact.read_bytes()
+        else:
+            with artifact.open("rb") as stream:
+                encoded = stream.read(max_bytes + 1)
+            if len(encoded) > max_bytes:
+                raise VideoDemoError(
+                    ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                    "阶段产物超过读取上限",
+                )
         if hashlib.sha256(encoded).hexdigest() != receipt.sha256:
             raise VideoDemoError(ErrorCode.ARTIFACT_DIGEST_MISMATCH, "阶段产物摘要不匹配")
         try:

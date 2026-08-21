@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import re
 import time
@@ -60,9 +61,11 @@ from video_demo.speech.alignment import NativeWhisperXBackend, WhisperXAligner
 from video_demo.speech.asr import FasterWhisperAdapter, NativeFasterWhisperBackend
 from video_demo.speech.diarization import NativePyannoteBackend, PyannoteDiarizer
 from video_demo.speech.language import FasterWhisperLanguageDetector, SegmentLanguageIdentifier
+from video_demo.speech.snapshots import SpeechFingerprintInputs
 from video_demo.speech.vad import NativeSileroBackend, SileroVadAdapter
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.object_store import LocalVideoObjectStore
+from video_demo.storage.snapshots import SnapshotStore
 from video_demo.visual.keyframes import KeyframeSelector, OpenCvFrameExtractor
 from video_demo.visual.scenes import PySceneDetectAdapter
 from video_demo.worker.runtime import ReliableWorker
@@ -176,16 +179,23 @@ def build_production_model_identity_report(
     """只从生产设置和固定组件契约生成稳定、可序列化的模型身份。"""
 
     models = [
-        _local_model_identity("silero_vad", "silero-vad", device="cpu"),
+        _local_model_identity(
+            "silero_vad",
+            "silero-vad",
+            package="silero-vad",
+            device="cpu",
+        ),
         _local_model_identity(
             "faster_whisper",
             "large-v3",
+            package="faster-whisper",
             device=settings.inference_device,
         ),
         *(
             _local_model_identity(
                 "whisperx",
                 f"whisperx-align-{language}",
+                package="whisperx",
                 device="cpu",
             )
             for language in _VALIDATION_LANGUAGES
@@ -193,9 +203,15 @@ def build_production_model_identity_report(
         _local_model_identity(
             "pyannote",
             "pyannote/speaker-diarization-community-1",
+            package="pyannote.audio",
             device="cpu",
         ),
-        _local_model_identity("yamnet", "yamnet", device="cpu"),
+        _local_model_identity(
+            "yamnet",
+            "yamnet",
+            package="tensorflow-hub",
+            device="cpu",
+        ),
         ModelIdentity(
             component="baidu_ocr",
             provider="baidu_ocr",
@@ -280,14 +296,23 @@ def _local_model_identity(
     component: str,
     model_id: str,
     *,
+    package: str,
     device: str,
 ) -> ModelIdentity:
     return ModelIdentity(
         component=component,
         provider="local",
         model_id=model_id,
+        revision=_installed_package_version(package),
         device=device,
     )
+
+
+def _installed_package_version(package: str) -> str:
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return "NOT_INSTALLED"
 
 
 def _normalized_qwen_model_id(
@@ -450,6 +475,8 @@ def build_production_pipeline(
             ),
             ProductionSpeechAnalyzer(
                 diagnostics.speech_component_factory,
+                snapshot_store=SnapshotStore(AtomicArtifactStore(settings.runtime_root)),
+                fingerprint_inputs=_speech_fingerprint_inputs(settings),
                 allow_speaker_fallback=settings.demo_degraded_mode,
             ),
             ProductionVisualAnalyzer(
@@ -548,6 +575,33 @@ def _build_speech_models(settings: Settings) -> ProductionSpeechModels:
             thresholds_path=thresholds_path,
         ),
     )
+
+
+def _speech_fingerprint_inputs(settings: Settings) -> SpeechFingerprintInputs:
+    assert settings.runtime_root is not None
+    report = build_production_model_identity_report(settings)
+    model_root = settings.runtime_root / "models"
+    return SpeechFingerprintInputs(
+        model_identities=tuple(
+            identity
+            for identity in report.models
+            if identity.component
+            in {"silero_vad", "faster_whisper", "whisperx", "pyannote", "yamnet"}
+        ),
+        asr_compute_type=settings.whisper_compute_type,
+        yamnet_class_map_sha256=_optional_file_sha256(
+            model_root / "yamnet/yamnet_class_map.csv"
+        ),
+        yamnet_thresholds_sha256=_optional_file_sha256(
+            settings.workspace_root / "src/video_demo/audio/thresholds.json"
+        ),
+    )
+
+
+def _optional_file_sha256(path: Path) -> str:
+    if path.is_file() and not path.is_symlink():
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashlib.sha256(f"MISSING:{path.name}".encode()).hexdigest()
 
 
 def _build_visual_component_factory(

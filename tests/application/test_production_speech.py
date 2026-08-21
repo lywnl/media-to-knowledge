@@ -26,12 +26,16 @@ from video_demo.media.transcode import SubtitleArtifact
 from video_demo.speech.alignment import AlignmentResult
 from video_demo.speech.asr import RawAsrSegment
 from video_demo.speech.language import LanguageIdentificationResult, LanguageSpan
+from video_demo.speech.snapshots import SpeechFingerprintInputs
 from video_demo.speech.vad import SpeechInterval, VadResult
+from video_demo.storage.artifacts import AtomicArtifactStore
+from video_demo.storage.snapshots import SnapshotStore
 
 
 def test_no_audio_skips_every_speech_component(tmp_path: Path) -> None:
     calls: list[str] = []
-    analyzer = ProductionSpeechAnalyzer(
+    analyzer = _analyzer(
+        tmp_path,
         lambda _media, _cancel: calls.append("components")  # type: ignore[arg-type]
     )
 
@@ -61,7 +65,7 @@ def test_eligible_subtitle_skips_every_speech_component(tmp_path: Path) -> None:
         subtitle=_parsed_subtitle(),
         warnings=("SUBTITLE_TRACK_REJECTED:3:INCOMPLETE",),
     )
-    result = ProductionSpeechAnalyzer(component_factory).analyze(media)
+    result = _analyzer(tmp_path, component_factory).analyze(media)
 
     assert result.transcript_source == "SUBTITLE"
     assert result.evidence == _parsed_subtitle().cues
@@ -96,7 +100,7 @@ def test_no_speech_still_runs_yamnet_and_skips_remaining_models(tmp_path: Path) 
             )
 
     components = _components(calls, vad=Vad(), events=Events())
-    result = ProductionSpeechAnalyzer(lambda _media, _cancel: components).analyze(
+    result = _analyzer(tmp_path, lambda _media, _cancel: components).analyze(
         replace(
             _media(tmp_path),
             warnings=("SUBTITLE_TRACK_REJECTED:2:INCOMPLETE",),
@@ -201,7 +205,7 @@ def test_complete_chain_preserves_order_config_absolute_time_speakers_and_sortin
         audio_events=Events(),  # type: ignore[arg-type]
         slicer=Slicer(),  # type: ignore[arg-type]
     )
-    result = ProductionSpeechAnalyzer(lambda _media, _cancel: components).analyze(
+    result = _analyzer(tmp_path, lambda _media, _cancel: components).analyze(
         replace(
             _media(
                 tmp_path,
@@ -305,7 +309,7 @@ def test_speech_analysis_exports_deduplicated_hybrid_boundary_candidates(
         }
     )
 
-    result = ProductionSpeechAnalyzer(lambda _media, _cancel: components).analyze(
+    result = _analyzer(tmp_path, lambda _media, _cancel: components).analyze(
         _media(tmp_path)
     )
 
@@ -350,7 +354,9 @@ def test_alignment_unavailable_preserves_segment_without_fabricating_word(tmp_pa
         }
     )
 
-    result = ProductionSpeechAnalyzer(lambda _media, _cancel: components).analyze(_media(tmp_path))
+    result = _analyzer(tmp_path, lambda _media, _cancel: components).analyze(
+        _media(tmp_path)
+    )
 
     assert segment in result.evidence
     assert not any(isinstance(item, AlignedWord) for item in result.evidence)
@@ -364,7 +370,7 @@ def test_component_failure_is_stable_and_never_leaks_secret(tmp_path: Path) -> N
         raise RuntimeError(secret)
 
     with pytest.raises(VideoDemoError) as raised:
-        ProductionSpeechAnalyzer(factory).analyze(_media(tmp_path))
+        _analyzer(tmp_path, factory).analyze(_media(tmp_path))
 
     rendered = f"{raised.value.message} {raised.value.details}"
     assert raised.value.code == ErrorCode.SPEECH_MODEL_UNAVAILABLE
@@ -425,7 +431,8 @@ def test_demo_mode_keeps_asr_when_pyannote_is_unavailable_and_marks_unknown_spea
         }
     )
 
-    result = ProductionSpeechAnalyzer(
+    result = _analyzer(
+        tmp_path,
         lambda _media, _cancel: components,
         allow_speaker_fallback=True,
     ).analyze(_media(tmp_path))
@@ -433,6 +440,128 @@ def test_demo_mode_keeps_asr_when_pyannote_is_unavailable_and_marks_unknown_spea
     word = next(item for item in result.evidence if isinstance(item, AlignedWord))
     assert word.speaker == "SPEAKER_UNKNOWN"
     assert "DEMO_DEGRADED_SPEAKER_UNKNOWN" in result.warnings
+
+
+def test_alignment_failure_retry_reuses_asr_snapshot(tmp_path: Path) -> None:
+    speech = SpeechInterval(evidence_id="vad_retry", start_ms=0, end_ms=2_000, confidence=0.9)
+    language = LanguageSpan(
+        evidence_id="lid_retry",
+        start_ms=0,
+        end_ms=2_000,
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    segment = SpeechSegment(
+        evidence_id="asr_retry",
+        start_ms=0,
+        end_ms=1_000,
+        text="重试文本",
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    calls = {"vad": 0, "lid": 0, "recognizer": 0, "aligner": 0}
+
+    class Vad:
+        def detect(self, _audio: Path, *, duration_ms: int) -> VadResult:
+            calls["vad"] += 1
+            return VadResult(speech=(speech,), silence=(), long_silence_boundaries_ms=())
+
+    class Lid:
+        def identify(self, _audio: Path, _speech: object, _hints: tuple[str, ...]) -> object:
+            calls["lid"] += 1
+            return LanguageIdentificationResult(spans=(language,), change_boundaries_ms=())
+
+    class Recognizer:
+        def transcribe_slice(self, _audio: Path, _language: LanguageSpan) -> object:
+            calls["recognizer"] += 1
+            return (RawAsrSegment(0, 1_000, segment.text, segment.confidence),)
+
+    class Aligner:
+        def align(self, _audio: Path, segments: object) -> AlignmentResult:
+            calls["aligner"] += 1
+            if calls["aligner"] == 1:
+                raise VideoDemoError(ErrorCode.SPEECH_MODEL_UNAVAILABLE, "模拟首次失败")
+            return AlignmentResult(
+                words=(),
+                preserved_segments=tuple(segments),  # type: ignore[arg-type]
+                warning_codes=(),
+            )
+
+    class Slicer:
+        def create(self, _audio: Path, _root: Path, slice_id: str, _range: TimeRange) -> Path:
+            path = tmp_path / f"{slice_id}.wav"
+            path.write_bytes(b"wav")
+            return path
+
+    class Empty:
+        def diarize(self, _audio: Path, **_kwargs: object) -> object:
+            return ()
+
+        def detect(self, _audio: Path, *, duration_ms: int) -> object:
+            return ()
+
+    components = SpeechComponents(
+        vad=Vad(),  # type: ignore[arg-type]
+        language_identifier=Lid(),  # type: ignore[arg-type]
+        recognizer=Recognizer(),  # type: ignore[arg-type]
+        aligner=Aligner(),  # type: ignore[arg-type]
+        diarizer=Empty(),  # type: ignore[arg-type]
+        audio_events=Empty(),  # type: ignore[arg-type]
+        slicer=Slicer(),  # type: ignore[arg-type]
+    )
+    analyzer = ProductionSpeechAnalyzer(
+        lambda _media, _cancel: components,
+        snapshot_store=SnapshotStore(AtomicArtifactStore(tmp_path)),
+        fingerprint_inputs=_fingerprint_inputs(),
+    )
+    media = _media(tmp_path)
+
+    with pytest.raises(VideoDemoError) as raised:
+        analyzer.analyze(media)
+    result = analyzer.analyze(media)
+
+    assert raised.value.code == ErrorCode.SPEECH_MODEL_UNAVAILABLE
+    assert result.transcript_source == "ASR"
+    assert calls == {"vad": 1, "lid": 1, "recognizer": 1, "aligner": 2}
+
+
+def test_complete_speech_snapshot_hit_skips_component_factory(tmp_path: Path) -> None:
+    speech = SpeechInterval(evidence_id="vad_cached", start_ms=0, end_ms=2_000, confidence=0.9)
+    language = LanguageSpan(
+        evidence_id="lid_cached",
+        start_ms=0,
+        end_ms=2_000,
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    segment = SpeechSegment(
+        evidence_id="asr_cached",
+        start_ms=0,
+        end_ms=1_000,
+        text="缓存文本",
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    components = _successful_components(tmp_path, speech, language, segment)
+    factory_calls = 0
+
+    def factory(_media: PreparedMedia, _cancel: object) -> SpeechComponents:
+        nonlocal factory_calls
+        factory_calls += 1
+        return components
+
+    analyzer = _analyzer(tmp_path, factory)
+    media = _media(tmp_path)
+
+    first = analyzer.analyze(media)
+    second = analyzer.analyze(media)
+
+    assert second == first
+    assert factory_calls == 1
 
 
 @dataclass
@@ -514,6 +643,37 @@ def _event(start_ms: int, end_ms: int) -> AudioEvent:
         normalized_event="音乐",
         confidence=0.8,
         threshold_version="test-v1",
+    )
+
+
+def _fingerprint_inputs() -> SpeechFingerprintInputs:
+    from video_demo.domain.run import ModelIdentity
+
+    return SpeechFingerprintInputs(
+        model_identities=(
+            ModelIdentity(component="silero_vad", provider="local", model_id="silero"),
+            ModelIdentity(component="faster_whisper", provider="local", model_id="large-v3"),
+            ModelIdentity(component="whisperx", provider="local", model_id="align"),
+            ModelIdentity(component="pyannote", provider="local", model_id="diarize"),
+            ModelIdentity(component="yamnet", provider="local", model_id="yamnet"),
+        ),
+        asr_compute_type="int8",
+        yamnet_class_map_sha256="d" * 64,
+        yamnet_thresholds_sha256="e" * 64,
+    )
+
+
+def _analyzer(
+    tmp_path: Path,
+    factory: object,
+    *,
+    allow_speaker_fallback: bool = False,
+) -> ProductionSpeechAnalyzer:
+    return ProductionSpeechAnalyzer(
+        factory,  # type: ignore[arg-type]
+        snapshot_store=SnapshotStore(AtomicArtifactStore(tmp_path)),
+        fingerprint_inputs=_fingerprint_inputs(),
+        allow_speaker_fallback=allow_speaker_fallback,
     )
 
 

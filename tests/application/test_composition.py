@@ -640,6 +640,15 @@ def test_demo_mode_accepts_unrecognized_qwen_model_for_deterministic_fallback(
     assert qwen_models[0].model_id == "provider-video-model"
 
 
+def test_speech_fingerprint_inputs_bind_installed_package_versions(tmp_path: Path) -> None:
+    from video_demo.application.composition import _speech_fingerprint_inputs
+
+    inputs = _speech_fingerprint_inputs(Settings(workspace_root=tmp_path))
+
+    assert inputs.model_identities
+    assert all(identity.revision for identity in inputs.model_identities)
+
+
 def test_production_speech_factory_reuses_lifecycle_models_across_tasks(
     tmp_path: Path,
 ) -> None:

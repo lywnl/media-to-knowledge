@@ -25,8 +25,17 @@ from video_demo.media.transcode import AudioSliceArtifact
 from video_demo.speech.alignment import AlignmentResult
 from video_demo.speech.asr import RawAsrSegment, build_speech_segments
 from video_demo.speech.language import LanguageIdentificationResult, LanguageSpan
+from video_demo.speech.snapshots import (
+    AsrSnapshotPayload,
+    SpeechAnalysisSnapshotPayload,
+    SpeechFingerprintInputs,
+    asr_fingerprint,
+    speech_fingerprint,
+    subtitle_transcript_payload_sha256,
+)
 from video_demo.speech.speaker_assignment import assign_speakers
 from video_demo.speech.vad import SpeechInterval, VadResult
+from video_demo.storage.snapshots import SnapshotStore
 from video_demo.storage.workspace import safe_runtime_path
 
 
@@ -100,9 +109,13 @@ class ProductionSpeechAnalyzer:
         self,
         component_factory: ComponentFactory,
         *,
+        snapshot_store: SnapshotStore,
+        fingerprint_inputs: SpeechFingerprintInputs,
         allow_speaker_fallback: bool = False,
     ) -> None:
         self._component_factory = component_factory
+        self._snapshot_store = snapshot_store
+        self._fingerprint_inputs = fingerprint_inputs
         self._allow_speaker_fallback = allow_speaker_fallback
 
     def analyze(
@@ -112,7 +125,7 @@ class ProductionSpeechAnalyzer:
         is_cancel_requested: Callable[[], bool] = lambda: False,
     ) -> SpeechAnalysis:
         if media.subtitle is not None:
-            return SpeechAnalysis(
+            analysis = SpeechAnalysis(
                 transcript_source="SUBTITLE",
                 evidence=media.subtitle.cues,
                 warnings=tuple(
@@ -124,6 +137,33 @@ class ProductionSpeechAnalyzer:
                     if 0 < cue.end_ms < media.source.duration_ms
                 ),
             )
+            fingerprint = speech_fingerprint(
+                processing_mode="SUBTITLE",
+                transcript_payload_sha256=subtitle_transcript_payload_sha256(
+                    analysis,
+                    media.subtitle.artifact.sha256,
+                ),
+                media_warnings=media.warnings,
+                min_speakers=media.source.asset.config.min_speakers,
+                max_speakers=media.source.asset.config.max_speakers,
+                allow_speaker_fallback=self._allow_speaker_fallback,
+                inputs=self._fingerprint_inputs,
+            )
+            cached = self._snapshot_store.load(
+                media.source.asset.run_relative_root,
+                "speech",
+                fingerprint,
+                SpeechAnalysisSnapshotPayload,
+            )
+            if cached is not None:
+                return cached[0].to_analysis()
+            self._snapshot_store.publish(
+                media.source.asset.run_relative_root,
+                "speech",
+                fingerprint,
+                SpeechAnalysisSnapshotPayload.from_analysis(analysis),
+            )
+            return analysis
         if media.audio_path is None:
             return SpeechAnalysis(
                 transcript_source="NONE",
@@ -131,11 +171,9 @@ class ProductionSpeechAnalyzer:
                 warnings=tuple(dict.fromkeys((*media.warnings, "NO_AUDIO_TRACK"))),
             )
         try:
-            components = self._component_factory(media, is_cancel_requested)
-            return self._run(
+            return self._analyze_asr(
                 media,
-                components,
-                allow_speaker_fallback=self._allow_speaker_fallback,
+                is_cancel_requested,
             )
         except VideoDemoError:
             raise
@@ -155,31 +193,90 @@ class ProductionSpeechAnalyzer:
                 "语音模型不可用",
             ) from None
 
+    def _analyze_asr(
+        self,
+        media: PreparedMedia,
+        is_cancel_requested: Callable[[], bool],
+    ) -> SpeechAnalysis:
+        assert media.audio_sha256 is not None
+        run_root = media.source.asset.run_relative_root
+        config = media.source.asset.config
+        asr_key = asr_fingerprint(
+            audio_sha256=media.audio_sha256,
+            duration_ms=media.source.duration_ms,
+            language_hints=config.language_hints,
+            hotwords=config.hotwords,
+            core_context=config.core_context,
+            inputs=self._fingerprint_inputs,
+        )
+        cached_asr = self._snapshot_store.load(
+            run_root,
+            "asr",
+            asr_key,
+            AsrSnapshotPayload,
+        )
+        components: SpeechComponents | None = None
+        if cached_asr is None:
+            components = self._component_factory(media, is_cancel_requested)
+            asr_payload = self._run_asr(media, components)
+            asr_receipt = self._snapshot_store.publish(
+                run_root,
+                "asr",
+                asr_key,
+                asr_payload,
+            )
+        else:
+            asr_payload, asr_receipt = cached_asr
+
+        speech_key = speech_fingerprint(
+            processing_mode="ASR",
+            transcript_payload_sha256=asr_receipt.sha256,
+            media_warnings=media.warnings,
+            min_speakers=config.min_speakers,
+            max_speakers=config.max_speakers,
+            allow_speaker_fallback=self._allow_speaker_fallback,
+            inputs=self._fingerprint_inputs,
+        )
+        cached_speech = self._snapshot_store.load(
+            run_root,
+            "speech",
+            speech_key,
+            SpeechAnalysisSnapshotPayload,
+        )
+        if cached_speech is not None:
+            return cached_speech[0].to_analysis()
+        if components is None:
+            components = self._component_factory(media, is_cancel_requested)
+        analysis = self._complete_asr(
+            media,
+            components,
+            asr_payload,
+            allow_speaker_fallback=self._allow_speaker_fallback,
+        )
+        self._snapshot_store.publish(
+            run_root,
+            "speech",
+            speech_key,
+            SpeechAnalysisSnapshotPayload.from_analysis(analysis),
+        )
+        return analysis
+
     @staticmethod
-    def _run(
+    def _run_asr(
         media: PreparedMedia,
         components: SpeechComponents,
-        *,
-        allow_speaker_fallback: bool = False,
-    ) -> SpeechAnalysis:
+    ) -> AsrSnapshotPayload:
         assert media.audio_path is not None
         audio = media.audio_path
         duration_ms = media.source.duration_ms
         vad = components.vad.detect(audio, duration_ms=duration_ms)
         if not vad.speech:
-            audio_events = components.audio_events.detect(audio, duration_ms=duration_ms)
-            return SpeechAnalysis(
-                transcript_source="ASR",
-                evidence=_sort_evidence(audio_events),
-                warnings=tuple(
-                    dict.fromkeys(
-                        (*media.warnings, *vad.warnings, "NO_SPEECH_DETECTED")
-                    )
-                ),
-                boundary_candidates=_boundary_candidates(
-                    duration_ms,
-                    silence=vad.long_silence_boundaries_ms,
-                ),
+            return AsrSnapshotPayload(
+                language_spans=(),
+                segments=(),
+                vad_warnings=vad.warnings,
+                silence_boundaries_ms=vad.long_silence_boundaries_ms,
+                language_change_boundaries_ms=(),
             )
 
         languages = _identify_languages(media, components, vad.speech)
@@ -193,8 +290,46 @@ class ProductionSpeechAnalyzer:
             )
             raw_segments = components.recognizer.transcribe_slice(audio_slice, language_span)
             segments.extend(build_speech_segments(language_span, raw_segments))
+        return AsrSnapshotPayload(
+            language_spans=languages.spans,
+            segments=tuple(segments),
+            vad_warnings=vad.warnings,
+            silence_boundaries_ms=vad.long_silence_boundaries_ms,
+            language_change_boundaries_ms=languages.change_boundaries_ms,
+        )
 
-        alignment = components.aligner.align(audio, segments)
+    @staticmethod
+    def _complete_asr(
+        media: PreparedMedia,
+        components: SpeechComponents,
+        asr_payload: AsrSnapshotPayload,
+        *,
+        allow_speaker_fallback: bool = False,
+    ) -> SpeechAnalysis:
+        assert media.audio_path is not None
+        audio = media.audio_path
+        duration_ms = media.source.duration_ms
+        if not asr_payload.language_spans:
+            audio_events = components.audio_events.detect(audio, duration_ms=duration_ms)
+            return SpeechAnalysis(
+                transcript_source="ASR",
+                evidence=_sort_evidence(audio_events),
+                warnings=tuple(
+                    dict.fromkeys(
+                        (
+                            *media.warnings,
+                            *asr_payload.vad_warnings,
+                            "NO_SPEECH_DETECTED",
+                        )
+                    )
+                ),
+                boundary_candidates=_boundary_candidates(
+                    duration_ms,
+                    silence=asr_payload.silence_boundaries_ms,
+                ),
+            )
+
+        alignment = components.aligner.align(audio, asr_payload.segments)
         speaker_warnings: tuple[str, ...] = ()
         try:
             turns = components.diarizer.diarize(
@@ -226,7 +361,7 @@ class ProductionSpeechAnalyzer:
                 dict.fromkeys(
                     (
                         *media.warnings,
-                        *vad.warnings,
+                        *asr_payload.vad_warnings,
                         *alignment.warning_codes,
                         *speaker_warnings,
                     )
@@ -234,10 +369,10 @@ class ProductionSpeechAnalyzer:
             ),
             boundary_candidates=_boundary_candidates(
                 duration_ms,
-                silence=vad.long_silence_boundaries_ms,
+                silence=asr_payload.silence_boundaries_ms,
                 sentence_ends=tuple(item.end_ms for item in alignment.preserved_segments),
                 speaker_changes=tuple(item.start_ms for item in turns),
-                language_changes=languages.change_boundaries_ms,
+                language_changes=asr_payload.language_change_boundaries_ms,
             ),
         )
 

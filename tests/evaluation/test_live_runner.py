@@ -2452,6 +2452,8 @@ def test_pyannote_model_tree_rejects_symlink_even_after_regular_cache_file(
 
 
 def test_production_model_identity_report_is_complete_and_redacted(tmp_path: Path) -> None:
+    from importlib.metadata import version
+
     settings = Settings(
         workspace_root=tmp_path,
         runtime_root=Path("runtime/live"),
@@ -2474,21 +2476,21 @@ def test_production_model_identity_report_is_complete_and_redacted(tmp_path: Pat
         (model.component, model.provider, model.model_id, model.device, model.revision)
         for model in report.models
     } == {
-        ("silero_vad", "local", "silero-vad", "cpu", None),
-        ("faster_whisper", "local", "large-v3", "mps", None),
-        ("whisperx", "local", "whisperx-align-zh", "cpu", None),
-        ("whisperx", "local", "whisperx-align-en", "cpu", None),
-        ("whisperx", "local", "whisperx-align-ja", "cpu", None),
-        ("whisperx", "local", "whisperx-align-ko", "cpu", None),
-        ("whisperx", "local", "whisperx-align-es", "cpu", None),
+        ("silero_vad", "local", "silero-vad", "cpu", version("silero-vad")),
+        ("faster_whisper", "local", "large-v3", "mps", version("faster-whisper")),
+        ("whisperx", "local", "whisperx-align-zh", "cpu", version("whisperx")),
+        ("whisperx", "local", "whisperx-align-en", "cpu", version("whisperx")),
+        ("whisperx", "local", "whisperx-align-ja", "cpu", version("whisperx")),
+        ("whisperx", "local", "whisperx-align-ko", "cpu", version("whisperx")),
+        ("whisperx", "local", "whisperx-align-es", "cpu", version("whisperx")),
         (
             "pyannote",
             "local",
             "pyannote/speaker-diarization-community-1",
             "cpu",
-            None,
+            version("pyannote.audio"),
         ),
-        ("yamnet", "local", "yamnet", "cpu", None),
+        ("yamnet", "local", "yamnet", "cpu", version("tensorflow-hub")),
         ("baidu_ocr", "baidu_ocr", "accurate_basic", None, None),
         ("qwen", "qwen", "qwen3-vl-plus", None, None),
     }
