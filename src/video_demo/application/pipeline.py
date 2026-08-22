@@ -95,9 +95,12 @@ class ProbedAsset:
     manifest: VideoAssetManifest
     limits: ProbeLimits
     warnings: tuple[str, ...] = ()
+    timeline_duration_ms: int | None = None
 
     @property
     def duration_ms(self) -> int:
+        if self.timeline_duration_ms is not None:
+            return self.timeline_duration_ms
         return self.manifest.duration_ms
 
 

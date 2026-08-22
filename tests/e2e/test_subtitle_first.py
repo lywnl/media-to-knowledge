@@ -109,6 +109,56 @@ def test_subtitle_eligibility_controls_audio_and_isolated_speech_route(
         assert tuple((runtime_root / "runs/scope/run_001/speech/ipc").iterdir()) == ()
 
 
+def test_video_timeline_truncates_container_length_subtitle_without_starting_asr(
+    tmp_path: Path,
+) -> None:
+    runtime_root, registered = _registered(tmp_path)
+    payload = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    payload["format"]["duration"] = "302.366"
+    payload["streams"][0]["duration"] = "302.101"
+    payload["streams"] = [stream for stream in payload["streams"] if stream["index"] <= 2]
+    probe = parse_ffprobe_payload(
+        payload,
+        object_ref=registered.object_ref,
+        source_sha256=registered.source_sha256,
+        source_size_bytes=registered.source_size_bytes,
+        source_mime=registered.source_mime,
+        ffprobe_version="ffprobe test",
+        limits=ProbeLimits(),
+    )
+    probed = ProbedAsset(
+        asset=registered,
+        manifest=probe.manifest,
+        limits=ProbeLimits(),
+        warnings=probe.warnings,
+        timeline_duration_ms=probe.timeline_duration_ms,
+    )
+    transcoder = _RecordingTranscoder(runtime_root, {2: _duration_mismatch_vtt()})
+    process_calls = 0
+
+    class Runner:
+        def run(self, _args: list[str], **_kwargs: object) -> ProcessResult:
+            nonlocal process_calls
+            process_calls += 1
+            raise AssertionError("有效字幕不得启动 ASR 子进程")
+
+    media = ProductionMediaTranscoder(
+        runtime_root,
+        lambda _cancel: transcoder,
+    ).transcode(probed)
+    result = _isolated_analyzer(runtime_root, lambda _cancel: Runner()).analyze(media)
+
+    subtitle_cues = tuple(item for item in result.evidence if isinstance(item, SubtitleCue))
+    assert probed.manifest.duration_ms == 302_366
+    assert probed.duration_ms == 302_101
+    assert subtitle_cues[-1].end_ms == 302_101
+    assert result.evidence == subtitle_cues
+    assert result.transcript_source == "SUBTITLE"
+    assert transcoder.extract_audio_calls == []
+    assert process_calls == 0
+    assert not (runtime_root / "runs/scope/run_001/media/audio.wav").exists()
+
+
 def test_pgs_is_detected_but_never_parsed_as_text_before_asr(tmp_path: Path) -> None:
     payload = json.loads(_FIXTURE.read_text(encoding="utf-8"))
     payload["streams"] = [
@@ -255,6 +305,34 @@ def _registered(tmp_path: Path) -> tuple[Path, RegisteredAsset]:
         source_mime="video/mp4",
         run_relative_root=run_root,
         config=PipelineRunConfig(language_hints=("zh",)),
+    )
+
+
+def _duration_mismatch_vtt() -> str:
+    return (
+        "WEBVTT\n\n"
+        "00:00:00.000 --> 00:00:30.000\n"
+        "第一段字幕用于验证容器时长与视频时间轴分离后的完整解析流程\n\n"
+        "00:00:30.000 --> 00:01:00.000\n"
+        "第二段字幕用于保证字幕数量和文本覆盖率满足有效性判断要求\n\n"
+        "00:01:00.000 --> 00:01:30.000\n"
+        "第三段字幕继续覆盖视频内容并保留清晰稳定的时间范围信息\n\n"
+        "00:01:30.000 --> 00:02:00.000\n"
+        "第四段字幕模拟真实中文内嵌字幕轨道中的连续讲解文本内容\n\n"
+        "00:02:00.000 --> 00:02:30.000\n"
+        "第五段字幕用于验证系统始终优先选择有效文本字幕而不是语音识别\n\n"
+        "00:02:30.000 --> 00:03:00.000\n"
+        "第六段字幕确保整个样本拥有足够字符并持续覆盖主要视频时间线\n\n"
+        "00:03:00.000 --> 00:03:30.000\n"
+        "第七段字幕验证后续片段仍然按照主视频流时间轴进行统一处理\n\n"
+        "00:03:30.000 --> 00:04:00.000\n"
+        "第八段字幕模拟教程视频内完整且连续出现的中文字幕轨文本\n\n"
+        "00:04:00.000 --> 00:04:30.000\n"
+        "第九段字幕用于覆盖视频后半部分并满足字幕完整性检查条件\n\n"
+        "00:04:30.000 --> 00:05:00.000\n"
+        "第十段字幕接近主视频流结束位置但仍保持合法的起止时间\n\n"
+        "00:05:00.000 --> 00:05:02.366\n"
+        "最后一段字幕跟随容器结尾并应被截断到主视频流实际结束位置\n"
     )
 
 

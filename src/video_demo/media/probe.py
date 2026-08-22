@@ -46,6 +46,7 @@ class ProbeLimits:
 class ProbeResult:
     manifest: VideoAssetManifest
     warnings: tuple[str, ...]
+    timeline_duration_ms: int | None = None
 
 
 class FFprobeClient:
@@ -172,10 +173,21 @@ def parse_ffprobe_payload(
     if len(subtitle_payloads) > limits.max_subtitle_streams:
         raise VideoDemoError(ErrorCode.VIDEO_STREAM_COUNT_EXCEEDED, "字幕流数量超过限制")
 
-    duration_ms = _duration_ms(format_payload.get("duration"))
-    if duration_ms > limits.max_duration_ms:
+    container_duration_ms = _duration_ms(format_payload.get("duration"))
+    video_payload = _object(video_payloads[0], "video_stream")
+    video_duration_ms = (
+        _optional_stream_duration_ms(video_payload["duration"])
+        if "duration" in video_payload
+        else None
+    )
+    if container_duration_ms > limits.max_duration_ms or (
+        video_duration_ms is not None and video_duration_ms > limits.max_duration_ms
+    ):
         raise VideoDemoError(ErrorCode.VIDEO_DURATION_LIMIT_EXCEEDED, "视频时长超过限制")
-    video_stream = _video_stream(_object(video_payloads[0], "video_stream"), limits)
+    timeline_duration_ms = (
+        video_duration_ms if video_duration_ms is not None else container_duration_ms
+    )
+    video_stream = _video_stream(video_payload, limits)
     audio_streams = tuple(
         _audio_stream(_object(stream, "audio_stream")) for stream in audio_payloads
     )
@@ -187,7 +199,7 @@ def parse_ffprobe_payload(
         source_sha256=source_sha256,
         source_size_bytes=source_size_bytes,
         source_mime=source_mime,
-        duration_ms=duration_ms,
+        duration_ms=container_duration_ms,
         video_stream=video_stream,
         audio_streams=audio_streams,
         subtitle_streams=subtitle_streams,
@@ -195,7 +207,11 @@ def parse_ffprobe_payload(
         ffprobe_version=ffprobe_version,
     )
     warnings = () if audio_streams else ("NO_AUDIO_TRACK",)
-    return ProbeResult(manifest=manifest, warnings=warnings)
+    return ProbeResult(
+        manifest=manifest,
+        warnings=warnings,
+        timeline_duration_ms=timeline_duration_ms,
+    )
 
 
 def _video_stream(payload: dict[str, Any], limits: ProbeLimits) -> VideoStream:
@@ -296,6 +312,12 @@ def _duration_ms(value: object) -> int:
     if not duration.is_finite() or duration <= 0:
         raise VideoDemoError(ErrorCode.VIDEO_PROBE_INVALID, "视频时长必须为正有限数")
     return int((duration * 1000).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _optional_stream_duration_ms(value: object) -> int | None:
+    if value == "N/A":
+        return None
+    return _duration_ms(value)
 
 
 def _rational(value: object, field: str) -> Rational:

@@ -150,6 +150,7 @@ class ProductionAssetProbe:
             manifest=result.manifest,
             limits=self._limits,
             warnings=result.warnings,
+            timeline_duration_ms=result.timeline_duration_ms,
         )
 
 

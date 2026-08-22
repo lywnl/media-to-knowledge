@@ -39,6 +39,96 @@ def test_parse_valid_manifest_and_integer_millisecond_duration() -> None:
     assert result.warnings == ()
 
 
+def test_parse_preserves_container_duration_and_uses_video_stream_timeline() -> None:
+    payload = _payload("valid_mp4.json")
+    payload["format"]["duration"] = "302.366"
+    payload["streams"][0]["duration"] = "302.101313"
+
+    result = parse_ffprobe_payload(
+        payload,
+        object_ref="obj_001",
+        source_sha256="a" * 64,
+        source_size_bytes=1024,
+        source_mime="video/mp4",
+        ffprobe_version="ffprobe version 7.1",
+        limits=ProbeLimits(),
+    )
+
+    assert result.manifest.duration_ms == 302_366
+    assert result.timeline_duration_ms == 302_101
+
+
+@pytest.mark.parametrize("video_duration", [None, "N/A"])
+def test_parse_falls_back_to_container_duration_when_video_duration_is_unavailable(
+    video_duration: str | None,
+) -> None:
+    payload = _payload("valid_mp4.json")
+    if video_duration is not None:
+        payload["streams"][0]["duration"] = video_duration
+
+    result = parse_ffprobe_payload(
+        payload,
+        object_ref="obj_001",
+        source_sha256="a" * 64,
+        source_size_bytes=1024,
+        source_mime="video/mp4",
+        ffprobe_version="ffprobe version 7.1",
+        limits=ProbeLimits(),
+    )
+
+    assert result.timeline_duration_ms == result.manifest.duration_ms == 12_345
+
+
+@pytest.mark.parametrize(
+    "video_duration",
+    [None, "0", "-0.001", "NaN", "Infinity", "invalid"],
+)
+def test_parse_rejects_explicit_invalid_video_stream_duration(
+    video_duration: object,
+) -> None:
+    payload = _payload("valid_mp4.json")
+    payload["streams"][0]["duration"] = video_duration
+
+    with pytest.raises(VideoDemoError) as raised:
+        parse_ffprobe_payload(
+            payload,
+            object_ref="obj_001",
+            source_sha256="a" * 64,
+            source_size_bytes=1024,
+            source_mime="video/mp4",
+            ffprobe_version="ffprobe version 7.1",
+            limits=ProbeLimits(),
+        )
+
+    assert raised.value.code == ErrorCode.VIDEO_PROBE_INVALID
+
+
+@pytest.mark.parametrize(
+    ("container_duration", "video_duration"),
+    [("1800.001", "1799.000"), ("1800.000", "1800.001")],
+)
+def test_parse_rejects_when_container_or_video_stream_exceeds_duration_limit(
+    container_duration: str,
+    video_duration: str,
+) -> None:
+    payload = _payload("valid_mp4.json")
+    payload["format"]["duration"] = container_duration
+    payload["streams"][0]["duration"] = video_duration
+
+    with pytest.raises(VideoDemoError) as raised:
+        parse_ffprobe_payload(
+            payload,
+            object_ref="obj_001",
+            source_sha256="a" * 64,
+            source_size_bytes=1024,
+            source_mime="video/mp4",
+            ffprobe_version="ffprobe version 7.1",
+            limits=ProbeLimits(),
+        )
+
+    assert raised.value.code == ErrorCode.VIDEO_DURATION_LIMIT_EXCEEDED
+
+
 def test_parse_preserves_text_and_bitmap_subtitle_metadata() -> None:
     result = parse_ffprobe_payload(
         _payload("embedded_text_subtitles.json"),

@@ -111,6 +111,28 @@ def test_production_probe_uses_registered_metadata_and_preserves_manifest_warnin
     assert probed.duration_ms == 1_000
 
 
+def test_production_probe_propagates_video_timeline_without_changing_container_duration(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    registered = _registered(source)
+    manifest = _manifest(has_audio=False)
+
+    class ProbeClient:
+        def probe(self, _path: Path, **_kwargs: object) -> ProbeResult:
+            return ProbeResult(
+                manifest=manifest,
+                warnings=("NO_AUDIO_TRACK",),
+                timeline_duration_ms=900,
+            )
+
+    probed = ProductionAssetProbe(lambda: ProbeClient()).probe(registered)
+
+    assert probed.duration_ms == 900
+    assert probed.manifest.duration_ms == 1_000
+
+
 def test_production_transcoder_generates_scoped_proxy_and_explicit_no_audio_warning(
     tmp_path: Path,
 ) -> None:
