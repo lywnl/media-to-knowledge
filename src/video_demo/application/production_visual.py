@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import threading
 from collections.abc import Callable, Sequence
@@ -14,6 +15,7 @@ from typing import Protocol
 
 import httpx
 
+from video_demo.application.adaptive_ocr import AdaptiveOcrRunner, ocr_language
 from video_demo.application.pipeline import (
     PreparedMedia,
     SpeechAnalysis,
@@ -22,13 +24,10 @@ from video_demo.application.pipeline import (
 )
 from video_demo.domain.base import stable_identifier
 from video_demo.domain.evidence import (
-    AlignedWord,
     EvidenceItem,
     KeyframeEvidence,
     OcrEvidence,
     SceneBoundary,
-    SpeechSegment,
-    SubtitleCue,
 )
 from video_demo.domain.manifest import Rational
 from video_demo.domain.run import TimeRange
@@ -37,13 +36,16 @@ from video_demo.fusion.merge import BoundaryPoint
 from video_demo.integrations.baidu_ocr import BaiduOcrClient, BaiduOcrCredentials
 from video_demo.integrations.video_port import VideoClipInput
 from video_demo.media.transcode import ClipArtifact
-from video_demo.storage.workspace import safe_runtime_path, verified_mp4_file, verified_run_file
+from video_demo.storage.workspace import verified_mp4_file, verified_run_file
 from video_demo.visual.keyframes import (
     FrameExtractor,
     KeyframeSelector,
     WindowFrameCandidates,
 )
-from video_demo.visual.ocr import KeyframeForOcr, OcrClient, OcrProcessor
+from video_demo.visual.ocr import (
+    OcrClient,
+    OcrProviderResponse,
+)
 from video_demo.visual.scenes import SceneDetector
 from video_demo.visual.windows import (
     BoundaryCandidate,
@@ -52,10 +54,9 @@ from video_demo.visual.windows import (
     refine_windows_with_ocr,
 )
 
-_OCR_LANGUAGES = frozenset({"zh", "en", "ja", "ko", "es"})
-_MAX_KEYFRAMES_PER_VIDEO = 30
 _SPACE_AND_PUNCTUATION = re.compile(r"[^\w\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
 _EMPTY_SPEECH_ANALYSIS = SpeechAnalysis(transcript_source="NONE")
+_LOGGER = logging.getLogger(__name__)
 
 
 class ClipClient(Protocol):
@@ -110,12 +111,28 @@ class ProductionVisualAnalyzer:
         component_factory: VisualComponentFactory,
         *,
         max_video_bytes: int = 4 * 1024 * 1024 * 1024,
+        ocr_budget_timeout_seconds: float = 30.0,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if max_video_bytes < 1:
             raise ValueError("视频字节上限必须大于 0")
+        if ocr_budget_timeout_seconds <= 0:
+            raise ValueError("OCR 预算超时必须大于 0")
         self._runtime_root = runtime_root.expanduser().resolve(strict=False)
         self._component_factory = component_factory
         self._max_video_bytes = max_video_bytes
+        self._adaptive_ocr = (
+            AdaptiveOcrRunner(
+                self._runtime_root,
+                timeout_seconds=ocr_budget_timeout_seconds,
+            )
+            if clock is None
+            else AdaptiveOcrRunner(
+                self._runtime_root,
+                timeout_seconds=ocr_budget_timeout_seconds,
+                clock=clock,
+            )
+        )
 
     def analyze(
         self,
@@ -259,16 +276,24 @@ class ProductionVisualAnalyzer:
             components.keyframe_selector,
             is_cancel_requested,
         )
-        selected = _limit_keyframes(selected, _MAX_KEYFRAMES_PER_VIDEO)
-        ocr, language_warnings = self._run_ocr(
+        candidate_count = len(selected)
+        ocr_result = self._adaptive_ocr.run(
             selected,
-            speech,
-            media,
-            run_relative_root,
-            components.ocr_client,
-            is_cancel_requested,
+            speech=speech,
+            media=media,
+            run_relative_root=run_relative_root,
+            client=components.ocr_client,
+            is_cancel_requested=is_cancel_requested,
         )
-        warnings.extend(language_warnings)
+        selected = ocr_result.keyframes
+        ocr = ocr_result.evidence
+        warnings.extend(ocr_result.warnings)
+        self._adaptive_ocr.log_result(
+            _LOGGER,
+            duration_ms=duration_ms,
+            candidate_count=candidate_count,
+            result=ocr_result,
+        )
         changes = _ocr_changes(ocr)
         final_windows = refine_windows_with_ocr(
             provisional,
@@ -360,40 +385,6 @@ class ProductionVisualAnalyzer:
                     ),
                 )
         return tuple(keyframes), warnings
-
-    def _run_ocr(
-        self,
-        keyframes: Sequence[KeyframeEvidence],
-        speech: SpeechAnalysis,
-        media: PreparedMedia,
-        run_relative_root: Path,
-        client: OcrClient,
-        is_cancel_requested: Callable[[], bool],
-    ) -> tuple[tuple[OcrEvidence, ...], list[str]]:
-        processor = OcrProcessor(
-            client,
-            allowed_root=safe_runtime_path(self._runtime_root, run_relative_root),
-        )
-        evidence: list[OcrEvidence] = []
-        warnings: list[str] = []
-        for keyframe in sorted(keyframes, key=lambda item: (item.timestamp_ms, item.keyframe_id)):
-            self._check_cancelled(is_cancel_requested)
-            language, warning = _ocr_language(keyframe.timestamp_ms, speech, media)
-            if warning is not None:
-                warnings.append(warning)
-            if language is None:
-                continue
-            item = KeyframeForOcr(
-                keyframe_id=keyframe.keyframe_id,
-                source_sha256=keyframe.sha256,
-                start_ms=keyframe.start_ms,
-                end_ms=keyframe.end_ms,
-                timestamp_ms=keyframe.timestamp_ms,
-                path=self._runtime_root / keyframe.relative_path,
-                language=language,
-            )
-            evidence.extend(processor.process((item,)))
-        return tuple(evidence), warnings
 
     def _create_clips(
         self,
@@ -505,8 +496,14 @@ class LazyBaiduOcrClient:
         self._client: BaiduOcrClient | None = None
         self._lock = threading.Lock()
 
-    def recognize(self, image: bytes, language: str):  # type: ignore[no-untyped-def]
-        return self._get_client().recognize(image, language)
+    def recognize(
+        self,
+        image: bytes,
+        language: str,
+        *,
+        deadline: float | None = None,
+    ) -> OcrProviderResponse:
+        return self._get_client().recognize(image, language, deadline=deadline)
 
     def _get_client(self) -> BaiduOcrClient:
         with self._lock:
@@ -571,26 +568,7 @@ def _ocr_language(
     speech: SpeechAnalysis,
     media: PreparedMedia,
 ) -> tuple[str | None, str | None]:
-    timed_languages = sorted(
-        (
-            item
-            for item in speech.evidence
-            if isinstance(item, (SubtitleCue, SpeechSegment, AlignedWord))
-            and item.start_ms <= timestamp_ms < item.end_ms
-        ),
-        key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),
-    )
-    language = timed_languages[0].language if timed_languages else None
-    if language is None:
-        language = next(
-            (item for item in media.source.asset.config.language_hints if item in _OCR_LANGUAGES),
-            None,
-        )
-    if language is None:
-        return "zh", "OCR_LANGUAGE_FALLBACK:zh"
-    if language not in _OCR_LANGUAGES:
-        return None, f"OCR_LANGUAGE_UNSUPPORTED:{language}"
-    return language, None
+    return ocr_language(timestamp_ms, speech, media)
 
 
 def _ocr_changes(evidence: Sequence[OcrEvidence]) -> tuple[int, ...]:

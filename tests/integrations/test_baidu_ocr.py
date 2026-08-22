@@ -11,6 +11,7 @@ import pytest
 
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.baidu_ocr import BaiduOcrClient, BaiduOcrCredentials
+from video_demo.visual.ocr import OcrDeadlineExceeded
 
 
 @pytest.mark.parametrize(
@@ -414,6 +415,297 @@ def test_ocr_timeout_stops_after_finite_attempts_and_is_classified() -> None:
     assert ocr_attempts == 2
     assert raised.value.__cause__ is None
     assert "httpx.ReadTimeout" not in "".join(traceback.format_exception(raised.value))
+
+
+def test_token_and_ocr_requests_share_remaining_global_deadline() -> None:
+    now = [100.0]
+    request_timeouts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeout = request.extensions["timeout"]["read"]
+        request_timeouts.append(timeout)
+        if request.url.path.endswith("/oauth/2.0/token"):
+            now[0] = 103.0
+            return httpx.Response(200, json={"access_token": "token-safe", "expires_in": 3600})
+        return httpx.Response(200, json={"log_id": 1, "words_result": []})
+
+    client = BaiduOcrClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        BaiduOcrCredentials(api_key="api-secret", secret_key="secret-value"),
+        endpoint="https://aip.baidubce.com/rest/2.0/ocr/v1/accurate",
+        clock=lambda: now[0],
+        timeout_seconds=30.0,
+    )
+
+    client.recognize(b"image", "zh", deadline=110.0)
+
+    assert request_timeouts == [10.0, 7.0]
+
+
+def test_retry_backoff_cannot_cross_global_deadline() -> None:
+    now = [10.0]
+    sleeps: list[float] = []
+    ocr_attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal ocr_attempts
+        if request.url.path.endswith("/oauth/2.0/token"):
+            return httpx.Response(200, json={"access_token": "token-safe", "expires_in": 3600})
+        ocr_attempts += 1
+        return httpx.Response(503)
+
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    client = BaiduOcrClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        BaiduOcrCredentials(api_key="api-secret", secret_key="secret-value"),
+        endpoint="https://aip.baidubce.com/rest/2.0/ocr/v1/accurate",
+        clock=lambda: now[0],
+        max_attempts=3,
+        retry_backoff_seconds=2.0,
+        sleeper=sleep,
+    )
+
+    with pytest.raises(OcrDeadlineExceeded) as raised:
+        client.recognize(b"image", "zh", deadline=11.0)
+
+    assert ocr_attempts == 1
+    assert sleeps == []
+    assert raised.value.provider_attempt_count == 1
+
+
+@pytest.mark.parametrize("during_token_request", [True, False])
+def test_network_timeout_that_consumes_remaining_budget_becomes_deadline_stop(
+    during_token_request: bool,
+) -> None:
+    now = [20.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not during_token_request and request.url.path.endswith("/oauth/2.0/token"):
+            return httpx.Response(200, json={"access_token": "token-safe", "expires_in": 3600})
+        now[0] = 21.0
+        raise httpx.ReadTimeout("timeout", request=request)
+
+    client = BaiduOcrClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        BaiduOcrCredentials(api_key="api-secret", secret_key="secret-value"),
+        endpoint="https://aip.baidubce.com/rest/2.0/ocr/v1/accurate",
+        clock=lambda: now[0],
+        max_attempts=1,
+    )
+
+    with pytest.raises(OcrDeadlineExceeded):
+        client.recognize(b"image", "zh", deadline=21.0)
+
+
+def test_deadline_stop_reports_ocr_attempts_already_sent() -> None:
+    now = [30.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/2.0/token"):
+            return httpx.Response(200, json={"access_token": "token-safe", "expires_in": 3600})
+        now[0] = 31.0
+        raise httpx.ReadTimeout("timeout", request=request)
+
+    client = BaiduOcrClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        BaiduOcrCredentials(api_key="api-secret", secret_key="secret-value"),
+        endpoint="https://aip.baidubce.com/rest/2.0/ocr/v1/accurate",
+        clock=lambda: now[0],
+        max_attempts=3,
+    )
+
+    with pytest.raises(OcrDeadlineExceeded) as raised:
+        client.recognize(b"image", "zh", deadline=31.0)
+
+    assert raised.value.provider_attempt_count == 1
+
+
+def test_successful_provider_response_returned_after_deadline_is_discarded() -> None:
+    now = [40.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/2.0/token"):
+            return httpx.Response(200, json={"access_token": "token-safe", "expires_in": 3600})
+        now[0] = 41.0
+        return httpx.Response(200, json={"log_id": 1, "words_result": []})
+
+    client = BaiduOcrClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        BaiduOcrCredentials(api_key="api-secret", secret_key="secret-value"),
+        endpoint="https://aip.baidubce.com/rest/2.0/ocr/v1/accurate",
+        clock=lambda: now[0],
+    )
+
+    with pytest.raises(OcrDeadlineExceeded) as raised:
+        client.recognize(b"image", "zh", deadline=41.0)
+
+    assert raised.value.provider_attempt_count == 1
+
+
+def test_token_response_returned_after_deadline_is_discarded_without_caching() -> None:
+    now = [50.0]
+    token_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_requests
+        if request.url.path.endswith("/oauth/2.0/token"):
+            token_requests += 1
+            if token_requests == 1:
+                now[0] = 51.0
+            return httpx.Response(
+                200,
+                json={"access_token": "token-safe", "expires_in": 3600},
+            )
+        return httpx.Response(200, json={"log_id": 1, "words_result": []})
+
+    client = BaiduOcrClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        BaiduOcrCredentials(api_key="api-secret", secret_key="secret-value"),
+        endpoint="https://aip.baidubce.com/rest/2.0/ocr/v1/accurate",
+        clock=lambda: now[0],
+    )
+
+    with pytest.raises(OcrDeadlineExceeded):
+        client.recognize(b"image", "zh", deadline=51.0)
+
+    now[0] = 52.0
+    client.recognize(b"image", "zh")
+
+    assert token_requests == 2
+
+
+def test_provider_error_response_returned_after_deadline_is_discarded() -> None:
+    now = [60.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/2.0/token"):
+            return httpx.Response(
+                200,
+                json={"access_token": "token-safe", "expires_in": 3600},
+            )
+        now[0] = 61.0
+        return httpx.Response(401)
+
+    client = BaiduOcrClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        BaiduOcrCredentials(api_key="api-secret", secret_key="secret-value"),
+        endpoint="https://aip.baidubce.com/rest/2.0/ocr/v1/accurate",
+        clock=lambda: now[0],
+    )
+
+    with pytest.raises(OcrDeadlineExceeded) as raised:
+        client.recognize(b"image", "zh", deadline=61.0)
+
+    assert raised.value.provider_attempt_count == 1
+
+
+def test_invalid_ocr_payload_parsed_after_deadline_is_discarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import video_demo.integrations.baidu_ocr as baidu_ocr_module
+
+    now = [70.0]
+    original_json_object = baidu_ocr_module._json_object
+
+    def parse_then_reach_deadline(response: httpx.Response) -> dict[str, object]:
+        payload = original_json_object(response)
+        if response.request.method == "POST":
+            now[0] = 71.0
+        return payload
+
+    monkeypatch.setattr(baidu_ocr_module, "_json_object", parse_then_reach_deadline)
+    client = BaiduOcrClient(
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: (
+                    httpx.Response(
+                        200,
+                        json={"access_token": "token-safe", "expires_in": 3600},
+                    )
+                    if request.url.path.endswith("/oauth/2.0/token")
+                    else httpx.Response(200, json={"words_result": []})
+                ),
+            ),
+        ),
+        BaiduOcrCredentials(api_key="api-secret", secret_key="secret-value"),
+        endpoint="https://aip.baidubce.com/rest/2.0/ocr/v1/accurate",
+        clock=lambda: now[0],
+    )
+
+    with pytest.raises(OcrDeadlineExceeded) as raised:
+        client.recognize(b"image", "zh", deadline=71.0)
+
+    assert raised.value.provider_attempt_count == 1
+
+
+def test_token_parsed_after_deadline_is_not_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import video_demo.integrations.baidu_ocr as baidu_ocr_module
+
+    now = [80.0]
+    token_requests = 0
+    original_json_object = baidu_ocr_module._json_object
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_requests
+        if request.url.path.endswith("/oauth/2.0/token"):
+            token_requests += 1
+            return httpx.Response(
+                200,
+                json={"access_token": "token-safe", "expires_in": 3600},
+            )
+        return httpx.Response(200, json={"log_id": 1, "words_result": []})
+
+    def parse_then_reach_deadline(response: httpx.Response) -> dict[str, object]:
+        payload = original_json_object(response)
+        if response.request.method == "GET" and token_requests == 1:
+            now[0] = 81.0
+        return payload
+
+    monkeypatch.setattr(baidu_ocr_module, "_json_object", parse_then_reach_deadline)
+    client = BaiduOcrClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        BaiduOcrCredentials(api_key="api-secret", secret_key="secret-value"),
+        endpoint="https://aip.baidubce.com/rest/2.0/ocr/v1/accurate",
+        clock=lambda: now[0],
+    )
+
+    with pytest.raises(OcrDeadlineExceeded):
+        client.recognize(b"image", "zh", deadline=81.0)
+
+    now[0] = 82.0
+    client.recognize(b"image", "zh")
+
+    assert token_requests == 2
+
+
+def test_provider_attempt_count_includes_retries_but_not_token_request() -> None:
+    ocr_attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal ocr_attempts
+        if request.url.path.endswith("/oauth/2.0/token"):
+            return httpx.Response(200, json={"access_token": "token-safe", "expires_in": 3600})
+        ocr_attempts += 1
+        if ocr_attempts < 3:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"log_id": 3, "words_result": []})
+
+    client = BaiduOcrClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        BaiduOcrCredentials(api_key="api-secret", secret_key="secret-value"),
+        endpoint="https://aip.baidubce.com/rest/2.0/ocr/v1/accurate",
+        retry_backoff_seconds=0,
+        sleeper=lambda _delay: None,
+    )
+
+    response = client.recognize(b"image", "zh")
+
+    assert response.provider_attempt_count == 3
 
 
 def test_token_timeout_does_not_retain_third_party_cause_or_secret() -> None:

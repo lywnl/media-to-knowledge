@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from video_demo.application import adaptive_ocr as adaptive_ocr_module
 from video_demo.application.pipeline import (
     PipelineRunConfig,
     PreparedMedia,
@@ -15,6 +17,7 @@ from video_demo.application.pipeline import (
     RegisteredAsset,
     SpeechAnalysis,
     SpeechBoundaryCandidate,
+    VisualAnalysis,
     VisualPreparation,
 )
 from video_demo.application.production_visual import (
@@ -159,8 +162,15 @@ def test_complete_visual_chain_returns_merged_windows_without_creating_clips(
             )
 
     class Ocr:
-        def recognize(self, image: bytes, language: str) -> OcrProviderResponse:
+        def recognize(
+            self,
+            image: bytes,
+            language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
             calls.append(f"ocr:{language}")
+            assert deadline is not None
             text = "第一页课程标题" if b"page-one" in image else "第二页完全不同内容"
             return _ocr(text)
 
@@ -195,8 +205,8 @@ def test_complete_visual_chain_returns_merged_windows_without_creating_clips(
     assert set(boundary.sources) == {"clip_edge", "ocr_change"}
 
 
-def test_visual_chain_evenly_limits_keyframes_and_ocr_to_thirty(tmp_path: Path) -> None:
-    duration_ms = 198_000
+def test_low_text_visual_chain_stops_after_probe_budget(tmp_path: Path) -> None:
+    duration_ms = 300_000
     media = _media(tmp_path, duration_ms=duration_ms)
     ocr_calls: list[str] = []
 
@@ -224,9 +234,16 @@ def test_visual_chain_evenly_limits_keyframes_and_ocr_to_thirty(tmp_path: Path) 
             )
 
     class Ocr:
-        def recognize(self, _image: bytes, language: str) -> OcrProviderResponse:
+        def recognize(
+            self,
+            _image: bytes,
+            language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
             ocr_calls.append(language)
-            return _ocr("页面")
+            assert deadline is not None
+            return _ocr("")
 
     speech = SpeechAnalysis(
         transcript_source="ASR",
@@ -249,12 +266,386 @@ def test_visual_chain_evenly_limits_keyframes_and_ocr_to_thirty(tmp_path: Path) 
     keyframes = [item for item in result.evidence if item.evidence_type == "KEYFRAME"]
     ocr = [item for item in result.evidence if item.evidence_type == "OCR"]
     timestamps = [item.timestamp_ms for item in keyframes]
-    assert len(keyframes) == 30
-    assert len(ocr) == 30
-    assert len(ocr_calls) == 30
+    assert len(keyframes) == 6
+    assert len(ocr) == 6
+    assert len(ocr_calls) == 6
     assert timestamps == sorted(set(timestamps))
-    assert timestamps[0] == 1_000
-    assert timestamps[-1] == 197_000
+    assert timestamps[0] == 25_000
+    assert timestamps[-1] < duration_ms
+
+
+def test_normal_text_visual_chain_stops_at_base_budget(tmp_path: Path) -> None:
+    result, calls = _run_budget_visual(
+        tmp_path,
+        text_for_call=lambda index: f"相同课程页面主体内容仅修改版本编号{index % 2}",
+    )
+
+    assert calls == 13
+    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == 13
+    assert len([item for item in result.evidence if item.evidence_type == "OCR"]) == 13
+
+
+def test_dense_text_visual_chain_adds_three_at_a_time_until_hard_limit(tmp_path: Path) -> None:
+    result, calls = _run_budget_visual(
+        tmp_path,
+        text_for_call=lambda index: chr(0x4E00 + index) * 30,
+    )
+
+    assert calls == 20
+    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == 20
+    assert len([item for item in result.evidence if item.evidence_type == "OCR"]) == 20
+
+
+def test_dense_text_visual_chain_stops_when_full_batch_has_less_than_two_new_pages(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_budget_visual(
+        tmp_path,
+        text_for_call=lambda index: (
+            chr(0x4E00 + index) * 30
+            if index < 6
+            else "龠" * 30
+        ),
+    )
+
+    assert calls == 9
+    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == 9
+
+
+def test_ocr_budget_timeout_keeps_completed_evidence_and_emits_warning(tmp_path: Path) -> None:
+    clock_values = iter((0.0, 0.0, 0.1, 0.2, 0.3, 31.0))
+    result, calls = _run_budget_visual(
+        tmp_path,
+        text_for_call=lambda index: f"第{index}页包含完全不同且足够长的有效文字内容",
+        clock=lambda: next(clock_values, 31.0),
+    )
+
+    assert calls == 1
+    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == 1
+    assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
+
+
+def test_deadline_reached_during_probe_scoring_wins_over_text_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    original_assess = adaptive_ocr_module.assess_probe_text
+
+    def assess_then_reach_deadline(*args: object, **kwargs: object) -> object:
+        assessment = original_assess(*args, **kwargs)  # type: ignore[arg-type]
+        now[0] = 31.0
+        return assessment
+
+    monkeypatch.setattr(
+        adaptive_ocr_module,
+        "assess_probe_text",
+        assess_then_reach_deadline,
+    )
+
+    result, calls = _run_budget_visual(
+        tmp_path,
+        text_for_call=lambda _index: "",
+        clock=lambda: now[0],
+    )
+
+    assert calls == 6
+    assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
+
+
+def test_deadline_reached_during_batch_value_scoring_wins_over_marginal_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+
+    def score_then_reach_deadline(*_args: object, **_kwargs: object) -> int:
+        now[0] = 31.0
+        return 0
+
+    monkeypatch.setattr(
+        adaptive_ocr_module,
+        "batch_new_text_count",
+        score_then_reach_deadline,
+    )
+
+    result, calls = _run_budget_visual(
+        tmp_path,
+        text_for_call=lambda index: chr(0x4E00 + index) * 30,
+        clock=lambda: now[0],
+    )
+
+    assert calls == 9
+    assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
+
+
+def test_deadline_reached_after_normal_batch_wins_over_base_budget_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    original_append = adaptive_ocr_module._append_batch
+
+    def append_then_reach_deadline(*args: object, **kwargs: object) -> None:
+        original_append(*args, **kwargs)  # type: ignore[arg-type]
+        now[0] = 31.0
+
+    monkeypatch.setattr(
+        adaptive_ocr_module,
+        "_append_batch",
+        append_then_reach_deadline,
+    )
+
+    result, calls = _run_budget_visual(
+        tmp_path,
+        text_for_call=lambda index: f"相同课程页面主体内容仅修改版本编号{index % 2}",
+        clock=lambda: now[0],
+    )
+
+    assert calls == 13
+    assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
+
+
+def test_deadline_reached_during_normal_candidate_selection_wins_over_exhaustion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+
+    def exhaust_then_reach_deadline(
+        _keyframes: Sequence[KeyframeEvidence],
+        selected: Sequence[KeyframeEvidence],
+        *,
+        count: int,
+    ) -> tuple[KeyframeEvidence, ...]:
+        assert count == 7
+        now[0] = 31.0
+        return tuple(selected)
+
+    monkeypatch.setattr(
+        adaptive_ocr_module,
+        "extend_keyframes",
+        exhaust_then_reach_deadline,
+    )
+
+    result, calls = _run_budget_visual(
+        tmp_path,
+        text_for_call=lambda index: f"相同课程页面主体内容仅修改版本编号{index % 2}",
+        clock=lambda: now[0],
+    )
+
+    assert calls == 6
+    assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
+
+
+def test_deadline_reached_during_last_dense_batch_scoring_wins_over_hard_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    score_calls = 0
+    original_effective_texts = adaptive_ocr_module.effective_frame_texts
+
+    def score_then_reach_deadline(*args: object, **kwargs: object) -> tuple[str, ...]:
+        nonlocal score_calls
+        texts = original_effective_texts(*args, **kwargs)  # type: ignore[arg-type]
+        score_calls += 1
+        if score_calls == 5:
+            now[0] = 31.0
+        return texts
+
+    monkeypatch.setattr(
+        adaptive_ocr_module,
+        "effective_frame_texts",
+        score_then_reach_deadline,
+    )
+
+    result, calls = _run_budget_visual(
+        tmp_path,
+        text_for_call=lambda index: chr(0x4E00 + index) * 30,
+        clock=lambda: now[0],
+    )
+
+    assert calls == 20
+    assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
+
+
+def test_deadline_reached_during_dense_candidate_selection_wins_over_exhaustion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+
+    def exhaust_then_reach_deadline(
+        _keyframes: Sequence[KeyframeEvidence],
+        selected: Sequence[KeyframeEvidence],
+        *,
+        count: int,
+    ) -> tuple[KeyframeEvidence, ...]:
+        assert count == 3
+        now[0] = 31.0
+        return tuple(selected)
+
+    monkeypatch.setattr(
+        adaptive_ocr_module,
+        "extend_keyframes",
+        exhaust_then_reach_deadline,
+    )
+
+    result, calls = _run_budget_visual(
+        tmp_path,
+        text_for_call=lambda index: chr(0x4E00 + index) * 30,
+        clock=lambda: now[0],
+    )
+
+    assert calls == 6
+    assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
+
+
+def test_cancellation_after_dense_batch_wins_over_budget_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled = [False]
+    original_append = adaptive_ocr_module._append_batch
+
+    def append_then_cancel(*args: object, **kwargs: object) -> None:
+        original_append(*args, **kwargs)  # type: ignore[arg-type]
+        cancelled[0] = True
+
+    monkeypatch.setattr(adaptive_ocr_module, "_append_batch", append_then_cancel)
+
+    with pytest.raises(VideoDemoError) as raised:
+        _run_budget_visual(
+            tmp_path,
+            text_for_call=lambda index: chr(0x4E00 + index) * 30,
+            is_cancel_requested=lambda: cancelled[0],
+        )
+
+    assert raised.value.code == ErrorCode.JOB_CANCELLED
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [ErrorCode.OCR_AUTHENTICATION_FAILED, ErrorCode.OCR_RESPONSE_INVALID],
+)
+def test_ocr_external_error_remains_fail_closed_in_visual_chain(
+    tmp_path: Path,
+    error_code: ErrorCode,
+) -> None:
+    with pytest.raises(VideoDemoError) as raised:
+        _run_budget_visual(
+            tmp_path,
+            text_for_call=lambda _index: "",
+            ocr_error_code=error_code,
+        )
+
+    assert raised.value.code == error_code
+
+
+def test_unsupported_language_batch_stops_at_deadline_without_provider_calls(
+    tmp_path: Path,
+) -> None:
+    now = [0.0]
+    language_checks = 0
+
+    def unsupported_then_reach_deadline(*_args: object, **_kwargs: object) -> object:
+        nonlocal language_checks
+        language_checks += 1
+        if language_checks == 1:
+            now[0] = 31.0
+        return None, "OCR_LANGUAGE_UNSUPPORTED:fr"
+
+    result, calls = _run_budget_visual(
+        tmp_path,
+        text_for_call=lambda _index: "",
+        clock=lambda: now[0],
+        before_analyze=lambda monkeypatch: monkeypatch.setattr(
+            adaptive_ocr_module,
+            "ocr_language",
+            unsupported_then_reach_deadline,
+        ),
+    )
+
+    assert calls == 0
+    assert language_checks == 1
+    assert len(
+        [item for item in result.evidence if item.evidence_type == "KEYFRAME"],
+    ) == 1
+    assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
+
+
+def test_cancellation_during_ocr_call_wins_over_deadline_and_discards_partial_result(
+    tmp_path: Path,
+) -> None:
+    duration_ms = 4_000
+    media = _media(tmp_path, duration_ms=duration_ms)
+    cancelled = [False]
+
+    class Frames:
+        def extract(
+            self,
+            _proxy: Path,
+            root: Path,
+            windows: Sequence[TimeRange],
+            **_kwargs: object,
+        ) -> tuple[WindowFrameCandidates, ...]:
+            return (
+                WindowFrameCandidates(
+                    window=windows[0],
+                    candidates=(_write_frame(tmp_path, root, 2_000, b"page"),),
+                ),
+            )
+
+    class Ocr:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            cancelled[0] = True
+            return _ocr("这一帧已经识别成功但任务同时收到取消请求")
+
+    analyzer = ProductionVisualAnalyzer(
+        tmp_path,
+        lambda _media, _cancel: VisualComponents(
+            scene_detector=_Scenes(duration_ms),
+            frame_extractor=Frames(),
+            keyframe_selector=KeyframeSelector(),
+            ocr_client=Ocr(),
+            clip_client=_Clips(tmp_path, []),
+        ),
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        analyzer.analyze(media, is_cancel_requested=lambda: cancelled[0])
+
+    assert raised.value.code == ErrorCode.JOB_CANCELLED
+
+
+def test_ocr_budget_log_contains_only_aggregate_diagnostics(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret_text = "绝不能出现在日志中的OCR正文"
+    with caplog.at_level(logging.INFO, logger="video_demo.application.production_visual"):
+        _result, _calls = _run_budget_visual(
+            tmp_path,
+            text_for_call=lambda _index: secret_text,
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("ocr_budget_complete" in message for message in messages)
+    assert all(secret_text not in message for message in messages)
+    record = next(
+        record
+        for record in caplog.records
+        if "ocr_budget_complete" in record.getMessage()
+    )
+    assert record.ocr_classification in {"LOW_TEXT", "NORMAL_TEXT", "DENSE_TEXT"}
+    assert isinstance(record.ocr_selected_keyframe_count, int)
 
 
 def test_keyframe_limit_accepts_one_frame(tmp_path: Path) -> None:
@@ -533,7 +924,13 @@ def test_no_frames_does_not_fabricate_evidence_or_construct_ocr_credentials(
             return tuple(WindowFrameCandidates(window=item, candidates=()) for item in windows)
 
     class Ocr:
-        def recognize(self, _image: bytes, _language: str) -> OcrProviderResponse:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
             ocr_calls.append("credentials")
             raise AssertionError("无关键帧时不得加载 OCR 凭据")
 
@@ -606,7 +1003,13 @@ def test_ocr_language_selection_and_warnings(
             )
 
     class Ocr:
-        def recognize(self, _image: bytes, language: str) -> OcrProviderResponse:
+        def recognize(
+            self,
+            _image: bytes,
+            language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
             languages.append(language)
             return _ocr("页面")
 
@@ -842,7 +1245,13 @@ class _StaticOcr:
     def __init__(self, text: str) -> None:
         self._text = text
 
-    def recognize(self, _image: bytes, _language: str) -> OcrProviderResponse:
+    def recognize(
+        self,
+        _image: bytes,
+        _language: str,
+        *,
+        deadline: float | None = None,
+    ) -> OcrProviderResponse:
         return _ocr(self._text)
 
 
@@ -887,6 +1296,90 @@ def _ocr(text: str) -> OcrProviderResponse:
         else ()
     )
     return OcrProviderResponse(request_id="request-safe", lines=lines)
+
+
+def _run_budget_visual(
+    tmp_path: Path,
+    *,
+    text_for_call: Callable[[int], str],
+    clock: Callable[[], float] | None = None,
+    ocr_error_code: ErrorCode | None = None,
+    is_cancel_requested: Callable[[], bool] = lambda: False,
+    before_analyze: Callable[[pytest.MonkeyPatch], None] | None = None,
+) -> tuple[VisualAnalysis, int]:
+    duration_ms = 300_000
+    media = _media(tmp_path, duration_ms=duration_ms)
+    call_count = 0
+
+    class Frames:
+        def extract(
+            self,
+            _proxy: Path,
+            run_relative_root: Path,
+            windows: Sequence[TimeRange],
+            **_kwargs: object,
+        ) -> tuple[WindowFrameCandidates, ...]:
+            return tuple(
+                WindowFrameCandidates(
+                    window=window,
+                    candidates=(
+                        _write_frame(
+                            tmp_path,
+                            run_relative_root,
+                            window.start_ms + 1_000,
+                            f"page-{window.start_ms}".encode(),
+                            perceptual_hash=f"{window.start_ms + 1:016x}",
+                        ),
+                    ),
+                )
+                for window in windows
+            )
+
+    class Ocr:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            nonlocal call_count
+            assert deadline is not None
+            if ocr_error_code is not None:
+                raise VideoDemoError(ocr_error_code, "模拟 OCR 外部错误")
+            text = text_for_call(call_count)
+            call_count += 1
+            return _ocr(text)
+
+    speech = SpeechAnalysis(
+        transcript_source="ASR",
+        boundary_candidates=tuple(
+            SpeechBoundaryCandidate(timestamp_ms=timestamp_ms, source="silence")
+            for timestamp_ms in range(10_000, duration_ms, 10_000)
+        ),
+    )
+    analyzer_kwargs: dict[str, object] = {}
+    if clock is not None:
+        analyzer_kwargs["clock"] = clock
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        if before_analyze is not None:
+            before_analyze(monkeypatch)
+        result = ProductionVisualAnalyzer(
+            tmp_path,
+            lambda _media, _cancel: VisualComponents(
+                scene_detector=_Scenes(duration_ms),
+                frame_extractor=Frames(),
+                keyframe_selector=KeyframeSelector(),
+                ocr_client=Ocr(),
+                clip_client=_Clips(tmp_path, []),
+            ),
+            **analyzer_kwargs,
+        ).analyze(
+            media,
+            speech=speech,
+            is_cancel_requested=is_cancel_requested,
+        )
+    return result, call_count
 
 
 def _scene(start_ms: int, end_ms: int, *, transition: str) -> SceneBoundary:

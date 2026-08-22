@@ -7,7 +7,12 @@ import pytest
 
 from video_demo.domain.evidence import BoundingBox, OcrLine
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.visual.ocr import KeyframeForOcr, OcrProcessor, OcrProviderResponse
+from video_demo.visual.ocr import (
+    KeyframeForOcr,
+    OcrDeadlineExceeded,
+    OcrProcessor,
+    OcrProviderResponse,
+)
 
 
 def test_ocr_processor_preserves_frame_time_bbox_confidence_and_request_id(
@@ -149,4 +154,196 @@ def test_ocr_processor_validates_image_before_external_call(
                     language="zh",
                 ),
             )
+        )
+
+
+def test_ocr_processor_checks_deadline_before_reading_or_sending_image(tmp_path: Path) -> None:
+    image = tmp_path / "keyframe.jpg"
+    image.write_bytes(b"\xff\xd8\xffjpeg-data\xff\xd9")
+
+    class Client:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            raise AssertionError(f"截止后不得外发，deadline={deadline}")
+
+    processor = OcrProcessor(Client(), allowed_root=tmp_path, clock=lambda: 10.0)
+
+    with pytest.raises(OcrDeadlineExceeded):
+        processor.process_with_diagnostics(
+            (
+                KeyframeForOcr(
+                    keyframe_id="keyframe_001",
+                    source_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+                    start_ms=0,
+                    end_ms=1_000,
+                    timestamp_ms=500,
+                    path=image,
+                    language="zh",
+                ),
+            ),
+            deadline=10.0,
+        )
+
+
+def test_ocr_processor_reports_provider_attempts_without_changing_evidence(tmp_path: Path) -> None:
+    image = tmp_path / "keyframe.png"
+    image.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + (13).to_bytes(4, "big")
+        + b"IHDR"
+        + (640).to_bytes(4, "big")
+        + (480).to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00",
+    )
+
+    class Client:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            assert deadline == 50.0
+            return OcrProviderResponse(
+                request_id="request-001",
+                lines=(),
+                provider_attempt_count=3,
+            )
+
+    result = OcrProcessor(
+        Client(),
+        allowed_root=tmp_path,
+        clock=lambda: 1.0,
+    ).process_with_diagnostics(
+        (
+            KeyframeForOcr(
+                keyframe_id="keyframe_001",
+                source_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+                start_ms=0,
+                end_ms=1_000,
+                timestamp_ms=500,
+                path=image,
+                language="zh",
+            ),
+        ),
+        deadline=50.0,
+    )
+
+    assert len(result.evidence) == 1
+    assert result.provider_attempt_count == 3
+    assert result.image_sizes == ((640, 480),)
+
+
+def test_ocr_processor_reads_jpeg_dimensions_for_subtitle_scoring(tmp_path: Path) -> None:
+    image = tmp_path / "keyframe.jpg"
+    image.write_bytes(
+        b"\xff\xd8\xff\xc0\x00\x11\x08"
+        + (720).to_bytes(2, "big")
+        + (1_280).to_bytes(2, "big")
+        + b"\x03\x01\x11\x00\x02\x11\x00\x03\x11\x00\xff\xd9",
+    )
+
+    class Client:
+        def recognize(self, _image: bytes, _language: str) -> OcrProviderResponse:
+            return OcrProviderResponse(request_id="request-001", lines=())
+
+    result = OcrProcessor(Client(), allowed_root=tmp_path).process_with_diagnostics(
+        (
+            KeyframeForOcr(
+                keyframe_id="keyframe_001",
+                source_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+                start_ms=0,
+                end_ms=1_000,
+                timestamp_ms=500,
+                path=image,
+                language="zh",
+            ),
+        ),
+    )
+
+    assert result.image_sizes == ((1_280, 720),)
+
+
+def test_ocr_processor_discards_response_returned_after_deadline(tmp_path: Path) -> None:
+    now = [1.0]
+    image = tmp_path / "keyframe.jpg"
+    image.write_bytes(b"\xff\xd8\xffjpeg-data\xff\xd9")
+
+    class Client:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            now[0] = 2.0
+            return OcrProviderResponse(
+                request_id="late-response",
+                lines=(),
+                provider_attempt_count=2,
+            )
+
+    processor = OcrProcessor(Client(), allowed_root=tmp_path, clock=lambda: now[0])
+
+    with pytest.raises(OcrDeadlineExceeded) as raised:
+        processor.process_with_diagnostics(
+            (
+                KeyframeForOcr(
+                    keyframe_id="keyframe_001",
+                    source_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+                    start_ms=0,
+                    end_ms=1_000,
+                    timestamp_ms=500,
+                    path=image,
+                    language="zh",
+                ),
+            ),
+            deadline=2.0,
+        )
+
+    assert raised.value.provider_attempt_count == 2
+
+
+def test_ocr_processor_does_not_send_image_when_read_crosses_deadline(tmp_path: Path) -> None:
+    clock_values = iter((1.0, 2.0))
+    image = tmp_path / "keyframe.jpg"
+    image.write_bytes(b"\xff\xd8\xffjpeg-data\xff\xd9")
+
+    class Client:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            raise AssertionError(f"读图越过截止时间后不得外发，deadline={deadline}")
+
+    processor = OcrProcessor(
+        Client(),
+        allowed_root=tmp_path,
+        clock=lambda: next(clock_values, 2.0),
+    )
+
+    with pytest.raises(OcrDeadlineExceeded):
+        processor.process_with_diagnostics(
+            (
+                KeyframeForOcr(
+                    keyframe_id="keyframe_001",
+                    source_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+                    start_ms=0,
+                    end_ms=1_000,
+                    timestamp_ms=500,
+                    path=image,
+                    language="zh",
+                ),
+            ),
+            deadline=2.0,
         )
