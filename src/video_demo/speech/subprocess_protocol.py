@@ -24,6 +24,13 @@ ALLOWED_SPEECH_SUBPROCESS_FAILURE_CODES = frozenset(
         ErrorCode.WORKSPACE_PATH_ESCAPE,
         ErrorCode.VIDEO_DIGEST_MISMATCH,
         ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID,
+        # 语音阶段会调用 FFmpeg 切片；这些媒体错误必须透传，不能被误报为模型不可用。
+        ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT,
+        ErrorCode.VIDEO_PROCESS_FAILED,
+        ErrorCode.VIDEO_PROCESS_TIMEOUT,
+        ErrorCode.VIDEO_OUTPUT_INVALID,
+        ErrorCode.VIDEO_OUTPUT_TOO_LARGE,
+        ErrorCode.VIDEO_INPUT_INVALID,
     }
 )
 
@@ -159,5 +166,11 @@ def speech_subprocess_failure_message(code: ErrorCode) -> str:
         ErrorCode.JOB_CANCELLED: "语音分析已取消",
         ErrorCode.WORKSPACE_PATH_ESCAPE: "语音运行路径非法",
         ErrorCode.VIDEO_DIGEST_MISMATCH: "语音音频摘要不匹配",
+        ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT: "可用磁盘空间不足",
+        ErrorCode.VIDEO_PROCESS_FAILED: "FFmpeg 音频切片失败",
+        ErrorCode.VIDEO_PROCESS_TIMEOUT: "FFmpeg 音频切片超时",
+        ErrorCode.VIDEO_OUTPUT_INVALID: "FFmpeg 输出音频非法",
+        ErrorCode.VIDEO_OUTPUT_TOO_LARGE: "FFmpeg 输出超过大小限制",
+        ErrorCode.VIDEO_INPUT_INVALID: "FFmpeg 输入音频非法",
         ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID: "语音请求或响应协议非法",
     }.get(code, "语音模型不可用")

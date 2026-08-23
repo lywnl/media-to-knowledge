@@ -36,6 +36,7 @@ from video_demo.speech.snapshots import (
 )
 from video_demo.speech.subprocess_main import main as subprocess_main
 from video_demo.speech.subprocess_protocol import (
+    ALLOWED_SPEECH_SUBPROCESS_FAILURE_CODES,
     SpeechRuntimeConfig,
     SpeechSubprocessCredentials,
     SpeechSubprocessFailure,
@@ -777,6 +778,85 @@ def test_subprocess_entry_writes_private_failure_response(tmp_path: Path) -> Non
     assert stat.S_IMODE(response_path.stat().st_mode) == 0o600
     assert envelope["payload"]["status"] == "FAILED"
     assert envelope["payload"]["stage"] == "ASR"
+
+
+@pytest.mark.parametrize(
+    ("error_code", "message"),
+    [
+        (ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT, "可用磁盘空间不足"),
+        (ErrorCode.VIDEO_PROCESS_FAILED, "FFmpeg 音频切片失败"),
+        (ErrorCode.VIDEO_PROCESS_TIMEOUT, "FFmpeg 音频切片超时"),
+        (ErrorCode.VIDEO_OUTPUT_INVALID, "FFmpeg 输出音频非法"),
+        (ErrorCode.VIDEO_OUTPUT_TOO_LARGE, "FFmpeg 输出超过大小限制"),
+        (ErrorCode.VIDEO_INPUT_INVALID, "FFmpeg 输入音频非法"),
+    ],
+)
+def test_speech_subprocess_preserves_media_failure_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: ErrorCode,
+    message: str,
+) -> None:
+    runtime_root = tmp_path / ".codex/video-rag-demo"
+    runtime_root.mkdir(parents=True)
+    run_root = Path("runs/scope/run_001")
+    audio_path = runtime_root / run_root / "media/audio.wav"
+    audio_path.parent.mkdir(parents=True)
+    audio_path.write_bytes(b"audio")
+    request = SpeechSubprocessRequest(
+        request_id="speech_request_media_failure",
+        run_relative_root=run_root.as_posix(),
+        audio_relative_path=(run_root / "media/audio.wav").as_posix(),
+        audio_sha256=hashlib.sha256(b"audio").hexdigest(),
+        duration_ms=1_000,
+        config=PipelineRunConfig(),
+        runtime=SpeechRuntimeConfig(
+            inference_device="cpu",
+            whisper_compute_type="int8",
+            model_identities=(),
+            yamnet_class_map_sha256="b" * 64,
+            yamnet_thresholds_sha256="c" * 64,
+        ),
+        credentials=SpeechSubprocessCredentials(),
+        asr_fingerprint="d" * 64,
+        stage="ASR",
+    )
+    request_relative = run_root / "speech/ipc/request-speech_request_media_failure.json"
+    response_relative = run_root / "speech/ipc/response-speech_request_media_failure.json"
+    receipt = AtomicArtifactStore(runtime_root).write_json(
+        request_relative,
+        ipc_request_payload(request),
+        schema_version=request.schema_version,
+        upstream_sha256=request.asr_fingerprint,
+        file_mode=0o600,
+    )
+
+    def raise_media_error(*_args: object, **_kwargs: object) -> SpeechSubprocessSuccess:
+        raise VideoDemoError(error_code, "底层媒体错误")
+
+    monkeypatch.setattr(subprocess_main_module, "_execute_request", raise_media_error)
+    result = subprocess_main(
+        [
+            "--workspace-root",
+            str(tmp_path),
+            "--runtime-root",
+            str(runtime_root),
+            "--request",
+            request_relative.as_posix(),
+            "--request-sha256",
+            receipt.sha256,
+            "--response",
+            response_relative.as_posix(),
+        ]
+    )
+
+    assert result == 0
+    envelope = json.loads(
+        (runtime_root / response_relative).read_text(encoding="utf-8")
+    )
+    assert error_code in ALLOWED_SPEECH_SUBPROCESS_FAILURE_CODES
+    assert envelope["payload"]["error_code"] == error_code
+    assert envelope["payload"]["message"] == message
 
 
 def test_enrichment_subprocess_rejects_receipt_other_than_bound_asr(
