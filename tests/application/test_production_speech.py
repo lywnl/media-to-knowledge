@@ -13,6 +13,7 @@ from video_demo.application.pipeline import (
     PreparedMedia,
     ProbedAsset,
     RegisteredAsset,
+    SpeechAnalysis,
     SpeechBoundaryCandidate,
 )
 from video_demo.application.production_speech import ProductionSpeechAnalyzer, SpeechComponents
@@ -26,7 +27,14 @@ from video_demo.media.transcode import SubtitleArtifact
 from video_demo.speech.alignment import AlignmentResult
 from video_demo.speech.asr import RawAsrSegment
 from video_demo.speech.language import LanguageIdentificationResult, LanguageSpan
-from video_demo.speech.snapshots import SpeechFingerprintInputs
+from video_demo.speech.snapshots import (
+    AsrSnapshotPayload,
+    SpeechAnalysisSnapshotPayload,
+    SpeechFingerprintInputs,
+    _speech_fingerprint_v1,
+    asr_fingerprint,
+    subtitle_transcript_payload_sha256,
+)
 from video_demo.speech.vad import SpeechInterval, VadResult
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.snapshots import SnapshotStore
@@ -39,12 +47,155 @@ def test_no_audio_skips_every_speech_component(tmp_path: Path) -> None:
         lambda _media, _cancel: calls.append("components")  # type: ignore[arg-type]
     )
 
-    result = analyzer.analyze(_media(tmp_path, has_audio=False))
+    result = analyzer.analyze(
+        _media(
+            tmp_path,
+            has_audio=False,
+            config=PipelineRunConfig(speech_enrichment_mode="full"),
+        )
+    )
 
     assert calls == []
     assert result.evidence == ()
     assert result.warnings == ("NO_AUDIO_TRACK",)
     assert result.transcript_source == "NONE"
+    assert result.enrichment_mode == "text"
+
+
+def test_text_mode_skips_optional_speech_enrichment_components(tmp_path: Path) -> None:
+    speech = SpeechInterval(evidence_id="vad_text", start_ms=0, end_ms=2_000, confidence=0.9)
+    language = LanguageSpan(
+        evidence_id="lid_text",
+        start_ms=0,
+        end_ms=2_000,
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    segment = SpeechSegment(
+        evidence_id="asr_text",
+        start_ms=0,
+        end_ms=1_000,
+        text="文本模式只保留转写",
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    calls: list[str] = []
+
+    class Forbidden:
+        def __getattr__(self, name: str) -> Any:
+            calls.append(name)
+            raise AssertionError(f"text 模式不应调用可选语音增强组件: {name}")
+
+    components = _successful_components(tmp_path, speech, language, segment)
+    components = SpeechComponents(
+        **{
+            **components.__dict__,
+            "aligner": Forbidden(),
+            "diarizer": Forbidden(),
+            "audio_events": Forbidden(),
+        }
+    )
+    media = _media(tmp_path, config=PipelineRunConfig(speech_enrichment_mode="text"))
+
+    result = _analyzer(tmp_path, lambda _media, _cancel: components).analyze(media)
+
+    assert result.transcript_source == "ASR"
+    assert len(result.evidence) == 1
+    assert isinstance(result.evidence[0], SpeechSegment)
+    assert result.evidence[0].text == segment.text
+    assert not calls
+
+
+def test_public_asr_stage_skips_optional_enrichment_components(tmp_path: Path) -> None:
+    speech = SpeechInterval(evidence_id="vad_stage", start_ms=0, end_ms=2_000, confidence=0.9)
+    language = LanguageSpan(
+        evidence_id="lid_stage",
+        start_ms=0,
+        end_ms=2_000,
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    segment = SpeechSegment(
+        evidence_id="asr_stage",
+        start_ms=0,
+        end_ms=1_000,
+        text="公开 ASR 阶段",
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    calls: list[str] = []
+
+    class Forbidden:
+        def __getattr__(self, name: str) -> Any:
+            calls.append(name)
+            raise AssertionError(f"ASR 阶段不得访问增强组件：{name}")
+
+    components = replace(
+        _successful_components(tmp_path, speech, language, segment),
+        aligner=Forbidden(),
+        diarizer=Forbidden(),
+        audio_events=Forbidden(),
+    )
+
+    payload = ProductionSpeechAnalyzer.run_asr_stage(_media(tmp_path), components)
+
+    assert payload.segments[0].text == segment.text
+    assert not calls
+
+
+def test_single_language_hint_skips_lid_and_marks_hint_source(tmp_path: Path) -> None:
+    speech = SpeechInterval(evidence_id="vad_hint_mode", start_ms=0, end_ms=2_000, confidence=0.9)
+    segment = SpeechSegment(
+        evidence_id="asr_hint_mode",
+        start_ms=0,
+        end_ms=1_000,
+        text="配置提示语言",
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    calls: list[str] = []
+
+    class Vad:
+        def detect(self, _audio: Path, *, duration_ms: int) -> VadResult:
+            return VadResult(speech=(speech,), silence=(), long_silence_boundaries_ms=())
+
+    class ForbiddenLid:
+        def identify(self, *_args: object, **_kwargs: object) -> object:
+            calls.append("lid")
+            raise AssertionError("单语言提示不应执行 LID")
+
+    components = _successful_components(tmp_path, speech, LanguageSpan(
+        evidence_id="unused",
+        start_ms=0,
+        end_ms=2_000,
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    ), segment)
+    components = SpeechComponents(
+        **{
+            **components.__dict__,
+            "vad": Vad(),
+            "language_identifier": ForbiddenLid(),
+        }
+    )
+    media = _media(
+        tmp_path,
+        config=PipelineRunConfig(language_hints=("zh",), speech_enrichment_mode="text"),
+    )
+
+    result = _analyzer(tmp_path, lambda _media, _cancel: components).analyze(media)
+
+    assert len(result.evidence) == 1
+    assert isinstance(result.evidence[0], SpeechSegment)
+    assert result.evidence[0].text == segment.text
+    assert result.enrichment_mode == "text"
+    assert calls == []
 
 
 def test_eligible_subtitle_skips_every_speech_component(tmp_path: Path) -> None:
@@ -77,6 +228,51 @@ def test_eligible_subtitle_skips_every_speech_component(tmp_path: Path) -> None:
         SpeechBoundaryCandidate(1_000, "sentence_end", 1.0),
     )
     assert component_factory_calls == 0
+
+
+def test_legacy_subtitle_snapshot_is_projected_to_text_semantics(tmp_path: Path) -> None:
+    media = replace(_media(tmp_path), subtitle=_parsed_subtitle())
+    inputs = _fingerprint_inputs()
+    store = SnapshotStore(AtomicArtifactStore(tmp_path))
+    analysis = SpeechAnalysis(
+        transcript_source="SUBTITLE",
+        enrichment_mode="text",
+        evidence=media.subtitle.cues if media.subtitle is not None else (),
+        warnings=("LEGACY",),
+    )
+    legacy_key = _speech_fingerprint_v1(
+        processing_mode="SUBTITLE",
+        transcript_payload_sha256=subtitle_transcript_payload_sha256(
+            analysis, media.subtitle.artifact.sha256 if media.subtitle is not None else "a" * 64
+        ),
+        media_warnings=media.warnings,
+        min_speakers=None,
+        max_speakers=None,
+        allow_speaker_fallback=False,
+        inputs=inputs,
+    )
+    store.publish(
+        media.source.asset.run_relative_root,
+        "speech",
+        legacy_key,
+        SpeechAnalysisSnapshotPayload(
+            schema_version="1.0.0",
+            enrichment_mode="full",
+            evidence=analysis.evidence,
+            warnings=analysis.warnings,
+            boundary_candidates=(),
+            transcript_source="SUBTITLE",
+        ),
+    )
+
+    result = ProductionSpeechAnalyzer(
+        lambda _media, _cancel: (_ for _ in ()).throw(AssertionError("字幕不得构造组件")),
+        snapshot_store=store,
+        fingerprint_inputs=inputs,
+    ).analyze(media)
+
+    assert result.enrichment_mode == "text"
+    assert result.warnings == ("LEGACY",)
 
 
 def test_no_speech_still_runs_yamnet_and_skips_remaining_models(tmp_path: Path) -> None:
@@ -228,6 +424,7 @@ def test_complete_chain_preserves_order_config_absolute_time_speakers_and_sortin
                     max_speakers=3,
                     hotwords=("Milvus", "WhisperX"),
                     core_context="这是向量检索课程。",
+                    speech_enrichment_mode="full",
                 ),
             ),
             warnings=("SUBTITLE_TRACK_REJECTED:2:TIMELINE_INVALID",),
@@ -434,7 +631,7 @@ def test_every_asr_slice_receives_same_hints_without_passing_them_to_lid(
         slicer=Slicer(),  # type: ignore[arg-type]
     )
     config = PipelineRunConfig(
-        language_hints=("zh",),
+        language_hints=("zh", "en"),
         hotwords=("Milvus", "WhisperX"),
         core_context="这是向量检索课程。",
     )
@@ -444,7 +641,7 @@ def test_every_asr_slice_receives_same_hints_without_passing_them_to_lid(
     )
 
     assert result.transcript_source == "ASR"
-    assert lid_calls == [("zh",)]
+    assert lid_calls == [("zh", "en")]
     assert asr_calls == [
         (("Milvus", "WhisperX"), "这是向量检索课程。"),
         (("Milvus", "WhisperX"), "这是向量检索课程。"),
@@ -699,6 +896,137 @@ def test_complete_speech_snapshot_hit_skips_component_factory(tmp_path: Path) ->
     assert factory_calls == 1
 
 
+def test_production_speech_reads_legacy_full_snapshot_when_current_pointer_is_legacy(
+    tmp_path: Path,
+) -> None:
+    language = LanguageSpan(
+        evidence_id="legacy_lid",
+        start_ms=0,
+        end_ms=2_000,
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    segment = SpeechSegment(
+        evidence_id="legacy_asr",
+        start_ms=0,
+        end_ms=1_000,
+        text="历史快照",
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    media = _media(tmp_path, config=PipelineRunConfig(speech_enrichment_mode="full"))
+    inputs = _fingerprint_inputs()
+    store = SnapshotStore(AtomicArtifactStore(tmp_path))
+    asr_key = asr_fingerprint(
+        audio_sha256=media.audio_sha256 or "",
+        duration_ms=media.source.duration_ms,
+        language_hints=(),
+        hotwords=(),
+        core_context=None,
+        inputs=inputs,
+    )
+    asr_receipt = store.publish(
+        media.source.asset.run_relative_root,
+        "asr",
+        asr_key,
+        AsrSnapshotPayload(
+            language_spans=(language,),
+            segments=(segment,),
+            vad_warnings=(),
+            silence_boundaries_ms=(),
+            language_change_boundaries_ms=(),
+        ),
+    )
+    legacy_key = _speech_fingerprint_v1(
+        processing_mode="ASR",
+        transcript_payload_sha256=asr_receipt.sha256,
+        media_warnings=(),
+        min_speakers=None,
+        max_speakers=None,
+        allow_speaker_fallback=False,
+        inputs=inputs,
+    )
+    store.publish(
+        media.source.asset.run_relative_root,
+        "speech",
+        legacy_key,
+        SpeechAnalysisSnapshotPayload(
+            schema_version="1.0.0",
+            evidence=(segment,),
+            warnings=("LEGACY",),
+            boundary_candidates=(),
+            transcript_source="ASR",
+        ),
+    )
+
+    result = ProductionSpeechAnalyzer(
+        lambda _media, _cancel: (_ for _ in ()).throw(
+            AssertionError("命中历史快照不应构造语音组件")
+        ),
+        snapshot_store=store,
+        fingerprint_inputs=inputs,
+    ).analyze(media)
+
+    assert result.warnings == ("LEGACY",)
+    assert result.evidence == (segment,)
+    assert result.enrichment_mode == "full"
+
+
+def test_text_mode_does_not_reuse_full_speech_snapshot(tmp_path: Path) -> None:
+    """text 结果必须只投影 ASR 快照，不能把历史 full 增强证据带入。"""
+    speech = SpeechInterval(evidence_id="vad_mode", start_ms=0, end_ms=2_000, confidence=0.9)
+    language = LanguageSpan(
+        evidence_id="lid_mode",
+        start_ms=0,
+        end_ms=2_000,
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    segment = SpeechSegment(
+        evidence_id="asr_mode",
+        start_ms=0,
+        end_ms=1_000,
+        text="只保留原始转写",
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    store = SnapshotStore(AtomicArtifactStore(tmp_path))
+    components = _successful_components(tmp_path, speech, language, segment)
+    media_full = _media(
+        tmp_path,
+        config=PipelineRunConfig(speech_enrichment_mode="full"),
+    )
+    ProductionSpeechAnalyzer(
+        lambda _media, _cancel: components,
+        snapshot_store=store,
+        fingerprint_inputs=_fingerprint_inputs(),
+    ).analyze(media_full)
+    media_text = replace(
+        media_full,
+        source=replace(
+            media_full.source,
+            asset=replace(
+                media_full.source.asset,
+                config=PipelineRunConfig(speech_enrichment_mode="text"),
+            ),
+        ),
+    )
+    result = ProductionSpeechAnalyzer(
+        lambda _media, _cancel: (_ for _ in ()).throw(
+            AssertionError("已有 ASR 快照时 text 不应构造组件")
+        ),
+        snapshot_store=store,
+        fingerprint_inputs=_fingerprint_inputs(),
+    ).analyze(media_text)
+
+    assert result.enrichment_mode == "text"
+    assert tuple(type(item) for item in result.evidence) == (SpeechSegment,)
+
+
 @dataclass
 class _StaticAligner:
     result: AlignmentResult
@@ -861,7 +1189,7 @@ def _media(
         source_size_bytes=6,
         source_mime="video/mp4",
         run_relative_root=run_root,
-        config=config or PipelineRunConfig(),
+        config=config or PipelineRunConfig(speech_enrichment_mode="full"),
     )
     manifest = VideoAssetManifest(
         object_ref="obj_001",

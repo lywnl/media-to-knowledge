@@ -4,7 +4,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from video_demo.domain.base import FrozenModel, LanguageCode, Probability, stable_identifier
 from video_demo.domain.run import TimeRange
@@ -23,7 +23,8 @@ class LanguageDetection:
 class LanguageSpan(TimeRange):
     evidence_id: str
     language: LanguageCode
-    confidence: Probability
+    confidence: Probability | None = None
+    detection_source: Literal["MODEL", "HINT"] = "MODEL"
     is_fully_evaluated_language: bool
 
 

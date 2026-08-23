@@ -45,6 +45,7 @@ class AdaptiveOcrResult:
     warnings: tuple[str, ...]
     assessment: OcrTextAssessment
     provider_attempt_count: int
+    image_request_count: int
     stop_reason: str
     elapsed_ms: int
 
@@ -56,6 +57,7 @@ class _OcrBatchResult:
     observations: tuple[OcrFrameObservation, ...]
     warnings: tuple[str, ...]
     provider_attempt_count: int
+    image_request_count: int
     reached_deadline: bool
 
 
@@ -117,6 +119,7 @@ class AdaptiveOcrRunner:
         observations = list(probe_result.observations)
         warnings = list(probe_result.warnings)
         provider_attempt_count = probe_result.provider_attempt_count
+        image_request_count = probe_result.image_request_count
         if probe_result.reached_deadline or self._clock() >= deadline:
             warnings.append(_OCR_BUDGET_TIME_LIMIT_WARNING)
             stop_reason = "TIME_LIMIT_REACHED"
@@ -125,7 +128,7 @@ class AdaptiveOcrRunner:
         elif assessment.classification == OcrClassification.LOW_TEXT:
             stop_reason = "LOW_TEXT"
         elif assessment.classification == OcrClassification.DENSE_TEXT:
-            stop_reason, provider_attempt_count = self._extend_dense(
+            stop_reason, provider_attempt_count, image_request_count = self._extend_dense(
                 keyframes,
                 selected=selected,
                 evidence=evidence,
@@ -139,9 +142,10 @@ class AdaptiveOcrRunner:
                 deadline=deadline,
                 is_cancel_requested=is_cancel_requested,
                 provider_attempt_count=provider_attempt_count,
+                image_request_count=image_request_count,
             )
         else:
-            stop_reason, provider_attempt_count = self._extend_normal(
+            stop_reason, provider_attempt_count, image_request_count = self._extend_normal(
                 keyframes,
                 selected=selected,
                 evidence=evidence,
@@ -154,6 +158,7 @@ class AdaptiveOcrRunner:
                 deadline=deadline,
                 is_cancel_requested=is_cancel_requested,
                 provider_attempt_count=provider_attempt_count,
+                image_request_count=image_request_count,
             )
         elapsed_ms = max(0, round((self._clock() - started_at) * 1_000))
         return AdaptiveOcrResult(
@@ -162,6 +167,7 @@ class AdaptiveOcrRunner:
             warnings=tuple(dict.fromkeys(warnings)),
             assessment=assessment,
             provider_attempt_count=provider_attempt_count,
+            image_request_count=image_request_count,
             stop_reason=stop_reason,
             elapsed_ms=elapsed_ms,
         )
@@ -186,6 +192,7 @@ class AdaptiveOcrRunner:
                 "ocr_selected_keyframe_count": len(result.keyframes),
                 "ocr_successful_image_count": len(result.evidence),
                 "ocr_provider_attempt_count": result.provider_attempt_count,
+                "ocr_image_request_count": result.image_request_count,
                 "ocr_valid_text_ratio": float(result.assessment.valid_text_ratio),
                 "ocr_text_change_ratio": float(result.assessment.text_change_ratio),
                 "ocr_median_effective_chars": result.assessment.median_effective_chars,
@@ -211,6 +218,7 @@ class AdaptiveOcrRunner:
         observations: list[OcrFrameObservation] = []
         warnings: list[str] = []
         provider_attempt_count = 0
+        image_request_count = 0
         for keyframe in keyframes:
             _check_cancelled(is_cancel_requested)
             if self._clock() >= deadline:
@@ -220,6 +228,7 @@ class AdaptiveOcrRunner:
                     observations=tuple(observations),
                     warnings=tuple(warnings),
                     provider_attempt_count=provider_attempt_count,
+                    image_request_count=image_request_count,
                     reached_deadline=True,
                 )
             language, warning = ocr_language(keyframe.timestamp_ms, speech, media)
@@ -239,7 +248,9 @@ class AdaptiveOcrRunner:
                 language=language,
             )
             try:
-                processed = processor.process_with_diagnostics((item,), deadline=deadline)
+                processed = processor.process_with_diagnostics(
+                    (item,), deadline=deadline, reuse_cache=True
+                )
             except OcrDeadlineExceeded as error:
                 _check_cancelled(is_cancel_requested)
                 return _OcrBatchResult(
@@ -250,12 +261,16 @@ class AdaptiveOcrRunner:
                     provider_attempt_count=(
                         provider_attempt_count + error.provider_attempt_count
                     ),
+                    image_request_count=(
+                        image_request_count + error.image_request_count
+                    ),
                     reached_deadline=True,
                 )
             _check_cancelled(is_cancel_requested)
             completed.append(keyframe)
             evidence.extend(processed.evidence)
             provider_attempt_count += processed.provider_attempt_count
+            image_request_count += processed.image_request_count
             width, height = processed.image_sizes[0]
             observations.append(
                 OcrFrameObservation(
@@ -271,6 +286,7 @@ class AdaptiveOcrRunner:
             observations=tuple(observations),
             warnings=tuple(warnings),
             provider_attempt_count=provider_attempt_count,
+            image_request_count=image_request_count,
             reached_deadline=False,
         )
 
@@ -289,7 +305,8 @@ class AdaptiveOcrRunner:
         deadline: float,
         is_cancel_requested: Callable[[], bool],
         provider_attempt_count: int,
-    ) -> tuple[str, int]:
+        image_request_count: int,
+    ) -> tuple[str, int, int]:
         target = extend_keyframes(
             keyframes,
             selected,
@@ -305,13 +322,14 @@ class AdaptiveOcrRunner:
         )
         _append_batch(batch, selected, evidence, observations, warnings)
         provider_attempt_count += batch.provider_attempt_count
+        image_request_count += batch.image_request_count
         _check_cancelled(is_cancel_requested)
         if batch.reached_deadline or self._clock() >= deadline:
             warnings.append(_OCR_BUDGET_TIME_LIMIT_WARNING)
-            return "TIME_LIMIT_REACHED", provider_attempt_count
+            return "TIME_LIMIT_REACHED", provider_attempt_count, image_request_count
         if len(selected) < base_limit:
-            return "CANDIDATES_EXHAUSTED", provider_attempt_count
-        return "BASE_BUDGET_REACHED", provider_attempt_count
+            return "CANDIDATES_EXHAUSTED", provider_attempt_count, image_request_count
+        return "BASE_BUDGET_REACHED", provider_attempt_count, image_request_count
 
     def _extend_dense(
         self,
@@ -329,7 +347,8 @@ class AdaptiveOcrRunner:
         deadline: float,
         is_cancel_requested: Callable[[], bool],
         provider_attempt_count: int,
-    ) -> tuple[str, int]:
+        image_request_count: int,
+    ) -> tuple[str, int, int]:
         seen_texts = list(assessment.frame_texts)
         has_subtitle_track = speech.transcript_source == "SUBTITLE"
         while len(selected) < hard_limit:
@@ -338,10 +357,10 @@ class AdaptiveOcrRunner:
             _check_cancelled(is_cancel_requested)
             if self._clock() >= deadline:
                 warnings.append(_OCR_BUDGET_TIME_LIMIT_WARNING)
-                return "TIME_LIMIT_REACHED", provider_attempt_count
+                return "TIME_LIMIT_REACHED", provider_attempt_count, image_request_count
             candidates = target[len(selected) :]
             if not candidates:
-                return "CANDIDATES_EXHAUSTED", provider_attempt_count
+                return "CANDIDATES_EXHAUSTED", provider_attempt_count, image_request_count
             batch = self._run_batch(
                 candidates,
                 speech=speech,
@@ -352,11 +371,12 @@ class AdaptiveOcrRunner:
             )
             _append_batch(batch, selected, evidence, observations, warnings)
             provider_attempt_count += batch.provider_attempt_count
+            image_request_count += batch.image_request_count
             if batch.reached_deadline:
                 warnings.append(_OCR_BUDGET_TIME_LIMIT_WARNING)
-                return "TIME_LIMIT_REACHED", provider_attempt_count
+                return "TIME_LIMIT_REACHED", provider_attempt_count, image_request_count
             if len(batch.keyframes) < batch_size:
-                return "CANDIDATES_EXHAUSTED", provider_attempt_count
+                return "CANDIDATES_EXHAUSTED", provider_attempt_count, image_request_count
             new_text_count = batch_new_text_count(
                 batch.observations,
                 previous_texts=seen_texts,
@@ -366,7 +386,7 @@ class AdaptiveOcrRunner:
             _check_cancelled(is_cancel_requested)
             if self._clock() >= deadline:
                 warnings.append(_OCR_BUDGET_TIME_LIMIT_WARNING)
-                return "TIME_LIMIT_REACHED", provider_attempt_count
+                return "TIME_LIMIT_REACHED", provider_attempt_count, image_request_count
             seen_texts.extend(
                 effective_frame_texts(
                     batch.observations,
@@ -377,10 +397,10 @@ class AdaptiveOcrRunner:
             _check_cancelled(is_cancel_requested)
             if self._clock() >= deadline:
                 warnings.append(_OCR_BUDGET_TIME_LIMIT_WARNING)
-                return "TIME_LIMIT_REACHED", provider_attempt_count
+                return "TIME_LIMIT_REACHED", provider_attempt_count, image_request_count
             if batch_size == 3 and new_text_count < 2:
-                return "MARGINAL_VALUE_LOW", provider_attempt_count
-        return "HARD_LIMIT_REACHED", provider_attempt_count
+                return "MARGINAL_VALUE_LOW", provider_attempt_count, image_request_count
+        return "HARD_LIMIT_REACHED", provider_attempt_count, image_request_count
 
 
 def ocr_language(

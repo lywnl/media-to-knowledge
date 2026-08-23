@@ -8,7 +8,12 @@ from sqlalchemy import Select, and_, delete, exists, or_, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
-from video_demo.domain.result import VideoSegment, VideoSummary, VideoUnderstandingResult
+from video_demo.domain.result import (
+    SUPPORTED_RESULT_SCHEMA_VERSIONS,
+    VideoSegment,
+    VideoSummary,
+    VideoUnderstandingResult,
+)
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.models import (
     JobModel,
@@ -933,7 +938,14 @@ class ResultRepository:
         )
         if not segments or summary is None:
             return None
+        versions = {str(item.schema_version) for item in segments} | {str(summary.schema_version)}
+        if not versions.issubset(SUPPORTED_RESULT_SCHEMA_VERSIONS) or len(versions) != 1:
+            raise VideoDemoError(
+                ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                "结果行 Schema 版本非法或不一致",
+            )
         return VideoUnderstandingResult(
+            # 旧结果行仍可按 1.0.0 双读，新写入结果由领域模型默认升级到 2.0.0。
             schema_version=summary.schema_version,
             run_id=run_id,
             asset_sha256=asset_sha256,

@@ -597,6 +597,7 @@ def _audio_phase(
                 probed.asset.source_path,
                 probed.asset.run_relative_root,
                 has_audio=True,
+                duration_ms=probed.duration_ms,
                 input_fd=source_descriptor,
                 output_fd=staged.descriptor,
             )
@@ -612,6 +613,7 @@ def _audio_phase(
             probed.asset.source_path,
             probed.asset.run_relative_root,
             has_audio=False,
+            duration_ms=probed.duration_ms,
         )
     warnings = list(probed.warnings)
     audio_path: Path | None = None

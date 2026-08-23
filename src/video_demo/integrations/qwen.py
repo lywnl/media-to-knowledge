@@ -8,7 +8,7 @@ import math
 import socket
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Annotated, Literal, TypeVar, overload
 from urllib.parse import SplitResult, urlsplit
@@ -45,7 +45,6 @@ from video_demo.integrations.prompts import (
     render_summary_segments,
     render_whole_video_evidence,
     select_spread_items,
-    whole_video_group_window_indexes,
 )
 from video_demo.integrations.video_port import (
     SegmentSummaryInput,
@@ -354,25 +353,11 @@ class QwenVideoClient:
             compact = _CompactWholeVideoUnderstanding.model_validate(content)
             if len(compact.group_summaries) > len(request.windows):
                 raise ValueError("Qwen 返回语义组数量非法")
-            group_indexes = whole_video_group_window_indexes(
-                request,
-                len(compact.group_summaries),
-            )
-            group_by_window = {
-                window_index: group_summary
-                for group_summary, window_indexes in zip(
-                    compact.group_summaries,
-                    group_indexes,
-                    strict=True,
-                )
-                for window_index in window_indexes
-            }
             return WholeVideoUnderstanding(
                 windows=tuple(
                     WholeVideoWindowUnderstanding(
                         window_id=window.window_id,
-                        understanding=_map_group_summary_to_window(
-                            group_by_window[window_index],
+                        understanding=_map_window_to_local_understanding(
                             request,
                             window_index,
                         ),
@@ -381,7 +366,10 @@ class QwenVideoClient:
                 ),
                 summary=SummaryUnderstanding(
                     title=compact.title,
-                    summary_zh=compact.summary_zh,
+                    summary_zh=_merge_summary_units(
+                        compact.group_summaries,
+                        compact.summary_zh,
+                    ),
                     topics=compact.topics,
                     keywords=compact.keywords,
                 ),
@@ -994,6 +982,7 @@ def _fallback_segment_understanding(
         for item in request.evidence
         if isinstance(item, SceneBoundary)
     )
+    visual_facts = tuple(dict.fromkeys(scene_values))
     return SegmentUnderstanding(
         title=title[:200],
         summary_zh=title[:4000],
@@ -1002,6 +991,7 @@ def _fallback_segment_understanding(
         topics=tuple(dict.fromkeys((*event_values, *scene_values))),
         keywords=keywords,
         original_keywords=keywords,
+        visual_facts=visual_facts,
         evidence_refs=tuple(item.evidence_id for item in request.evidence),
     )
 
@@ -1011,8 +1001,7 @@ def _truncate_local_semantic_text(value: str, limit: int) -> str:
     return normalized if len(normalized) <= limit else normalized[: limit - 1] + "…"
 
 
-def _map_group_summary_to_window(
-    group_summary: str,
+def _map_window_to_local_understanding(
     request: WholeVideoUnderstandingRequest,
     window_index: int,
 ) -> SegmentUnderstanding:
@@ -1030,20 +1019,36 @@ def _map_group_summary_to_window(
             evidence=window.evidence,
         ),
     )
-    normalized_group = " ".join(group_summary.split())
-    summary_zh = f"{normalized_group}；本地证据：{local.summary_zh}"
     return SegmentUnderstanding(
         title=local.title,
-        summary_zh=summary_zh[:4000],
+        summary_zh=local.summary_zh,
         speakers=local.speakers,
         languages=local.languages,
-        topics=tuple(dict.fromkeys((normalized_group, *local.topics))),
+        topics=local.topics,
         entities=local.entities,
         actions=local.actions,
         keywords=local.keywords,
         original_keywords=local.original_keywords,
+        visual_facts=local.visual_facts,
         evidence_refs=tuple(item.evidence_id for item in window.evidence),
     )
+
+
+def _merge_summary_units(
+    summary_units: Sequence[str],
+    compact_summary: str | None = None,
+) -> str:
+    """按固定顺序合并视频级摘要，并删除完全重复的语义单元。"""
+
+    candidates = ((compact_summary,) if compact_summary is not None else ()) + tuple(
+        summary_units
+    )
+    ordered: list[str] = []
+    for value in candidates:
+        normalized = " ".join(value.split())
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
+    return _truncate_local_semantic_text("；".join(ordered), 4_000)
 
 
 def _fallback_summary_understanding(
@@ -1052,7 +1057,9 @@ def _fallback_summary_understanding(
     first = request.segments[0].understanding
     return SummaryUnderstanding(
         title=first.title,
-        summary_zh="；".join(item.understanding.summary_zh for item in request.segments),
+        summary_zh=_merge_summary_units(
+            tuple(item.understanding.summary_zh for item in request.segments),
+        ),
         speakers=_ordered_values(request, "speakers"),
         languages=_ordered_values(request, "languages"),
         topics=_ordered_values(request, "topics"),

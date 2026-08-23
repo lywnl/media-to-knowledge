@@ -6,6 +6,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from video_demo.application.composition import build_production_model_identity_report
 from video_demo.config import Settings, resolve_workspace_path
 from video_demo.errors import ErrorCode, VideoDemoError
 
@@ -27,6 +28,8 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(settings.qwen_max_video_bytes, 64 * 1024 * 1024)
             self.assertEqual(settings.qwen_max_video_duration_ms, 30_000)
             self.assertEqual(settings.qwen_timeout_seconds, 300.0)
+            self.assertEqual(settings.speech_subprocess_timeout_seconds, 1_800)
+            self.assertEqual(settings.speech_enrichment_timeout_seconds, 600)
             self.assertEqual(settings.oss_prefix, "video-demo/qwen-clips")
             self.assertEqual(settings.oss_signed_url_ttl_seconds, 3_600)
             self.assertFalse(settings.has_complete_oss_configuration())
@@ -49,6 +52,22 @@ class SettingsTest(unittest.TestCase):
             self.assertTrue(settings.has_complete_oss_configuration())
             self.assertNotIn("test-access-key-id", serialized)
             self.assertNotIn("test-access-key-secret", serialized)
+
+    def test_speech_enrichment_timeout_changes_settings_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            baseline = build_production_model_identity_report(
+                Settings(workspace_root=workspace, _env_file=None),
+            )
+            changed = build_production_model_identity_report(
+                Settings(
+                    workspace_root=workspace,
+                    speech_enrichment_timeout_seconds=601,
+                    _env_file=None,
+                ),
+            )
+
+            self.assertNotEqual(baseline.settings_fingerprint, changed.settings_fingerprint)
 
     def test_partial_oss_configuration_is_rejected(self) -> None:
         with (

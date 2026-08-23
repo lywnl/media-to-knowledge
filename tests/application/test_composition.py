@@ -283,7 +283,7 @@ def test_production_pipeline_reuses_complete_orchestration_and_builds_retrieval_
 
     assert outcome.status == RunStatus.SUCCEEDED
     segment = outcome.result.segments[0]
-    assert segment.retrieval_text.startswith("标题：")
+    assert segment.retrieval_text.startswith("文档类型：VIDEO_SEGMENT")
     assert segment.retrieval_hash == hashlib.sha256(
         segment.retrieval_text.encode("utf-8"),
     ).hexdigest()

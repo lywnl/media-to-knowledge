@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from video_demo.speech.vad import RawVadSpan, build_vad_result
+from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.speech.vad import RawVadSpan, SileroVadAdapter, build_vad_result
 
 
 def test_vad_merges_short_gaps_and_keeps_long_silence_boundaries() -> None:
@@ -41,6 +42,77 @@ def test_vad_empty_speech_covers_whole_audio_as_silence() -> None:
     assert result.speech == ()
     assert [(item.start_ms, item.end_ms) for item in result.silence] == [(0, 3_000)]
     assert result.warnings == ("NO_SPEECH_DETECTED",)
+
+
+def test_vad_clamps_only_one_millisecond_quantization_tail() -> None:
+    result = build_vad_result(
+        duration_ms=1_000,
+        raw_spans=(RawVadSpan(start_ms=100, end_ms=1_001, confidence=0.9),),
+        merge_gap_ms=200,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in result.speech] == [(100, 1_000)]
+    assert [(item.start_ms, item.end_ms) for item in result.silence] == [(0, 100)]
+
+
+def test_silero_adapter_maps_material_timeline_overrun_to_audio_invalid(
+    tmp_path: Path,
+) -> None:
+    class Backend:
+        def load_audio(self, _path: Path, _sampling_rate: int) -> object:
+            return object()
+
+        def speech_timestamps(
+            self,
+            _audio: object,
+            *,
+            sampling_rate: int,
+            threshold: float,
+        ) -> list[dict[str, int]]:
+            del sampling_rate, threshold
+            return [{"start": 0, "end": 16_032}]
+
+        def interval_confidence(self, *_args: object, **_kwargs: object) -> float:
+            return 0.9
+
+    with pytest.raises(VideoDemoError) as raised:
+        SileroVadAdapter(Backend()).detect(
+            tmp_path / "audio.wav",
+            duration_ms=1_000,
+        )
+
+    assert raised.value.code == ErrorCode.SPEECH_AUDIO_INVALID
+    assert raised.value.__cause__ is None
+
+
+def test_silero_adapter_maps_invalid_confidence_to_model_unavailable(
+    tmp_path: Path,
+) -> None:
+    class Backend:
+        def load_audio(self, _path: Path, _sampling_rate: int) -> object:
+            return object()
+
+        def speech_timestamps(
+            self,
+            _audio: object,
+            *,
+            sampling_rate: int,
+            threshold: float,
+        ) -> list[dict[str, int]]:
+            del sampling_rate, threshold
+            return [{"start": 0, "end": 8_000}]
+
+        def interval_confidence(self, *_args: object, **_kwargs: object) -> float:
+            return 1.1
+
+    with pytest.raises(VideoDemoError) as raised:
+        SileroVadAdapter(Backend()).detect(
+            tmp_path / "audio.wav",
+            duration_ms=1_000,
+        )
+
+    assert raised.value.code == ErrorCode.SPEECH_MODEL_UNAVAILABLE
+    assert raised.value.__cause__ is None
 
 
 def test_silero_adapter_uses_16khz_and_real_interval_scores(tmp_path: Path) -> None:

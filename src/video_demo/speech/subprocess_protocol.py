@@ -77,6 +77,9 @@ class SpeechSubprocessRequest(FrozenModel):
     credentials: SpeechSubprocessCredentials
     asr_fingerprint: Sha256
     allow_speaker_fallback: bool = False
+    stage: Literal["ASR", "ENRICHMENT"]
+    speech_fingerprint: Sha256 | None = None
+    asr_payload_receipt: ArtifactReceipt | None = None
 
     @model_validator(mode="after")
     def validate_relative_paths(self) -> Self:
@@ -90,6 +93,19 @@ class SpeechSubprocessRequest(FrozenModel):
             or not audio.is_relative_to(run_root)
         ):
             raise ValueError("语音子进程路径必须属于当前运行目录")
+        if self.stage == "ASR":
+            token = self.credentials.huggingface_token
+            if token is not None and token.get_secret_value():
+                raise ValueError("ASR 请求不得携带 Hugging Face Token")
+            if self.speech_fingerprint is not None or self.asr_payload_receipt is not None:
+                raise ValueError("ASR 请求不得携带增强目标或上游回执")
+        else:
+            if self.config.speech_enrichment_mode != "full":
+                raise ValueError("ENRICHMENT 请求必须使用 full 模式")
+            if self.speech_fingerprint is None or self.asr_payload_receipt is None:
+                raise ValueError("ENRICHMENT 请求必须携带目标指纹和 ASR 回执")
+            if self.asr_payload_receipt.upstream_sha256 != self.asr_fingerprint:
+                raise ValueError("ENRICHMENT 请求上游回执必须绑定 ASR 指纹")
         return self
 
 
@@ -97,6 +113,7 @@ class SpeechSubprocessSuccess(FrozenModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     status: Literal["SUCCEEDED"] = "SUCCEEDED"
     request_id: StableId
+    stage: Literal["ASR", "ENRICHMENT"]
     speech_fingerprint: Sha256
     payload_receipt: ArtifactReceipt
 
@@ -105,6 +122,7 @@ class SpeechSubprocessFailure(FrozenModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     status: Literal["FAILED"] = "FAILED"
     request_id: StableId
+    stage: Literal["ASR", "ENRICHMENT"]
     error_code: ErrorCode
     message: str = Field(min_length=1, max_length=200)
 

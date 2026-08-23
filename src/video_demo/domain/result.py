@@ -17,6 +17,9 @@ from video_demo.domain.evidence import SpeakerId, TimedEvidence
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 
+RESULT_SCHEMA_VERSION: Literal["2.0.0"] = "2.0.0"
+SUPPORTED_RESULT_SCHEMA_VERSIONS = frozenset({"1.0.0", RESULT_SCHEMA_VERSION})
+
 
 class SemanticFields(UniqueStringTuplesMixin, FrozenModel):
     title: str = Field(min_length=1, max_length=200)
@@ -33,6 +36,7 @@ class SemanticFields(UniqueStringTuplesMixin, FrozenModel):
 class SegmentUnderstanding(SemanticFields):
     """Qwen 可返回的片段语义; 此契约故意不包含时间字段。"""
 
+    visual_facts: tuple[str, ...] = ()
     evidence_refs: tuple[StableId, ...] = Field(min_length=1)
 
 
@@ -46,6 +50,11 @@ class VideoSegment(TimeRange, SemanticFields):
     evidence_refs: tuple[StableId, ...] = Field(min_length=1)
     retrieval_text: str = Field(min_length=1)
     retrieval_hash: Sha256
+    video_title: str = ""
+    transcript_text: str = ""
+    ocr_text: tuple[str, ...] = ()
+    visual_facts: tuple[str, ...] = ()
+    transcript_source: Literal["SUBTITLE", "ASR", "NONE"] = "NONE"
 
     @model_validator(mode="after")
     def validate_retrieval_hash(self) -> Self:
@@ -72,7 +81,8 @@ class VideoSummary(SemanticFields):
 
 
 class VideoUnderstandingResult(FrozenModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    # 1.0.0 仍允许读取历史 bundle；新结果统一写入 2.0.0。
+    schema_version: Literal["1.0.0", "2.0.0"] = RESULT_SCHEMA_VERSION
     run_id: StableId
     asset_sha256: Sha256
     segments: tuple[VideoSegment, ...] = Field(min_length=1)

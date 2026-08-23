@@ -17,6 +17,7 @@ from video_demo.speech.runtime import build_subprocess_component_factory
 from video_demo.speech.snapshots import (
     AsrSnapshotPayload,
     SpeechAnalysisSnapshotPayload,
+    asr_fingerprint,
     speech_fingerprint,
 )
 from video_demo.speech.subprocess_protocol import (
@@ -71,6 +72,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             response = SpeechSubprocessFailure(
                 request_id=request.request_id,
+                stage=request.stage,
                 error_code=code,
                 message=speech_subprocess_failure_message(code),
             )
@@ -100,10 +102,7 @@ def _execute_request(
         digest=_sha256_file,
         message="语音音频必须位于当前运行目录内",
     )
-    actual_asr_fingerprint = __import__(
-        "video_demo.speech.snapshots",
-        fromlist=["asr_fingerprint"],
-    ).asr_fingerprint(
+    actual_asr_fingerprint = asr_fingerprint(
         audio_sha256=request.audio_sha256,
         duration_ms=request.duration_ms,
         language_hints=request.config.language_hints,
@@ -157,19 +156,38 @@ def _execute_request(
         fingerprint_inputs=request.runtime.fingerprint_inputs(),
         allow_speaker_fallback=request.allow_speaker_fallback,
     )
-    analyzer.analyze(media)
+    run_root = Path(request.run_relative_root)
+    if request.stage == "ASR":
+        # ASR 阶段只执行 VAD/LID/faster-whisper；full 模式的增强必须由独立
+        # ENRICHMENT 请求触发，不能通过 analyzer.analyze() 误跑增强链路。
+        components = component_factory(media, lambda: False)
+        asr_payload = analyzer.run_asr_stage(media, components)
+        snapshots.publish(run_root, "asr", request.asr_fingerprint, asr_payload)
+        cached_asr = snapshots.load(
+            run_root, "asr", request.asr_fingerprint, AsrSnapshotPayload
+        )
+        if cached_asr is None:
+            raise VideoDemoError(
+                ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID,
+                "语音子进程未发布 ASR 快照",
+            )
+        return SpeechSubprocessSuccess(
+            request_id=request.request_id,
+            stage="ASR",
+            speech_fingerprint=request.asr_fingerprint,
+            payload_receipt=cached_asr[1],
+        )
+    if request.asr_payload_receipt is None or request.speech_fingerprint is None:
+        raise VideoDemoError(ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID, "增强请求缺少 ASR 绑定")
     cached_asr = snapshots.load(
-        Path(request.run_relative_root),
-        "asr",
-        request.asr_fingerprint,
-        AsrSnapshotPayload,
+        run_root, "asr", request.asr_fingerprint, AsrSnapshotPayload
     )
-    if cached_asr is None:
+    if cached_asr is None or cached_asr[1] != request.asr_payload_receipt:
         raise VideoDemoError(
             ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID,
-            "语音子进程未发布 ASR 快照",
+            "增强请求 ASR 快照校验失败",
         )
-    speech_key = speech_fingerprint(
+    expected_speech_fingerprint = speech_fingerprint(
         processing_mode="ASR",
         transcript_payload_sha256=cached_asr[1].sha256,
         media_warnings=request.media_warnings,
@@ -177,25 +195,32 @@ def _execute_request(
         max_speakers=request.config.max_speakers,
         allow_speaker_fallback=request.allow_speaker_fallback,
         inputs=request.runtime.fingerprint_inputs(),
+        enrichment_mode="full",
     )
-    cached_speech = snapshots.load(
-        Path(request.run_relative_root),
-        "speech",
-        speech_key,
-        SpeechAnalysisSnapshotPayload,
-    )
-    if cached_speech is None:
+    if request.speech_fingerprint != expected_speech_fingerprint:
         raise VideoDemoError(
             ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID,
-            "语音子进程未发布完整快照",
+            "增强请求完整指纹不匹配",
         )
+    components = component_factory(media, lambda: False)
+    analysis = analyzer.enrich_from_asr_snapshot(
+        media,
+        components,
+        cached_asr[0],
+        allow_speaker_fallback=request.allow_speaker_fallback,
+    )
+    speech_receipt = snapshots.publish(
+        run_root,
+        "speech",
+        request.speech_fingerprint,
+        SpeechAnalysisSnapshotPayload.from_analysis(analysis),
+    )
     return SpeechSubprocessSuccess(
         request_id=request.request_id,
-        speech_fingerprint=speech_key,
-        payload_receipt=cached_speech[1],
+        stage="ENRICHMENT",
+        speech_fingerprint=request.speech_fingerprint,
+        payload_receipt=speech_receipt,
     )
-
-
 def _trusted_roots(workspace_root: Path, runtime_root: Path) -> tuple[Path, Path]:
     if not workspace_root.is_absolute() or not runtime_root.is_absolute():
         raise ValueError("可信根必须是绝对路径")

@@ -256,7 +256,7 @@ def test_pipeline_runs_all_stages_and_returns_metrics(tmp_path: Path) -> None:
     assert set(calls[3:5]) == {"SPEECH", "VISUAL"}
     assert calls[5:] == ["UNDERSTANDING"]
     assert outcome.status == RunStatus.SUCCEEDED
-    assert outcome.result.segments[0].retrieval_text.startswith("标题：")
+    assert outcome.result.segments[0].retrieval_text.startswith("文档类型：VIDEO_SEGMENT")
     assert [metric.stage for metric in outcome.stage_metrics] == [
         "REGISTER",
         "PROBE",

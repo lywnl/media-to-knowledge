@@ -648,6 +648,26 @@ def test_ocr_budget_log_contains_only_aggregate_diagnostics(
     assert isinstance(record.ocr_selected_keyframe_count, int)
 
 
+def test_ocr_budget_log_separates_image_requests_from_provider_attempts(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger="video_demo.application.production_visual"):
+        _run_budget_visual(
+            tmp_path,
+            text_for_call=lambda _index: "同一页面内容" * 4,
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if "ocr_budget_complete" in record.getMessage()
+    )
+    assert isinstance(record.ocr_image_request_count, int)
+    assert record.ocr_image_request_count <= record.ocr_selected_keyframe_count
+    assert record.ocr_provider_attempt_count >= record.ocr_image_request_count
+
+
 def test_keyframe_limit_accepts_one_frame(tmp_path: Path) -> None:
     media = _media(tmp_path, duration_ms=4_000)
     windows = (

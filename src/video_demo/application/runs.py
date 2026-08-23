@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import ValidationError
 
@@ -57,6 +58,7 @@ class RunService:
         max_speakers: int | None,
         hotwords: tuple[str, ...] = (),
         core_context: str | None = None,
+        speech_enrichment_mode: Literal["text", "full"] = "text",
     ) -> RunView:
         config = PipelineRunConfig(
             language_hints=language_hints,
@@ -64,6 +66,7 @@ class RunService:
             max_speakers=max_speakers,
             hotwords=hotwords,
             core_context=core_context,
+            speech_enrichment_mode=speech_enrichment_mode,
         )
         config_snapshot = config.model_dump(mode="json")
         with self._database.session() as session:

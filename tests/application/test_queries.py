@@ -23,11 +23,20 @@ from video_demo.domain.result import (
     VideoSummary,
     VideoUnderstandingResult,
 )
-from video_demo.domain.result_artifact import TranscriptSource
+from video_demo.domain.result_artifact import (
+    ARTIFACT_ENVELOPE_SCHEMA_VERSION,
+    ResultArtifactPayload,
+    TranscriptSource,
+)
 from video_demo.domain.run import RunStatus
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
-from video_demo.persistence.models import JobStatus, RunStatusValue
+from video_demo.persistence.models import (
+    JobStatus,
+    RunStatusValue,
+    VideoSegmentModel,
+    VideoSummaryModel,
+)
 from video_demo.persistence.repositories import JobRepository, Scope, VideoRunRepository
 from video_demo.storage.artifacts import AtomicArtifactStore
 
@@ -109,6 +118,81 @@ def _scene_fixture() -> SceneBoundary:
     )
 
 
+def test_result_artifact_rejects_unknown_stage_and_invalid_cache_hit() -> None:
+    result = _result()
+    evidence = (_speech_fixture(),)
+    with pytest.raises(ValueError, match="阶段名称"):
+        ResultArtifactPayload(
+            result=result,
+            evidence=evidence,
+            stage_metrics={"UNKNOWN": 1},
+            status="SUCCEEDED",
+            warnings=(),
+            transcript_source="ASR",
+        )
+    with pytest.raises(ValueError, match="缓存命中"):
+        ResultArtifactPayload(
+            result=result,
+            evidence=evidence,
+            stage_metrics={"SPEECH_ASR": 1},
+            stage_cache_hits=("RESULT",),
+            status="SUCCEEDED",
+            warnings=(),
+            transcript_source="ASR",
+        )
+
+
+def test_result_artifact_requires_cache_hit_stage_to_have_zero_duration() -> None:
+    with pytest.raises(ValueError, match="耗时必须为 0"):
+        ResultArtifactPayload(
+            result=_result(),
+            evidence=(_speech_fixture(),),
+            stage_metrics={"SPEECH_ASR": 1},
+            stage_cache_hits=("SPEECH_ASR",),
+            status="SUCCEEDED",
+            warnings=(),
+            transcript_source="ASR",
+        )
+
+
+def test_result_artifact_rejects_non_speech_cache_hit_stage() -> None:
+    with pytest.raises(ValueError, match="语音子阶段"):
+        ResultArtifactPayload(
+            result=_result(),
+            evidence=(_speech_fixture(),),
+            stage_metrics={"RESULT": 0},
+            stage_cache_hits=("RESULT",),
+            status="SUCCEEDED",
+            warnings=(),
+            transcript_source="ASR",
+        )
+
+
+def test_result_repository_rejects_inconsistent_schema_versions(
+    result_service: tuple[ResultQueryService, Scope, Path],
+) -> None:
+    service, scope, runtime_root = result_service
+    service.persist(
+        scope,
+        _result(),
+        evidence=(_speech_fixture(),),
+        stage_metrics={},
+        status=RunStatus.SUCCEEDED,
+        transcript_source="ASR",
+        fence=_claim_fence(runtime_root),
+    )
+    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
+    with database.session() as session:
+        summary = session.query(VideoSummaryModel).one()
+        segment = session.query(VideoSegmentModel).one()
+        summary.schema_version = "1.0.0"
+        segment.schema_version = "2.0.0"
+
+    with pytest.raises(VideoDemoError) as raised:
+        service.get_result(scope, "run_001")
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+
+
 def _claim_fence(runtime_root: Path, worker_id: str = "worker-a") -> ResultWriteFence:
     database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
     with database.session() as session:
@@ -178,7 +262,8 @@ def test_result_bundle_persists_segments_summary_evidence_and_status(
         scope,
         _result(),
         evidence=(speech,),
-        stage_metrics={"RESULT": 12},
+        stage_metrics={"RESULT": 12, "SPEECH_ASR": 0},
+        stage_cache_hits=("SPEECH_ASR",),
         status=RunStatus.PARTIAL_SUCCEEDED,
         transcript_source="ASR",
         fence=_claim_fence(runtime_root),
@@ -190,6 +275,53 @@ def test_result_bundle_persists_segments_summary_evidence_and_status(
     assert page.items == (speech,)
     assert page.next_cursor is None
     assert service.get_run_metadata(scope, "run_001").status == RunStatus.PARTIAL_SUCCEEDED
+    metadata = service.get_run_metadata(scope, "run_001")
+    assert metadata.stage_metrics == {"RESULT": 12, "SPEECH_ASR": 0}
+    assert metadata.stage_cache_hits == ("SPEECH_ASR",)
+    bundle = service._read_bundle(scope, "run_001")
+    assert bundle["result"]["schema_version"] == "2.0.0"
+
+
+def test_production_query_reads_legacy_bundle_without_stage_cache_hits(
+    result_service: tuple[ResultQueryService, Scope, Path],
+) -> None:
+    service, scope, runtime_root = result_service
+    service.persist(
+        scope,
+        _result(),
+        evidence=(_speech_fixture(),),
+        stage_metrics={"RESULT": 12},
+        status=RunStatus.SUCCEEDED,
+        transcript_source="ASR",
+        fence=_claim_fence(runtime_root),
+    )
+    legacy_bundle = service._read_bundle(scope, "run_001")
+    legacy_bundle.pop("stage_cache_hits")
+    result_payload = legacy_bundle["result"]
+    assert isinstance(result_payload, dict)
+    result_payload["schema_version"] = "1.0.0"
+    replacement = AtomicArtifactStore(runtime_root).write_json(
+        Path("runs")
+        / service.scope_key(scope)
+        / "run_001"
+        / "result"
+        / "bundle-legacy.json",
+        legacy_bundle,
+        schema_version=ARTIFACT_ENVELOPE_SCHEMA_VERSION,
+        upstream_sha256="a" * 64,
+    )
+    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
+    with database.session() as session:
+        run = VideoRunRepository(session).get(scope, "run_001")
+        assert run is not None
+        run.artifact_manifest_relative_path = replacement.relative_path
+        run.artifact_manifest_sha256 = replacement.sha256
+
+    bundle = service._read_bundle(scope, "run_001")
+    metadata = service.get_run_metadata(scope, "run_001")
+
+    assert "stage_cache_hits" not in bundle
+    assert metadata.stage_cache_hits == ()
 
 
 @pytest.mark.parametrize(

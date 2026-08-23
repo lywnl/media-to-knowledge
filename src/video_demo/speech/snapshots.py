@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -54,11 +55,28 @@ class SpeechBoundaryCandidateSnapshot(FrozenModel):
 
 
 class SpeechAnalysisSnapshotPayload(FrozenModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.0.0", "2.0.0"] = "2.0.0"
+    enrichment_mode: Literal["text", "full"]
     evidence: tuple[EvidenceItem, ...]
     warnings: tuple[str, ...]
     boundary_candidates: tuple[SpeechBoundaryCandidateSnapshot, ...]
     transcript_source: TranscriptSource
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_enrichment_mode_by_version(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        version = value.get("schema_version", "2.0.0")
+        if version == "1.0.0":
+            if "enrichment_mode" not in value:
+                return {**value, "enrichment_mode": "full"}
+            if value["enrichment_mode"] != "full":
+                raise ValueError("历史语音快照只支持 full 模式")
+            return value
+        if version == "2.0.0" and "enrichment_mode" not in value:
+            raise ValueError("2.0.0 语音快照必须显式携带 enrichment_mode")
+        return value
 
     @model_validator(mode="after")
     def validate_transcript_source_evidence(self) -> SpeechAnalysisSnapshotPayload:
@@ -68,6 +86,10 @@ class SpeechAnalysisSnapshotPayload(FrozenModel):
             for item in self.evidence
             if isinstance(item, (SpeechSegment, AlignedWord, SpeakerTurn, AudioEvent))
         )
+        if self.enrichment_mode == "text" and any(
+            isinstance(item, (AlignedWord, SpeakerTurn, AudioEvent)) for item in self.evidence
+        ):
+            raise ValueError("text 模式快照不得包含词级、说话人或音频事件证据")
         if self.transcript_source == "SUBTITLE":
             if not subtitle_cues or asr_evidence:
                 raise ValueError("字幕快照必须包含字幕且不得包含 ASR 语音证据")
@@ -82,6 +104,7 @@ class SpeechAnalysisSnapshotPayload(FrozenModel):
     def from_analysis(cls, analysis: SpeechAnalysis) -> SpeechAnalysisSnapshotPayload:
         return cls(
             evidence=analysis.evidence,
+            enrichment_mode=analysis.enrichment_mode,
             warnings=analysis.warnings,
             boundary_candidates=tuple(
                 SpeechBoundaryCandidateSnapshot.from_candidate(candidate)
@@ -93,6 +116,7 @@ class SpeechAnalysisSnapshotPayload(FrozenModel):
     def to_analysis(self) -> SpeechAnalysis:
         return SpeechAnalysis(
             transcript_source=self.transcript_source,
+            enrichment_mode=self.enrichment_mode,
             evidence=self.evidence,
             warnings=self.warnings,
             boundary_candidates=tuple(
@@ -150,11 +174,47 @@ def speech_fingerprint(
     max_speakers: int | None,
     allow_speaker_fallback: bool,
     inputs: SpeechFingerprintInputs,
+    enrichment_mode: Literal["text", "full"] = "full",
 ) -> str:
     payload: dict[str, object] = {
         "schema_version": SpeechAnalysisSnapshotPayload.model_fields[
             "schema_version"
         ].default,
+        "processing_mode": processing_mode,
+        "enrichment_mode": enrichment_mode if processing_mode == "ASR" else "text",
+        "transcript_payload_sha256": transcript_payload_sha256,
+        "media_warnings": sorted(set(media_warnings)),
+    }
+    if processing_mode == "SUBTITLE":
+        payload["subtitle_passthrough_contract"] = "1.0.0"
+    elif enrichment_mode == "full":
+        payload.update(
+            {
+                "model_identities": _model_payload(inputs, _DOWNSTREAM_COMPONENTS),
+                "min_speakers": min_speakers,
+                "max_speakers": max_speakers,
+                "allow_speaker_fallback": allow_speaker_fallback,
+                "yamnet_class_map_sha256": inputs.yamnet_class_map_sha256,
+                "yamnet_thresholds_sha256": inputs.yamnet_thresholds_sha256,
+            }
+        )
+    return _canonical_sha256(payload)
+
+
+def _speech_fingerprint_v1(
+    *,
+    processing_mode: Literal["SUBTITLE", "ASR"],
+    transcript_payload_sha256: str,
+    media_warnings: tuple[str, ...],
+    min_speakers: int | None,
+    max_speakers: int | None,
+    allow_speaker_fallback: bool,
+    inputs: SpeechFingerprintInputs,
+) -> str:
+    """重建历史 1.0.0 speech 指纹，仅用于仍指向旧快照的兼容读取。"""
+
+    payload: dict[str, object] = {
+        "schema_version": "1.0.0",
         "processing_mode": processing_mode,
         "transcript_payload_sha256": transcript_payload_sha256,
         "media_warnings": sorted(set(media_warnings)),
@@ -170,7 +230,7 @@ def speech_fingerprint(
                 "allow_speaker_fallback": allow_speaker_fallback,
                 "yamnet_class_map_sha256": inputs.yamnet_class_map_sha256,
                 "yamnet_thresholds_sha256": inputs.yamnet_thresholds_sha256,
-            }
+            },
         )
     return _canonical_sha256(payload)
 

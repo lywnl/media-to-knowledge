@@ -50,6 +50,7 @@ def create_video_run(
             max_speakers=payload.max_speakers,
             hotwords=payload.hotwords,
             core_context=payload.core_context,
+            speech_enrichment_mode=payload.speech_enrichment_mode,
         ),
     )
 

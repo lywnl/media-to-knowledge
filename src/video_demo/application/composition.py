@@ -339,6 +339,7 @@ def _settings_fingerprint(settings: Settings) -> str:
             "max_video_bytes": settings.max_video_bytes,
             "demo_degraded_mode": settings.demo_degraded_mode,
             "speech_subprocess_timeout_seconds": settings.speech_subprocess_timeout_seconds,
+            "speech_enrichment_timeout_seconds": settings.speech_enrichment_timeout_seconds,
         },
         "model_cache": {
             "root": _workspace_relative(settings, model_root),
@@ -491,7 +492,8 @@ def build_production_pipeline(
                 credentials=SpeechSubprocessCredentials(
                     huggingface_token=settings.huggingface_token,
                 ),
-                timeout_seconds=settings.speech_subprocess_timeout_seconds,
+                asr_timeout_seconds=settings.speech_subprocess_timeout_seconds,
+                enrichment_timeout_seconds=settings.speech_enrichment_timeout_seconds,
                 allow_speaker_fallback=settings.demo_degraded_mode,
             ),
             ProductionVisualAnalyzer(

@@ -32,6 +32,7 @@ class CreateRunRequest(ApiModel):
     max_speakers: int | None = Field(default=None, ge=1, le=10)
     hotwords: tuple[str, ...] = Field(default=(), max_length=50)
     core_context: str | None = Field(default=None, max_length=1000)
+    speech_enrichment_mode: Literal["text", "full"] = "text"
 
     @model_validator(mode="after")
     def validate_speaker_range(self) -> Self:

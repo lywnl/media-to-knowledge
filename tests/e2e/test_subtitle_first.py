@@ -27,9 +27,7 @@ from video_demo.media.transcode import (
 from video_demo.speech.isolated import IsolatedSpeechAnalyzer
 from video_demo.speech.snapshots import (
     AsrSnapshotPayload,
-    SpeechAnalysisSnapshotPayload,
     SpeechFingerprintInputs,
-    speech_fingerprint,
 )
 from video_demo.speech.subprocess_protocol import (
     SpeechRuntimeConfig,
@@ -102,7 +100,7 @@ def test_subtitle_eligibility_controls_audio_and_isolated_speech_route(
         assert not (runtime_root / "runs/scope/run_001/media/audio.wav").exists()
         assert not (runtime_root / "runs/scope/run_001/speech/ipc").exists()
     else:
-        assert transcoder.extract_audio_calls == [True]
+        assert transcoder.extract_audio_calls == [(True, 30_000)]
         assert media.audio_path is not None
         assert process_calls == 1
         assert "SUBTITLE_TRACK_REJECTED:2:INCOMPLETE" in result.warnings
@@ -193,7 +191,7 @@ def test_pgs_is_detected_but_never_parsed_as_text_before_asr(tmp_path: Path) -> 
         "hdmv_pgs_subtitle"
     ]
     assert transcoder.extract_subtitle_calls == []
-    assert transcoder.extract_audio_calls == [True]
+    assert transcoder.extract_audio_calls == [(True, 120_000)]
     assert media.subtitle is None
     assert media.audio_path is not None
 
@@ -248,7 +246,7 @@ def test_retry_after_crash_reuses_published_asr_snapshot(tmp_path: Path) -> None
 
     assert raised.value.code == ErrorCode.SPEECH_SUBPROCESS_CRASHED
     assert result.transcript_source == "ASR"
-    assert process_calls == 2
+    assert process_calls == 1
     assert recognizer_calls == 1
     assert tuple((runtime_root / "runs/scope/run_001/speech/ipc").iterdir()) == ()
 
@@ -341,7 +339,7 @@ class _RecordingTranscoder:
         self.runtime_root = runtime_root
         self.subtitle_payloads = subtitle_payloads
         self.extract_subtitle_calls: list[int] = []
-        self.extract_audio_calls: list[bool] = []
+        self.extract_audio_calls: list[tuple[bool, int]] = []
 
     def create_proxy(self, _source: Path, root: Path) -> ProxyVideoArtifact:
         relative = root / "media/proxy.mp4"
@@ -383,8 +381,9 @@ class _RecordingTranscoder:
         root: Path,
         *,
         has_audio: bool,
+        duration_ms: int,
     ) -> AudioArtifact:
-        self.extract_audio_calls.append(has_audio)
+        self.extract_audio_calls.append((has_audio, duration_ms))
         payload = b"wav"
         relative = root / "media/audio.wav"
         output = self.runtime_root / relative
@@ -435,6 +434,7 @@ def _publish_successful_asr_response(
     if request is None:
         envelope = json.loads((runtime_root / request_path).read_text(encoding="utf-8"))
         request = SpeechSubprocessRequest.model_validate(envelope["payload"])
+    assert request.stage == "ASR"
     snapshots = SnapshotStore(AtomicArtifactStore(runtime_root))
     if asr_receipt_sha256 is None:
         asr_receipt_sha256 = snapshots.publish(
@@ -443,32 +443,21 @@ def _publish_successful_asr_response(
             request.asr_fingerprint,
             _asr_payload(),
         ).sha256
-    speech_key = speech_fingerprint(
-        processing_mode="ASR",
-        transcript_payload_sha256=asr_receipt_sha256,
-        media_warnings=request.media_warnings,
-        min_speakers=request.config.min_speakers,
-        max_speakers=request.config.max_speakers,
-        allow_speaker_fallback=request.allow_speaker_fallback,
-        inputs=request.runtime.fingerprint_inputs(),
-    )
-    speech_receipt = snapshots.publish(
+    asr_receipt = snapshots.load(
         Path(request.run_relative_root),
-        "speech",
-        speech_key,
-        SpeechAnalysisSnapshotPayload(
-            evidence=_asr_payload().segments,
-            warnings=request.media_warnings,
-            boundary_candidates=(),
-            transcript_source="ASR",
-        ),
+        "asr",
+        request.asr_fingerprint,
+        AsrSnapshotPayload,
     )
+    if asr_receipt is None:
+        raise AssertionError("测试辅助函数未发布 ASR 快照")
     response = {
         "schema_version": "1.0.0",
         "status": "SUCCEEDED",
         "request_id": request.request_id,
-        "speech_fingerprint": speech_key,
-        "payload_receipt": speech_receipt.model_dump(mode="json"),
+        "stage": "ASR",
+        "speech_fingerprint": request.asr_fingerprint,
+        "payload_receipt": asr_receipt[1].model_dump(mode="json"),
     }
     AtomicArtifactStore(runtime_root).write_json(
         response_path,

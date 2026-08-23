@@ -25,9 +25,16 @@ class OcrProviderResponse(FrozenModel):
 class OcrDeadlineExceeded(RuntimeError):
     """OCR 成本截止时间已到；仅用于内部正常降级，不代表供应商故障。"""
 
-    def __init__(self, message: str, *, provider_attempt_count: int = 0) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_attempt_count: int = 0,
+        image_request_count: int = 0,
+    ) -> None:
         super().__init__(message)
         self.provider_attempt_count = provider_attempt_count
+        self.image_request_count = image_request_count
 
 
 class OcrClient(Protocol):
@@ -54,6 +61,7 @@ class KeyframeForOcr(FrozenModel):
 class OcrProcessResult:
     evidence: tuple[OcrEvidence, ...]
     provider_attempt_count: int
+    image_request_count: int
     image_sizes: tuple[tuple[int | None, int | None], ...]
 
 
@@ -72,6 +80,9 @@ class OcrProcessor:
         self._allowed_root = allowed_root.resolve(strict=True)
         self._max_image_bytes = max_image_bytes
         self._clock = clock
+        # 只按内容摘要和语言缓存供应商结果；时间戳、窗口和 keyframe ID 不参与
+        # 缓存键，避免同一图片在不同批次重复计费，同时仍为每个时间位置生成证据。
+        self._response_cache: dict[tuple[str, str], OcrProviderResponse] = {}
 
     def process(self, keyframes: Sequence[KeyframeForOcr]) -> tuple[OcrEvidence, ...]:
         return self.process_with_diagnostics(keyframes).evidence
@@ -81,30 +92,63 @@ class OcrProcessor:
         keyframes: Sequence[KeyframeForOcr],
         *,
         deadline: float | None = None,
+        reuse_cache: bool = False,
     ) -> OcrProcessResult:
         evidence: list[OcrEvidence] = []
         image_sizes: list[tuple[int | None, int | None]] = []
         provider_attempt_count = 0
+        responses = self._response_cache if reuse_cache else {}
+        image_request_count = 0
         for keyframe in keyframes:
-            self._check_deadline(deadline)
+            self._check_deadline(
+                deadline,
+                provider_attempt_count=provider_attempt_count,
+                image_request_count=image_request_count,
+            )
             image = self._read_image(keyframe)
             image_sizes.append(_image_size(image))
-            self._check_deadline(deadline)
-            response = (
-                self._client.recognize(image, keyframe.language)
-                if deadline is None
-                else self._client.recognize(
-                    image,
-                    keyframe.language,
-                    deadline=deadline,
-                )
+            self._check_deadline(
+                deadline,
+                provider_attempt_count=provider_attempt_count,
+                image_request_count=image_request_count,
             )
+            cache_key = (keyframe.source_sha256, keyframe.language)
+            response = responses.get(cache_key)
+            cached_response = response is not None
+            if response is None:
+                image_request_count += 1
+                try:
+                    response = (
+                        self._client.recognize(image, keyframe.language)
+                        if deadline is None
+                        else self._client.recognize(
+                            image,
+                            keyframe.language,
+                            deadline=deadline,
+                        )
+                    )
+                except OcrDeadlineExceeded as error:
+                    raise OcrDeadlineExceeded(
+                        str(error),
+                        provider_attempt_count=(
+                            provider_attempt_count + error.provider_attempt_count
+                        ),
+                        image_request_count=image_request_count,
+                    ) from error
             if deadline is not None and self._clock() >= deadline:
                 raise OcrDeadlineExceeded(
                     "OCR 全局截止时间已到",
-                    provider_attempt_count=response.provider_attempt_count,
+                    provider_attempt_count=(
+                        provider_attempt_count
+                        + (0 if cached_response else response.provider_attempt_count)
+                    ),
+                    image_request_count=image_request_count,
                 )
-            provider_attempt_count += response.provider_attempt_count
+            if response is None:
+                raise RuntimeError("OCR 响应缓存状态非法")
+            if not cached_response:
+                responses[cache_key] = response
+                provider_attempt_count += response.provider_attempt_count
             evidence.append(
                 OcrEvidence(
                     evidence_id=stable_identifier(
@@ -127,12 +171,23 @@ class OcrProcessor:
         return OcrProcessResult(
             evidence=tuple(evidence),
             provider_attempt_count=provider_attempt_count,
+            image_request_count=image_request_count,
             image_sizes=tuple(image_sizes),
         )
 
-    def _check_deadline(self, deadline: float | None) -> None:
+    def _check_deadline(
+        self,
+        deadline: float | None,
+        *,
+        provider_attempt_count: int,
+        image_request_count: int,
+    ) -> None:
         if deadline is not None and self._clock() >= deadline:
-            raise OcrDeadlineExceeded("OCR 全局截止时间已到")
+            raise OcrDeadlineExceeded(
+                "OCR 全局截止时间已到",
+                provider_attempt_count=provider_attempt_count,
+                image_request_count=image_request_count,
+            )
 
     def _read_image(self, keyframe: KeyframeForOcr) -> bytes:
         path = reject_symlink_components(

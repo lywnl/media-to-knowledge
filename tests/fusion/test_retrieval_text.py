@@ -37,17 +37,25 @@ def test_segment_retrieval_text_has_fixed_chinese_field_order_and_stable_hash() 
     segment = segments[0]
 
     assert segment.retrieval_text.splitlines() == [
-        "标题：产品 演示",
-        "时间范围(毫秒)：[0, 1000)",
-        "中文摘要：展示 视频理解能力。 生成检索文本。",
-        "说话人：SPEAKER_01",
+        "文档类型：VIDEO_SEGMENT",
+        "视频标题：未提供",
+        "片段标题：产品 演示",
+        "时间范围：[0, 1000)",
+        "文本来源：NONE",
         "语言：zh、en",
+        "",
+        "局部摘要：展示 视频理解能力。 生成检索文本。",
+        "原始文本：无",
+        "画面事实：无",
+        "OCR文字：无",
         "主题：视频检索",
         "实体：Qwen",
         "动作：演示",
         "关键词：视频理解",
         "原语言关键词：retrieval_text",
     ]
+    assert "segment_id" not in segment.retrieval_text
+    assert "evidence_refs" not in segment.retrieval_text
     assert render_segment_retrieval_text(segment) == segment.retrieval_text
     assert segment.retrieval_hash == hashlib.sha256(
         segment.retrieval_text.encode("utf-8"),

@@ -237,7 +237,152 @@ def test_ocr_processor_reports_provider_attempts_without_changing_evidence(tmp_p
 
     assert len(result.evidence) == 1
     assert result.provider_attempt_count == 3
+    assert result.image_request_count == 1
     assert result.image_sizes == ((640, 480),)
+
+
+def test_ocr_processor_deduplicates_same_image_digest_but_preserves_frame_evidence(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "keyframe.jpg"
+    payload = b"\xff\xd8\xffjpeg-data\xff\xd9"
+    image.write_bytes(payload)
+    calls = 0
+
+    class Client:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            nonlocal calls
+            calls += 1
+            return OcrProviderResponse(request_id="request-001", lines=())
+
+    digest = hashlib.sha256(payload).hexdigest()
+    keyframes = tuple(
+        KeyframeForOcr(
+            keyframe_id=f"keyframe_{index}",
+            source_sha256=digest,
+            start_ms=index * 1_000,
+            end_ms=(index + 1) * 1_000,
+            timestamp_ms=index * 1_000 + 500,
+            path=image,
+            language="zh",
+        )
+        for index in range(2)
+    )
+
+    result = OcrProcessor(Client(), allowed_root=tmp_path).process_with_diagnostics(keyframes)
+
+    assert calls == 1
+    assert result.image_request_count == 1
+    assert len(result.evidence) == 2
+    assert result.image_sizes == ((None, None), (None, None))
+
+
+def test_ocr_processor_reuses_cross_batch_cache_by_digest_and_language(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "keyframe.jpg"
+    payload = b"\xff\xd8\xffjpeg-data\xff\xd9"
+    image.write_bytes(payload)
+    calls: list[str] = []
+
+    class Client:
+        def recognize(
+            self,
+            _image: bytes,
+            language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            calls.append(language)
+            return OcrProviderResponse(
+                request_id=f"request-{language}",
+                lines=(),
+                provider_attempt_count=3,
+            )
+
+    digest = hashlib.sha256(payload).hexdigest()
+
+    def keyframe(keyframe_id: str, language: str) -> KeyframeForOcr:
+        return KeyframeForOcr(
+            keyframe_id=keyframe_id,
+            source_sha256=digest,
+            start_ms=0,
+            end_ms=1_000,
+            timestamp_ms=500,
+            path=image,
+            language=language,
+        )
+
+    processor = OcrProcessor(Client(), allowed_root=tmp_path)
+    first = processor.process_with_diagnostics((keyframe("keyframe_001", "zh"),), reuse_cache=True)
+    cached = processor.process_with_diagnostics((keyframe("keyframe_002", "zh"),), reuse_cache=True)
+    other_language = processor.process_with_diagnostics(
+        (keyframe("keyframe_003", "en"),),
+        reuse_cache=True,
+    )
+
+    assert calls == ["zh", "en"]
+    assert (first.image_request_count, first.provider_attempt_count) == (1, 3)
+    assert (cached.image_request_count, cached.provider_attempt_count) == (0, 0)
+    assert (other_language.image_request_count, other_language.provider_attempt_count) == (1, 3)
+    assert len(cached.evidence) == 1
+
+
+def test_ocr_processor_cache_hit_after_deadline_does_not_recount_provider_attempts(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "keyframe.jpg"
+    payload = b"\xff\xd8\xffjpeg-data\xff\xd9"
+    image.write_bytes(payload)
+    calls: list[str] = []
+
+    class Client:
+        def recognize(
+            self,
+            _image: bytes,
+            language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            calls.append(language)
+            return OcrProviderResponse(
+                request_id="request-zh",
+                lines=(),
+                provider_attempt_count=3,
+            )
+
+    keyframe = KeyframeForOcr(
+        keyframe_id="keyframe_001",
+        source_sha256=hashlib.sha256(payload).hexdigest(),
+        start_ms=0,
+        end_ms=1_000,
+        timestamp_ms=500,
+        path=image,
+        language="zh",
+    )
+    processor = OcrProcessor(
+        Client(),
+        allowed_root=tmp_path,
+        clock=iter((1.0, 1.0, 2.0)).__next__,
+    )
+    processor.process_with_diagnostics((keyframe,), reuse_cache=True)
+
+    with pytest.raises(OcrDeadlineExceeded) as raised:
+        processor.process_with_diagnostics(
+            (keyframe,),
+            deadline=2.0,
+            reuse_cache=True,
+        )
+
+    assert calls == ["zh"]
+    assert raised.value.image_request_count == 0
+    assert raised.value.provider_attempt_count == 0
 
 
 def test_ocr_processor_reads_jpeg_dimensions_for_subtitle_scoring(tmp_path: Path) -> None:
@@ -309,6 +454,57 @@ def test_ocr_processor_discards_response_returned_after_deadline(tmp_path: Path)
         )
 
     assert raised.value.provider_attempt_count == 2
+    assert raised.value.image_request_count == 1
+
+
+def test_ocr_processor_does_not_cache_response_returned_after_deadline(
+    tmp_path: Path,
+) -> None:
+    now = [1.0]
+    calls = 0
+    image = tmp_path / "keyframe.jpg"
+    image.write_bytes(b"\xff\xd8\xffjpeg-data\xff\xd9")
+
+    class Client:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            nonlocal calls
+            calls += 1
+            now[0] = 2.0
+            return OcrProviderResponse(
+                request_id=f"request-{calls}",
+                lines=(),
+                provider_attempt_count=2,
+            )
+
+    keyframe = KeyframeForOcr(
+        keyframe_id="keyframe_001",
+        source_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+        start_ms=0,
+        end_ms=1_000,
+        timestamp_ms=500,
+        path=image,
+        language="zh",
+    )
+    processor = OcrProcessor(Client(), allowed_root=tmp_path, clock=lambda: now[0])
+
+    with pytest.raises(OcrDeadlineExceeded):
+        processor.process_with_diagnostics(
+            (keyframe,),
+            deadline=2.0,
+            reuse_cache=True,
+        )
+
+    result = processor.process_with_diagnostics((keyframe,), reuse_cache=True)
+
+    assert calls == 2
+    assert result.image_request_count == 1
+    assert result.provider_attempt_count == 2
 
 
 def test_ocr_processor_does_not_send_image_when_read_crosses_deadline(tmp_path: Path) -> None:
@@ -347,3 +543,173 @@ def test_ocr_processor_does_not_send_image_when_read_crosses_deadline(tmp_path: 
             ),
             deadline=2.0,
         )
+
+
+def test_ocr_processor_preserves_accumulated_cost_before_deadline_inside_client(
+    tmp_path: Path,
+) -> None:
+    first_image = tmp_path / "first.jpg"
+    second_image = tmp_path / "second.jpg"
+    first_payload = b"\xff\xd8\xfffirst-image\xff\xd9"
+    second_payload = b"\xff\xd8\xffsecond-image\xff\xd9"
+    first_image.write_bytes(first_payload)
+    second_image.write_bytes(second_payload)
+    calls = 0
+
+    class Client:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OcrDeadlineExceeded(
+                    "OCR 全局截止时间已到",
+                    provider_attempt_count=1,
+                    image_request_count=0,
+                )
+            return OcrProviderResponse(
+                request_id="request-first",
+                lines=(),
+                provider_attempt_count=2,
+            )
+
+    processor = OcrProcessor(Client(), allowed_root=tmp_path, clock=lambda: 1.0)
+
+    with pytest.raises(OcrDeadlineExceeded) as raised:
+        processor.process_with_diagnostics(
+            (
+                _keyframe("keyframe_first", first_image, first_payload, timestamp_ms=500),
+                _keyframe("keyframe_second", second_image, second_payload, timestamp_ms=1_500),
+            ),
+            deadline=2.0,
+        )
+
+    assert calls == 2
+    assert raised.value.provider_attempt_count == 3
+    assert raised.value.image_request_count == 2
+
+
+def test_ocr_processor_preserves_accumulated_cost_before_deadline_between_images(
+    tmp_path: Path,
+) -> None:
+    first_image = tmp_path / "first.jpg"
+    second_image = tmp_path / "second.jpg"
+    first_payload = b"\xff\xd8\xfffirst-image\xff\xd9"
+    second_payload = b"\xff\xd8\xffsecond-image\xff\xd9"
+    first_image.write_bytes(first_payload)
+    second_image.write_bytes(second_payload)
+    calls = 0
+
+    class Client:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            nonlocal calls
+            calls += 1
+            return OcrProviderResponse(
+                request_id="request-first",
+                lines=(),
+                provider_attempt_count=2,
+            )
+
+    processor = OcrProcessor(
+        Client(),
+        allowed_root=tmp_path,
+        clock=iter((1.0, 1.0, 1.0, 2.0)).__next__,
+    )
+
+    with pytest.raises(OcrDeadlineExceeded) as raised:
+        processor.process_with_diagnostics(
+            (
+                _keyframe("keyframe_first", first_image, first_payload, timestamp_ms=500),
+                _keyframe("keyframe_second", second_image, second_payload, timestamp_ms=1_500),
+            ),
+            deadline=2.0,
+        )
+
+    assert calls == 1
+    assert raised.value.provider_attempt_count == 2
+    assert raised.value.image_request_count == 1
+
+
+def test_ocr_processor_preserves_prior_cost_when_cached_image_crosses_deadline(
+    tmp_path: Path,
+) -> None:
+    first_image = tmp_path / "first.jpg"
+    cached_image = tmp_path / "cached.jpg"
+    first_payload = b"\xff\xd8\xfffirst-image\xff\xd9"
+    cached_payload = b"\xff\xd8\xffcached-image\xff\xd9"
+    first_image.write_bytes(first_payload)
+    cached_image.write_bytes(cached_payload)
+    cached_keyframe = _keyframe(
+        "keyframe_cached",
+        cached_image,
+        cached_payload,
+        timestamp_ms=1_500,
+    )
+    calls = 0
+
+    class Client:
+        def recognize(
+            self,
+            _image: bytes,
+            _language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            nonlocal calls
+            calls += 1
+            return OcrProviderResponse(
+                request_id=f"request-{calls}",
+                lines=(),
+                provider_attempt_count=2,
+            )
+
+    clock_values = iter((1.0, 1.0, 1.0, 1.0, 1.0, 2.0))
+    processor = OcrProcessor(
+        Client(),
+        allowed_root=tmp_path,
+        clock=clock_values.__next__,
+    )
+    processor.process_with_diagnostics((cached_keyframe,), reuse_cache=True)
+
+    with pytest.raises(OcrDeadlineExceeded) as raised:
+        processor.process_with_diagnostics(
+            (
+                _keyframe("keyframe_first", first_image, first_payload, timestamp_ms=500),
+                cached_keyframe,
+            ),
+            deadline=2.0,
+            reuse_cache=True,
+        )
+
+    assert calls == 2
+    assert raised.value.provider_attempt_count == 2
+    assert raised.value.image_request_count == 1
+
+
+def _keyframe(
+    keyframe_id: str,
+    path: Path,
+    payload: bytes,
+    *,
+    timestamp_ms: int,
+) -> KeyframeForOcr:
+    return KeyframeForOcr(
+        keyframe_id=keyframe_id,
+        source_sha256=hashlib.sha256(payload).hexdigest(),
+        start_ms=max(0, timestamp_ms - 500),
+        end_ms=timestamp_ms + 500,
+        timestamp_ms=timestamp_ms,
+        path=path,
+        language="zh",
+    )

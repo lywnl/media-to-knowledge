@@ -9,14 +9,30 @@ from pydantic import TypeAdapter, ValidationError
 
 from video_demo.domain.evidence import EvidenceItem
 from video_demo.domain.result import VideoUnderstandingResult
-from video_demo.domain.result_artifact import ResultArtifactPayload
+from video_demo.domain.result_artifact import (
+    ARTIFACT_ENVELOPE_SCHEMA_VERSION,
+    ResultArtifactPayload,
+)
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.evaluation import prediction_runner as prediction_runner_module
+from video_demo.evaluation import predictions as predictions_module
 from video_demo.evaluation.annotations import VerifiedAnnotation, load_semantic_judgment
 from video_demo.evaluation.dataset import EvaluationSample
-from video_demo.evaluation.predictions import EvaluationPrediction, load_verified_prediction
+from video_demo.evaluation.predictions import (
+    EvaluationPrediction,
+    load_verified_prediction,
+)
 from video_demo.storage.artifacts import AtomicArtifactStore
 
 _EVIDENCE_ADAPTER = TypeAdapter(tuple[EvidenceItem, ...])
+
+
+def test_evaluation_manifest_uses_shared_artifact_envelope_version() -> None:
+    assert predictions_module.ARTIFACT_ENVELOPE_SCHEMA_VERSION == ARTIFACT_ENVELOPE_SCHEMA_VERSION
+    assert (
+        prediction_runner_module.ARTIFACT_ENVELOPE_SCHEMA_VERSION
+        == ARTIFACT_ENVELOPE_SCHEMA_VERSION
+    )
 
 
 def _prediction_kwargs(tmp_path: Path) -> dict[str, Path]:

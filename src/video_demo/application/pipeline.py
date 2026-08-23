@@ -73,6 +73,7 @@ class PipelineRunConfig(FrozenModel):
     max_speakers: int | None = Field(default=None, ge=1, le=10)
     hotwords: tuple[str, ...] = ()
     core_context: str | None = None
+    speech_enrichment_mode: Literal["text", "full"] = "text"
 
     @model_validator(mode="after")
     def validate_speaker_range(self) -> Self:
@@ -124,11 +125,21 @@ class SpeechBoundaryCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class StageMetric:
+    stage: str
+    duration_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class SpeechAnalysis:
     transcript_source: TranscriptSource
+    # 直接构造领域对象的历史调用默认保留完整语音分析语义；生产运行模式由 PipelineRunConfig 控制。
+    enrichment_mode: Literal["text", "full"] = "full"
     evidence: tuple[EvidenceItem, ...] = ()
     warnings: tuple[str, ...] = ()
     boundary_candidates: tuple[SpeechBoundaryCandidate, ...] = ()
+    stage_metrics: tuple[StageMetric, ...] = ()
+    stage_cache_hits: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,12 +163,6 @@ class VisualAnalysis:
 
 
 @dataclass(frozen=True, slots=True)
-class StageMetric:
-    stage: str
-    duration_ms: int
-
-
-@dataclass(frozen=True, slots=True)
 class PipelineOutcome:
     status: RunStatus
     result: VideoUnderstandingResult
@@ -165,6 +170,7 @@ class PipelineOutcome:
     warnings: tuple[str, ...]
     stage_metrics: tuple[StageMetric, ...]
     transcript_source: TranscriptSource
+    stage_cache_hits: tuple[str, ...] = ()
 
 
 class AssetRegistrar(Protocol):
@@ -272,6 +278,8 @@ class VideoUnderstandingPipeline:
         segments = merge_segment_understandings(
             window_results,
             boundaries=visual.boundaries,
+            evidence=evidence,
+            video_title=whole_understanding.summary.title,
         )
         chapters = tuple(
             SummaryChapter(
@@ -314,6 +322,7 @@ class VideoUnderstandingPipeline:
             evidence=tuple(evidence),
             warnings=warnings,
             stage_metrics=tuple(metrics),
+            stage_cache_hits=speech.stage_cache_hits,
             transcript_source=speech.transcript_source,
         )
 
@@ -327,7 +336,7 @@ class VideoUnderstandingPipeline:
         self,
         context: PipelineContext,
         media: PreparedMedia,
-    ) -> tuple[SpeechAnalysis, VisualAnalysis, tuple[StageMetric, StageMetric]]:
+    ) -> tuple[SpeechAnalysis, VisualAnalysis, tuple[StageMetric, ...]]:
         self._check_cancelled(context)
         self._start_stage(context, "SPEECH")
         self._start_stage(context, "VISUAL")
@@ -359,11 +368,16 @@ class VideoUnderstandingPipeline:
             is_cancel_requested=context.is_cancel_requested,
         )
         visual_duration = max(0, round((self._clock() - visual_started_at) * 1000))
+        speech_metrics = tuple(
+            metric for metric in speech.stage_metrics
+            if metric.stage in {"SPEECH_ASR", "SPEECH_ENRICHMENT"}
+        )
         return (
             speech,
             visual,
             (
                 StageMetric(stage="SPEECH", duration_ms=speech_duration),
+                *speech_metrics,
                 StageMetric(stage="VISUAL", duration_ms=visual_duration),
             ),
         )
@@ -555,6 +569,7 @@ class PipelineJobHandler:
                     metric.stage: metric.duration_ms
                     for metric in outcome.stage_metrics
                 },
+                stage_cache_hits=outcome.stage_cache_hits,
                 status=outcome.status,
                 warnings=outcome.warnings,
                 transcript_source=outcome.transcript_source,

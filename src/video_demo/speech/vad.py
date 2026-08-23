@@ -11,6 +11,8 @@ from video_demo.domain.base import FrozenModel, Probability, stable_identifier
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 
+_TIMESTAMP_QUANTIZATION_TOLERANCE_MS = 1
+
 
 @dataclass(frozen=True, slots=True)
 class RawVadSpan:
@@ -33,6 +35,10 @@ class VadResult(FrozenModel):
     silence: tuple[SilenceInterval, ...]
     long_silence_boundaries_ms: tuple[int, ...]
     warnings: tuple[str, ...] = ()
+
+
+class _VadTimelineOverrun(ValueError):
+    pass
 
 
 class SileroBackend(Protocol):
@@ -97,11 +103,22 @@ class SileroVadAdapter:
                 ErrorCode.SPEECH_MODEL_UNAVAILABLE,
                 "Silero VAD 返回结构非法",
             ) from None
-        return build_vad_result(
-            duration_ms=duration_ms,
-            raw_spans=spans,
-            merge_gap_ms=self._merge_gap_ms,
-        )
+        try:
+            return build_vad_result(
+                duration_ms=duration_ms,
+                raw_spans=spans,
+                merge_gap_ms=self._merge_gap_ms,
+            )
+        except _VadTimelineOverrun:
+            raise VideoDemoError(
+                ErrorCode.SPEECH_AUDIO_INVALID,
+                "VAD 语音区间超出音频时间轴",
+            ) from None
+        except ValueError:
+            raise VideoDemoError(
+                ErrorCode.SPEECH_MODEL_UNAVAILABLE,
+                "Silero VAD 返回结构非法",
+            ) from None
 
 
 class NativeSileroBackend:
@@ -240,7 +257,20 @@ def build_vad_result(
     ordered = sorted(raw_spans, key=lambda item: (item.start_ms, item.end_ms))
     merged: list[RawVadSpan] = []
     for span in ordered:
-        if span.start_ms < 0 or span.end_ms <= span.start_ms or span.end_ms > duration_ms:
+        if (
+            span.start_ms < 0
+            or span.end_ms <= span.start_ms
+        ):
+            raise ValueError("VAD 区间越界或为空")
+        if span.end_ms > duration_ms + _TIMESTAMP_QUANTIZATION_TOLERANCE_MS:
+            raise _VadTimelineOverrun("VAD 区间超出时间轴")
+        if span.end_ms > duration_ms:
+            span = RawVadSpan(
+                start_ms=span.start_ms,
+                end_ms=duration_ms,
+                confidence=span.confidence,
+            )
+        if span.end_ms <= span.start_ms:
             raise ValueError("VAD 区间越界或为空")
         if not 0 <= span.confidence <= 1:
             raise ValueError("VAD 置信度必须在 0 到 1 之间")

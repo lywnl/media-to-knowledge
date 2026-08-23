@@ -63,6 +63,7 @@ class TranscodeClient(Protocol):
         run_relative_root: Path,
         *,
         has_audio: bool,
+        duration_ms: int,
     ) -> AudioArtifact | NoAudioArtifact: ...
 
     def extract_subtitle(
@@ -194,6 +195,7 @@ class ProductionMediaTranscoder:
                 asset.source_path,
                 asset.run_relative_root,
                 has_audio=bool(probed.manifest.audio_streams),
+                duration_ms=probed.duration_ms,
             )
             if isinstance(audio, NoAudioArtifact):
                 warnings.append(audio.warning_code)

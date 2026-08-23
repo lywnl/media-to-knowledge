@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from video_demo.persistence.repositories import Scope, VideoRunRepository
+
 
 def _upload(
     client: TestClient,
@@ -77,6 +79,65 @@ def test_create_run_accepts_bounded_hotwords_and_core_context(
     )
 
     assert response.status_code == 202
+
+
+def test_create_run_defaults_to_text_speech_enrichment_mode(
+    client: TestClient,
+    scope_headers: dict[str, str],
+    mp4_content: bytes,
+) -> None:
+    object_ref = _upload(client, scope_headers, mp4_content)
+    response = client.post(
+        "/api/kb/knowledge-bases/kb-a/video-understanding-runs",
+        headers=scope_headers,
+        json=_create_payload(object_ref),
+    )
+
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+    stored = client.app.state.container.database
+    with stored.session() as session:
+        run = VideoRunRepository(session).get(Scope("tenant-a", "app-a", "kb-a"), run_id)
+        assert run is not None
+        assert run.config_snapshot["speech_enrichment_mode"] == "text"
+
+
+def test_create_run_accepts_full_speech_enrichment_mode_and_mode_is_idempotency_sensitive(
+    client: TestClient,
+    scope_headers: dict[str, str],
+    mp4_content: bytes,
+) -> None:
+    object_ref = _upload(client, scope_headers, mp4_content)
+    runs_url = "/api/kb/knowledge-bases/kb-a/video-understanding-runs"
+    first = client.post(
+        runs_url,
+        headers=scope_headers,
+        json={**_create_payload(object_ref), "speech_enrichment_mode": "text"},
+    )
+    assert first.status_code == 202
+
+    conflict = client.post(
+        runs_url,
+        headers=scope_headers,
+        json={**_create_payload(object_ref), "speech_enrichment_mode": "full"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_create_run_rejects_unknown_speech_enrichment_mode(
+    client: TestClient,
+    scope_headers: dict[str, str],
+    mp4_content: bytes,
+) -> None:
+    object_ref = _upload(client, scope_headers, mp4_content)
+    response = client.post(
+        "/api/kb/knowledge-bases/kb-a/video-understanding-runs",
+        headers=scope_headers,
+        json={**_create_payload(object_ref), "speech_enrichment_mode": "invalid"},
+    )
+
+    assert response.status_code == 422
 
 
 def test_same_idempotency_key_rejects_changed_speech_hints(

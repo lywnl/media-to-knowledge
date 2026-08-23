@@ -24,7 +24,11 @@ from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.domain.evidence import EvidenceItem, KeyframeEvidence
 from video_demo.domain.result import VideoUnderstandingResult
-from video_demo.domain.result_artifact import ResultArtifactPayload, TranscriptSource
+from video_demo.domain.result_artifact import (
+    ARTIFACT_ENVELOPE_SCHEMA_VERSION,
+    ResultArtifactPayload,
+    TranscriptSource,
+)
 from video_demo.domain.run import ModelIdentity
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.evaluation.annotations import (
@@ -1023,6 +1027,7 @@ def _export_manifest_bytes(
         result=source.result,
         evidence=evidence,
         stage_metrics=source.stage_metrics,
+        stage_cache_hits=source.stage_cache_hits,
         status=source.status,
         warnings=source.warnings,
         transcript_source=source.transcript_source,
@@ -1045,7 +1050,7 @@ def _load_index_prediction(
 def _envelope_bytes(payload: dict[str, object], upstream_sha256: str) -> bytes:
     return json.dumps(
         {
-            "schema_version": "1.0.0",
+            "schema_version": ARTIFACT_ENVELOPE_SCHEMA_VERSION,
             "upstream_sha256": upstream_sha256,
             "payload": payload,
         },
