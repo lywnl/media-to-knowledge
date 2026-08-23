@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import re
 import time
+import uuid
 from collections.abc import Callable
 from email.utils import formatdate
 from pathlib import Path
@@ -17,6 +19,7 @@ from pydantic import SecretStr
 from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.video_port import (
+    PublishedVideo,
     SegmentUnderstandingRequest,
     SummaryUnderstandingRequest,
     VideoClipInput,
@@ -29,13 +32,16 @@ from video_demo.storage.workspace import reject_symlink_components
 
 _BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
 _ENDPOINT_PATTERN = re.compile(r"^oss-[a-z0-9-]+\.aliyuncs\.com$")
+_LOGGER = logging.getLogger(__name__)
 
 
 class TemporaryVideoPublisher(Protocol):
     @property
     def remote_host(self) -> str: ...
 
-    def publish(self, clip: VideoClipInput) -> VideoClipInput: ...
+    def publish(self, clip: VideoClipInput) -> PublishedVideo: ...
+
+    def delete(self, object_key: str) -> None: ...
 
 
 def oss_remote_host(endpoint: str, bucket: str) -> str:
@@ -65,12 +71,15 @@ class PublishedVideoUnderstanding:
         request: SegmentUnderstandingRequest,
     ) -> SegmentUnderstanding:
         published = self._publisher.publish(request.clip)
-        delegate = self._delegate
-        if not isinstance(delegate, VideoUnderstandingPort):
-            raise TypeError("底层端口不支持片段理解")
-        return delegate.understand_segment(
-            request.model_copy(update={"clip": published}),
-        )
+        try:
+            delegate = self._delegate
+            if not isinstance(delegate, VideoUnderstandingPort):
+                raise TypeError("底层端口不支持片段理解")
+            return delegate.understand_segment(
+                request.model_copy(update={"clip": published.published_clip}),
+            )
+        finally:
+            self._best_effort_delete(published.object_key)
 
     def summarize_video(
         self,
@@ -86,12 +95,25 @@ class PublishedVideoUnderstanding:
         request: WholeVideoUnderstandingRequest,
     ) -> WholeVideoUnderstanding:
         published = self._publisher.publish(request.video)
-        delegate = self._delegate
-        if not isinstance(delegate, WholeVideoUnderstandingPort):
-            raise TypeError("底层端口不支持全片理解")
-        return delegate.understand_video(
-            request.model_copy(update={"video": published}),
-        )
+        try:
+            delegate = self._delegate
+            if not isinstance(delegate, WholeVideoUnderstandingPort):
+                raise TypeError("底层端口不支持全片理解")
+            return delegate.understand_video(
+                request.model_copy(update={"video": published.published_clip}),
+            )
+        finally:
+            self._best_effort_delete(published.object_key)
+
+    def _best_effort_delete(self, object_key: str) -> None:
+        try:
+            self._publisher.delete(object_key)
+        except Exception:
+            _LOGGER.warning(
+                "OSS 临时视频清理失败",
+                extra={"object_key": object_key},
+                exc_info=True,
+            )
 
 
 class OssTemporaryVideoPublisher:
@@ -126,7 +148,7 @@ class OssTemporaryVideoPublisher:
     def remote_host(self) -> str:
         return f"{self._bucket}.{self._endpoint_host}"
 
-    def publish(self, clip: VideoClipInput) -> VideoClipInput:
+    def publish(self, clip: VideoClipInput) -> PublishedVideo:
         path, size_bytes, sha256 = self._verify_local_clip(clip)
         object_key = self._object_key(clip, path, sha256)
         existing = self._head(object_key, missing_allowed=True)
@@ -136,13 +158,48 @@ class OssTemporaryVideoPublisher:
         if existing is None:
             raise _object_error()
         self._validate_remote_object(existing, size_bytes=size_bytes, sha256=sha256)
-        return VideoClipInput(
-            clip_id=clip.clip_id,
-            start_ms=clip.start_ms,
-            end_ms=clip.end_ms,
-            source_url=self._signed_get_url(object_key),
-            mime_type=clip.mime_type,
-            sha256=sha256,
+        return PublishedVideo(
+            published_clip=VideoClipInput(
+                clip_id=clip.clip_id,
+                start_ms=clip.start_ms,
+                end_ms=clip.end_ms,
+                source_url=self._signed_get_url(object_key),
+                mime_type=clip.mime_type,
+                sha256=sha256,
+            ),
+            object_key=object_key,
+        )
+
+    def delete(self, object_key: str) -> None:
+        if not self._is_owned_object_key(object_key):
+            _LOGGER.warning("拒绝清理不属于临时视频前缀的 OSS 对象")
+            return
+        try:
+            response = self._request("DELETE", object_key)
+        except VideoDemoError:
+            _LOGGER.warning(
+                "OSS 临时视频 DELETE 请求失败",
+                extra={"object_key": object_key},
+                exc_info=True,
+            )
+            return
+        if response.status_code == 404 or 200 <= response.status_code < 300:
+            return
+        if response.status_code in (401, 403):
+            _LOGGER.warning(
+                "OSS 临时视频 DELETE 鉴权失败",
+                extra={"object_key": object_key, "status_code": response.status_code},
+            )
+            return
+        if response.status_code == 429 or response.status_code >= 500:
+            _LOGGER.warning(
+                "OSS 临时视频 DELETE 暂时失败",
+                extra={"object_key": object_key, "status_code": response.status_code},
+            )
+            return
+        _LOGGER.warning(
+            "OSS 临时视频 DELETE 返回非成功状态",
+            extra={"object_key": object_key, "status_code": response.status_code},
         )
 
     def _verify_local_clip(self, clip: VideoClipInput) -> tuple[Path, int, str]:
@@ -169,7 +226,17 @@ class OssTemporaryVideoPublisher:
     def _object_key(self, clip: VideoClipInput, path: Path, sha256: str) -> str:
         relative_parent = path.parent.relative_to(self._allowed_video_root).as_posix()
         owner_hash = hashlib.sha256(relative_parent.encode("utf-8")).hexdigest()[:24]
-        return f"{self._prefix}/{owner_hash}/{clip.clip_id}-{sha256[:24]}.mp4"
+        publish_id = uuid.uuid4().hex
+        return f"{self._prefix}/{owner_hash}/{publish_id}-{clip.clip_id}-{sha256[:24]}.mp4"
+
+    def _is_owned_object_key(self, object_key: str) -> bool:
+        object_pattern = re.compile(
+            rf"^{re.escape(self._prefix)}/[0-9a-f]{{24}}/"
+            r"[0-9a-f]{32}-[A-Za-z0-9_-]+-[0-9a-f]{24}\.mp4$",
+        )
+        if not object_pattern.fullmatch(object_key):
+            return False
+        return all(ord(character) >= 32 and ord(character) != 127 for character in object_key)
 
     def _head(self, object_key: str, *, missing_allowed: bool) -> httpx.Headers | None:
         response = self._request("HEAD", object_key)

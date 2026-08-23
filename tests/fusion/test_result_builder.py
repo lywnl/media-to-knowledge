@@ -108,6 +108,31 @@ def test_summary_retrieval_text_and_hash_are_deterministic() -> None:
     ).hexdigest()
 
 
+def test_summary_retrieval_text_omits_duplicate_original_keywords() -> None:
+    segments = _segments()
+    summary = build_video_summary(
+        SummaryUnderstanding(
+            title="测试视频",
+            summary_zh="视频包含一段问候。",
+            keywords=("问候",),
+            original_keywords=("问候", "Hello"),
+        ),
+        duration_ms=500,
+        segments=segments,
+        chapters=(
+            SummaryChapter(
+                title="问候",
+                start_ms=0,
+                end_ms=500,
+                segment_ids=(segments[0].segment_id,),
+            ),
+        ),
+    )
+
+    assert "核心关键词：问候" in summary.retrieval_text
+    assert "原语言关键词：Hello" in summary.retrieval_text
+
+
 def test_retrieval_ready_fixture_keeps_key_evidence_without_internal_identifiers() -> None:
     """检索文本保留回答所需事实，同时隔离运行与供应商内部标识。"""
     speech = SpeechSegment(

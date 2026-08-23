@@ -656,6 +656,7 @@ def test_demo_fallback_builds_deterministic_semantics_when_qwen_is_unavailable(
     assert result.title == "Hello demo"
     assert result.summary_zh == "Hello demo"
     assert result.evidence_refs == ("asr_001",)
+    assert result.original_keywords == ()
     assert fallback.degraded_warnings == ("DEMO_DEGRADED_QWEN",)
 
     summary = fallback.summarize_video(
@@ -832,6 +833,35 @@ def test_first_segment_uses_current_verified_clip_for_probe_then_understanding(
     segment_video = payloads[1]["messages"][1]["content"][0]["video_url"]["url"]  # type: ignore[index]
     assert probe_video == segment_video
     assert str(probe_video).endswith("dmlkZW8tYnl0ZXM=")
+
+
+def test_qwen_normalizes_and_deduplicates_keywords_before_returning_semantics(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if _is_probe_request(request):
+            return _provider_response({"supported": True})
+        return _provider_response(
+            {
+                **_valid_segment(),
+                "keywords": [" AI  共创社群 ", "Codex"],
+                "original_keywords": ["ai 共创社群", "codex", "HNSW"],
+            },
+        )
+
+    client = QwenVideoClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://dashscope.example/compatible-mode/v1",
+        api_key="qwen-secret",
+        model_id="qwen3-vl-plus",
+        allowed_video_root=tmp_path,
+        sleeper=lambda _delay: None,
+    )
+
+    result = client.understand_segment(_segment_request(tmp_path))
+
+    assert result.keywords == ("AI 共创社群", "Codex")
+    assert result.original_keywords == ("HNSW",)
 
 
 def test_diagnostic_calls_expose_only_validated_provider_receipts(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, Self, runtime_checkable
 
@@ -28,6 +29,20 @@ class VideoClipInput(TimeRange):
         if has_path and self.sha256 is None:
             raise ValueError("本地视频片段必须同时提供 path 和 sha256")
         return self
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedVideo:
+    """一次临时发布产生的远端视频和精确 OSS 对象句柄。"""
+
+    published_clip: VideoClipInput
+    object_key: str
+
+    @property
+    def clip(self) -> VideoClipInput:
+        """兼容调用方使用更短的远端视频属性名。"""
+
+        return self.published_clip
 
 
 class SegmentUnderstandingRequest(FrozenModel):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import unicodedata
 from collections.abc import Iterable
 from typing import Literal, Self
 
@@ -19,6 +20,41 @@ from video_demo.errors import ErrorCode, VideoDemoError
 
 RESULT_SCHEMA_VERSION: Literal["2.0.0"] = "2.0.0"
 SUPPORTED_RESULT_SCHEMA_VERSIONS = frozenset({"1.0.0", RESULT_SCHEMA_VERSION})
+
+
+def normalize_keyword_fields(
+    keywords: Iterable[str],
+    original_keywords: Iterable[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """规范化关键词，并从原语言关键词中移除跨字段重复项。"""
+
+    def normalize(value: str) -> str:
+        return " ".join(value.casefold().split())
+
+    def display(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", value).split()).strip()
+
+    normalized_keywords: list[str] = []
+    keyword_ids: set[str] = set()
+    for value in keywords:
+        normalized = display(value)
+        value_id = normalize(normalized)
+        if normalized and value_id not in keyword_ids:
+            normalized_keywords.append(normalized)
+            keyword_ids.add(value_id)
+    normalized_original_keywords: list[str] = []
+    original_ids: set[str] = set()
+    for value in original_keywords:
+        normalized = display(value)
+        value_id = normalize(normalized)
+        if (
+            normalized
+            and value_id not in keyword_ids
+            and value_id not in original_ids
+        ):
+            normalized_original_keywords.append(normalized)
+            original_ids.add(value_id)
+    return tuple(normalized_keywords), tuple(normalized_original_keywords)
 
 
 class SemanticFields(UniqueStringTuplesMixin, FrozenModel):

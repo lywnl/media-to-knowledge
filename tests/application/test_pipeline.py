@@ -31,7 +31,7 @@ from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
 from video_demo.domain.run import RunStatus, TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.fusion.merge import BoundaryPoint
-from video_demo.integrations.oss import PublishedVideoUnderstanding
+from video_demo.integrations.oss import PublishedVideo, PublishedVideoUnderstanding
 from video_demo.integrations.video_port import (
     VideoClipInput,
     WholeVideoUnderstanding,
@@ -360,19 +360,25 @@ def test_pipeline_fuses_asr_ocr_keyframe_scene_with_published_qwen_result(
         def remote_host(self) -> str:
             return "private-video-bucket.oss-cn-hangzhou.aliyuncs.com"
 
-        def publish(self, local_clip: VideoClipInput) -> VideoClipInput:
+        def publish(self, local_clip: VideoClipInput) -> PublishedVideo:
             published.append(local_clip)
-            return VideoClipInput(
-                clip_id=local_clip.clip_id,
-                start_ms=local_clip.start_ms,
-                end_ms=local_clip.end_ms,
-                source_url=(
-                    "https://private-video-bucket.oss-cn-hangzhou.aliyuncs.com/"
-                    "video-demo/qwen-clips/clip.mp4?Signature=redacted"
+            return PublishedVideo(
+                published_clip=VideoClipInput(
+                    clip_id=local_clip.clip_id,
+                    start_ms=local_clip.start_ms,
+                    end_ms=local_clip.end_ms,
+                    source_url=(
+                        "https://private-video-bucket.oss-cn-hangzhou.aliyuncs.com/"
+                        "video-demo/qwen-clips/clip.mp4?Signature=redacted"
+                    ),
+                    mime_type=local_clip.mime_type,
+                    sha256=local_clip.sha256,
                 ),
-                mime_type=local_clip.mime_type,
-                sha256=local_clip.sha256,
+                object_key="video-demo/qwen-clips/owner/publish-clip.mp4",
             )
+
+        def delete(self, _object_key: str) -> None:
+            return None
 
     class Qwen:
         def understand_video(

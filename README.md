@@ -42,7 +42,7 @@ VIDEO_DEMO_OSS_PREFIX=video-demo/qwen-clips
 VIDEO_DEMO_OSS_SIGNED_URL_TTL_SECONDS=3600
 ```
 
-部署前必须在 Bucket 上完成两项设置：Bucket 禁止公共读；为 `video-demo/qwen-clips/` 前缀配置一天后删除的生命周期规则。应用保留临时对象以支持任务重试，不在成功后立即删除。AccessKey、Secret 和签名 URL 不写入结果、证据或报告；建议使用仅具备目标前缀读写权限的 RAM 子账号，并定期轮换凭据。
+部署前必须在 Bucket 上完成两项设置：Bucket 禁止公共读；为 `video-demo/qwen-clips/` 前缀配置对象创建后一天自动删除的生命周期规则。Qwen 调用成功或失败后，应用会按本次发布返回的精确对象键立即发送 DELETE；Worker 崩溃、断电或 DELETE 失败时由生命周期规则兜底。AccessKey、Secret 和签名 URL 不写入结果、证据或报告；建议使用仅具备目标前缀读写权限的 RAM 子账号，并定期轮换凭据。
 
 配置 Qwen 时必须同时完整配置 OSS；严格生产模式拒绝使用本地 Base64/Data URI 发送视频。Qwen 收到的是 FFmpeg 生成的完整 MP4 代理视频，而且生产 Run 不执行能力探测、逐窗口 `understand_segment()` 或第二次摘要请求。窗口时间只来自本地冻结边界，不依赖“完整视频 URL + `start_ms/end_ms`”让供应商自动 seek；Qwen 响应不是合法 JSON、顶层结构不符、粗语义为空或数量超过本地窗口数时，整次理解失败，不发布部分模型结果。Qwen 不生成时间和证据 ID，因此无法把模型引用误绑定到窗口外。显式 Demo 降级只能使用本地证据生成确定性语义，并产生 `DEMO_DEGRADED_QWEN`。
 

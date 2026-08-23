@@ -7,6 +7,62 @@ from video_demo.fusion.merge import BoundaryPoint, WindowUnderstanding, merge_se
 from video_demo.fusion.retrieval_text import render_segment_retrieval_text
 
 
+def test_duplicate_keyword_fields_are_rendered_only_once() -> None:
+    understanding = SegmentUnderstanding(
+        title="演示",
+        summary_zh="展示关键词去重。",
+        keywords=(" AI  共创社群 ", "Codex"),
+        original_keywords=("ai 共创社群", "codex", "HNSW"),
+        evidence_refs=("asr_001",),
+    )
+    segments = merge_segment_understandings(
+        (
+            WindowUnderstanding(
+                window_id="window_001",
+                start_ms=0,
+                end_ms=1_000,
+                understanding=understanding,
+            ),
+        ),
+        boundaries=(
+            BoundaryPoint(timestamp_ms=0, sources=("video_start",)),
+            BoundaryPoint(timestamp_ms=1_000, sources=("video_end",)),
+        ),
+    )
+
+    lines = segments[0].retrieval_text.splitlines()
+
+    assert "关键词：AI 共创社群、Codex" in lines
+    assert "原语言关键词：HNSW" in lines
+
+
+def test_all_duplicate_original_keywords_are_omitted_from_retrieval_text() -> None:
+    understanding = SegmentUnderstanding(
+        title="演示",
+        summary_zh="展示关键词去重。",
+        keywords=("AI共创社群", "Codex"),
+        original_keywords=("AI共创社群", "codex"),
+        evidence_refs=("asr_001",),
+    )
+    segments = merge_segment_understandings(
+        (
+            WindowUnderstanding(
+                window_id="window_001",
+                start_ms=0,
+                end_ms=1_000,
+                understanding=understanding,
+            ),
+        ),
+        boundaries=(
+            BoundaryPoint(timestamp_ms=0, sources=("video_start",)),
+            BoundaryPoint(timestamp_ms=1_000, sources=("video_end",)),
+        ),
+    )
+
+    assert "关键词：AI共创社群、Codex" in segments[0].retrieval_text
+    assert "原语言关键词：" not in segments[0].retrieval_text
+
+
 def test_segment_retrieval_text_has_fixed_chinese_field_order_and_stable_hash() -> None:
     understanding = SegmentUnderstanding(
         title="  产品   演示 ",

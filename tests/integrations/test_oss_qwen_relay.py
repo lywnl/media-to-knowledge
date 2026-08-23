@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from video_demo.domain.evidence import SpeechSegment
 from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
 from video_demo.domain.run import TimeRange
+from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.fusion.timeline import build_timeline
-from video_demo.integrations.oss import PublishedVideoUnderstanding
+from video_demo.integrations.oss import PublishedVideo, PublishedVideoUnderstanding
 from video_demo.integrations.video_port import (
     SegmentSummaryInput,
     SegmentUnderstandingRequest,
@@ -67,6 +70,7 @@ def test_relay_publishes_local_clip_and_delegates_same_window_and_digest(
 ) -> None:
     original = _request(tmp_path)
     published_clips: list[VideoClipInput] = []
+    discarded_keys: list[str] = []
     delegated_requests: list[SegmentUnderstandingRequest] = []
 
     class Publisher:
@@ -74,16 +78,22 @@ def test_relay_publishes_local_clip_and_delegates_same_window_and_digest(
         def remote_host(self) -> str:
             return "private-video-bucket.oss-cn-hangzhou.aliyuncs.com"
 
-        def publish(self, clip: VideoClipInput) -> VideoClipInput:
+        def publish(self, clip: VideoClipInput) -> PublishedVideo:
             published_clips.append(clip)
-            return VideoClipInput(
-                clip_id=clip.clip_id,
-                start_ms=clip.start_ms,
-                end_ms=clip.end_ms,
-                source_url="https://private-video-bucket.oss-cn-hangzhou.aliyuncs.com/clip.mp4?signature=redacted",
-                mime_type=clip.mime_type,
-                sha256=clip.sha256,
+            return PublishedVideo(
+                published_clip=VideoClipInput(
+                    clip_id=clip.clip_id,
+                    start_ms=clip.start_ms,
+                    end_ms=clip.end_ms,
+                    source_url="https://private-video-bucket.oss-cn-hangzhou.aliyuncs.com/clip.mp4?signature=redacted",
+                    mime_type=clip.mime_type,
+                    sha256=clip.sha256,
+                ),
+                object_key="video-demo/qwen-clips/owner/publish-clip.mp4",
             )
+
+        def delete(self, object_key: str) -> None:
+            discarded_keys.append(object_key)
 
     class Delegate:
         degraded_warnings = ("DELEGATE_WARNING",)
@@ -107,6 +117,7 @@ def test_relay_publishes_local_clip_and_delegates_same_window_and_digest(
 
     assert result == _understanding()
     assert published_clips == [original.clip]
+    assert discarded_keys == ["video-demo/qwen-clips/owner/publish-clip.mp4"]
     assert len(delegated_requests) == 1
     delegated = delegated_requests[0]
     assert delegated.clip.path is None
@@ -133,10 +144,13 @@ def test_relay_summary_does_not_publish_another_video(tmp_path: Path) -> None:
         def remote_host(self) -> str:
             return "private-video-bucket.oss-cn-hangzhou.aliyuncs.com"
 
-        def publish(self, _clip: VideoClipInput) -> VideoClipInput:
+        def publish(self, _clip: VideoClipInput) -> PublishedVideo:
             nonlocal published
             published += 1
             raise AssertionError("摘要阶段不应再次发布视频")
+
+        def delete(self, _object_key: str) -> None:
+            raise AssertionError("摘要阶段不应删除视频")
 
     class Delegate:
         def understand_segment(
@@ -176,6 +190,7 @@ def test_relay_publishes_full_video_exactly_once(tmp_path: Path) -> None:
         ),
     )
     published: list[VideoClipInput] = []
+    discarded_keys: list[str] = []
     delegated: list[WholeVideoUnderstandingRequest] = []
 
     class Publisher:
@@ -183,17 +198,23 @@ def test_relay_publishes_full_video_exactly_once(tmp_path: Path) -> None:
         def remote_host(self) -> str:
             return "private-video-bucket.oss-cn-hangzhou.aliyuncs.com"
 
-        def publish(self, video: VideoClipInput) -> VideoClipInput:
+        def publish(self, video: VideoClipInput) -> PublishedVideo:
             published.append(video)
-            return video.model_copy(
-                update={
-                    "path": None,
-                    "source_url": (
-                        "https://private-video-bucket.oss-cn-hangzhou.aliyuncs.com/"
-                        "full.mp4?signature=redacted"
-                    ),
-                },
+            return PublishedVideo(
+                published_clip=video.model_copy(
+                    update={
+                        "path": None,
+                        "source_url": (
+                            "https://private-video-bucket.oss-cn-hangzhou.aliyuncs.com/"
+                            "full.mp4?signature=redacted"
+                        ),
+                    },
+                ),
+                object_key="video-demo/qwen-clips/owner/publish-full.mp4",
             )
+
+        def delete(self, object_key: str) -> None:
+            discarded_keys.append(object_key)
 
     class Delegate:
         def understand_video(
@@ -216,8 +237,81 @@ def test_relay_publishes_full_video_exactly_once(tmp_path: Path) -> None:
     )
 
     assert published == [whole_request.video]
+    assert discarded_keys == ["video-demo/qwen-clips/owner/publish-full.mp4"]
     assert len(delegated) == 1
     assert delegated[0].video.path is None
     assert delegated[0].video.sha256 == whole_request.video.sha256
     assert delegated[0].windows == whole_request.windows
     assert "signature=redacted" not in result.model_dump_json()
+
+
+def test_relay_discards_after_qwen_failure_without_replacing_original_error(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    discarded_keys: list[str] = []
+    original_error = VideoDemoError(ErrorCode.QWEN_RESPONSE_INVALID, "Qwen 返回非法")
+
+    class Publisher:
+        @property
+        def remote_host(self) -> str:
+            return "private-video-bucket.oss-cn-hangzhou.aliyuncs.com"
+
+        def publish(self, clip: VideoClipInput) -> PublishedVideo:
+            return PublishedVideo(published_clip=clip, object_key="owner/publish.mp4")
+
+        def delete(self, object_key: str) -> None:
+            discarded_keys.append(object_key)
+
+    class Delegate:
+        def understand_segment(
+            self,
+            _request: SegmentUnderstandingRequest,
+        ) -> SegmentUnderstanding:
+            raise original_error
+
+        def summarize_video(
+            self,
+            _request: SummaryUnderstandingRequest,
+        ) -> SummaryUnderstanding:
+            raise AssertionError("测试不调用摘要")
+
+    with pytest.raises(VideoDemoError) as raised:
+        PublishedVideoUnderstanding(Delegate(), Publisher()).understand_segment(request)
+
+    assert raised.value is original_error
+    assert discarded_keys == ["owner/publish.mp4"]
+
+
+def test_relay_discards_best_effort_when_cleanup_fails(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    original_error = VideoDemoError(ErrorCode.QWEN_RESPONSE_INVALID, "Qwen 返回非法")
+
+    class Publisher:
+        @property
+        def remote_host(self) -> str:
+            return "private-video-bucket.oss-cn-hangzhou.aliyuncs.com"
+
+        def publish(self, clip: VideoClipInput) -> PublishedVideo:
+            return PublishedVideo(published_clip=clip, object_key="owner/publish.mp4")
+
+        def delete(self, _object_key: str) -> None:
+            raise RuntimeError("OSS 删除失败")
+
+    class Delegate:
+        def understand_segment(
+            self,
+            _request: SegmentUnderstandingRequest,
+        ) -> SegmentUnderstanding:
+            raise original_error
+
+        def summarize_video(
+            self,
+            _request: SummaryUnderstandingRequest,
+        ) -> SummaryUnderstanding:
+            raise AssertionError("测试不调用摘要")
+
+    with pytest.raises(VideoDemoError) as raised:
+        PublishedVideoUnderstanding(Delegate(), Publisher()).understand_segment(request)
+
+    assert raised.value is original_error

@@ -15,11 +15,20 @@ from video_demo.integrations.video_port import VideoClipInput
 _ACCESS_KEY_ID = "test-access-key-id"
 _ACCESS_KEY_SECRET = "test-access-key-secret"
 _MP4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + b"media"
+_OBJECT_KEY = (
+    "video-demo/qwen-clips/"
+    + "a" * 24
+    + "/"
+    + "b" * 32
+    + "-clip_001-"
+    + "c" * 24
+    + ".mp4"
+)
 
 
 def _clip(tmp_path: Path) -> VideoClipInput:
     path = tmp_path / "runs" / "scope" / "run_001" / "visual" / "clips" / "clip.mp4"
-    path.parent.mkdir(parents=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(_MP4)
     return VideoClipInput(
         clip_id="clip_001",
@@ -80,24 +89,31 @@ def test_publisher_uploads_private_object_verifies_it_and_returns_signed_url(
     assert requests[1].headers["x-oss-meta-sha256"] == hashlib.sha256(_MP4).hexdigest()
     assert requests[1].headers["content-md5"]
     assert all(_ACCESS_KEY_SECRET not in str(request.headers) for request in requests)
-    assert published.path is None
-    assert published.sha256 == hashlib.sha256(_MP4).hexdigest()
-    assert (published.start_ms, published.end_ms) == (1_000, 6_000)
-    parsed = urlsplit(published.source_url or "")
+    assert published.clip.path is None
+    assert published.clip.sha256 == hashlib.sha256(_MP4).hexdigest()
+    assert (published.clip.start_ms, published.clip.end_ms) == (1_000, 6_000)
+    parsed = urlsplit(published.clip.source_url or "")
     query = parse_qs(parsed.query)
     assert parsed.scheme == "https"
     assert parsed.hostname == publisher.remote_host
     assert query["OSSAccessKeyId"] == [_ACCESS_KEY_ID]
     assert query["Expires"] == ["1800003600"]
     assert len(query["Signature"]) == 1
-    assert _ACCESS_KEY_SECRET not in published.source_url
+    assert _ACCESS_KEY_SECRET not in published.clip.source_url
+    assert published.object_key in parsed.path
 
 
-def test_publisher_reuses_matching_private_object_without_upload(tmp_path: Path) -> None:
+def test_publisher_creates_a_unique_private_object_for_each_publish(
+    tmp_path: Path,
+) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        if request.method == "HEAD" and len(requests) in (1, 4):
+            return httpx.Response(404, request=request)
+        if request.method == "PUT":
+            return httpx.Response(200, request=request)
         return httpx.Response(
             200,
             headers={
@@ -107,10 +123,39 @@ def test_publisher_reuses_matching_private_object_without_upload(tmp_path: Path)
             request=request,
         )
 
-    published = _publisher(tmp_path, httpx.MockTransport(handler)).publish(_clip(tmp_path))
+    publisher = _publisher(tmp_path, httpx.MockTransport(handler))
+    first = publisher.publish(_clip(tmp_path))
+    second = publisher.publish(_clip(tmp_path))
 
-    assert published.source_url is not None
-    assert [request.method for request in requests] == ["HEAD"]
+    assert first.clip.source_url is not None
+    assert second.clip.source_url is not None
+    assert first.object_key != second.object_key
+    assert [request.method for request in requests] == [
+        "HEAD",
+        "PUT",
+        "HEAD",
+        "HEAD",
+        "PUT",
+        "HEAD",
+    ]
+
+
+@pytest.mark.parametrize("status_code", [204, 404, 401, 403, 429, 500])
+def test_publisher_delete_is_idempotent_and_best_effort(
+    tmp_path: Path,
+    status_code: int,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status_code, request=request)
+
+    publisher = _publisher(tmp_path, httpx.MockTransport(handler))
+    publisher.delete(_OBJECT_KEY)
+
+    assert [request.method for request in requests] == ["DELETE"]
+    assert _ACCESS_KEY_SECRET not in str(requests[0].headers)
 
 
 @pytest.mark.parametrize(
