@@ -1,0 +1,397 @@
+from __future__ import annotations
+
+import json
+import time
+from collections.abc import Callable
+from typing import TypeVar
+
+import httpx
+from pydantic import BaseModel, ValidationError
+
+from video_demo.domain.document import VisualBlock
+from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.integrations.document_port import (
+    ChapterPlanningRequest,
+    ChapterPlanningResponse,
+    ChapterPlanRepairRequest,
+    ChapterWritingRepairRequest,
+    ChapterWritingRequest,
+    ChapterWritingResponse,
+    DocumentTextPort,
+    GlobalWritingRepairRequest,
+    GlobalWritingRequest,
+    GlobalWritingResponse,
+    ModelResponseValidationError,
+    allowed_global_chapter_ids,
+    allowed_writing_evidence_ids,
+    invalid_model_response,
+)
+from video_demo.integrations.document_prompts import (
+    prompt_for_global_editing,
+    prompt_for_global_repair,
+    prompt_for_plan_repair,
+    prompt_for_planning,
+    prompt_for_writing,
+    prompt_for_writing_repair,
+)
+
+ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
+Prompt = tuple[str, str, str]
+
+
+class OpenAIDocumentClient(DocumentTextPort):
+    """OpenAI 兼容文本模型客户端；只负责协议调用和严格响应解析。"""
+
+    def __init__(
+        self,
+        http_client: httpx.Client,
+        *,
+        base_url: str,
+        api_key: str,
+        model_id: str,
+        timeout_seconds: float = 120.0,
+        max_attempts: int = 3,
+        max_input_chars: int = 60_000,
+        max_input_bytes: int = 1 * 1024 * 1024,
+        max_response_bytes: int = 2 * 1024 * 1024,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._http_client = http_client
+        self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
+        self._api_key = api_key
+        self._model_id = model_id
+        self._timeout_seconds = timeout_seconds
+        self._max_attempts = max_attempts
+        self._max_input_chars = max_input_chars
+        self._max_input_bytes = max_input_bytes
+        self._max_response_bytes = max_response_bytes
+        self._sleeper = sleeper
+
+    def plan_chapters(self, request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        return self._call(
+            prompt_for_planning(request),
+            response_type=ChapterPlanningResponse,
+            schema_name="chapter_planning_v1",
+            validate_response=lambda response: _validate_planning_response(
+                response,
+                allowed_segment_ids={segment.segment_id for segment in request.segments},
+                allowed_transcript_ids={
+                    item.evidence_id for item in request.transcript_evidence
+                },
+            ),
+        )
+
+    def repair_chapter_plan(self, request: ChapterPlanRepairRequest) -> ChapterPlanningResponse:
+        return self._call(
+            prompt_for_plan_repair(request),
+            response_type=ChapterPlanningResponse,
+            schema_name="chapter_planning_repair_v1",
+            validate_response=lambda response: _validate_planning_response(
+                response,
+                allowed_segment_ids=set(request.allowed_segment_ids),
+                allowed_transcript_ids=set(request.allowed_transcript_ids),
+            ),
+        )
+
+    def write_chapter(self, request: ChapterWritingRequest) -> ChapterWritingResponse:
+        return self._call(
+            prompt_for_writing(request),
+            response_type=ChapterWritingResponse,
+            schema_name="chapter_writing_v1",
+            validate_response=lambda response: _validate_writing_response(
+                response,
+                allowed_evidence_ids=set(allowed_writing_evidence_ids(request)),
+                allowed_visual_observation_ids={
+                    item.evidence_id for item in request.visual_observations
+                },
+            ),
+        )
+
+    def repair_chapter_writing(
+        self,
+        request: ChapterWritingRepairRequest,
+    ) -> ChapterWritingResponse:
+        return self._call(
+            prompt_for_writing_repair(request),
+            response_type=ChapterWritingResponse,
+            schema_name="chapter_writing_repair_v1",
+            validate_response=lambda response: _validate_writing_response(
+                response,
+                allowed_evidence_ids=set(request.allowed_evidence_ids),
+                allowed_visual_observation_ids={
+                    item.evidence_id for item in request.request.visual_observations
+                },
+            ),
+        )
+
+    def organize_document(self, request: GlobalWritingRequest) -> GlobalWritingResponse:
+        return self._call(
+            prompt_for_global_editing(request),
+            response_type=GlobalWritingResponse,
+            schema_name="global_writing_v1",
+            validate_response=lambda response: _validate_global_response(
+                response,
+                allowed_chapter_ids=set(allowed_global_chapter_ids(request)),
+            ),
+        )
+
+    def repair_global_writing(self, request: GlobalWritingRepairRequest) -> GlobalWritingResponse:
+        return self._call(
+            prompt_for_global_repair(request),
+            response_type=GlobalWritingResponse,
+            schema_name="global_writing_repair_v1",
+            validate_response=lambda response: _validate_global_response(
+                response,
+                allowed_chapter_ids=set(request.allowed_chapter_ids),
+            ),
+        )
+
+    def _call(
+        self,
+        prompt: Prompt,
+        *,
+        response_type: type[ResponseModel],
+        schema_name: str,
+        validate_response: Callable[[ResponseModel], None],
+    ) -> ResponseModel:
+        version, instruction, data = prompt
+        _validate_input_budget(data, self._max_input_chars, self._max_input_bytes)
+        payload = _request_payload(
+            model_id=self._model_id,
+            version=version,
+            instruction=instruction,
+            data=data,
+            response_type=response_type,
+            schema_name=schema_name,
+        )
+        raw = self._post_with_retry(payload)
+        return _parse_and_validate_response(
+            raw,
+            response_type,
+            validate_response=validate_response,
+        )
+
+    def _post_with_retry(self, payload: dict[str, object]) -> bytes:
+        last_error: VideoDemoError | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            try:
+                with self._http_client.stream(
+                    "POST",
+                    self._endpoint,
+                    headers={"Authorization": f"Bearer {self._api_key}"},
+                    json=payload,
+                    timeout=self._timeout_seconds,
+                ) as response:
+                    _raise_response_status(response)
+                    content = _bounded_response(response, self._max_response_bytes)
+                return content
+            except (httpx.RequestError, TimeoutError) as error:
+                last_error = VideoDemoError(
+                    ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
+                    "文本模型暂时不可用",
+                )
+                if attempt == self._max_attempts:
+                    raise last_error from error
+            except VideoDemoError as error:
+                if (
+                    error.code != ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
+                    or attempt == self._max_attempts
+                ):
+                    raise
+                last_error = error
+            if attempt < self._max_attempts:
+                self._sleeper(min(2 ** (attempt - 1), 4))
+        raise last_error or RuntimeError("文本模型调用状态非法")
+
+
+def _request_payload(
+    *,
+    model_id: str,
+    version: str,
+    instruction: str,
+    data: str,
+    response_type: type[BaseModel],
+    schema_name: str,
+) -> dict[str, object]:
+    return {
+        "model": model_id,
+        "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": True,
+                "schema": response_type.model_json_schema(),
+            },
+        },
+        "messages": [
+            {
+                "role": "system",
+                "content": f"PROMPT_VERSION={version}\n{instruction}",
+            },
+            {
+                "role": "user",
+                "content": "UNTRUSTED_DOCUMENT_DATA_JSON\n" + data,
+            },
+        ],
+    }
+
+
+def _bounded_response(response: httpx.Response, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            raise VideoDemoError(ErrorCode.TEXT_LLM_RESPONSE_INVALID, "文本模型响应超过大小上限")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _raise_response_status(response: httpx.Response) -> None:
+    if response.status_code < 400:
+        return
+    if response.status_code in {401, 403}:
+        raise VideoDemoError(ErrorCode.TEXT_LLM_AUTHENTICATION_FAILED, "文本模型鉴权失败")
+    if response.status_code in {408, 429} or response.status_code >= 500:
+        raise VideoDemoError(ErrorCode.DEPENDENCY_TEMPORARY_FAILURE, "文本模型暂时不可用")
+    if response.status_code in {404, 415, 422}:
+        raise VideoDemoError(
+            ErrorCode.TEXT_LLM_CAPABILITY_UNAVAILABLE,
+            "文本模型或结构化输出能力不可用",
+        )
+    raise VideoDemoError(ErrorCode.TEXT_LLM_RESPONSE_INVALID, "文本模型请求被拒绝")
+
+
+def _parse_and_validate_response(
+    content: bytes,
+    response_type: type[ResponseModel],
+    *,
+    validate_response: Callable[[ResponseModel], None],
+) -> ResponseModel:
+    raw_message, parsed = _extract_model_message(content)
+    try:
+        response = response_type.model_validate(parsed)
+        validate_response(response)
+        return response
+    except ValidationError as error:
+        summaries = tuple(_pydantic_error_summary(item) for item in error.errors())
+    except _ReferenceValidationError as error:
+        summaries = (error.summary,)
+    raise ModelResponseValidationError(
+        ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+        "文本模型响应结构非法",
+        invalid_model_response(
+            raw_message,
+            summaries,
+            parsed_json=parsed,
+        ),
+    ) from None
+
+
+def _extract_model_message(content: bytes) -> tuple[bytes, object | None]:
+    envelope: object | None = None
+    raw: bytes | None = None
+    try:
+        envelope = json.loads(
+            content,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+        message = envelope["choices"][0]["message"]["content"]  # type: ignore[index]
+        if not isinstance(message, str):
+            raise ValueError
+        raw = message.encode("utf-8")
+        parsed = json.loads(
+            message,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+        return raw, parsed
+    except (KeyError, IndexError, TypeError, ValueError, UnicodeDecodeError):
+        safe_envelope = envelope if raw is None else None
+        raise ModelResponseValidationError(
+            ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+            "文本模型响应结构非法",
+            invalid_model_response(
+                raw if raw is not None else content,
+                ("response_envelope:invalid",),
+                parsed_json=safe_envelope,
+            ),
+        ) from None
+
+
+def _pydantic_error_summary(error: object) -> str:
+    assert isinstance(error, dict)
+    location_value = error.get("loc", ())
+    location = ".".join(str(item) for item in location_value) or "response"
+    error_type = str(error.get("type", "invalid"))
+    return f"{location}:{error_type}"[:500]
+
+
+def _validate_input_budget(data: str, max_chars: int, max_bytes: int) -> None:
+    if len(data) > max_chars or len(data.encode("utf-8")) > max_bytes:
+        raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "文本模型输入超过大小上限")
+
+
+def _validate_planning_response(
+    response: ChapterPlanningResponse,
+    *,
+    allowed_segment_ids: set[str],
+    allowed_transcript_ids: set[str],
+) -> None:
+    for draft in response.chapter_drafts:
+        _require_known_ids(
+            draft.segment_refs,
+            allowed_segment_ids,
+            "chapter_drafts.segment_refs",
+        )
+        for target in draft.semantic_targets:
+            _require_known_ids(
+                target.anchor_evidence_refs,
+                allowed_transcript_ids,
+                "chapter_drafts.semantic_targets.anchor_evidence_refs",
+            )
+
+
+def _validate_writing_response(
+    response: ChapterWritingResponse,
+    *,
+    allowed_evidence_ids: set[str],
+    allowed_visual_observation_ids: set[str],
+) -> None:
+    for block in response.body_blocks:
+        _require_known_ids(block.evidence_refs, allowed_evidence_ids, "body_blocks.evidence_refs")
+        if isinstance(block, VisualBlock):
+            _require_known_ids(
+                (block.visual_observation_ref,),
+                allowed_visual_observation_ids,
+                "body_blocks.visual_observation_ref",
+            )
+            _require_known_ids(
+                (block.visual_observation_ref,),
+                set(block.evidence_refs),
+                "body_blocks.visual_observation_ref",
+            )
+    for claim in response.claims:
+        _require_known_ids(claim.evidence_refs, allowed_evidence_ids, "claims.evidence_refs")
+
+
+def _validate_global_response(
+    response: GlobalWritingResponse,
+    *,
+    allowed_chapter_ids: set[str],
+) -> None:
+    for point in response.key_points:
+        _require_known_ids(point.chapter_refs, allowed_chapter_ids, "key_points.chapter_refs")
+    for section in response.sections:
+        _require_known_ids(section.chapter_refs, allowed_chapter_ids, "sections.chapter_refs")
+
+
+class _ReferenceValidationError(ValueError):
+    def __init__(self, summary: str) -> None:
+        super().__init__(summary)
+        self.summary = summary
+
+
+def _require_known_ids(values: tuple[str, ...], allowed: set[str], field: str) -> None:
+    if any(value not in allowed for value in values):
+        raise _ReferenceValidationError(f"{field}:unknown_reference")

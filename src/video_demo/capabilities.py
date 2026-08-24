@@ -41,6 +41,12 @@ class CapabilityReport(BaseModel):
     cloud_asr_model: str | None
     cloud_asr_base_url: str | None
     cloud_asr_configured: bool
+    text_llm_model: str | None
+    text_llm_base_url: str | None
+    text_llm_configured: bool
+    vlm_model: str | None
+    vlm_base_url: str | None
+    vlm_configured: bool
     binaries: tuple[BinaryCapability, ...]
     issues: tuple[CapabilityIssue, ...]
 
@@ -117,10 +123,22 @@ def probe_runtime_capabilities(settings: Settings) -> CapabilityReport:
     binaries: list[BinaryCapability] = []
     issues: list[CapabilityIssue] = []
     cloud_asr = None
+    text_llm = None
+    vlm = None
     try:
         cloud_asr = settings.require_cloud_asr_configuration()
     except VideoDemoError as error:
         issues.append(CapabilityIssue(code=error.code, message="云端语音识别配置不完整"))
+    try:
+        text_llm = settings.require_text_llm_configuration()
+    except VideoDemoError as error:
+        if _has_partial_text_llm_configuration(settings):
+            issues.append(CapabilityIssue(code=error.code, message="文本模型配置不完整"))
+    try:
+        vlm = settings.require_vlm_configuration()
+    except VideoDemoError as error:
+        if _has_partial_vlm_configuration(settings):
+            issues.append(CapabilityIssue(code=error.code, message="视觉模型配置不完整"))
     specifications = (
         ("ffmpeg", settings.ffmpeg_path, ErrorCode.VIDEO_FFMPEG_UNAVAILABLE),
         ("ffprobe", settings.ffprobe_path, ErrorCode.VIDEO_FFPROBE_UNAVAILABLE),
@@ -150,6 +168,31 @@ def probe_runtime_capabilities(settings: Settings) -> CapabilityReport:
         cloud_asr_model=cloud_asr.model if cloud_asr is not None else None,
         cloud_asr_base_url=cloud_asr.base_url if cloud_asr is not None else None,
         cloud_asr_configured=cloud_asr is not None,
+        text_llm_model=text_llm.model_id if text_llm is not None else None,
+        text_llm_base_url=text_llm.base_url if text_llm is not None else None,
+        text_llm_configured=text_llm is not None,
+        vlm_model=vlm.model_id if vlm is not None else None,
+        vlm_base_url=vlm.base_url if vlm is not None else None,
+        vlm_configured=vlm is not None,
         binaries=tuple(binaries),
         issues=tuple(issues),
+    )
+
+
+def _has_partial_text_llm_configuration(settings: Settings) -> bool:
+    return any(
+        (
+            bool(settings.text_llm_base_url and settings.text_llm_base_url.strip()),
+            bool(settings.text_llm_api_key),
+            bool(settings.text_llm_model_id and settings.text_llm_model_id.strip()),
+        ),
+    )
+
+
+def _has_partial_vlm_configuration(settings: Settings) -> bool:
+    return any(
+        (
+            bool(settings.vlm_base_url and settings.vlm_base_url.strip()),
+            bool(settings.vlm_api_key),
+        ),
     )

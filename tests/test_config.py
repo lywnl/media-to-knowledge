@@ -14,6 +14,96 @@ from video_demo.errors import ErrorCode, VideoDemoError
 
 
 class SettingsTest(unittest.TestCase):
+    def test_text_llm_and_vlm_configuration_are_independent_and_vlm_has_default_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                workspace_root=Path(directory),
+                text_llm_base_url="https://text.example.test/v1",
+                text_llm_api_key="text-secret",
+                text_llm_model_id="text-model",
+                vlm_base_url="https://vision.example.test/v1",
+                vlm_api_key="vision-secret",
+                _env_file=None,
+            )
+
+            text = settings.require_text_llm_configuration()
+            vision = settings.require_vlm_configuration()
+
+            self.assertEqual(text.base_url, "https://text.example.test/v1")
+            self.assertEqual(text.model_id, "text-model")
+            self.assertEqual(vision.base_url, "https://vision.example.test/v1")
+            self.assertEqual(vision.model_id, "qwen3-vl-flash")
+
+    def test_model_configuration_rejects_partial_values_and_unsafe_http(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            for values in (
+                {
+                    "text_llm_base_url": "https://text.example.test/v1",
+                    "text_llm_api_key": "secret",
+                },
+                {
+                    "vlm_base_url": "http://vision.example.test/v1",
+                    "vlm_api_key": "secret",
+                },
+            ):
+                with self.subTest(values=values), self.assertRaises(ValidationError):
+                    Settings(workspace_root=workspace, _env_file=None, **values)
+
+    def test_explicit_vlm_model_without_endpoint_or_key_is_partial_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValidationError):
+            Settings(
+                workspace_root=Path(directory),
+                vlm_model_id="qwen3-vl-plus",
+                _env_file=None,
+            )
+
+    def test_local_http_model_endpoint_requires_explicit_localhost_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                workspace_root=Path(directory),
+                vlm_base_url="http://127.0.0.1:8080/v1",
+                vlm_api_key="vision-secret",
+                allow_insecure_local_model_endpoint=True,
+                _env_file=None,
+            )
+            self.assertEqual(settings.require_vlm_configuration().base_url, "http://127.0.0.1:8080/v1")
+
+    def test_model_secrets_are_hidden_from_serialized_settings_and_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            secret = "new-model-secret"
+            settings = Settings(
+                workspace_root=Path(directory),
+                text_llm_base_url="https://text.example.test/v1",
+                text_llm_api_key=secret,
+                text_llm_model_id="text-model",
+                vlm_base_url="https://vision.example.test/v1",
+                vlm_api_key="vision-secret",
+                _env_file=None,
+            )
+            serialized = (repr(settings), repr(settings.model_dump()), settings.model_dump_json())
+            self.assertTrue(all(secret not in value for value in serialized))
+
+    def test_document_model_internal_concurrency_is_capped_at_two(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for field in ("vlm_concurrency", "chapter_writer_concurrency"):
+                with self.subTest(field=field), self.assertRaises(ValidationError):
+                    Settings(
+                        workspace_root=Path(directory),
+                        _env_file=None,
+                        **{field: 3},
+                    )
+
+    def test_vlm_inflight_budget_must_cover_all_concurrent_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValidationError):
+            Settings(
+                workspace_root=Path(directory),
+                vlm_concurrency=2,
+                vlm_max_encoded_request_bytes=36 * 1024 * 1024,
+                vlm_max_inflight_encoded_bytes=64 * 1024 * 1024,
+                _env_file=None,
+            )
+
     def test_retired_local_model_dotenv_keys_are_ignored_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
