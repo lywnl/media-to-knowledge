@@ -74,9 +74,13 @@ def _result(chapter: SemanticChapter | None = None) -> VideoUnderstandingResult:
             vlm_model_id="vlm",
             prompt_versions=PromptVersions(
                 chapter_planner="chapter-planner-v1",
+                chapter_planner_repair="chapter-planner-repair-v1",
                 chapter_vlm="chapter-vlm-v1",
+                chapter_vlm_repair="chapter-vlm-repair-v1",
                 chapter_writer="chapter-writer-v1",
+                chapter_writer_repair="chapter-writer-repair-v1",
                 global_editor="global-editor-v1",
+                global_editor_repair="global-editor-repair-v1",
             ),
         ),
     )
@@ -94,14 +98,19 @@ def _speech() -> SpeechSegment:
     )
 
 
-def _keyframe(keyframe_id: str = "frame_001", *, timestamp_ms: int = 600) -> KeyframeEvidence:
+def _keyframe(
+    keyframe_id: str = "frame_001",
+    *,
+    timestamp_ms: int = 600,
+    end_ms: int | None = None,
+) -> KeyframeEvidence:
     return KeyframeEvidence(
         evidence_id=f"keyframe_{keyframe_id}",
-        start_ms=500,
-        end_ms=700,
+        start_ms=timestamp_ms,
+        end_ms=end_ms or timestamp_ms + 1,
         keyframe_id=keyframe_id,
         timestamp_ms=timestamp_ms,
-        relative_path=f"visual/keyframes/{keyframe_id}.jpg",
+        relative_path=f"visual/keyframes/{'b' * 64}.jpg",
         mime_type="image/jpeg",
         sha256="b" * 64,
         perceptual_hash="0123456789abcdef",
@@ -182,6 +191,36 @@ def test_cross_object_validation_rejects_observation_outside_chapter() -> None:
         validate_evidence_references(_result(), (_speech(), _keyframe(), observation))
 
     assert raised.value.code == ErrorCode.EVIDENCE_OUTSIDE_CHAPTER
+
+
+def test_cross_object_validation_requires_observation_to_cover_its_keyframes() -> None:
+    observation = _observation().model_copy(update={"start_ms": 500, "end_ms": 550})
+
+    with pytest.raises(VideoDemoError) as raised:
+        validate_evidence_references(_result(), (_speech(), _keyframe(), observation))
+
+    assert raised.value.code == ErrorCode.EVIDENCE_OUTSIDE_CHAPTER
+
+
+def test_keyframe_is_jpeg_only_run_relative_and_one_millisecond_long() -> None:
+    payload = _keyframe().model_dump(exclude={"duration_ms"})
+
+    for field, invalid in (
+        ("mime_type", "image/png"),
+        ("relative_path", "../visual/keyframes/" + "b" * 64 + ".jpg"),
+        ("relative_path", "visual/keyframes/not-the-digest.jpg"),
+        ("end_ms", payload["end_ms"] + 1),
+    ):
+        invalid_payload = {**payload, field: invalid}
+        with pytest.raises(ValidationError):
+            KeyframeEvidence.model_validate(invalid_payload)
+
+
+def test_keyframe_at_chapter_end_is_clipped_to_a_valid_half_open_range() -> None:
+    keyframe = _keyframe(timestamp_ms=999, end_ms=1_000)
+
+    assert keyframe.start_ms == 999
+    assert keyframe.end_ms == 1_000
 
 
 def test_cross_object_validation_rejects_reverse_frame_relation() -> None:

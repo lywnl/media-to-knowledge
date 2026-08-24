@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import re
+import unicodedata
 from collections.abc import Iterable
 from typing import Annotated, Literal, TypeAlias
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from video_demo.domain.base import FrozenModel, Probability, Sha256, StableId, stable_identifier
 from video_demo.domain.evidence import (
@@ -20,14 +22,49 @@ from video_demo.errors import ErrorCode, VideoDemoError
 
 RESULT_SCHEMA_VERSION: Literal["3.0.0"] = "3.0.0"
 TranscriptSource: TypeAlias = Literal["SUBTITLE", "ASR", "NONE"]
+_TITLE_MAX_LENGTH = 200
+_TITLE_WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
+def sanitize_document_title(
+    explicit_title: str | None,
+    original_filename: str | None = None,
+) -> str | None:
+    """生成唯一的安全标题；仅文件名回退分支移除扩展名。"""
+
+    candidate = explicit_title
+    if candidate is None or not candidate.strip():
+        if original_filename is None:
+            return None
+        filename = original_filename.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
+        extension_separator = filename.rfind(".")
+        candidate = (
+            filename[:extension_separator]
+            if extension_separator > 0
+            else filename
+        )
+    cleaned = "".join(
+        " " if character in "/\\" or unicodedata.category(character).startswith("C") else character
+        for character in candidate
+    )
+    normalized = _TITLE_WHITESPACE_PATTERN.sub(" ", cleaned).strip()
+    return normalized[:_TITLE_MAX_LENGTH] or None
 
 
 class DocumentGenerationConfig(FrozenModel):
+    document_title: str | None = Field(default=None, max_length=_TITLE_MAX_LENGTH)
     detail_level: Literal["concise", "standard", "detailed"] = "standard"
     chapter_granularity: Literal["fine", "standard", "coarse"] = "standard"
     include_verbatim_quotes: bool = True
-    max_visuals_per_chapter: int = Field(default=2, ge=1, le=3)
+    max_visuals_per_chapter: int = Field(default=2, ge=0, le=3)
     uncertainty_policy: Literal["explicit", "conservative"] = "explicit"
+
+    @field_validator("document_title", mode="before")
+    @classmethod
+    def normalize_document_title(cls, value: object) -> object:
+        if value is None or isinstance(value, str):
+            return sanitize_document_title(value)
+        return value
 
 
 class SummaryPoint(FrozenModel):
@@ -175,18 +212,22 @@ class SemanticChapter(TimeRange):
         return self
 
 
+class PromptVersions(FrozenModel):
+    chapter_planner: Literal["chapter-planner-v1"]
+    chapter_planner_repair: Literal["chapter-planner-repair-v1"]
+    chapter_vlm: Literal["chapter-vlm-v1"]
+    chapter_vlm_repair: Literal["chapter-vlm-repair-v1"]
+    chapter_writer: Literal["chapter-writer-v1"]
+    chapter_writer_repair: Literal["chapter-writer-repair-v1"]
+    global_editor: Literal["global-editor-v1"]
+    global_editor_repair: Literal["global-editor-repair-v1"]
+
+
 class DocumentGenerationMetadata(FrozenModel):
     document_config: DocumentGenerationConfig
     text_model_id: str = Field(min_length=1, max_length=256)
     vlm_model_id: str = Field(min_length=1, max_length=256)
     prompt_versions: PromptVersions
-
-
-class PromptVersions(FrozenModel):
-    chapter_planner: Literal["chapter-planner-v1"]
-    chapter_vlm: Literal["chapter-vlm-v1"]
-    chapter_writer: Literal["chapter-writer-v1"]
-    global_editor: Literal["global-editor-v1"]
 
 
 class VideoUnderstandingResult(FrozenModel):
@@ -217,6 +258,8 @@ class VideoUnderstandingResult(FrozenModel):
                 raise ValueError("Section chapter_refs 不得重复")
             if any(ref not in chapter_set for ref in section.chapter_refs):
                 raise ValueError("Section 引用了不存在的章节")
+            if section.section_id != section_id_for(self.asset_sha256, section.chapter_refs):
+                raise ValueError("Section ID 必须由资产摘要和有序章节引用稳定生成")
             section_refs.extend(section.chapter_refs)
         if tuple(section_refs) != chapter_ids:
             raise ValueError("Section 必须按顺序完整覆盖每个章节一次")
@@ -329,6 +372,12 @@ def validate_evidence_references(
                 raise VideoDemoError(
                     ErrorCode.EVIDENCE_OUTSIDE_CHAPTER,
                     "关键帧不属于视觉观察所在章节",
+                )
+            if not evidence_item.contains(frame):
+                raise VideoDemoError(
+                    ErrorCode.EVIDENCE_OUTSIDE_CHAPTER,
+                    "视觉观察时间范围未覆盖所引用的关键帧",
+                    {"evidence_id": evidence_item.evidence_id},
                 )
         keyframe_times = {
             frame_ref: _keyframe_timestamp(evidence_by_id, frame_ref)

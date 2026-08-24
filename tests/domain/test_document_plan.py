@@ -10,6 +10,7 @@ from video_demo.domain.document_plan import (
     FrameCandidateArtifact,
     VisualSearchTarget,
 )
+from video_demo.domain.evidence import ChapterVisualObservation
 
 
 def test_chapter_plan_contains_only_program_owned_time_and_ids() -> None:
@@ -42,6 +43,18 @@ def test_chapter_plan_contains_only_program_owned_time_and_ids() -> None:
     assert "chapter_id" not in ChapterDraft.model_fields
 
 
+def test_base_segment_without_transcript_allows_empty_evidence_refs() -> None:
+    segment = BaseSegment(
+        segment_id="segment_001",
+        start_ms=0,
+        end_ms=10_000,
+        evidence_refs=(),
+        transcript_source="NONE",
+    )
+
+    assert segment.evidence_refs == ()
+
+
 def test_semantic_target_requires_one_to_three_transcript_anchors() -> None:
     with pytest.raises(ValidationError):
         VisualSearchTarget(
@@ -64,17 +77,101 @@ def test_base_coverage_target_cannot_use_transcript_anchor() -> None:
 
 
 def test_frame_candidate_has_bounded_identity_and_positive_size() -> None:
+    digest = "a" * 64
     candidate = FrameCandidateArtifact(
         frame_id="frame_001",
         timestamp_ms=2_000,
-        sha256="a" * 64,
+        sha256=digest,
         size_bytes=128,
-        relative_path="visual/candidates/a.jpg",
+        relative_path=f"visual/candidates/{digest}.jpg",
         perceptual_hash="0123456789abcdef",
         target_ids=("target_001",),
     )
 
     assert candidate.size_bytes == 128
+
+
+def test_frame_candidate_is_jpeg_only_and_uses_content_addressed_run_path() -> None:
+    valid = {
+        "frame_id": "frame_001",
+        "timestamp_ms": 2_000,
+        "sha256": "a" * 64,
+        "size_bytes": 128,
+        "relative_path": f"visual/candidates/{'a' * 64}.jpg",
+        "mime_type": "image/jpeg",
+        "perceptual_hash": "0123456789abcdef",
+        "target_ids": ("target_001",),
+    }
+
+    for field, invalid in (
+        ("mime_type", "image/png"),
+        ("relative_path", f"runs/scope/run/visual/candidates/{'a' * 64}.jpg"),
+        ("relative_path", "visual/candidates/wrong.jpg"),
+    ):
+        with pytest.raises(ValidationError):
+            FrameCandidateArtifact.model_validate({**valid, field: invalid})
+
+
+def test_candidate_and_observation_accept_at_most_six_target_ids() -> None:
+    target_ids = tuple(f"target_{index}" for index in range(6))
+    candidate = FrameCandidateArtifact(
+        frame_id="frame_001",
+        timestamp_ms=2_000,
+        sha256="a" * 64,
+        size_bytes=128,
+        relative_path=f"visual/candidates/{'a' * 64}.jpg",
+        perceptual_hash="0123456789abcdef",
+        target_ids=target_ids,
+    )
+    observation = ChapterVisualObservation(
+        target_ids=target_ids,
+        selected_frame_ids=("frame_001",),
+        visual_type="GENERAL",
+        caption="代表性画面",
+        relation_to_transcript="INDEPENDENT",
+        certainty=0.9,
+    )
+
+    assert len(candidate.target_ids) == 6
+    assert len(observation.target_ids) == 6
+
+    with pytest.raises(ValidationError):
+        FrameCandidateArtifact.model_validate(
+            {**candidate.model_dump(), "target_ids": (*target_ids, "target_6")},
+        )
+    with pytest.raises(ValidationError):
+        ChapterVisualObservation.model_validate(
+            {**observation.model_dump(), "target_ids": (*target_ids, "target_6")},
+        )
+
+
+def test_chapter_models_accept_twenty_thousand_segment_refs_but_no_more() -> None:
+    segment_refs = tuple(f"segment_{index}" for index in range(20_000))
+    plan = ChapterPlan(
+        chapter_id="chapter_001",
+        start_ms=0,
+        end_ms=10_000,
+        segment_refs=segment_refs,
+        title_hint="章节",
+        visual_mode="NONE",
+        semantic_targets=(),
+        base_coverage_targets=(),
+    )
+    draft = ChapterDraft(
+        segment_refs=segment_refs,
+        title_hint="章节",
+        visual_mode="NONE",
+        semantic_targets=(),
+    )
+
+    assert len(plan.segment_refs) == 20_000
+    assert len(draft.segment_refs) == 20_000
+
+    too_many = (*segment_refs, "segment_20000")
+    with pytest.raises(ValidationError):
+        ChapterPlan.model_validate({**plan.model_dump(), "segment_refs": too_many})
+    with pytest.raises(ValidationError):
+        ChapterDraft.model_validate({**draft.model_dump(), "segment_refs": too_many})
 
 
 def test_base_coverage_without_scenes_uses_program_owned_sample_timestamp() -> None:

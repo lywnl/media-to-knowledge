@@ -16,8 +16,40 @@ from video_demo.domain.document import (
     SummaryPoint,
     VideoDocumentSummary,
     VideoUnderstandingResult,
+    sanitize_document_title,
     section_id_for,
 )
+
+
+def test_document_generation_config_allows_zero_visuals() -> None:
+    configuration = DocumentGenerationConfig(max_visuals_per_chapter=0)
+
+    assert configuration.max_visuals_per_chapter == 0
+
+
+def test_document_title_is_normalized_without_treating_explicit_title_as_filename() -> None:
+    configuration = DocumentGenerationConfig(
+        document_title="  faster-whisper v1.0\n/ 入门\\教程  ",
+    )
+
+    assert configuration.document_title == "faster-whisper v1.0 入门 教程"
+
+
+def test_document_title_falls_back_to_cross_platform_filename_stem() -> None:
+    assert sanitize_document_title(None, r"C:\uploads\faster-whisper.v1.mp4") == (
+        "faster-whisper.v1"
+    )
+    assert sanitize_document_title(None, "/uploads/课程.mov") == "课程"
+
+
+def test_document_title_drops_control_characters_and_is_bounded() -> None:
+    assert sanitize_document_title("\x00\t\n") is None
+    assert sanitize_document_title("标题\u202e伪装") == "标题 伪装"
+    assert sanitize_document_title("标题" * 150) == ("标题" * 100)
+
+
+def test_document_title_keeps_hidden_filename_name_when_falling_back() -> None:
+    assert sanitize_document_title(None, "/uploads/.env") == ".env"
 
 ASSET_SHA = "a" * 64
 
@@ -33,9 +65,13 @@ def _metadata() -> DocumentGenerationMetadata:
         vlm_model_id="qwen3-vl-flash",
         prompt_versions=PromptVersions(
             chapter_planner="chapter-planner-v1",
+            chapter_planner_repair="chapter-planner-repair-v1",
             chapter_vlm="chapter-vlm-v1",
+            chapter_vlm_repair="chapter-vlm-repair-v1",
             chapter_writer="chapter-writer-v1",
+            chapter_writer_repair="chapter-writer-repair-v1",
             global_editor="global-editor-v1",
+            global_editor_repair="global-editor-repair-v1",
         ),
     )
 
@@ -159,6 +195,29 @@ def test_section_id_is_stable_and_does_not_depend_on_title() -> None:
 
     assert first == second
     assert first != different_order
+
+
+def test_document_rejects_section_id_not_derived_from_asset_and_chapters() -> None:
+    chapters = (_chapter("ch_001", 0, 1_000),)
+    section = SemanticSection(
+        section_id="section_wrong",
+        title="章节",
+        summary_zh="摘要",
+        chapter_refs=("ch_001",),
+    )
+
+    with pytest.raises(ValidationError, match=r"section_id|Section ID"):
+        _result(chapters, sections=(section,))
+
+
+def test_prompt_versions_requires_main_and_repair_versions() -> None:
+    with pytest.raises(ValidationError):
+        PromptVersions(
+            chapter_planner="chapter-planner-v1",
+            chapter_vlm="chapter-vlm-v1",
+            chapter_writer="chapter-writer-v1",
+            global_editor="global-editor-v1",
+        )
 
 
 def test_summary_point_must_reference_grounded_existing_chapter() -> None:
