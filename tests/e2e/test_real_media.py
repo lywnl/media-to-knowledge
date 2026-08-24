@@ -39,7 +39,6 @@ def test_absent_real_media_models_credentials_and_durability_stay_not_run(
         "real_media_chain",
         "baidu_ocr_live",
         "qwen_live",
-        "pyannote_live",
         "five_language_models",
         "m1_durability",
     ):

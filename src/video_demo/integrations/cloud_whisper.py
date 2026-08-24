@@ -11,11 +11,7 @@ import httpx
 
 from video_demo.config import CloudAsrConfiguration
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.speech.asr import (
-    RawAsrSegment,
-    WindowTranscriptionResult,
-    asr_segment_confidence,
-)
+from video_demo.speech.asr import RawAsrSegment, WindowTranscriptionResult
 from video_demo.storage.workspace import reject_symlink_components
 
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -358,7 +354,7 @@ def _parse_segment(value: object) -> RawAsrSegment | None:
         start_ms=start_ms,
         end_ms=end_ms,
         text=normalized_text,
-        confidence=asr_segment_confidence(avg_logprob, no_speech_prob),
+        confidence=_derived_confidence(avg_logprob, no_speech_prob),
     )
 
 
@@ -369,6 +365,11 @@ def _finite_number(value: object) -> float:
     if not math.isfinite(number):
         raise ValueError
     return number
+
+
+def _derived_confidence(avg_logprob: float, no_speech_prob: float) -> float:
+    probability = math.exp(min(0.0, avg_logprob)) * (1 - no_speech_prob)
+    return min(1.0, max(0.0, probability))
 
 
 def _normalize_language(value: str) -> tuple[str, str | None]:

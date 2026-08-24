@@ -35,31 +35,18 @@ dev = [
   "ruff>=0.9,<1",
 ]
 speech = [
-  "faster-whisper>=1.2,<2",
-  "huggingface-hub>=0.28,<1",
-  "numpy>=2.2.2,<2.3",
-  "pyannote.audio>=4,<5",
-  "requests>=2.32,<3",
   "silero-vad>=5.1,<7",
   "torch>=2.8,<2.9",
   "torchaudio>=2.8,<2.9",
-  "transformers>=4.48,<5",
-  "whisperx==3.4.2",
 ]
 vision = [
   "opencv-python-headless>=4.10,<5",
   "pillow>=11,<13",
   "scenedetect[opencv]>=0.6.5,<0.7",
 ]
-audio-events = [
-  "setuptools>=80.9,<82",
-  "tensorflow>=2.20,<2.21",
-  "tensorflow-hub>=0.16,<1",
-]
 evaluation = [
   "jiwer>=3.1,<5",
   "psutil>=6.1,<8",
-  "pyannote.metrics>=4,<5",
   "rapidfuzz>=3.11,<4",
 ]
 

@@ -121,7 +121,7 @@ def test_dependency_probe_rejects_module_that_fails_during_import() -> None:
             side_effect=AttributeError("torchaudio.AudioMetaData"),
         ),
     ):
-        assert _has_dependency("whisperx") is False
+        assert _has_dependency("silero_vad") is False
 
 
 def test_prediction_index_path_points_to_index_json_not_run_snapshot() -> None:

@@ -226,6 +226,39 @@ class VideoRunRepository:
             ),
         )
 
+    def list_with_objects(
+        self,
+        scope: Scope,
+    ) -> list[tuple[VideoUnderstandingRunModel, VideoObjectModel]]:
+        """按创建时间倒序返回当前知识库的任务及其上传文件信息。"""
+        statement = (
+            select(VideoUnderstandingRunModel, VideoObjectModel)
+            .join(
+                VideoObjectModel,
+                and_(
+                    VideoObjectModel.tenant_id == VideoUnderstandingRunModel.tenant_id,
+                    VideoObjectModel.application_id
+                    == VideoUnderstandingRunModel.application_id,
+                    VideoObjectModel.knowledge_base_id
+                    == VideoUnderstandingRunModel.knowledge_base_id,
+                    VideoObjectModel.object_ref == VideoUnderstandingRunModel.object_ref,
+                ),
+            )
+            .where(
+                VideoUnderstandingRunModel.tenant_id == scope.tenant_id,
+                VideoUnderstandingRunModel.application_id == scope.application_id,
+                VideoUnderstandingRunModel.knowledge_base_id == scope.knowledge_base_id,
+            )
+            .order_by(
+                VideoUnderstandingRunModel.created_at.desc(),
+                VideoUnderstandingRunModel.id.desc(),
+            )
+        )
+        return [
+            (run, video)
+            for run, video in self._session.execute(statement).all()
+        ]
+
     def get_by_idempotency(
         self,
         scope: Scope,

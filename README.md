@@ -2,28 +2,30 @@
 
 这是一个独立的 Python 3.11 + FastAPI 视频理解 Demo。目标是对独立视频执行音频、画面和多模态理解，输出带证据引用的 `VIDEO_SEGMENT`、`VIDEO_SUMMARY`、`retrieval_text` 和 `retrieval_hash`。
 
-当前状态：Demo 主链已完成。上传、可靠 Worker、ffprobe/FFmpeg、字幕优先与 ASR 兜底、可选的 WhisperX 中文对齐、镜头/关键帧、百度 OCR、确定性融合、结构化结果、`retrieval_text`、证据分页和关键帧查询均已接通。生产 Qwen 链路使用私有 OSS 完整视频签名 URL：完整代理视频只上传一次，`qwen3-vl-flash` 只发起一次全片请求；模型返回按时间排序的粗粒度视觉语义和全片摘要，程序再映射到本地冻结的精确窗口和证据。实施账本见[计划](./.codex/plans/2026-08-17-video-understanding-retrieval-text-implementation.md)。
+当前状态：Demo 主链已完成。上传、可靠 Worker、ffprobe/FFmpeg、字幕优先、Silero VAD、串行云端 Whisper、镜头/关键帧、百度 OCR、确定性融合、结构化结果、`retrieval_text`、证据分页和关键帧查询均已接通。生产 Qwen 链路使用私有 OSS 完整视频签名 URL：完整代理视频只上传一次，`qwen3-vl-flash` 只发起一次全片请求；模型返回按时间排序的粗粒度视觉语义和全片摘要，程序再映射到本地冻结的精确窗口和证据。实施账本见[计划](./.codex/plans/2026-08-17-video-understanding-retrieval-text-implementation.md)。
 
 提交时必须准确区分两类结论：
 
 - Demo 产品链与机器一致性 smoke：已通过。详见[双视频产品链报告](./.codex/reports/two-video-demo-chain-20260821.md)和[双视频质量 smoke](./.codex/reports/two-video-quality-smoke-20260821.md)。
-- 正式五语质量、pyannote 说话人分析和 M1 两段耐久：仍为 `NOT_RUN` 或外部前置条件不足，不能用中文 Demo 代替。Qwen 公网完整视频视觉理解已真实通过；同一个完整公网 URL 不保证按 `start_ms/end_ms` 截取片段，因此不能冒充精确片段输入。综合验证见[报告](./.codex/reports/qwen-visual-understanding-20260821.md)，公网 URL 对账见[对账报告](./.codex/reports/qwen-remote-url-reconciliation-20260821.md)。
+- 正式五语云端 ASR 质量和 M1 两段耐久：仍为 `NOT_RUN` 或外部前置条件不足，不能用中文 Demo 代替。Qwen 公网完整视频视觉理解已真实通过；同一个完整公网 URL 不保证按 `start_ms/end_ms` 截取片段，因此不能冒充精确片段输入。综合验证见[报告](./.codex/reports/qwen-visual-understanding-20260821.md)，公网 URL 对账见[对账报告](./.codex/reports/qwen-remote-url-reconciliation-20260821.md)。
 
-`示例视频.mp4` 的 921,484 毫秒全片已完成一次真实本地产品链，产生 601 条 ASR、5,743 条对齐词、329 个关键帧、329 条 OCR 和 128 个场景证据；首次运行因旧 Qwen 细窗口协议降级。修复后的严格 Qwen 与融合验收复用了该次运行的 47,881,184 字节完整代理和已落库证据，没有重新执行约 53 分钟的本地 ASR/OCR。最新严格验收用唯一对象键完成一次 OSS PUT 上传、一次 Qwen 全片请求、32 个细窗口合法映射和 10 个融合检索片段；每个窗口都绑定该窗口的全部本地证据，首段 `retrieval_text` 为 975 字符，全部检索哈希重算一致。融合片段数会随 Qwen 返回的粗语义分组变化，不是固定协议。当前尚未再次从上传接口启动并持久化一条全新 Run。报告见[全片严格验收](./.codex/reports/qwen-production-full-video-validation-20260821.json)。
+历史实现记录：`示例视频.mp4` 的 921,484 毫秒全片曾完成一次本地 ASR 与增强链验收，产生 601 条 ASR、5,743 条对齐词、329 个关键帧、329 条 OCR 和 128 个场景证据。该数据只描述迁移前实现，当前产品不再生成对齐词，也不能用于证明云端 ASR 已通过。后续严格 Qwen 与融合验收复用了该次运行的代理和已落库证据；报告见[全片严格验收](./.codex/reports/qwen-production-full-video-validation-20260821.json)。
 
-Qwen 的视觉职责与证据边界：完整视频视觉报告可识别人物、场景、账号页、软件界面、关键事件和画面文字；模型观察可能误读账号名、数字或字幕。原始可定位画面文字仍以百度 OCR 证据为权威，语音以 ASR/WhisperX 为权威。需要精确片段视觉理解时，必须传实际派生短片（本地 clip/Data URI 或该短片自己的公网 URL），不得只给完整视频 URL 再依赖时间字段让供应商自动 seek。
+Qwen 的视觉职责与证据边界：完整视频视觉报告可识别人物、场景、账号页、软件界面、关键事件和画面文字；模型观察可能误读账号名、数字或字幕。原始可定位画面文字仍以百度 OCR 证据为权威，语音以字幕或云端 ASR 的 `SpeechSegment` 为权威。需要精确片段视觉理解时，必须传实际派生短片（本地 clip/Data URI 或该短片自己的公网 URL），不得只给完整视频 URL 再依赖时间字段让供应商自动 seek。
 
 ## 视频转文本策略
 
-视频文本解析按“内嵌文本字幕优先、ASR 兜底”执行：`ffprobe` 先发现容器内字幕流，系统只把 `subrip`、`ass`、`ssa`、`webvtt` 和 `mov_text` 当作可解析文本字幕。候选字幕经 UTF-8 解析、大小和 cue 数量限制、时间轴及启发式完整性检查后，以独立的 `SUBTITLE_CUE` 证据输出；命中时不生成 `audio.wav`，也不启动 VAD、faster-whisper、WhisperX、pyannote 或 YAMNet。
+视频文本解析按“内嵌文本字幕优先、云端 ASR 兜底”执行：`ffprobe` 先发现容器内字幕流，系统只把 `subrip`、`ass`、`ssa`、`webvtt` 和 `mov_text` 当作可解析文本字幕。候选字幕经 UTF-8 解析、大小和 cue 数量限制、时间轴及启发式完整性检查后，以独立的 `SUBTITLE_CUE` 证据输出；命中时不生成 `audio.wav`，也不启动 VAD 或调用云端 ASR。
 
 PGS、DVD Subtitle 等位图字幕和直接烧录在画面里的字幕当前不做 OCR，存在音轨时自动提取 WAV 并进入 ASR，不能把“探测到字幕轨”误解为“字幕文本已识别”。字幕完整性门槛只用于决定是否启用 ASR，是工程启发式，不是字幕准确率或完整性的认证；字幕不合格、解码失败或缺失时会自动兜底，不需要重新创建 Run。
 
-ASR 是自动语音识别，即把音频中的语音转成文本，不是人声分离，也不负责区分谁在说话。创建 Run 时 `speech_enrichment_mode` 默认是 `text`：无合格字幕时只执行 VAD、LID 和 faster-whisper，输出可用于检索的 ASR 文本，不执行增强模型。只有显式传入 `speech_enrichment_mode="full"`，才会在复用 ASR 快照后继续运行 WhisperX 词级时间对齐、pyannote 说话人分析和 YAMNet 音频事件识别。省略该字段的旧客户端仍能创建 Run，但新版本不再默认产生词级、说话人和音频事件证据；依赖这些字段的调用方必须显式迁移到 `full`。字幕路径不会运行 ASR 或增强模型，因此对应质量指标记为“不适用（`NOT_RUN`）”；这不代表模型零错误，也不能把字幕 cue 伪装成 ASR 词时间或置信度。
+ASR 是自动语音识别，即把音频中的语音转成文本，不是人声分离，也不负责区分谁在说话。无合格字幕时，Worker 提取单声道 16kHz PCM WAV，在一次性 ASR 子进程内执行 Silero VAD，然后通过 OpenAI 兼容接口严格串行上传本地派生 WAV。普通 VAD 区间各自成为独立窗口；只有单个连续语音区间超过 10 分钟时，才按 1 秒重叠均衡拆分。当前只输出段级 `SpeechSegment`，不提供词级对齐、说话人分析或音频事件。
 
-创建 Run 时可提供热词和核心上下文。热词用于提高人名、术语和产品名的识别概率，核心上下文用于提供视频主题先验；它们分别映射到 faster-whisper 的 `hotwords` 和 `initial_prompt`，只影响 ASR 兜底，不会改写已提取字幕，也不会传给语言探测。两者都是识别偏置而不是强制替换规则，错误提示可能降低准确率。
+创建 Run 时可提供热词和核心上下文。系统按“核心上下文在前、空格连接的热词在后”确定性合并为云端 Whisper `prompt`，只影响 ASR 兜底，不会改写已提取字幕。两者都是识别偏置而不是强制替换规则，错误提示可能降低准确率；prompt、API Key 和请求头不会写入日志、快照或评测报告。
 
-`text` 或 `full` 的 ASR 阶段都在受监督的一次性子进程中加载重语音模型，以隔离原生崩溃和内存故障；每次真正执行 ASR 都有模型冷启动成本。字幕命中、完整语音快照命中或 ASR 快照命中会跳过相应加载；快照只服务同一 Run 的失败重试，保证已成功的 ASR 不被无意义重复执行，不是跨视频或跨 Run 的全局缓存。`full` 在 ASR 快照命中但增强快照未命中时只运行增强阶段，不重复转写。
+ASR 阶段仍在受监督的一次性子进程中执行，以隔离 FFmpeg、VAD 和网络调用故障。每个成功窗口会立即发布独立 JSON 缓存；同一 Run 重试时只补传失败窗口，全部成功后再发布整段 ASR 快照。云端最终失败会使整个 ASR 阶段失败，不会发布空转写或部分成功结果。上传 WAV 是可再生临时产物，窗口完成、失败、超时或取消后都会清理。
+
+云端 ASR 只接受本地文件的 `multipart/form-data` 上传，当前实现不接受 OSS 音频 URL。一个 ASR 阶段内窗口请求严格串行；单 Worker 部署下不会并发上传窗口，多 Worker 部署则不提供跨进程全局限流。
 
 质量评测会单独生成提示效果伴随报告，只比较同一授权媒体的 `NONE/CORRECT` 成对 ASR 结果，并报告术语召回率及 CER/WER 差值。它不进入现有发布硬门槛；失败预测、空术语、任一端不是 ASR 或没有合格配对时均为 `NOT_RUN`。字幕命中不能证明热词或核心上下文有效。
 
@@ -54,33 +56,13 @@ uv sync --extra dev
 .venv/bin/pytest
 ```
 
-重模型依赖必须按实际组件显式安装，基础 API 环境不会自动下载模型：
+语音与视觉可选依赖必须按实际组件显式安装；语音组只保留 Silero VAD、Torch 和 Torchaudio，不下载本地 Whisper 权重：
 
 ```bash
-uv sync --extra dev --extra speech --extra vision --extra audio-events --extra evaluation
+uv sync --extra dev --extra speech --extra vision --extra evaluation
 ```
 
-`faster-whisper` 首次真实调用会将 `large-v3` 的五个必需文件平铺到
-`.codex/video-rag-demo/models/faster-whisper/`，下载缓存独立放在
-`.codex/video-rag-demo/cache/huggingface/`。模型完整后只从本地目录加载，不再依赖网络；
-`config.json`、`model.bin`、`preprocessor_config.json`、`tokenizer.json` 或
-`vocabulary.json` 任一缺失、为空或为符号链接时，预检都会报告模型不可用。
-
-`speech` 依赖组显式约束 `torch/torchaudio 2.8.x`、`pyannote.audio 4.x`、
-`WhisperX 3.4.2` 和 `huggingface-hub 0.x`：该组合匹配
-`speaker-diarization-community-1` 的 PLDA 配置，并保留当前 WhisperX 对齐 API。
-macOS 上 pyannote 通过内存 PCM 波形执行，不依赖 TorchCodec 动态链接系统 FFmpeg。
-WhisperX alignment 模型只缓存到
-`.codex/video-rag-demo/models/whisperx/<language>/`；上游无法对齐且未返回
-`start/end/score`，或返回的完整词时间不属于任何原 ASR segment 时，该词项会被跳过并产生
-稳定警告，不会伪造或裁剪词时间；字段不完整或数值非法仍以稳定模型错误失败关闭。
-
-`audio-events` 依赖组使用支持 NumPy 2.x 和 Apple Silicon 的 TensorFlow 2.20，
-并将 Setuptools 约束为 `>=80.9,<82`：`tensorflow-hub 0.16.1` 仍导入
-`pkg_resources`，而 Setuptools 82 已移除该 API。
-YAMNet SavedModel 和 521 项官方类别表固定在
-`.codex/video-rag-demo/models/yamnet/`，来源与摘要见该目录的 `SOURCE.md`。
-生产代码只在 TensorFlow Hub 导入边界屏蔽这一条已知上游弃用警告，不吞其他依赖警告。
+生产 API、Worker、生产流水线和诊断入口启动时都要求完整的 `OPENAI_BASE_URL`、`OPENAI_API_KEY` 和 `OPENAI_MODEL`。Base URL 必须是 HTTPS 的 OpenAI 兼容 `/v1` 根路径，客户端会自行追加 `/audio/transcriptions`；不要把完整转写端点填入 Base URL。真实 API Key 只写入被 Git 忽略的本地 `.env`，不得提交到源码、示例、测试或报告。
 
 任何缺少模型、外部凭据或授权评测素材的质量项都必须报告 `NOT_RUN`，不能用 mock 结果冒充通过。
 
@@ -106,7 +88,7 @@ Worker 会按现有错误语义结束任务，页面只展示后端返回的结�
 .venv/bin/video-demo-worker --once --worker-id local-debug-worker
 ```
 
-缺少 ffmpeg/ffprobe、重模型或外部服务凭据时，Worker 会以稳定错误码失败关闭，真实媒体、五语质量与性能验收保持 `NOT_RUN`。当前工作区已包含 FFmpeg/ffprobe 6.0，无需重复下载。
+缺少 ffmpeg/ffprobe、Silero 运行依赖或外部服务凭据时，Worker 会以稳定错误码失败关闭，真实媒体、五语质量与性能验收保持 `NOT_RUN`。当前工作区已包含 FFmpeg/ffprobe 6.0，无需重复下载。
 
 ## 唯一评测 CLI
 
