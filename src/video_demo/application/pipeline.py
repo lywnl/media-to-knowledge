@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Literal, Protocol, Self, TypeVar
 
-from pydantic import Field, model_validator
+from pydantic import model_validator
 
 from video_demo.application.queries import ResultQueryService, ResultWriteFence
 from video_demo.domain.base import FrozenModel, LanguageCode, stable_identifier
-from video_demo.domain.evidence import EvidenceItem, SceneBoundary, TimelineEvidence
+from video_demo.domain.evidence import (
+    EvidenceItem,
+    KeyframeEvidence,
+    OcrEvidence,
+    SceneBoundary,
+    TimelineEvidence,
+)
 from video_demo.domain.manifest import VideoAssetManifest
 from video_demo.domain.result import (
     SummaryChapter,
@@ -69,25 +76,34 @@ class RegisteredAsset:
 
 class PipelineRunConfig(FrozenModel):
     language_hints: tuple[LanguageCode, ...] = ()
-    min_speakers: int | None = Field(default=None, ge=1, le=10)
-    max_speakers: int | None = Field(default=None, ge=1, le=10)
     hotwords: tuple[str, ...] = ()
     core_context: str | None = None
-    speech_enrichment_mode: Literal["text", "full"] = "text"
 
     @model_validator(mode="after")
-    def validate_speaker_range(self) -> Self:
+    def normalize_speech_configuration(self) -> Self:
         if len(self.language_hints) != len(set(self.language_hints)):
             raise ValueError("language_hints 不得重复")
-        if (
-            self.min_speakers is not None
-            and self.max_speakers is not None
-            and self.min_speakers > self.max_speakers
-        ):
-            raise ValueError("min_speakers 不得大于 max_speakers")
         object.__setattr__(self, "hotwords", normalize_hotwords(self.hotwords))
         object.__setattr__(self, "core_context", normalize_core_context(self.core_context))
         return self
+
+
+_RETIRED_SPEECH_CONFIG_FIELDS = frozenset(
+    {"speech_enrichment_mode", "min_speakers", "max_speakers"}
+)
+
+
+def pipeline_run_config_from_snapshot(
+    snapshot: Mapping[str, object],
+) -> PipelineRunConfig:
+    """只在读取历史数据库快照时丢弃三个已退役语音字段。"""
+
+    normalized = {
+        key: value
+        for key, value in snapshot.items()
+        if key not in _RETIRED_SPEECH_CONFIG_FIELDS
+    }
+    return PipelineRunConfig.model_validate(normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,8 +149,6 @@ class StageMetric:
 @dataclass(frozen=True, slots=True)
 class SpeechAnalysis:
     transcript_source: TranscriptSource
-    # 直接构造领域对象的历史调用默认保留完整语音分析语义；生产运行模式由 PipelineRunConfig 控制。
-    enrichment_mode: Literal["text", "full"] = "full"
     evidence: tuple[EvidenceItem, ...] = ()
     warnings: tuple[str, ...] = ()
     boundary_candidates: tuple[SpeechBoundaryCandidate, ...] = ()
@@ -151,6 +165,11 @@ class VisualPreparation:
     frame_tolerance_ms: int
     scenes: tuple[SceneBoundary, ...]
     preparation_sha256: str
+    observation_windows: tuple[TimeRange, ...] = ()
+    keyframes: tuple[KeyframeEvidence, ...] = ()
+    ocr: tuple[OcrEvidence, ...] = ()
+    warnings: tuple[str, ...] = ()
+    stage_metrics: tuple[StageMetric, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +179,7 @@ class VisualAnalysis:
     clips: tuple[VideoClipInput, ...] = ()
     windows: tuple[TimeRange, ...] = ()
     warnings: tuple[str, ...] = ()
+    stage_metrics: tuple[StageMetric, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +361,13 @@ class VideoUnderstandingPipeline:
         self._start_stage(context, "SPEECH")
         self._start_stage(context, "VISUAL")
         self._check_cancelled(context)
+        completion_times: dict[str, float] = {}
+        completion_events = {"speech": Event(), "visual": Event()}
+
+        def record_completion(name: str) -> None:
+            completion_times[name] = self._clock()
+            completion_events[name].set()
+
         with ThreadPoolExecutor(
             max_workers=2,
             thread_name_prefix="video-understanding",
@@ -358,8 +385,18 @@ class VideoUnderstandingPipeline:
                 media,
                 is_cancel_requested=context.is_cancel_requested,
             )
+            speech_future.add_done_callback(
+                lambda _future: record_completion("speech"),
+            )
+            visual_future.add_done_callback(
+                lambda _future: record_completion("visual"),
+            )
             speech, speech_duration = speech_future.result()
+            completion_events["speech"].wait()
+            speech_completed_at = completion_times["speech"]
             preparation = visual_future.result()
+            completion_events["visual"].wait()
+            visual_completed_at = completion_times["visual"]
         self._check_cancelled(context)
         visual = self._visual_analyzer.finalize(
             media,
@@ -368,9 +405,23 @@ class VideoUnderstandingPipeline:
             is_cancel_requested=context.is_cancel_requested,
         )
         visual_duration = max(0, round((self._clock() - visual_started_at) * 1000))
+        visual_wait_speech = max(0, round((speech_completed_at - visual_completed_at) * 1000))
         speech_metrics = tuple(
             metric for metric in speech.stage_metrics
-            if metric.stage in {"SPEECH_ASR", "SPEECH_ENRICHMENT"}
+            if metric.stage == "SPEECH_ASR"
+        )
+        visual_metrics = tuple((*preparation.stage_metrics, *visual.stage_metrics))
+        visual_metrics = tuple(
+            metric for metric in visual_metrics
+            if metric.stage not in {"VISUAL", "VISUAL_WAIT_SPEECH", "VISUAL_FUSION"}
+        )
+        visual_fusion = next(
+            (
+                metric.duration_ms
+                for metric in visual.stage_metrics
+                if metric.stage == "VISUAL_FUSION"
+            ),
+            0,
         )
         return (
             speech,
@@ -378,6 +429,9 @@ class VideoUnderstandingPipeline:
             (
                 StageMetric(stage="SPEECH", duration_ms=speech_duration),
                 *speech_metrics,
+                *visual_metrics,
+                StageMetric(stage="VISUAL_WAIT_SPEECH", duration_ms=visual_wait_speech),
+                StageMetric(stage="VISUAL_FUSION", duration_ms=visual_fusion),
                 StageMetric(stage="VISUAL", duration_ms=visual_duration),
             ),
         )

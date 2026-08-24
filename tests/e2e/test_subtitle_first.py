@@ -401,21 +401,13 @@ class _RecordingTranscoder:
 
 def _isolated_analyzer(runtime_root: Path, factory: object) -> IsolatedSpeechAnalyzer:
     store = AtomicArtifactStore(runtime_root)
-    inputs = _fingerprint_inputs()
     return IsolatedSpeechAnalyzer(
         workspace_root=runtime_root.parent.parent,
         runtime_root=runtime_root,
         snapshot_store=SnapshotStore(store),
         artifact_store=store,
-        fingerprint_inputs=inputs,
-        speech_runtime=SpeechRuntimeConfig(
-            inference_device="cpu",
-            whisper_compute_type="int8",
-            model_identities=inputs.model_identities,
-            yamnet_class_map_sha256="b" * 64,
-            yamnet_thresholds_sha256="c" * 64,
-        ),
-        credentials=SpeechSubprocessCredentials(),
+        speech_runtime=_speech_runtime(),
+        credentials=SpeechSubprocessCredentials(openai_api_key="test-openai-key"),
         timeout_seconds=5,
         process_runner_factory=factory,  # type: ignore[arg-type]
     )
@@ -434,7 +426,6 @@ def _publish_successful_asr_response(
     if request is None:
         envelope = json.loads((runtime_root / request_path).read_text(encoding="utf-8"))
         request = SpeechSubprocessRequest.model_validate(envelope["payload"])
-    assert request.stage == "ASR"
     snapshots = SnapshotStore(AtomicArtifactStore(runtime_root))
     if asr_receipt_sha256 is None:
         asr_receipt_sha256 = snapshots.publish(
@@ -455,8 +446,7 @@ def _publish_successful_asr_response(
         "schema_version": "1.0.0",
         "status": "SUCCEEDED",
         "request_id": request.request_id,
-        "stage": "ASR",
-        "speech_fingerprint": request.asr_fingerprint,
+        "asr_fingerprint": request.asr_fingerprint,
         "payload_receipt": asr_receipt[1].model_dump(mode="json"),
     }
     AtomicArtifactStore(runtime_root).write_json(
@@ -488,10 +478,20 @@ def _asr_payload() -> AsrSnapshotPayload:
     )
 
 
-def _fingerprint_inputs() -> SpeechFingerprintInputs:
-    return SpeechFingerprintInputs(
+def _speech_runtime() -> SpeechRuntimeConfig:
+    inputs = SpeechFingerprintInputs(
         model_identities=(),
-        asr_compute_type="int8",
-        yamnet_class_map_sha256="b" * 64,
-        yamnet_thresholds_sha256="c" * 64,
+        cloud_asr_base_url="https://ai-proxy.example/v1",
+        max_window_ms=600_000,
+        overlap_ms=1_000,
+    )
+    return SpeechRuntimeConfig(
+        base_url=inputs.cloud_asr_base_url,
+        model="openai/whisper",
+        timeout_seconds=300,
+        max_attempts=3,
+        max_window_ms=inputs.max_window_ms,
+        overlap_ms=inputs.overlap_ms,
+        model_identities=inputs.model_identities,
+        ffmpeg_relative_path="tools/ffmpeg",
     )

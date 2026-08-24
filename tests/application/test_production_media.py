@@ -4,7 +4,6 @@ import hashlib
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
-from typing import Literal
 
 import pytest
 
@@ -59,9 +58,6 @@ def test_production_registrar_materializes_scoped_input_and_carries_run_config(
         object_ref=uploaded.object_ref,
         idempotency_key="production-media-0001",
         language_hints=("zh", "en"),
-        min_speakers=1,
-        max_speakers=3,
-        speech_enrichment_mode="full",
     )
 
     registered = ProductionAssetRegistrar(database, store).register(
@@ -77,9 +73,6 @@ def test_production_registrar_materializes_scoped_input_and_carries_run_config(
     assert registered.source_mime == "video/mp4"
     assert registered.run_relative_root == expected_root
     assert registered.config.language_hints == ("zh", "en")
-    assert registered.config.min_speakers == 1
-    assert registered.config.max_speakers == 3
-    assert registered.config.speech_enrichment_mode == "full"
 
 
 def test_production_probe_uses_registered_metadata_and_preserves_manifest_warnings(
@@ -203,7 +196,6 @@ def test_complete_text_subtitle_is_selected_before_audio_extraction(tmp_path: Pa
         subtitle_streams=(SubtitleStream(index=2, codec_name="mov_text", language="zh"),),
         duration_ms=30_000,
         language_hints=("zh",),
-        speech_enrichment_mode="full",
     )
     client = _RecordingTranscoder(runtime_root, subtitle_payloads={2: _complete_vtt()})
 
@@ -469,7 +461,6 @@ def _probed_media(
     subtitle_streams: tuple[SubtitleStream, ...],
     duration_ms: int,
     language_hints: tuple[str, ...] = (),
-    speech_enrichment_mode: Literal["text", "full"] = "text",
 ) -> tuple[Path, object]:
     from video_demo.application.pipeline import PipelineRunConfig
 
@@ -482,7 +473,6 @@ def _probed_media(
         registered,
         config=PipelineRunConfig(
             language_hints=language_hints,
-            speech_enrichment_mode=speech_enrichment_mode,
         ),
     )
     probed = ProductionAssetProbe(

@@ -13,6 +13,7 @@ from video_demo.application.pipeline import (
     PreparedMedia,
     ProbedAsset,
     RegisteredAsset,
+    pipeline_run_config_from_snapshot,
 )
 from video_demo.domain.manifest import SubtitleStream
 from video_demo.errors import ErrorCode, VideoDemoError
@@ -119,7 +120,7 @@ class ProductionAssetRegistrar:
     @staticmethod
     def _run_config(snapshot: dict[str, object]) -> PipelineRunConfig:
         try:
-            return PipelineRunConfig.model_validate(snapshot)
+            return pipeline_run_config_from_snapshot(snapshot)
         except ValidationError as error:
             raise VideoDemoError(
                 ErrorCode.INVALID_CONFIGURATION,

@@ -41,6 +41,9 @@
   const errorMessage = document.querySelector("#error-message");
   const resultPanel = document.querySelector("#result-panel");
   const resultContent = document.querySelector("#result-content");
+  const historyStatus = document.querySelector("#history-status");
+  const historyList = document.querySelector("#history-list");
+  const refreshHistoryButton = document.querySelector("#refresh-history");
   let activeController = null;
 
   class RequestError extends Error {
@@ -67,6 +70,9 @@
     clearError();
   });
 
+  refreshHistoryButton.addEventListener("click", () => loadHistory());
+  loadHistory();
+
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const [file] = fileInput.files;
@@ -90,7 +96,8 @@
       const completedRun = await waitForCompletion(createdRun.run_id, controller.signal);
       updateStatus("处理完成，正在读取结果", `运行 ${completedRun.run_id}`, 3);
       const result = await fetchResult(completedRun.run_id, controller.signal);
-      renderResult(result, completedRun);
+      renderResult(result, { ...completedRun, original_filename: videoObject.original_filename });
+      await loadHistory();
       updateStatus("处理完成", `运行 ${completedRun.run_id}`, 4);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
@@ -164,8 +171,6 @@
           object_ref: objectRef,
           idempotency_key: `web-${crypto.randomUUID()}`,
           language_hints: [],
-          min_speakers: null,
-          max_speakers: null,
         }),
         signal,
       },
@@ -220,6 +225,65 @@
     );
   }
 
+  async function loadHistory() {
+    historyStatus.textContent = "正在读取历史记录";
+    try {
+      const payload = await requestJson(
+        `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs`,
+      );
+      renderHistory(payload.items ?? []);
+      historyStatus.textContent = payload.items?.length ? "" : "还没有历史解析记录";
+    } catch (error) {
+      historyList.replaceChildren();
+      historyStatus.textContent = error instanceof Error
+        ? `历史记录读取失败：${error.message}`
+        : "历史记录读取失败";
+    }
+  }
+
+  function renderHistory(items) {
+    const fragment = document.createDocumentFragment();
+    items.forEach((item) => {
+      const button = element("button", "history-item");
+      button.type = "button";
+      button.append(
+        element("span", "history-item-name", item.original_filename),
+        element("span", "history-item-meta", `${formatHistoryStatus(item)} · ${formatDate(item.created_at)}`),
+      );
+      button.addEventListener("click", () => openHistoryItem(item));
+      fragment.append(button);
+    });
+    historyList.replaceChildren(fragment);
+  }
+
+  async function openHistoryItem(item) {
+    clearError();
+    if (!SUCCESS_STATUSES.has(item.status)) {
+      updateStatus("该任务尚未完成", `${item.original_filename} · ${formatHistoryStatus(item)}`, 1);
+      return;
+    }
+    try {
+      updateStatus("正在读取历史解析文本", item.original_filename, 3);
+      const result = await fetchResult(item.run_id);
+      renderResult(result, item);
+    } catch (error) {
+      renderError(error);
+    }
+  }
+
+  function formatHistoryStatus(item) {
+    if (item.status === "SUCCEEDED") return "已完成";
+    if (item.status === "PARTIAL_SUCCEEDED") return "部分完成";
+    if (item.status === "FAILED") return "失败";
+    if (item.status === "CANCELLED") return "已取消";
+    return item.status === "RUNNING" ? `处理中：${STAGE_LABELS[item.current_stage] ?? item.current_stage}` : "排队中";
+  }
+
+  function formatDate(value) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString("zh-CN", { hour12: false });
+  }
+
   function isRetryablePollingError(error) {
     if (error instanceof TypeError) {
       return true;
@@ -257,6 +321,7 @@
     const summary = result.summary;
     const summaryCard = element("article", "result-summary");
     summaryCard.append(
+      element("p", "result-source", run.original_filename ? `视频文件：${run.original_filename}` : `运行：${run.run_id}`),
       element("h3", null, summary.title),
       element("p", null, summary.summary_zh),
       renderTags([...summary.topics, ...summary.keywords]),

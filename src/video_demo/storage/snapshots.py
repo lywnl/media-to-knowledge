@@ -17,7 +17,7 @@ from video_demo.storage.artifacts import (
 )
 from video_demo.storage.workspace import reject_symlink_components
 
-SnapshotKind = Literal["asr", "speech"]
+SnapshotKind = Literal["asr"]
 PayloadT = TypeVar("PayloadT", bound=FrozenModel)
 _MAX_POINTER_BYTES = 64 * 1024
 _MAX_SNAPSHOT_PAYLOAD_BYTES = 64 * 1024 * 1024

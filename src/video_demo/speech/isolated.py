@@ -16,17 +16,13 @@ from typing import Literal
 from pydantic import ValidationError
 
 from video_demo.application.pipeline import PreparedMedia, SpeechAnalysis, StageMetric
-from video_demo.application.production_speech import ProductionSpeechAnalyzer, SpeechComponents
+from video_demo.application.production_speech import (
+    analysis_from_asr_snapshot,
+    transcript_shortcut,
+)
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.process import SafeProcessRunner
-from video_demo.speech.snapshots import (
-    AsrSnapshotPayload,
-    SpeechAnalysisSnapshotPayload,
-    SpeechFingerprintInputs,
-    _speech_fingerprint_v1,
-    asr_fingerprint,
-    speech_fingerprint,
-)
+from video_demo.speech.snapshots import AsrSnapshotPayload, asr_fingerprint
 from video_demo.speech.subprocess_protocol import (
     ALLOWED_SPEECH_SUBPROCESS_FAILURE_CODES,
     SpeechRuntimeConfig,
@@ -44,18 +40,9 @@ from video_demo.storage.workspace import reject_symlink_components
 _MAX_RESPONSE_BYTES = 64 * 1024
 
 
-class _NeedSpeechSubprocess(Exception):
-    pass
-
-
 @dataclass(frozen=True, slots=True)
 class AsrStageResult:
     payload: AsrSnapshotPayload
-    receipt: ArtifactReceipt
-
-
-@dataclass(frozen=True, slots=True)
-class EnrichmentStageResult:
     receipt: ArtifactReceipt
 
 
@@ -121,7 +108,7 @@ def _open_descendant_directory(root: Path, relative: Path) -> int:
 
 
 class IsolatedSpeechAnalyzer:
-    """在父 Worker 中只处理轻量快照路径，其余语音计算交给一次性子进程。"""
+    """父进程只处理 shortcut/快照，未命中时启动一次 ASR 子进程。"""
 
     def __init__(
         self,
@@ -130,13 +117,10 @@ class IsolatedSpeechAnalyzer:
         runtime_root: Path,
         snapshot_store: SnapshotStore,
         artifact_store: AtomicArtifactStore,
-        fingerprint_inputs: SpeechFingerprintInputs,
         speech_runtime: SpeechRuntimeConfig,
         credentials: SpeechSubprocessCredentials,
         timeout_seconds: int | None = None,
-        asr_timeout_seconds: int = 1800,
-        enrichment_timeout_seconds: int = 600,
-        allow_speaker_fallback: bool = False,
+        asr_timeout_seconds: int = 3600,
         process_runner_factory: ProcessRunnerFactory | None = None,
         python_executable: Path | None = None,
     ) -> None:
@@ -144,16 +128,11 @@ class IsolatedSpeechAnalyzer:
         self._runtime_root = runtime_root.resolve(strict=False)
         self._snapshot_store = snapshot_store
         self._artifact_store = artifact_store
-        self._fingerprint_inputs = fingerprint_inputs
         self._speech_runtime = speech_runtime
         self._credentials = credentials
         self._asr_timeout_seconds = (
             timeout_seconds if timeout_seconds is not None else asr_timeout_seconds
         )
-        self._enrichment_timeout_seconds = (
-            timeout_seconds if timeout_seconds is not None else enrichment_timeout_seconds
-        )
-        self._allow_speaker_fallback = allow_speaker_fallback
         self._process_runner_factory = process_runner_factory or (
             lambda cancel: SafeProcessRunner(
                 max_output_bytes=64 * 1024,
@@ -169,38 +148,51 @@ class IsolatedSpeechAnalyzer:
         *,
         is_cancel_requested: Callable[[], bool] = lambda: False,
     ) -> SpeechAnalysis:
-        if media.subtitle is not None or media.audio_path is None:
-            shortcut = ProductionSpeechAnalyzer(
-                self._require_subprocess,
-                snapshot_store=self._snapshot_store,
-                fingerprint_inputs=self._fingerprint_inputs,
-                allow_speaker_fallback=self._allow_speaker_fallback,
-            )
-            try:
-                return shortcut.analyze(media, is_cancel_requested=is_cancel_requested)
-            except _NeedSpeechSubprocess:
-                pass
+        shortcut = transcript_shortcut(media)
+        if shortcut is not None:
+            return shortcut
         if media.audio_path is None or media.audio_sha256 is None:
             raise VideoDemoError(
                 ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID,
                 "语音子进程输入缺少音频",
             )
-        return self._run_subprocess(media, is_cancel_requested)
-
-    @staticmethod
-    def _require_subprocess(
-        _media: PreparedMedia,
-        _cancel: Callable[[], bool],
-    ) -> SpeechComponents:
-        raise _NeedSpeechSubprocess
+        run_root = media.source.asset.run_relative_root
+        config = media.source.asset.config
+        asr_key = asr_fingerprint(
+            audio_sha256=media.audio_sha256,
+            duration_ms=media.source.duration_ms,
+            language_hints=config.language_hints,
+            hotwords=config.hotwords,
+            core_context=config.core_context,
+            inputs=self._speech_runtime.fingerprint_inputs(),
+        )
+        started_at = time.monotonic()
+        cached = self._snapshot_store.load(run_root, "asr", asr_key, AsrSnapshotPayload)
+        if cached is not None:
+            analysis = analysis_from_asr_snapshot(media, cached[0])
+            return replace(
+                analysis,
+                stage_metrics=(StageMetric("SPEECH_ASR", 0),),
+                stage_cache_hits=("SPEECH_ASR",),
+            )
+        result = self._run_subprocess(
+            media,
+            asr_key=asr_key,
+            is_cancel_requested=is_cancel_requested,
+        )
+        analysis = analysis_from_asr_snapshot(media, result.payload)
+        return replace(
+            analysis,
+            stage_metrics=(StageMetric("SPEECH_ASR", _elapsed_ms(started_at)),),
+        )
 
     def _run_subprocess(
         self,
         media: PreparedMedia,
+        *,
+        asr_key: str,
         is_cancel_requested: Callable[[], bool],
-    ) -> SpeechAnalysis:
-        run_root = media.source.asset.run_relative_root
-        config = media.source.asset.config
+    ) -> AsrStageResult:
         assert media.audio_path is not None
         assert media.audio_sha256 is not None
         try:
@@ -211,158 +203,37 @@ class IsolatedSpeechAnalyzer:
                 "语音音频必须位于运行目录内",
             ) from None
         request_id = f"speech_{uuid.uuid4().hex}"
-        asr_key = asr_fingerprint(
-            audio_sha256=media.audio_sha256,
-            duration_ms=media.source.duration_ms,
-            language_hints=config.language_hints,
-            hotwords=config.hotwords,
-            core_context=config.core_context,
-            inputs=self._fingerprint_inputs,
-        )
-        asr_request = SpeechSubprocessRequest(
+        request = SpeechSubprocessRequest(
             request_id=request_id,
-            run_relative_root=run_root.as_posix(),
+            run_relative_root=media.source.asset.run_relative_root.as_posix(),
             audio_relative_path=audio_relative.as_posix(),
             audio_sha256=media.audio_sha256,
             duration_ms=media.source.duration_ms,
-            config=config,
+            config=media.source.asset.config,
             media_warnings=media.warnings,
             runtime=self._speech_runtime,
-            credentials=SpeechSubprocessCredentials(),
+            credentials=self._credentials,
             asr_fingerprint=asr_key,
-            allow_speaker_fallback=self._allow_speaker_fallback,
-            stage="ASR",
         )
-        stage_cache_hits: list[str] = []
-        asr_started_at = time.monotonic()
-        cached_asr = self._snapshot_store.load(
-            run_root, "asr", asr_key, AsrSnapshotPayload
-        )
-        if cached_asr is None:
-            asr_result = self._run_stage(
-                asr_request, run_root, is_cancel_requested, self._asr_timeout_seconds
+        try:
+            return self._run_stage(
+                request,
+                media.source.asset.run_relative_root,
+                is_cancel_requested,
             )
-            assert isinstance(asr_result, AsrStageResult)
-            asr_duration_ms = _elapsed_ms(asr_started_at)
-        else:
-            asr_result = AsrStageResult(*cached_asr)
-            asr_duration_ms = 0
-            stage_cache_hits.append("SPEECH_ASR")
-        asr_payload, asr_receipt = asr_result.payload, asr_result.receipt
-        if config.speech_enrichment_mode == "text":
-            text_key = speech_fingerprint(
-                processing_mode="ASR",
-                transcript_payload_sha256=asr_receipt.sha256,
-                media_warnings=media.warnings,
-                min_speakers=config.min_speakers,
-                max_speakers=config.max_speakers,
-                allow_speaker_fallback=self._allow_speaker_fallback,
-                inputs=self._fingerprint_inputs,
-                enrichment_mode="text",
-            )
-            cached_text = self._snapshot_store.load(
-                run_root, "speech", text_key, SpeechAnalysisSnapshotPayload
-            )
-            if cached_text is not None:
-                analysis = cached_text[0].to_analysis()
-            else:
-                analysis = ProductionSpeechAnalyzer.analysis_from_asr_snapshot(
-                    media, asr_payload, enrichment_mode="text"
+        finally:
+            with suppress(OSError, VideoDemoError):
+                self._discard_request_slices(
+                    media.source.asset.run_relative_root,
+                    request_id,
                 )
-                self._snapshot_store.publish(
-                    run_root,
-                    "speech",
-                    text_key,
-                    SpeechAnalysisSnapshotPayload.from_analysis(analysis),
-                )
-            return replace(
-                analysis,
-                stage_metrics=(StageMetric("SPEECH_ASR", asr_duration_ms),),
-                stage_cache_hits=tuple(stage_cache_hits),
-            )
-        speech_key = speech_fingerprint(
-            processing_mode="ASR",
-            transcript_payload_sha256=asr_receipt.sha256,
-            media_warnings=media.warnings,
-            min_speakers=config.min_speakers,
-            max_speakers=config.max_speakers,
-            allow_speaker_fallback=self._allow_speaker_fallback,
-            inputs=self._fingerprint_inputs,
-            enrichment_mode="full",
-        )
-        enrichment_started_at = time.monotonic()
-        cached = self._snapshot_store.load(
-            run_root, "speech", speech_key, SpeechAnalysisSnapshotPayload
-        )
-        if cached is None:
-            legacy_key = _speech_fingerprint_v1(
-                processing_mode="ASR",
-                transcript_payload_sha256=asr_receipt.sha256,
-                media_warnings=media.warnings,
-                min_speakers=config.min_speakers,
-                max_speakers=config.max_speakers,
-                allow_speaker_fallback=self._allow_speaker_fallback,
-                inputs=self._fingerprint_inputs,
-            )
-            cached = self._snapshot_store.load(
-                run_root, "speech", legacy_key, SpeechAnalysisSnapshotPayload
-            )
-        if cached is not None:
-            stage_cache_hits.append("SPEECH_ENRICHMENT")
-            enrichment_duration_ms = 0
-            analysis = cached[0].to_analysis()
-        else:
-            base_payload = asr_request.model_dump(
-                mode="python",
-                exclude={
-                    "request_id",
-                    "credentials",
-                    "stage",
-                    "speech_fingerprint",
-                    "asr_payload_receipt",
-                },
-            )
-            enrich_request = SpeechSubprocessRequest.model_validate(
-                {
-                    **base_payload,
-                    "request_id": f"speech_{uuid.uuid4().hex}",
-                    "credentials": self._credentials,
-                    "stage": "ENRICHMENT",
-                    "speech_fingerprint": speech_key,
-                    "asr_payload_receipt": asr_receipt,
-                }
-            )
-            enrichment_result = self._run_stage(
-                enrich_request, run_root, is_cancel_requested, self._enrichment_timeout_seconds
-            )
-            assert isinstance(enrichment_result, EnrichmentStageResult)
-            enrichment_duration_ms = _elapsed_ms(enrichment_started_at)
-            loaded = self._snapshot_store.load(
-                run_root, "speech", speech_key, SpeechAnalysisSnapshotPayload
-            )
-            if loaded is None:
-                raise VideoDemoError(
-                    ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID,
-                    "语音增强子进程未发布完整快照",
-                    details={"stage": "ENRICHMENT"},
-                )
-            analysis = loaded[0].to_analysis()
-        return replace(
-            analysis,
-            stage_metrics=(
-                StageMetric("SPEECH_ASR", asr_duration_ms),
-                StageMetric("SPEECH_ENRICHMENT", enrichment_duration_ms),
-            ),
-            stage_cache_hits=tuple(stage_cache_hits),
-        )
 
     def _run_stage(
         self,
         request: SpeechSubprocessRequest,
         run_root: Path,
         is_cancel_requested: Callable[[], bool],
-        timeout_seconds: int,
-    ) -> AsrStageResult | EnrichmentStageResult:
+    ) -> AsrStageResult:
         python = self._verified_python()
         request_id = request.request_id
         ipc_root = run_root / "speech" / "ipc"
@@ -397,18 +268,18 @@ class IsolatedSpeechAnalyzer:
             try:
                 result = runner.run(
                     command,
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=self._asr_timeout_seconds,
                     output_paths=(self._runtime_root / response_relative,),
                     env=self._subprocess_environment(),
                 )
             except VideoDemoError as error:
-                self._map_process_error(error, request.stage)
+                self._map_process_error(error)
                 raise AssertionError("不可达") from error
             if result.returncode != 0:
                 raise VideoDemoError(
                     ErrorCode.SPEECH_SUBPROCESS_CRASHED,
                     "语音子进程异常退出",
-                    details={"stage": request.stage},
+                    details={"stage": "ASR"},
                 )
             try:
                 response_receipt = self._response_receipt(
@@ -428,10 +299,7 @@ class IsolatedSpeechAnalyzer:
                     raise ValueError("响应 payload 必须是对象")
                 if payload.get("status") == "FAILED":
                     failure = SpeechSubprocessFailure.model_validate(payload)
-                    if failure.request_id != request_id:
-                        raise ValueError("响应请求 ID 不匹配")
-                    if failure.stage != request.stage:
-                        raise ValueError("失败响应阶段与请求不匹配")
+                    self._validate_response_binding(request, failure)
                     if failure.error_code not in ALLOWED_SPEECH_SUBPROCESS_FAILURE_CODES:
                         raise ValueError("响应错误码不在语音子进程白名单")
                     stable_message = speech_subprocess_failure_message(failure.error_code)
@@ -440,34 +308,19 @@ class IsolatedSpeechAnalyzer:
                     raise VideoDemoError(
                         failure.error_code,
                         stable_message,
-                        details={"stage": request.stage},
+                        details={"stage": "ASR"},
                     )
                 response = SpeechSubprocessSuccess.model_validate(payload)
-                if response.request_id != request_id:
-                    raise ValueError("响应请求 ID 不匹配")
-                if request.stage == "ASR":
-                    if (
-                        response.stage != "ASR"
-                        or response.speech_fingerprint != request.asr_fingerprint
-                    ):
-                        raise ValueError("ASR 响应指纹或阶段不匹配")
-                    loaded_asr = self._snapshot_store.load(
-                        run_root, "asr", request.asr_fingerprint, AsrSnapshotPayload
-                    )
-                    if loaded_asr is None or loaded_asr[1] != response.payload_receipt:
-                        raise ValueError("响应回执未绑定当前 ASR 快照")
-                    return AsrStageResult(*loaded_asr)
-                if (
-                    response.stage != "ENRICHMENT"
-                    or response.speech_fingerprint != request.speech_fingerprint
-                ):
-                    raise ValueError("增强响应指纹或阶段不匹配")
-                loaded_speech = self._snapshot_store.load(
-                    run_root, "speech", response.speech_fingerprint, SpeechAnalysisSnapshotPayload
+                self._validate_response_binding(request, response)
+                loaded = self._snapshot_store.load(
+                    run_root,
+                    "asr",
+                    request.asr_fingerprint,
+                    AsrSnapshotPayload,
                 )
-                if loaded_speech is None or loaded_speech[1] != response.payload_receipt:
-                    raise ValueError("响应回执未绑定当前完整快照")
-                return EnrichmentStageResult(response.payload_receipt)
+                if loaded is None or loaded[1] != response.payload_receipt:
+                    raise ValueError("响应回执未绑定当前 ASR 快照")
+                return AsrStageResult(*loaded)
             except VideoDemoError as error:
                 if error.code in {
                     ErrorCode.ARTIFACT_NOT_FOUND,
@@ -478,14 +331,14 @@ class IsolatedSpeechAnalyzer:
                     raise VideoDemoError(
                         ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID,
                         "语音子进程响应非法",
-                        details={"stage": request.stage},
+                        details={"stage": "ASR"},
                     ) from None
                 raise
             except (OSError, ValueError, ValidationError):
                 raise VideoDemoError(
                     ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID,
                     "语音子进程响应非法",
-                    details={"stage": request.stage},
+                    details={"stage": "ASR"},
                 ) from None
         finally:
             with suppress(OSError, VideoDemoError):
@@ -503,6 +356,34 @@ class IsolatedSpeechAnalyzer:
                     response_receipt.sha256 if response_receipt is not None else None,
                 )
 
+    @staticmethod
+    def _validate_response_binding(
+        request: SpeechSubprocessRequest,
+        response: SpeechSubprocessSuccess | SpeechSubprocessFailure,
+    ) -> None:
+        if (
+            response.request_id != request.request_id
+            or response.asr_fingerprint != request.asr_fingerprint
+        ):
+            raise ValueError("语音响应请求 ID 或 ASR 指纹不匹配")
+
+    def _discard_request_slices(self, run_root: Path, request_id: str) -> None:
+        slices_relative = run_root / "speech" / "slices"
+        slices_path = self._runtime_root / slices_relative
+        if not slices_path.exists():
+            return
+        descriptor = _open_descendant_directory(self._runtime_root, slices_relative)
+        try:
+            prefix = f"{request_id}_"
+            for filename in os.listdir(descriptor):
+                if not filename.startswith(prefix) or not filename.endswith(".wav"):
+                    continue
+                details = os.stat(filename, dir_fd=descriptor, follow_symlinks=False)
+                if stat.S_ISREG(details.st_mode):
+                    os.unlink(filename, dir_fd=descriptor)
+        finally:
+            os.close(descriptor)
+
     def _discard_ipc_artifact(
         self,
         run_root: Path,
@@ -515,8 +396,6 @@ class IsolatedSpeechAnalyzer:
         ipc_descriptor = _open_descendant_directory(self._runtime_root, ipc_relative)
         file_descriptor: int | None = None
         try:
-            # 目录 fd 必须先于路径校验取得；校验回调期间即使命名目录被交换，
-            # 后续删除仍只作用于已经持有的原 IPC 目录。
             reject_symlink_components(
                 self._runtime_root,
                 self._runtime_root / ipc_relative / filename,
@@ -539,12 +418,13 @@ class IsolatedSpeechAnalyzer:
                     digest.update(chunk)
                 after = os.fstat(file_descriptor)
                 current = os.stat(filename, dir_fd=ipc_descriptor, follow_symlinks=False)
+                identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
                 if (
                     digest.hexdigest() != expected_sha256
                     or not stat.S_ISREG(current.st_mode)
-                    or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                    or identity
                     != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-                    or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                    or identity
                     != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
                 ):
                     return
@@ -617,21 +497,21 @@ class IsolatedSpeechAnalyzer:
         return path
 
     @staticmethod
-    def _map_process_error(error: VideoDemoError, stage: str) -> None:
+    def _map_process_error(error: VideoDemoError) -> None:
         if error.code == ErrorCode.VIDEO_PROCESS_CANCELLED:
             raise VideoDemoError(
                 ErrorCode.JOB_CANCELLED,
                 "语音分析已取消",
-                details={"stage": stage},
+                details={"stage": "ASR"},
             ) from None
         if error.code == ErrorCode.VIDEO_PROCESS_TIMEOUT:
             raise VideoDemoError(
                 ErrorCode.SPEECH_SUBPROCESS_TIMEOUT,
                 "语音子进程执行超时",
-                details={"stage": stage},
+                details={"stage": "ASR"},
             ) from None
         raise VideoDemoError(
             ErrorCode.SPEECH_SUBPROCESS_CRASHED,
             "语音子进程执行失败",
-            details={"stage": stage},
+            details={"stage": "ASR"},
         ) from None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -28,20 +29,11 @@ class CreateRunRequest(ApiModel):
     object_ref: str = Field(pattern=r"^obj_[0-9a-f]{32}$")
     idempotency_key: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
     language_hints: tuple[Literal["zh", "en", "ja", "ko", "es"], ...] = ()
-    min_speakers: int | None = Field(default=None, ge=1, le=10)
-    max_speakers: int | None = Field(default=None, ge=1, le=10)
     hotwords: tuple[str, ...] = Field(default=(), max_length=50)
     core_context: str | None = Field(default=None, max_length=1000)
-    speech_enrichment_mode: Literal["text", "full"] = "text"
 
     @model_validator(mode="after")
-    def validate_speaker_range(self) -> Self:
-        if (
-            self.min_speakers is not None
-            and self.max_speakers is not None
-            and self.min_speakers > self.max_speakers
-        ):
-            raise ValueError("min_speakers 不能大于 max_speakers")
+    def normalize_speech_configuration(self) -> Self:
         if len(self.language_hints) != len(set(self.language_hints)):
             raise ValueError("language_hints 不得重复")
         self.hotwords = normalize_hotwords(self.hotwords)
@@ -56,6 +48,24 @@ class RunResponse(ApiModel):
     current_stage: str
     warning_codes: tuple[str, ...]
     error_code: str | None
+
+
+class RunHistoryItem(ApiModel):
+    run_id: str
+    object_ref: str
+    original_filename: str
+    detected_mime: str
+    size_bytes: int
+    status: str
+    current_stage: str
+    warning_codes: tuple[str, ...]
+    error_code: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class RunHistoryResponse(ApiModel):
+    items: tuple[RunHistoryItem, ...]
 
 
 class JobResponse(ApiModel):
@@ -137,7 +147,7 @@ class PublicKeyframeEvidence(PublicTimedEvidence):
 
 class PublicOcrLine(ApiModel):
     text: str
-    bounding_box: BoundingBox
+    bounding_box: BoundingBox | None = None
     confidence: Probability
 
 

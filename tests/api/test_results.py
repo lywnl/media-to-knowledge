@@ -62,8 +62,6 @@ def _upload_and_create(
             "object_ref": uploaded["object_ref"],
             "idempotency_key": "result-query-0001",
             "language_hints": ["en"],
-            "min_speakers": None,
-            "max_speakers": None,
         },
     ).json()
     return created, str(uploaded["sha256"])

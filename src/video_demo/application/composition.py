@@ -31,7 +31,7 @@ from video_demo.application.production_media import (
     build_ffmpeg_factory,
     build_ffprobe_factory,
 )
-from video_demo.application.production_speech import ComponentFactory
+from video_demo.application.production_speech import AsrComponentFactory
 from video_demo.application.production_visual import (
     LazyBaiduOcrClient,
     ProductionVisualAnalyzer,
@@ -53,9 +53,11 @@ from video_demo.persistence.database import Database
 from video_demo.speech.isolated import IsolatedSpeechAnalyzer
 from video_demo.speech.runtime import ProductionSpeechModels
 from video_demo.speech.runtime import (
+    build_diagnostic_speech_models as _build_speech_models,
+)
+from video_demo.speech.runtime import (
     build_speech_component_factory as _build_speech_component_factory,
 )
-from video_demo.speech.runtime import build_speech_models as _build_speech_models
 from video_demo.speech.snapshots import SpeechFingerprintInputs
 from video_demo.speech.subprocess_protocol import (
     SpeechRuntimeConfig,
@@ -95,7 +97,7 @@ class ProductionDiagnosticComponents:
         self,
         *,
         ffmpeg_factory: Callable[[Callable[[], bool]], TranscodeClient],
-        speech_component_factory: ComponentFactory,
+        speech_component_factory: AsrComponentFactory,
         visual_component_factory: ProductionVisualComponentFactory,
         speech_models: ProductionSpeechModels,
         qwen_client: QwenVideoClient,
@@ -173,7 +175,7 @@ def build_production_model_identity_report(
         ),
         _local_model_identity(
             "faster_whisper",
-            "large-v3",
+            settings.whisper_model_id,
             package="faster-whisper",
             device=settings.inference_device,
         ),
@@ -241,6 +243,8 @@ def build_production_diagnostic_components(
     with ExitStack() as pending_resources:
         visual_factory = _build_visual_component_factory(settings, ffmpeg_factory)
         pending_resources.callback(visual_factory.http_client.close)
+        speech_http_client = httpx.Client()
+        pending_resources.callback(speech_http_client.close)
         qwen_http_client = httpx.Client()
         pending_resources.callback(qwen_http_client.close)
 
@@ -259,7 +263,7 @@ def build_production_diagnostic_components(
             timeout_seconds=settings.qwen_timeout_seconds,
             allowed_remote_video_hosts=allowed_remote_video_hosts,
         )
-        speech_models = _build_speech_models(settings)
+        speech_models = _build_speech_models(settings, speech_http_client)
         speech_component_factory = _build_speech_component_factory(
             settings,
             ffmpeg_factory,
@@ -273,8 +277,13 @@ def build_production_diagnostic_components(
             qwen_client=qwen,
             qwen_http_client=qwen_http_client,
             model_identity_report=build_production_model_identity_report(settings),
-            owned_resources=(visual_factory.http_client, qwen_http_client),
+            owned_resources=(
+                visual_factory.http_client,
+                speech_http_client,
+                qwen_http_client,
+            ),
         )
+        # 所有权已经转交给 components，避免 ExitStack 与 owner 双重关闭同一资源。
         pending_resources.pop_all()
     return components
 
@@ -337,6 +346,7 @@ def _settings_fingerprint(settings: Settings) -> str:
         "execution": {
             "inference_device": settings.inference_device,
             "whisper_compute_type": settings.whisper_compute_type,
+            "whisper_model_id": settings.whisper_model_id,
             "max_video_bytes": settings.max_video_bytes,
             "demo_degraded_mode": settings.demo_degraded_mode,
             "speech_subprocess_timeout_seconds": settings.speech_subprocess_timeout_seconds,
@@ -346,7 +356,12 @@ def _settings_fingerprint(settings: Settings) -> str:
             "root": _workspace_relative(settings, model_root),
             "faster_whisper_root": _workspace_relative(
                 settings,
-                model_root / "faster-whisper",
+                model_root
+                / (
+                    "faster-whisper-medium"
+                    if settings.whisper_model_id == "medium"
+                    else "faster-whisper"
+                ),
             ),
             "whisperx_languages": {
                 language: _workspace_relative(
@@ -489,14 +504,11 @@ def build_production_pipeline(
                 runtime_root=settings.runtime_root,
                 snapshot_store=SnapshotStore(AtomicArtifactStore(settings.runtime_root)),
                 artifact_store=AtomicArtifactStore(settings.runtime_root),
-                fingerprint_inputs=_speech_fingerprint_inputs(settings),
                 speech_runtime=_speech_runtime_config(settings, ffmpeg),
                 credentials=SpeechSubprocessCredentials(
-                    huggingface_token=settings.huggingface_token,
+                    openai_api_key=settings.require_cloud_asr_configuration().api_key,
                 ),
                 asr_timeout_seconds=settings.speech_subprocess_timeout_seconds,
-                enrichment_timeout_seconds=settings.speech_enrichment_timeout_seconds,
-                allow_speaker_fallback=settings.demo_degraded_mode,
             ),
             ProductionVisualAnalyzer(
                 settings.runtime_root,
@@ -528,38 +540,40 @@ def _configured_oss_host(settings: Settings) -> str:
 
 
 def _speech_fingerprint_inputs(settings: Settings) -> SpeechFingerprintInputs:
-    assert settings.runtime_root is not None
-    report = build_production_model_identity_report(settings)
-    model_root = settings.runtime_root / "models"
+    configuration = settings.require_cloud_asr_configuration()
     return SpeechFingerprintInputs(
-        model_identities=tuple(
-            identity
-            for identity in report.models
-            if identity.component
-            in {"silero_vad", "faster_whisper", "whisperx", "pyannote", "yamnet"}
+        model_identities=(
+            _local_model_identity(
+                "silero_vad",
+                "silero-vad",
+                package="silero-vad",
+                device="cpu",
+            ),
+            ModelIdentity(
+                component="cloud_whisper",
+                provider="openai_compatible",
+                model_id=configuration.model,
+            ),
         ),
-        asr_compute_type=settings.whisper_compute_type,
-        yamnet_class_map_sha256=_optional_file_sha256(
-            model_root / "yamnet/yamnet_class_map.csv"
-        ),
-        yamnet_thresholds_sha256=_optional_file_sha256(
-            settings.workspace_root / "src/video_demo/audio/thresholds.json"
-        ),
+        cloud_asr_base_url=configuration.base_url,
+        max_window_ms=configuration.max_window_ms,
+        overlap_ms=configuration.overlap_ms,
     )
 
 
 def _speech_runtime_config(settings: Settings, ffmpeg: Path) -> SpeechRuntimeConfig:
+    configuration = settings.require_cloud_asr_configuration()
     inputs = _speech_fingerprint_inputs(settings)
     return SpeechRuntimeConfig(
-        inference_device=settings.inference_device,
-        whisper_compute_type=settings.whisper_compute_type,
+        base_url=configuration.base_url,
+        model=configuration.model,
+        timeout_seconds=configuration.timeout_seconds,
+        max_attempts=configuration.max_attempts,
+        max_window_ms=configuration.max_window_ms,
+        overlap_ms=configuration.overlap_ms,
         model_identities=inputs.model_identities,
-        yamnet_class_map_sha256=inputs.yamnet_class_map_sha256,
-        yamnet_thresholds_sha256=inputs.yamnet_thresholds_sha256,
         vad_threshold=inputs.vad_threshold,
         vad_merge_gap_ms=inputs.vad_merge_gap_ms,
-        lid_threshold=inputs.lid_threshold,
-        asr_beam_size=inputs.asr_beam_size,
         ffmpeg_relative_path=ffmpeg.relative_to(settings.workspace_root).as_posix(),
     )
 

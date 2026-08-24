@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 import video_demo.application.pipeline as pipeline_module
 from video_demo.application.pipeline import (
@@ -17,6 +18,7 @@ from video_demo.application.pipeline import (
     VideoUnderstandingPipeline,
     VisualAnalysis,
     VisualPreparation,
+    pipeline_run_config_from_snapshot,
 )
 from video_demo.domain.evidence import (
     BoundingBox,
@@ -262,6 +264,8 @@ def test_pipeline_runs_all_stages_and_returns_metrics(tmp_path: Path) -> None:
         "PROBE",
         "TRANSCODE",
         "SPEECH",
+        "VISUAL_WAIT_SPEECH",
+        "VISUAL_FUSION",
         "VISUAL",
         "FUSION",
         "UNDERSTANDING",
@@ -927,3 +931,43 @@ def test_incomplete_whole_video_window_set_fails_the_entire_pipeline(
         pipeline.run(PipelineContext(run_id="run_001"))
 
     assert raised.value.code == ErrorCode.QWEN_RESPONSE_INVALID
+@pytest.mark.parametrize(
+    "retired_fields",
+    [
+        {"speech_enrichment_mode": "text"},
+        {"speech_enrichment_mode": "full"},
+        {"min_speakers": 1, "max_speakers": 2},
+        {"min_speakers": None, "max_speakers": None},
+    ],
+)
+def test_pipeline_run_config_loads_retired_snapshot_fields_without_mutation(
+    retired_fields: dict[str, object],
+) -> None:
+    snapshot = {
+        "language_hints": ["zh"],
+        "hotwords": ["Milvus"],
+        "core_context": "向量数据库课程",
+        **retired_fields,
+    }
+    original = snapshot.copy()
+
+    config = pipeline_run_config_from_snapshot(snapshot)
+
+    assert config == PipelineRunConfig(
+        language_hints=("zh",),
+        hotwords=("Milvus",),
+        core_context="向量数据库课程",
+    )
+    assert snapshot == original
+
+
+def test_pipeline_run_config_rejects_unknown_historical_snapshot_field() -> None:
+    with pytest.raises(ValidationError):
+        pipeline_run_config_from_snapshot(
+            {
+                "language_hints": [],
+                "hotwords": [],
+                "core_context": None,
+                "unexpected": True,
+            }
+        )

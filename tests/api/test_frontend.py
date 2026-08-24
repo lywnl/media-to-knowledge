@@ -40,6 +40,8 @@ def test_frontend_page_exposes_local_video_file_workflow(client: TestClient) -> 
     assert "tenant-id" not in html
     assert "application-id" not in html
     assert "knowledge-base-id" not in html
+    assert 'id="history-panel"' in html
+    assert 'id="history-list"' in html
 
 
 def test_frontend_static_resources_are_available(client: TestClient) -> None:
@@ -82,6 +84,12 @@ def test_frontend_script_uses_existing_async_api_contract(client: TestClient) ->
     assert "isRetryablePollingError(error)" in script
     assert 'signal.removeEventListener("abort", rejectOnAbort)' in script
     assert 'updateStatus("处理未完成"' in script
+    assert "loadHistory()" in script
+    assert "/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs" in script
+    assert "original_filename" in script
+    assert "min_speakers" not in script
+    assert "max_speakers" not in script
+    assert "speech_enrichment_mode" not in script
 
 
 def test_frontend_script_renders_untrusted_result_as_text(client: TestClient) -> None:

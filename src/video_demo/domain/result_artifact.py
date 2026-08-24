@@ -24,14 +24,19 @@ RESULT_STAGE_NAMES = frozenset(
         "TRANSCODE",
         "SPEECH",
         "SPEECH_ASR",
-        "SPEECH_ENRICHMENT",
         "VISUAL",
+        "VISUAL_SCENE_DETECT",
+        "VISUAL_FRAME_EXTRACT",
+        "VISUAL_KEYFRAME_SELECT",
+        "VISUAL_OCR",
+        "VISUAL_WAIT_SPEECH",
+        "VISUAL_FUSION",
         "FUSION",
         "UNDERSTANDING",
         "RESULT",
     },
 )
-SPEECH_CACHE_HIT_STAGE_NAMES = frozenset({"SPEECH_ASR", "SPEECH_ENRICHMENT"})
+SPEECH_CACHE_HIT_STAGE_NAMES = frozenset({"SPEECH_ASR"})
 
 
 class ResultArtifactPayload(FrozenModel):
