@@ -186,3 +186,35 @@ def test_no_semantic_evidence_chapter_has_no_claims_or_retrieval_text() -> None:
     payload["claims"] = (GroundedClaim(text="伪造", evidence_refs=("asr_001",), certainty=0.8),)
     with pytest.raises(ValidationError, match=r"NO_SEMANTIC_EVIDENCE|语义"):
         SemanticChapter.model_validate(payload)
+
+
+def test_summary_retrieval_text_is_limited_to_eight_thousand_characters() -> None:
+    text = "a" * 8_001
+    with pytest.raises(ValidationError, match="string_too_long"):
+        VideoDocumentSummary(
+            title="测试视频",
+            duration_ms=1_000,
+            overview_zh="摘要",
+            key_points=(),
+            retrieval_text=text,
+            retrieval_hash=_hash(text),
+        )
+
+
+def test_chapter_retrieval_text_is_limited_to_thirty_two_thousand_characters() -> None:
+    text = "a" * 32_001
+    with pytest.raises(ValidationError, match="string_too_long"):
+        SemanticChapter(
+            chapter_id="ch_001",
+            start_ms=0,
+            end_ms=1_000,
+            title="章节",
+            summary_zh="摘要",
+            body_blocks=(ParagraphBlock(text="正文", evidence_refs=("asr_001",)),),
+            claims=(GroundedClaim(text="结论", evidence_refs=("asr_001",), certainty=0.9),),
+            content_status="GROUNDED",
+            evidence_refs=("asr_001",),
+            transcript_source="ASR",
+            retrieval_text=text,
+            retrieval_hash=_hash(text),
+        )

@@ -40,7 +40,7 @@ class VideoDocumentSummary(FrozenModel):
     duration_ms: int = Field(gt=0, le=7_200_000)
     overview_zh: str = Field(max_length=8_000)
     key_points: tuple[SummaryPoint, ...] = Field(max_length=64)
-    retrieval_text: str = Field(max_length=64_000)
+    retrieval_text: str = Field(max_length=8_000)
     retrieval_hash: Sha256
 
     @model_validator(mode="after")
@@ -151,7 +151,7 @@ class SemanticChapter(TimeRange):
     evidence_refs: tuple[StableId, ...] = Field(max_length=256)
     selected_keyframe_refs: tuple[StableId, ...] = Field(default=(), max_length=3)
     transcript_source: TranscriptSource
-    retrieval_text: str = Field(max_length=64_000)
+    retrieval_text: str = Field(max_length=32_000)
     retrieval_hash: Sha256
 
     @model_validator(mode="after")

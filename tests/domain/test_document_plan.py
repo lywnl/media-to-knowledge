@@ -75,3 +75,102 @@ def test_frame_candidate_has_bounded_identity_and_positive_size() -> None:
     )
 
     assert candidate.size_bytes == 128
+
+
+def test_base_coverage_without_scenes_uses_program_owned_sample_timestamp() -> None:
+    target = VisualSearchTarget(
+        target_id="target_001",
+        purpose="BASE_COVERAGE",
+        query_zh="章节代表性画面",
+        sample_timestamps_ms=(5_000,),
+    )
+    plan = ChapterPlan(
+        chapter_id="chapter_001",
+        start_ms=0,
+        end_ms=10_000,
+        segment_refs=("segment_001",),
+        title_hint="章节",
+        visual_mode="SINGLE",
+        semantic_targets=(),
+        base_coverage_targets=(target,),
+    )
+
+    assert plan.base_coverage_targets[0].sample_timestamps_ms == (5_000,)
+
+
+def test_base_coverage_sample_timestamp_must_be_inside_chapter() -> None:
+    target = VisualSearchTarget(
+        target_id="target_001",
+        purpose="BASE_COVERAGE",
+        query_zh="章节代表性画面",
+        sample_timestamps_ms=(10_000,),
+    )
+    with pytest.raises(ValidationError, match="章节范围"):
+        ChapterPlan(
+            chapter_id="chapter_001",
+            start_ms=0,
+            end_ms=10_000,
+            segment_refs=("segment_001",),
+            title_hint="章节",
+            visual_mode="SINGLE",
+            semantic_targets=(),
+            base_coverage_targets=(target,),
+        )
+
+
+def test_none_visual_mode_rejects_semantic_targets() -> None:
+    target = VisualSearchTarget(
+        target_id="target_001",
+        purpose="SEMANTIC",
+        query_zh="参数",
+        anchor_evidence_refs=("asr_001",),
+    )
+    with pytest.raises(ValidationError, match="NONE"):
+        ChapterPlan(
+            chapter_id="chapter_001",
+            start_ms=0,
+            end_ms=10_000,
+            segment_refs=("segment_001",),
+            title_hint="章节",
+            visual_mode="NONE",
+            semantic_targets=(target,),
+            base_coverage_targets=(),
+        )
+
+
+def test_complex_visual_mode_requires_two_disjoint_anchor_groups() -> None:
+    target = VisualSearchTarget(
+        target_id="target_001",
+        purpose="SEMANTIC",
+        query_zh="参数",
+        anchor_evidence_refs=("asr_001",),
+    )
+    with pytest.raises(ValidationError, match="两个"):
+        ChapterPlan(
+            chapter_id="chapter_001",
+            start_ms=0,
+            end_ms=10_000,
+            segment_refs=("segment_001",),
+            title_hint="章节",
+            visual_mode="COMPARISON",
+            semantic_targets=(target,),
+            base_coverage_targets=(),
+        )
+
+    overlapping = VisualSearchTarget(
+        target_id="target_002",
+        purpose="SEMANTIC",
+        query_zh="另一个参数",
+        anchor_evidence_refs=("asr_001", "asr_002"),
+    )
+    with pytest.raises(ValidationError, match="不重叠"):
+        ChapterPlan(
+            chapter_id="chapter_001",
+            start_ms=0,
+            end_ms=10_000,
+            segment_refs=("segment_001",),
+            title_hint="章节",
+            visual_mode="MULTI_STEP",
+            semantic_targets=(target, overlapping),
+            base_coverage_targets=(),
+        )
