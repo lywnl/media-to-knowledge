@@ -62,8 +62,44 @@ from video_demo.speech.vad import SileroVadAdapter
 from video_demo.storage.object_store import LocalVideoObjectStore
 
 
+@pytest.mark.parametrize(
+    "builder",
+    (
+        lambda settings: build_worker(settings, worker_id="worker-missing-cloud-asr"),
+        lambda settings: __import__(
+            "video_demo.application.composition",
+            fromlist=["build_production_pipeline"],
+        ).build_production_pipeline(settings, object(), object()),
+        lambda settings: build_production_diagnostic_components(settings),
+    ),
+)
+def test_production_composition_rejects_missing_cloud_asr_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    builder: object,
+) -> None:
+    import video_demo.application.composition as composition
+
+    settings = Settings(workspace_root=tmp_path, _env_file=None)
+    assert settings.runtime_root is not None
+    monkeypatch.setattr(
+        composition.httpx,
+        "Client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("配置失败前不得创建 HTTP 客户端")
+        ),
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        builder(settings)  # type: ignore[operator]
+
+    assert raised.value.code == ErrorCode.INVALID_CONFIGURATION
+    assert not settings.runtime_root.exists()
+
+
 def test_production_worker_consumes_created_job_and_records_missing_ffprobe(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     settings = Settings(
         workspace_root=tmp_path,
@@ -325,6 +361,7 @@ def test_production_pipeline_preserves_injectable_stage_clock() -> None:
 
 def test_worker_builds_real_production_media_adapters(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     from video_demo.application.composition import build_production_pipeline
 
@@ -352,6 +389,7 @@ def test_worker_builds_real_production_media_adapters(
 def test_production_pipeline_does_not_construct_in_process_speech_models(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -376,6 +414,7 @@ def test_production_pipeline_does_not_construct_in_process_speech_models(
 
 def test_strict_production_pipeline_rejects_configured_qwen_without_oss(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     from video_demo.application.composition import build_production_pipeline
 
@@ -399,6 +438,7 @@ def test_strict_production_pipeline_rejects_configured_qwen_without_oss(
 
 def test_production_pipeline_wraps_qwen_with_private_oss_publisher(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     from video_demo.application.composition import build_production_pipeline
 
@@ -432,6 +472,7 @@ def test_production_pipeline_wraps_qwen_with_private_oss_publisher(
 
 def test_demo_pipeline_fallback_wraps_published_qwen(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     from video_demo.application.composition import build_production_pipeline
 
@@ -466,6 +507,7 @@ def test_demo_pipeline_fallback_wraps_published_qwen(
 def test_production_pipeline_passes_nullable_qwen_configuration_and_dedicated_limits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -520,6 +562,7 @@ def test_production_pipeline_passes_nullable_qwen_configuration_and_dedicated_li
 def test_diagnostic_builder_uses_public_qwen_api_key_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -552,6 +595,7 @@ def test_diagnostic_builder_uses_public_qwen_api_key_provider(
 def test_worker_starts_without_qwen_configuration_and_fails_at_first_clip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -818,6 +862,7 @@ def test_production_pipeline_close_attempts_all_resources_when_later_close_raise
 def test_production_pipeline_build_closes_http_client_when_owner_construction_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -845,6 +890,7 @@ def test_production_pipeline_build_closes_http_client_when_owner_construction_fa
 def test_qwen_adapter_construction_failure_closes_visual_and_qwen_http_clients(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -878,6 +924,7 @@ def test_qwen_adapter_construction_failure_closes_visual_and_qwen_http_clients(
 def test_qwen_http_client_construction_failure_closes_visual_http_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -940,6 +987,7 @@ def test_build_worker_closes_pipeline_when_downstream_construction_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -975,6 +1023,7 @@ def test_build_worker_closes_pipeline_when_downstream_construction_fails(
 def test_build_worker_transfers_pipeline_to_successful_worker_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -1002,6 +1051,7 @@ def test_build_worker_transfers_pipeline_to_successful_worker_owner(
 def test_production_pipeline_builds_lightweight_dependencies_without_diagnostics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -1032,6 +1082,7 @@ def test_production_pipeline_builds_lightweight_dependencies_without_diagnostics
 def test_diagnostic_builder_keeps_all_secrets_lazy_until_adapter_call(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -1141,6 +1192,7 @@ def test_diagnostic_builder_keeps_all_secrets_lazy_until_adapter_call(
 def test_diagnostic_components_close_resources_in_reverse_order_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -1192,6 +1244,7 @@ def test_diagnostic_builder_closes_created_resources_in_reverse_on_failure(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
     expected_closes: list[int],
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 

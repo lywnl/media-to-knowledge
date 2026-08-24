@@ -1,9 +1,27 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+from video_demo.api.app import create_app
+from video_demo.config import Settings
+from video_demo.errors import ErrorCode, VideoDemoError
+
+
+def test_api_rejects_missing_cloud_asr_configuration_before_writing_runtime(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(workspace_root=tmp_path, _env_file=None)
+    assert settings.runtime_root is not None
+
+    with pytest.raises(VideoDemoError) as raised:
+        create_app(settings)
+
+    assert raised.value.code == ErrorCode.INVALID_CONFIGURATION
+    assert not settings.runtime_root.exists()
 
 def test_frontend_page_exposes_local_video_file_workflow(client: TestClient) -> None:
     response = client.get("/")

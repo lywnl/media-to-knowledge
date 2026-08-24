@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 
 def pytest_configure() -> None:
     for name in (
@@ -19,6 +21,25 @@ def pytest_configure() -> None:
         "VIDEO_DEMO_OSS_ACCESS_KEY_SECRET",
     ):
         os.environ[name] = ""
+    for name in (
+        "OPENAI_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
+        "OPENAI_ASR_TIMEOUT_SECONDS",
+        "OPENAI_ASR_MAX_ATTEMPTS",
+    ):
+        os.environ.pop(name, None)
     os.environ["VIDEO_DEMO_BAIDU_OCR_ENDPOINT"] = (
         "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"
     )
+
+
+@pytest.fixture
+def cloud_asr_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """只供显式启动生产组合根的测试注入非真实凭据。"""
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://ai-proxy.example.test/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("OPENAI_MODEL", "openai/whisper")
+    monkeypatch.setenv("OPENAI_ASR_TIMEOUT_SECONDS", "300")
+    monkeypatch.setenv("OPENAI_ASR_MAX_ATTEMPTS", "3")

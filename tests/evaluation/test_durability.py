@@ -661,6 +661,7 @@ def test_each_sample_failure_condition_produces_fail(
 def test_cleanup_removes_only_database_bound_durability_product_runs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
     settings = Settings(workspace_root=tmp_path)

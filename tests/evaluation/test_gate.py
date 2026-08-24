@@ -2051,13 +2051,18 @@ def _write_five_language_live_report(
 def test_five_language_live_verifier_accepts_exact_local_stack_coverage(
     tmp_path: Path,
 ) -> None:
-    report_path = _write_five_language_live_report(tmp_path)
+    settings = Settings(
+        workspace_root=tmp_path,
+        qwen_model_id="qwen3-vl-plus",
+        whisper_model_id="large-v3",
+    )
+    report_path = _write_five_language_live_report(tmp_path, settings=settings)
 
     check = build_verified_gate_check(
         "five_language_models",
         report_path,
         workspace_root=tmp_path,
-        settings=Settings(workspace_root=tmp_path, qwen_model_id="qwen3-vl-plus"),
+        settings=settings,
     )
 
     assert check.status == GateStatus.PASS

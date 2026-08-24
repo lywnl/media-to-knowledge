@@ -230,6 +230,7 @@ def build_production_diagnostic_components(
 ) -> ProductionDiagnosticComponents:
     """构造唯一生产诊断组合根，Secret 仅在 Adapter 首次真实调用时解封。"""
 
+    settings.require_cloud_asr_configuration()
     assert settings.runtime_root is not None
     ffmpeg = settings.ffmpeg_path or settings.runtime_root / "tools" / "ffmpeg"
     ffmpeg_factory = build_ffmpeg_factory(
@@ -415,6 +416,7 @@ def build_production_pipeline(
 ) -> ProductionPipeline:
     """组装工作区内安全媒体工具与延迟验证配置的 Qwen Adapter。"""
 
+    settings.require_cloud_asr_configuration()
     assert settings.runtime_root is not None
     ffmpeg = settings.ffmpeg_path or settings.runtime_root / "tools" / "ffmpeg"
     ffprobe = settings.ffprobe_path or settings.runtime_root / "tools" / "ffprobe"
@@ -653,6 +655,7 @@ class ProductionVisualComponentFactory:
 def build_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
     """用与 API 相同的数据库和运行目录组装可执行 Worker。"""
 
+    settings.require_cloud_asr_configuration()
     assert settings.runtime_root is not None
     settings.runtime_root.mkdir(parents=True, exist_ok=True)
     database = Database(f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}")

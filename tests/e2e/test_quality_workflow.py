@@ -233,6 +233,7 @@ def _fake_worker_factory(app: FastAPI, calls: list[str]):
 
 def test_prediction_runner_drives_api_worker_queries_and_model_free_score(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     media = b"\x00\x00\x00\x18ftypisom" + b"m" * 128
     runtime_root, package = _write_runner_package(tmp_path, media)
@@ -322,6 +323,7 @@ def test_cleanup_keeps_unbound_placeholder_product_run(tmp_path: Path) -> None:
 
 def test_cleanup_rejects_tampered_prediction_before_deleting_anything(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     media = b"\x00\x00\x00\x18ftypisom" + b"m" * 128
     runtime_root, package = _write_runner_package(tmp_path, media)
@@ -357,6 +359,7 @@ def test_cleanup_rejects_tampered_prediction_before_deleting_anything(
 
 def test_prediction_runner_uses_real_production_worker_factory_for_failure_path(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     media = b"\x00\x00\x00\x18ftypisom" + b"m" * 128
     runtime_root, package = _write_runner_package(tmp_path, media)

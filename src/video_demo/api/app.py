@@ -55,6 +55,7 @@ _PUBLIC_DETAIL_KEYS = frozenset(
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     actual_settings = settings or Settings()
+    actual_settings.require_cloud_asr_configuration()
     assert actual_settings.runtime_root is not None
     actual_settings.runtime_root.mkdir(parents=True, exist_ok=True)
     database = Database(
