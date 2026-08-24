@@ -14,6 +14,57 @@ from video_demo.errors import ErrorCode, VideoDemoError
 
 
 class SettingsTest(unittest.TestCase):
+    def test_retired_local_model_dotenv_keys_are_ignored_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            dotenv = workspace / ".env"
+            dotenv.write_text(
+                "\n".join(
+                    (
+                        "OPENAI_BASE_URL=https://ai-proxy.example.test/v1",
+                        "OPENAI_API_KEY=test-openai-key",
+                        "OPENAI_MODEL=openai/whisper",
+                        "VIDEO_DEMO_INFERENCE_DEVICE=cpu",
+                        "VIDEO_DEMO_WHISPER_COMPUTE_TYPE=int8",
+                        "VIDEO_DEMO_WHISPER_MODEL_ID=medium",
+                        "VIDEO_DEMO_SPEECH_ENRICHMENT_TIMEOUT_SECONDS=3600",
+                        "VIDEO_DEMO_HUGGINGFACE_TOKEN=retired-test-token",
+                    ),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            settings = Settings(workspace_root=workspace, _env_file=dotenv)
+
+            configuration = settings.require_cloud_asr_configuration()
+            self.assertEqual(configuration.model, "openai/whisper")
+            self.assertTrue(
+                {
+                    "inference_device",
+                    "whisper_compute_type",
+                    "whisper_model_id",
+                    "speech_enrichment_timeout_seconds",
+                    "huggingface_token",
+                }.isdisjoint(Settings.model_fields),
+            )
+
+    def test_unknown_dotenv_key_is_rejected_without_revealing_its_value(self) -> None:
+        secret = "unknown-sensitive-test-value"
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            dotenv = workspace / ".env"
+            dotenv.write_text(
+                f"VIDEO_DEMO_UNKNOWN_CREDENTIAL={secret}\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValidationError) as raised:
+                Settings(workspace_root=workspace, _env_file=dotenv)
+
+            self.assertIn("extra_forbidden", str(raised.exception))
+            self.assertNotIn(secret, str(raised.exception))
+
     def test_cloud_asr_configuration_requires_all_required_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(workspace_root=Path(directory), _env_file=None)

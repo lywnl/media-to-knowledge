@@ -1,17 +1,56 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic.fields import FieldInfo
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 from video_demo.domain.base import FrozenModel
 from video_demo.errors import ErrorCode, VideoDemoError
 
 _CLOUD_ASR_MAX_WINDOW_MS = 600_000
 _CLOUD_ASR_OVERLAP_MS = 1_000
+_RETIRED_LOCAL_MODEL_DOTENV_KEYS = frozenset(
+    {
+        "video_demo_inference_device",
+        "video_demo_whisper_compute_type",
+        "video_demo_whisper_model_id",
+        "video_demo_speech_enrichment_timeout_seconds",
+        "video_demo_huggingface_token",
+    },
+)
+
+
+class _RetiredLocalModelDotenvFilter(PydanticBaseSettingsSource):
+    """只在 dotenv 边界丢弃迁移前已退役的本地模型配置。"""
+
+    def __init__(self, source: PydanticBaseSettingsSource) -> None:
+        super().__init__(source.settings_cls)
+        self._source = source
+
+    def get_field_value(
+        self,
+        field: FieldInfo,
+        field_name: str,
+    ) -> tuple[Any, str, bool]:
+        return self._source.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        self._source._set_current_state(self.current_state)
+        self._source._set_settings_sources_data(self.settings_sources_data)
+        values = self._source()
+        return {
+            key: value
+            for key, value in values.items()
+            if key.casefold() not in _RETIRED_LOCAL_MODEL_DOTENV_KEYS
+        }
 
 
 def resolve_workspace_path(root: Path, candidate: Path) -> Path:
@@ -53,6 +92,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="forbid",
+        hide_input_in_errors=True,
         validate_default=True,
     )
 
@@ -115,6 +155,23 @@ class Settings(BaseSettings):
             "openai_asr_max_attempts",
         ),
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        del settings_cls
+        return (
+            init_settings,
+            env_settings,
+            _RetiredLocalModelDotenvFilter(dotenv_settings),
+            file_secret_settings,
+        )
 
     @field_validator("openai_api_key", mode="before")
     @classmethod
