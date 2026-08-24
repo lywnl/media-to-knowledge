@@ -4,19 +4,138 @@ import pytest
 from pydantic import ValidationError
 
 from video_demo.domain.evidence import SpeechSegment, SubtitleCue
-from video_demo.domain.run import ModelIdentity
+from video_demo.domain.run import ModelIdentity, TimeRange
+from video_demo.speech.asr import CloudAsrWindow
+from video_demo.speech.language import LanguageSpan
 from video_demo.speech.snapshots import (
     AsrSnapshotPayload,
+    AsrWindowSnapshotPayload,
     SpeechAnalysisSnapshotPayload,
     SpeechFingerprintInputs,
     _speech_fingerprint_v1,
     asr_fingerprint,
+    asr_window_fingerprint,
     speech_fingerprint,
 )
+from video_demo.speech.vad import SpeechInterval
 
 
 def test_asr_snapshot_uses_hint_enabled_behavior_contract() -> None:
     assert AsrSnapshotPayload.model_fields["schema_version"].default == "1.1.0"
+
+
+def test_asr_window_snapshot_has_strict_minimal_payload() -> None:
+    window = _window()
+    language_span = LanguageSpan(
+        evidence_id="lid_window",
+        start_ms=window.owned_range.start_ms,
+        end_ms=window.owned_range.end_ms,
+        language="zh",
+        confidence=None,
+        is_fully_evaluated_language=True,
+    )
+    segment = SpeechSegment(
+        evidence_id="asr_window",
+        start_ms=10_000,
+        end_ms=11_000,
+        text="窗口缓存文本",
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+
+    payload = AsrWindowSnapshotPayload(
+        upload_range=window.upload_range,
+        owned_range=window.owned_range,
+        speech_interval=window.speech_interval,
+        language_span=language_span,
+        segments=(segment,),
+        warnings=("ASR_OVERLAP_TIMESTAMP_CLAMPED",),
+    )
+
+    assert payload.schema_version == "1.0.0"
+    assert payload.model_dump(mode="json", exclude_computed_fields=True) == {
+        "schema_version": "1.0.0",
+        "upload_range": {"start_ms": 10_000, "end_ms": 370_500},
+        "owned_range": {"start_ms": 10_000, "end_ms": 370_000},
+        "speech_interval": {
+            "start_ms": 10_000,
+            "end_ms": 730_000,
+            "evidence_id": "vad_window",
+            "confidence": 0.9,
+        },
+        "language_span": {
+            "start_ms": 10_000,
+            "end_ms": 370_000,
+            "evidence_id": "lid_window",
+            "language": "zh",
+            "confidence": None,
+            "detection_source": "MODEL",
+            "is_fully_evaluated_language": True,
+        },
+        "segments": [
+            {
+                "start_ms": 10_000,
+                "end_ms": 11_000,
+                "evidence_id": "asr_window",
+                "evidence_type": "ASR_SEGMENT",
+                "text": "窗口缓存文本",
+                "language": "zh",
+                "confidence": 0.9,
+                "is_fully_evaluated_language": True,
+            }
+        ],
+        "warnings": ["ASR_OVERLAP_TIMESTAMP_CLAMPED"],
+    }
+
+
+def test_asr_window_fingerprint_binds_parent_and_window_only() -> None:
+    window = _window()
+    base = asr_window_fingerprint(asr_fingerprint="a" * 64, window=window)
+    changed_parent = asr_window_fingerprint(asr_fingerprint="b" * 64, window=window)
+    changed_window = asr_window_fingerprint(
+        asr_fingerprint="a" * 64,
+        window=CloudAsrWindow(
+            upload_range=TimeRange(start_ms=10_000, end_ms=370_501),
+            owned_range=TimeRange(start_ms=10_000, end_ms=370_001),
+            speech_interval=window.speech_interval,
+        ),
+    )
+
+    assert len(base) == 64
+    assert base != changed_parent
+    assert base != changed_window
+
+
+def test_asr_window_snapshot_and_fingerprint_do_not_accept_secrets_or_request_data() -> None:
+    window = _window()
+    forbidden = {
+        "prompt": "SECRET_PROMPT_SENTINEL",
+        "api_key": "SECRET_KEY_SENTINEL",
+        "authorization": "Bearer SECRET_AUTH_SENTINEL",
+        "request_headers": {"X-Secret": "SECRET_HEADER_SENTINEL"},
+    }
+
+    with pytest.raises(ValidationError):
+        AsrWindowSnapshotPayload.model_validate(
+            {
+                "upload_range": window.upload_range,
+                "owned_range": window.owned_range,
+                "speech_interval": window.speech_interval,
+                "language_span": {
+                    "evidence_id": "lid_window",
+                    "start_ms": 10_000,
+                    "end_ms": 370_000,
+                    "language": "zh",
+                    "is_fully_evaluated_language": True,
+                },
+                "segments": [],
+                **forbidden,
+            }
+        )
+    fingerprint = asr_window_fingerprint(asr_fingerprint="a" * 64, window=window)
+    serialized = repr(fingerprint)
+    assert all(str(value) not in serialized for value in forbidden.values())
 
 
 def test_legacy_speech_snapshot_defaults_to_full_and_keeps_schema_version() -> None:
@@ -353,4 +472,18 @@ def _inputs() -> SpeechFingerprintInputs:
         asr_compute_type="int8",
         yamnet_class_map_sha256="d" * 64,
         yamnet_thresholds_sha256="e" * 64,
+    )
+
+
+def _window() -> CloudAsrWindow:
+    speech = SpeechInterval(
+        evidence_id="vad_window",
+        start_ms=10_000,
+        end_ms=730_000,
+        confidence=0.9,
+    )
+    return CloudAsrWindow(
+        upload_range=TimeRange(start_ms=10_000, end_ms=370_500),
+        owned_range=TimeRange(start_ms=10_000, end_ms=370_000),
+        speech_interval=speech,
     )

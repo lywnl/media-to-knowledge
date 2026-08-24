@@ -18,8 +18,10 @@ from video_demo.domain.evidence import (
     SubtitleCue,
 )
 from video_demo.domain.result_artifact import TranscriptSource
-from video_demo.domain.run import ModelIdentity
+from video_demo.domain.run import ModelIdentity, TimeRange
+from video_demo.speech.asr import CloudAsrWindow
 from video_demo.speech.language import LanguageSpan
+from video_demo.speech.vad import SpeechInterval
 
 _ASR_COMPONENTS = frozenset({"silero_vad", "faster_whisper"})
 _DOWNSTREAM_COMPONENTS = frozenset({"whisperx", "pyannote", "yamnet"})
@@ -32,6 +34,16 @@ class AsrSnapshotPayload(FrozenModel):
     vad_warnings: tuple[str, ...]
     silence_boundaries_ms: tuple[int, ...]
     language_change_boundaries_ms: tuple[int, ...]
+
+
+class AsrWindowSnapshotPayload(FrozenModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    upload_range: TimeRange
+    owned_range: TimeRange
+    speech_interval: SpeechInterval
+    language_span: LanguageSpan
+    segments: tuple[SpeechSegment, ...]
+    warnings: tuple[str, ...] = ()
 
 
 class SpeechBoundaryCandidateSnapshot(FrozenModel):
@@ -161,6 +173,33 @@ def asr_fingerprint(
             "lid_threshold": inputs.lid_threshold,
             "asr_beam_size": inputs.asr_beam_size,
             "asr_compute_type": inputs.asr_compute_type,
+        }
+    )
+
+
+def asr_window_fingerprint(
+    *,
+    asr_fingerprint: str,
+    window: CloudAsrWindow,
+) -> str:
+    return _canonical_sha256(
+        {
+            "schema_version": AsrWindowSnapshotPayload.model_fields[
+                "schema_version"
+            ].default,
+            "asr_fingerprint": asr_fingerprint,
+            "upload_range": window.upload_range.model_dump(
+                mode="json",
+                exclude_computed_fields=True,
+            ),
+            "owned_range": window.owned_range.model_dump(
+                mode="json",
+                exclude_computed_fields=True,
+            ),
+            "speech_interval": window.speech_interval.model_dump(
+                mode="json",
+                exclude_computed_fields=True,
+            ),
         }
     )
 
