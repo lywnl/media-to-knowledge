@@ -9,9 +9,6 @@ import pytest
 from video_demo.application.pipeline import PipelineRunConfig, ProbedAsset, RegisteredAsset
 from video_demo.application.production_media import ProductionMediaTranscoder
 from video_demo.domain.evidence import (
-    AlignedWord,
-    AudioEvent,
-    SpeakerTurn,
     SpeechSegment,
     SubtitleCue,
 )
@@ -93,10 +90,7 @@ def test_subtitle_eligibility_controls_audio_and_isolated_speech_route(
         assert media.audio_path is None
         assert process_calls == 0
         assert any(isinstance(item, SubtitleCue) for item in result.evidence)
-        assert not any(
-            isinstance(item, (SpeechSegment, AlignedWord, SpeakerTurn, AudioEvent))
-            for item in result.evidence
-        )
+        assert not any(isinstance(item, SpeechSegment) for item in result.evidence)
         assert not (runtime_root / "runs/scope/run_001/media/audio.wav").exists()
         assert not (runtime_root / "runs/scope/run_001/speech/ipc").exists()
     else:

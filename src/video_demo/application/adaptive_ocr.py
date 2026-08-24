@@ -8,7 +8,6 @@ from pathlib import Path
 
 from video_demo.application.pipeline import PreparedMedia, SpeechAnalysis
 from video_demo.domain.evidence import (
-    AlignedWord,
     KeyframeEvidence,
     OcrEvidence,
     SpeechSegment,
@@ -412,7 +411,7 @@ def ocr_language(
         (
             item
             for item in speech.evidence
-            if isinstance(item, (SubtitleCue, SpeechSegment, AlignedWord))
+            if isinstance(item, (SubtitleCue, SpeechSegment))
             and item.start_ms <= timestamp_ms < item.end_ms
         ),
         key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),

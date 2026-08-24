@@ -41,40 +41,6 @@ class SubtitleCue(TimedEvidence):
     stream_index: int = Field(ge=0)
 
 
-class AlignedWord(TimedEvidence):
-    evidence_type: Literal["ALIGNED_WORD"] = "ALIGNED_WORD"
-    text: str = Field(min_length=1)
-    language: LanguageCode
-    probability: Probability
-    speaker: SpeakerId = "SPEAKER_UNKNOWN"
-    overlap_speakers: tuple[SpeakerId, ...] = ()
-
-    @field_validator("overlap_speakers")
-    @classmethod
-    def reject_duplicate_overlap_speakers(
-        cls,
-        value: tuple[SpeakerId, ...],
-    ) -> tuple[SpeakerId, ...]:
-        if len(value) != len(set(value)):
-            raise ValueError("overlap_speakers 不得重复")
-        return value
-
-
-class SpeakerTurn(TimedEvidence):
-    evidence_type: Literal["SPEAKER_TURN"] = "SPEAKER_TURN"
-    speaker: SpeakerId
-    confidence: Probability | None = None
-    overlap_speakers: tuple[SpeakerId, ...] = ()
-
-
-class AudioEvent(TimedEvidence):
-    evidence_type: Literal["AUDIO_EVENT"] = "AUDIO_EVENT"
-    audioset_class: str = Field(min_length=1, max_length=256)
-    normalized_event: str = Field(min_length=1, max_length=128)
-    confidence: Probability
-    threshold_version: str = Field(min_length=1, max_length=64)
-
-
 class SceneBoundary(TimedEvidence):
     evidence_type: Literal["SCENE"] = "SCENE"
     transition: Literal["hard_cut", "gradual", "candidate"]
@@ -140,9 +106,6 @@ class TimelineEvidence(TimeRange):
 EvidenceItem: TypeAlias = (
     SpeechSegment
     | SubtitleCue
-    | AlignedWord
-    | SpeakerTurn
-    | AudioEvent
     | SceneBoundary
     | KeyframeEvidence
     | OcrEvidence

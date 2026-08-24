@@ -6,7 +6,7 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from video_demo.domain.base import LanguageCode, Probability, StableId
-from video_demo.domain.evidence import BoundingBox, SpeakerId
+from video_demo.domain.evidence import BoundingBox
 from video_demo.domain.run import TimeRange
 from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
 
@@ -106,30 +106,6 @@ class PublicSubtitleCue(PublicTimedEvidence):
     stream_index: int = Field(ge=0)
 
 
-class PublicAlignedWord(PublicTimedEvidence):
-    evidence_type: Literal["ALIGNED_WORD"] = "ALIGNED_WORD"
-    text: str
-    language: LanguageCode
-    probability: Probability
-    speaker: SpeakerId
-    overlap_speakers: tuple[SpeakerId, ...]
-
-
-class PublicSpeakerTurn(PublicTimedEvidence):
-    evidence_type: Literal["SPEAKER_TURN"] = "SPEAKER_TURN"
-    speaker: SpeakerId
-    confidence: Probability | None
-    overlap_speakers: tuple[SpeakerId, ...]
-
-
-class PublicAudioEvent(PublicTimedEvidence):
-    evidence_type: Literal["AUDIO_EVENT"] = "AUDIO_EVENT"
-    audioset_class: str
-    normalized_event: str
-    confidence: Probability
-    threshold_version: str
-
-
 class PublicSceneBoundary(PublicTimedEvidence):
     evidence_type: Literal["SCENE"] = "SCENE"
     transition: Literal["hard_cut", "gradual", "candidate"]
@@ -163,9 +139,6 @@ class PublicOcrEvidence(PublicTimedEvidence):
 PublicEvidence = Annotated[
     PublicSpeechSegment
     | PublicSubtitleCue
-    | PublicAlignedWord
-    | PublicSpeakerTurn
-    | PublicAudioEvent
     | PublicSceneBoundary
     | PublicKeyframeEvidence
     | PublicOcrEvidence,

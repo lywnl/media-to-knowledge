@@ -7,7 +7,6 @@ import httpx
 
 from video_demo.config import CloudAsrConfiguration
 from video_demo.domain.evidence import (
-    AlignedWord,
     BoundingBox,
     KeyframeEvidence,
     OcrEvidence,
@@ -154,14 +153,6 @@ def test_whole_video_prompt_projects_only_model_relevant_evidence(
             confidence=0.9,
             is_fully_evaluated_language=True,
         ),
-        AlignedWord(
-            evidence_id="word_001",
-            start_ms=0,
-            end_ms=100,
-            text="讲解",
-            language="zh",
-            probability=0.9,
-        ),
         SceneBoundary(
             evidence_id="scene_001",
             start_ms=0,
@@ -235,7 +226,9 @@ def test_whole_video_prompt_projects_only_model_relevant_evidence(
         "keyframe_001",
         "ocr_001",
     }
-    assert "word_001" not in rendered
+    assert "aligned_words" not in rendered
+    assert "speakers" not in rendered
+    assert "audio_events" not in rendered
     assert "timeline" not in document["windows"][0]
     assert "relative_path" not in rendered
     assert "sha256" not in rendered

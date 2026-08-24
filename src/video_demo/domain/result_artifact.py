@@ -6,10 +6,7 @@ from pydantic import StrictInt, field_validator, model_validator
 
 from video_demo.domain.base import FrozenModel
 from video_demo.domain.evidence import (
-    AlignedWord,
-    AudioEvent,
     EvidenceItem,
-    SpeakerTurn,
     SpeechSegment,
     SubtitleCue,
 )
@@ -90,11 +87,7 @@ class ResultArtifactPayload(FrozenModel):
     @model_validator(mode="after")
     def validate_transcript_source_evidence(self) -> ResultArtifactPayload:
         subtitle_cues = tuple(item for item in self.evidence if isinstance(item, SubtitleCue))
-        asr_evidence = tuple(
-            item
-            for item in self.evidence
-            if isinstance(item, (SpeechSegment, AlignedWord, SpeakerTurn, AudioEvent))
-        )
+        asr_evidence = tuple(item for item in self.evidence if isinstance(item, SpeechSegment))
         if self.transcript_source == "SUBTITLE":
             if not subtitle_cues or asr_evidence:
                 raise ValueError("字幕来源必须包含字幕且不得包含 ASR 语音证据")

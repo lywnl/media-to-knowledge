@@ -5,13 +5,10 @@ from collections.abc import Callable, Sequence
 from typing import TypeVar
 
 from video_demo.domain.evidence import (
-    AlignedWord,
-    AudioEvent,
     EvidenceItem,
     KeyframeEvidence,
     OcrEvidence,
     SceneBoundary,
-    SpeakerTurn,
     SpeechSegment,
     SubtitleCue,
 )
@@ -196,37 +193,7 @@ def _project_window_evidence(
         tuple(item for item in evidence if isinstance(item, KeyframeEvidence)),
         indexes,
     )
-    audio_events = select_spread_items(
-        tuple(item for item in evidence if isinstance(item, AudioEvent)),
-        limit=2,
-    )
-    if audio_events:
-        groups["audio_events"] = {
-            "indices": indexes(audio_events),
-            "events": [item.normalized_event for item in audio_events],
-        }
-    speaker_turns = select_spread_items(
-        tuple(item for item in evidence if isinstance(item, SpeakerTurn)),
-        limit=2,
-    )
-    if speaker_turns:
-        groups["speakers"] = {
-            "indices": indexes(speaker_turns),
-            "labels": [item.speaker for item in speaker_turns],
-        }
-    if groups:
-        return groups, tuple(evidence_refs)
-    aligned_words = select_spread_items(
-        tuple(item for item in evidence if isinstance(item, AlignedWord)),
-        limit=3,
-    )
-    projected: dict[str, object] = {
-        "aligned_words": {
-            "indices": indexes(aligned_words),
-            "texts": [_truncate(item.text, 80) for item in aligned_words],
-        },
-    }
-    return projected, tuple(evidence_refs)
+    return groups, tuple(evidence_refs)
 
 
 def _add_anchor_group(

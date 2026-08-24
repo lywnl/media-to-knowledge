@@ -24,11 +24,8 @@ from pydantic import (
 
 from video_demo.domain.base import FrozenModel
 from video_demo.domain.evidence import (
-    AlignedWord,
-    AudioEvent,
     OcrEvidence,
     SceneBoundary,
-    SpeakerTurn,
     SpeechSegment,
     SubtitleCue,
 )
@@ -945,15 +942,8 @@ def _fallback_segment_understanding(
         for item in request.evidence
         if isinstance(item, SpeechSegment) and item.text.strip()
     )
-    aligned_items = tuple(
-        item
-        for item in request.evidence
-        if isinstance(item, AlignedWord) and item.text.strip()
-    )
-    spoken_items: tuple[SubtitleCue | SpeechSegment | AlignedWord, ...] = (
-        subtitle_items
-        if subtitle_items
-        else (speech_items if speech_items else aligned_items)
+    spoken_items: tuple[SubtitleCue | SpeechSegment, ...] = (
+        subtitle_items if subtitle_items else speech_items
     )
     spoken_values = tuple(
         _truncate_local_semantic_text(item.text, 160)
@@ -976,28 +966,14 @@ def _fallback_segment_understanding(
     )
     text_values = (*spoken_values, *ocr_values)
     title = text_values[0] if text_values else "视频片段"
-    speakers = tuple(
-        dict.fromkeys(
-            item.speaker
-            for item in request.evidence
-            if isinstance(item, (AlignedWord, SpeakerTurn))
-        )
-    )
     languages = tuple(
         dict.fromkeys(
             item.language
             for item in request.evidence
-            if isinstance(item, (SubtitleCue, SpeechSegment, AlignedWord, OcrEvidence))
+            if isinstance(item, (SubtitleCue, SpeechSegment, OcrEvidence))
         )
     )
     keywords = tuple(dict.fromkeys(text_values))
-    event_values = tuple(
-        dict.fromkeys(
-            item.normalized_event
-            for item in request.evidence
-            if isinstance(item, AudioEvent)
-        )
-    )
     scene_values = tuple(
         "画面场景"
         for item in request.evidence
@@ -1008,9 +984,9 @@ def _fallback_segment_understanding(
         SegmentUnderstanding(
             title=title[:200],
             summary_zh=title[:4000],
-            speakers=speakers,
+            speakers=(),
             languages=languages,
-            topics=tuple(dict.fromkeys((*event_values, *scene_values))),
+            topics=tuple(dict.fromkeys(scene_values)),
             keywords=keywords,
             original_keywords=(),
             visual_facts=visual_facts,

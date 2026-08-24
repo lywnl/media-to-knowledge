@@ -17,7 +17,6 @@ class BoundaryCandidate:
 _SOURCE_WEIGHTS = {
     "sentence_end": 1.0,
     "silence": 1.0,
-    "speaker_change": 0.9,
     "language_change": 1.0,
     "scene": 0.45,
     "ocr_change": 1.0,
@@ -26,9 +25,8 @@ _SOURCE_PRIORITY = {
     "silence": 0,
     "language_change": 1,
     "sentence_end": 2,
-    "speaker_change": 3,
-    "ocr_change": 4,
-    "scene": 5,
+    "ocr_change": 3,
+    "scene": 4,
 }
 
 

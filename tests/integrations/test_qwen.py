@@ -14,7 +14,6 @@ from pydantic import SecretStr
 
 import video_demo.integrations.qwen as qwen_module
 from video_demo.domain.evidence import (
-    AlignedWord,
     BoundingBox,
     OcrEvidence,
     OcrLine,
@@ -389,15 +388,19 @@ def test_whole_video_binds_all_local_evidence_even_when_prompt_projects_a_subset
     remote_url = "https://private-bucket.oss-cn-hangzhou.aliyuncs.com/full.mp4?signed=1"
     base_request = _whole_request(remote_url)
     speech = base_request.windows[0].evidence[0]
-    aligned_word = AlignedWord(
-        evidence_id="word_001",
-        start_ms=100,
-        end_ms=200,
-        text="H",
-        language="en",
-        probability=0.9,
+    extra_speech = tuple(
+        SpeechSegment(
+            evidence_id=f"asr_{index:03d}",
+            start_ms=100 + index * 50,
+            end_ms=140 + index * 50,
+            text=f"补充文本 {index}",
+            language="en",
+            confidence=0.9,
+            is_fully_evaluated_language=True,
+        )
+        for index in range(2, 5)
     )
-    evidence = (speech, aligned_word)
+    evidence = (speech, *extra_speech)
     request = base_request.model_copy(
         update={
             "windows": (
@@ -440,9 +443,18 @@ def test_whole_video_binds_all_local_evidence_even_when_prompt_projects_a_subset
 
     result = client.understand_video(request)
 
-    assert result.windows[0].understanding.evidence_refs == ("asr_001", "word_001")
+    assert result.windows[0].understanding.evidence_refs == (
+        "asr_001",
+        "asr_002",
+        "asr_003",
+        "asr_004",
+    )
     assert result.windows[0].understanding.title == "Hello"
-    assert result.windows[0].understanding.keywords == ("Hello",)
+    assert result.windows[0].understanding.keywords == (
+        "Hello",
+        "补充文本 3",
+        "补充文本 4",
+    )
 
 
 def test_whole_video_transport_failure_never_retries_full_video_request(
@@ -656,6 +668,7 @@ def test_demo_fallback_builds_deterministic_semantics_when_qwen_is_unavailable(
     assert result.title == "Hello demo"
     assert result.summary_zh == "Hello demo"
     assert result.evidence_refs == ("asr_001",)
+    assert result.speakers == ()
     assert result.original_keywords == ()
     assert fallback.degraded_warnings == ("DEMO_DEGRADED_QWEN",)
 

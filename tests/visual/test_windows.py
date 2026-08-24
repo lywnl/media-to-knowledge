@@ -20,13 +20,12 @@ def test_weak_scene_alone_does_not_force_semantic_boundary() -> None:
     assert [(window.start_ms, window.end_ms) for window in windows] == [(0, 20_000)]
 
 
-def test_sentence_silence_speaker_and_language_build_hybrid_windows() -> None:
+def test_sentence_silence_and_language_build_hybrid_windows() -> None:
     windows = build_provisional_windows(
         duration_ms=40_000,
         candidates=(
             BoundaryCandidate(9_800, "sentence_end", score=1.0),
             BoundaryCandidate(10_000, "silence", score=1.0),
-            BoundaryCandidate(10_100, "speaker_change", score=1.0),
             BoundaryCandidate(25_000, "language_change", score=1.0),
             BoundaryCandidate(25_100, "scene", score=0.9),
         ),

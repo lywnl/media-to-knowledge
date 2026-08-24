@@ -136,7 +136,7 @@ class PreparedMedia:
 @dataclass(frozen=True, slots=True)
 class SpeechBoundaryCandidate:
     timestamp_ms: int
-    source: Literal["silence", "sentence_end", "speaker_change", "language_change"]
+    source: Literal["silence", "sentence_end", "language_change"]
     score: float = 1.0
 
 
