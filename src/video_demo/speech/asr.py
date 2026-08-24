@@ -33,6 +33,23 @@ class RawAsrSegment:
     confidence: float
 
 
+@dataclass(frozen=True, slots=True)
+class WindowTranscriptionResult:
+    language: str
+    segments: tuple[RawAsrSegment, ...]
+    warnings: tuple[str, ...] = ()
+
+
+class WindowRecognizerPort(Protocol):
+    def transcribe_window(
+        self,
+        audio_slice: Path,
+        *,
+        language_hint: str | None,
+        prompt: str | None,
+    ) -> WindowTranscriptionResult: ...
+
+
 class TranscriptionSegment(Protocol):
     start: float
     end: float
