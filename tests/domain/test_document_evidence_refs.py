@@ -202,7 +202,7 @@ def test_cross_object_validation_requires_observation_to_cover_its_keyframes() -
     assert raised.value.code == ErrorCode.EVIDENCE_OUTSIDE_CHAPTER
 
 
-def test_keyframe_is_jpeg_only_run_relative_and_one_millisecond_long() -> None:
+def test_shared_keyframe_remains_compatible_but_document_boundary_is_strict() -> None:
     payload = _keyframe().model_dump(exclude={"duration_ms"})
 
     for field, invalid in (
@@ -212,8 +212,12 @@ def test_keyframe_is_jpeg_only_run_relative_and_one_millisecond_long() -> None:
         ("end_ms", payload["end_ms"] + 1),
     ):
         invalid_payload = {**payload, field: invalid}
-        with pytest.raises(ValidationError):
-            KeyframeEvidence.model_validate(invalid_payload)
+        legacy_compatible = KeyframeEvidence.model_validate(invalid_payload)
+
+        with pytest.raises(VideoDemoError) as raised:
+            validate_evidence_references(_result(), (_speech(), legacy_compatible))
+
+        assert raised.value.code == ErrorCode.EVIDENCE_RELATION_INVALID
 
 
 def test_keyframe_at_chapter_end_is_clipped_to_a_valid_half_open_range() -> None:

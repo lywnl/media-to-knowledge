@@ -24,6 +24,7 @@ RESULT_SCHEMA_VERSION: Literal["3.0.0"] = "3.0.0"
 TranscriptSource: TypeAlias = Literal["SUBTITLE", "ASR", "NONE"]
 _TITLE_MAX_LENGTH = 200
 _TITLE_WHITESPACE_PATTERN = re.compile(r"\s+")
+_DOCUMENT_KEYFRAME_PATH_PATTERN = re.compile(r"^visual/keyframes/([0-9a-f]{64})\.jpg$")
 
 
 def sanitize_document_title(
@@ -296,6 +297,9 @@ def validate_evidence_references(
         evidence_by_id[item.evidence_id] = item
 
     chapters_by_id = {chapter.chapter_id: chapter for chapter in result.chapters}
+    for evidence_item in evidence_by_id.values():
+        if isinstance(evidence_item, KeyframeEvidence):
+            _validate_document_keyframe(evidence_item)
     for chapter in result.chapters:
         for evidence_ref in chapter.evidence_refs:
             _require_chapter_evidence(chapter, evidence_ref, evidence_by_id)
@@ -445,6 +449,31 @@ def _keyframe_timestamp(
             "帧关系只能引用关键帧证据",
         )
     return item.timestamp_ms
+
+
+def _validate_document_keyframe(keyframe: KeyframeEvidence) -> None:
+    path_match = _DOCUMENT_KEYFRAME_PATH_PATTERN.fullmatch(keyframe.relative_path)
+    if keyframe.mime_type != "image/jpeg":
+        raise VideoDemoError(
+            ErrorCode.EVIDENCE_RELATION_INVALID,
+            "3.0 文档关键帧只允许 JPEG",
+            {"evidence_id": keyframe.evidence_id},
+        )
+    if path_match is None or path_match.group(1) != keyframe.sha256:
+        raise VideoDemoError(
+            ErrorCode.EVIDENCE_RELATION_INVALID,
+            "3.0 文档关键帧必须使用 Run 相对内容寻址路径",
+            {"evidence_id": keyframe.evidence_id},
+        )
+    if (
+        keyframe.start_ms != keyframe.timestamp_ms
+        or keyframe.end_ms > keyframe.timestamp_ms + 1
+    ):
+        raise VideoDemoError(
+            ErrorCode.EVIDENCE_RELATION_INVALID,
+            "3.0 文档关键帧必须使用实际帧时间起始且最长 1ms 的半开区间",
+            {"evidence_id": keyframe.evidence_id},
+        )
 
 
 def _validate_retrieval_hash(text: str, digest: str) -> None:

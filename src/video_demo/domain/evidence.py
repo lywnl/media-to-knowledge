@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Annotated, Literal, Self, TypeAlias
 
 from pydantic import Field, field_validator, model_validator
@@ -21,7 +20,6 @@ SpeakerId = Literal[
     "SPEAKER_09",
     "SPEAKER_10",
 ]
-_KEYFRAME_PATH_PATTERN = re.compile(r"^visual/keyframes/([0-9a-f]{64})\.jpg$")
 
 
 class TimedEvidence(TimeRange):
@@ -54,7 +52,7 @@ class KeyframeEvidence(TimedEvidence):
     keyframe_id: StableId
     timestamp_ms: int = Field(ge=0)
     relative_path: str = Field(min_length=1, max_length=1024)
-    mime_type: Literal["image/jpeg"]
+    mime_type: Literal["image/jpeg", "image/png"]
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     perceptual_hash: str = Field(min_length=8, max_length=128)
     size_bytes: int = Field(ge=1)
@@ -63,11 +61,6 @@ class KeyframeEvidence(TimedEvidence):
     def validate_timestamp_inside_range(self) -> Self:
         if not self.start_ms <= self.timestamp_ms < self.end_ms:
             raise ValueError("timestamp_ms 必须位于关键帧证据区间内")
-        if self.start_ms != self.timestamp_ms or self.end_ms > self.timestamp_ms + 1:
-            raise ValueError("关键帧证据必须使用实际帧时间起始且最长 1ms 的半开区间")
-        match = _KEYFRAME_PATH_PATTERN.fullmatch(self.relative_path)
-        if match is None or match.group(1) != self.sha256:
-            raise ValueError("关键帧路径必须是当前 Run 根下的内容寻址 JPEG")
         return self
 
 
