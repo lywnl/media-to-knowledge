@@ -124,6 +124,12 @@ def test_asr_fingerprint_binds_cloud_content_inputs() -> None:
     assert base != asr_fingerprint(
         **{
             **arguments,
+            "inputs": inputs.model_copy(update={"window_strategy_version": "2.0.0"}),
+        }  # type: ignore[arg-type]
+    )
+    assert base != asr_fingerprint(
+        **{
+            **arguments,
             "inputs": inputs.model_copy(
                 update={
                     "model_identities": (

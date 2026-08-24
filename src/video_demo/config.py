@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal, Self
+from typing import Self
 from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
@@ -61,12 +61,9 @@ class Settings(BaseSettings):
     ffmpeg_path: Path | None = None
     ffprobe_path: Path | None = None
 
-    inference_device: Literal["cpu", "mps"] = "cpu"
-    whisper_compute_type: Literal["int8", "float16", "float32"] = "int8"
     worker_concurrency: int = Field(default=1, ge=1, le=4)
     process_timeout_seconds: int = Field(default=600, ge=1, le=86_400)
-    speech_subprocess_timeout_seconds: int = Field(default=1_800, ge=1, le=7_200)
-    speech_enrichment_timeout_seconds: int = Field(default=600, ge=1, le=7_200)
+    speech_subprocess_timeout_seconds: int = Field(default=3_600, ge=1, le=7_200)
     max_video_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
     # 仅供本地演示显式开启；默认保持严格外部依赖失败语义。
     demo_degraded_mode: bool = False
@@ -86,7 +83,6 @@ class Settings(BaseSettings):
     baidu_ocr_endpoint: str = "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"
     baidu_api_key: SecretStr | None = Field(default=None, exclude=True)
     baidu_secret_key: SecretStr | None = Field(default=None, exclude=True)
-    huggingface_token: SecretStr | None = Field(default=None, exclude=True)
     openai_base_url: str | None = Field(
         default=None,
         validation_alias=AliasChoices("OPENAI_BASE_URL", "openai_base_url"),

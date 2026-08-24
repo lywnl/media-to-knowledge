@@ -54,8 +54,6 @@ from video_demo.evaluation.evidence import (
     PerformanceSampleRawReport,
     PreflightDetails,
     PreflightRawReport,
-    PyannoteLiveDetails,
-    PyannoteLiveRawReport,
     QwenLiveDetails,
     QwenLiveRawReport,
     RealMediaDetails,
@@ -85,7 +83,6 @@ REQUIRED_FAILURE_SCENARIOS: tuple[str, ...] = (
     "no_audio",
     "no_speech",
     "black_frames",
-    "overlapping_speakers",
     "five_language_switch",
     "ocr_401",
     "ocr_429",
@@ -137,7 +134,6 @@ _LIVE_IMPLEMENTATION_FILES: tuple[Path, ...] = implementation_import_closure(
     extra_files=(
         Path("pyproject.toml"),
         Path("uv.lock"),
-        Path("src/video_demo/audio/thresholds.json"),
     ),
     excluded_files=_LIVE_ONLY_PRODUCTION_ISOLATION_FILES,
     leaf_files=_GATE_VERIFIER_LEAF,
@@ -149,7 +145,6 @@ _DURABILITY_IMPLEMENTATION_FILES: tuple[Path, ...] = implementation_import_closu
     extra_files=(
         Path("pyproject.toml"),
         Path("uv.lock"),
-        Path("src/video_demo/audio/thresholds.json"),
     ),
     leaf_files=_GATE_VERIFIER_LEAF,
 )
@@ -172,9 +167,6 @@ FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     ),
     "black_frames": (
         "tests/visual/test_keyframes.py::test_all_black_candidates_produce_no_keyframe",
-    ),
-    "overlapping_speakers": (
-        "tests/speech/test_diarization.py::test_speaker_ids_follow_first_appearance_and_keep_overlap",
     ),
     "five_language_switch": (
         "tests/speech/test_language.py::test_language_identifier_tracks_all_five_validation_languages",
@@ -258,7 +250,6 @@ FINAL_GATE_CHECKS: tuple[str, ...] = (
     "real_media_chain",
     "baidu_ocr_live",
     "qwen_live",
-    "pyannote_live",
     "five_language_models",
     "m1_durability",
 )
@@ -267,7 +258,6 @@ _LIVE_GATE_CHECKS = frozenset(
     {
         "baidu_ocr_live",
         "qwen_live",
-        "pyannote_live",
         "five_language_models",
     }
 )
@@ -308,17 +298,8 @@ _LIVE_COMPONENT_FAILURE_CODES: dict[str, frozenset[ErrorCode]] = {
             ErrorCode.SYSTEM_FAILURE,
         }
     ),
-    "pyannote": frozenset(
-        {
-            ErrorCode.PYANNOTE_AUTHENTICATION_FAILED,
-            ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-            *_LOCAL_MODEL_FAILURE_CODES,
-        }
-    ),
     "silero_vad": _LOCAL_MODEL_FAILURE_CODES,
-    "faster_whisper": _LOCAL_MODEL_FAILURE_CODES,
-    "whisperx": _LOCAL_MODEL_FAILURE_CODES,
-    "yamnet": _LOCAL_MODEL_FAILURE_CODES,
+    "cloud_whisper": _LOCAL_MODEL_FAILURE_CODES,
     "components_close": frozenset({ErrorCode.SYSTEM_FAILURE}),
 }
 
@@ -335,7 +316,6 @@ _MISSING_CHECK_REASONS: dict[str, str] = {
     "real_media_chain": "缺少工作区 FFmpeg/ffprobe 与真实媒体运行结果",
     "baidu_ocr_live": "缺少百度 OCR 凭据或真实联调结果",
     "qwen_live": "缺少 Qwen 凭据或真实联调结果",
-    "pyannote_live": "缺少 Hugging Face Token、模型授权或真实联调结果",
     "five_language_models": "缺少五语授权素材、模型或真实预测",
     "m1_durability": "未提供 M1 耐久机器证据",
 }
@@ -355,16 +335,6 @@ _DURABILITY_ISSUE_REASONS: dict[ErrorCode, str] = {
     ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE: "视觉依赖不可用",
     ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
     ErrorCode.SILERO_MODEL_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
-    ErrorCode.FASTER_WHISPER_DEPENDENCY_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
-    ErrorCode.FASTER_WHISPER_MODEL_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
-    ErrorCode.WHISPERX_DEPENDENCY_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
-    ErrorCode.WHISPERX_MODEL_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
-    ErrorCode.PYANNOTE_DEPENDENCY_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
-    ErrorCode.PYANNOTE_TERMS_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
-    ErrorCode.PYANNOTE_MODEL_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
-    ErrorCode.PYANNOTE_TOKEN_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
-    ErrorCode.YAMNET_DEPENDENCY_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
-    ErrorCode.YAMNET_MODEL_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
     ErrorCode.QWEN_ENDPOINT_UNAVAILABLE: "Qwen 配置不可用",
     ErrorCode.QWEN_API_KEY_UNAVAILABLE: "Qwen 配置不可用",
     ErrorCode.QWEN_MODEL_ID_UNAVAILABLE: "Qwen 配置不可用",
@@ -675,7 +645,6 @@ _MINIMUM_EVIDENCE_LEVEL: dict[str, EvidenceLevel] = {
     "real_media_chain": EvidenceLevel.REAL_MEDIA,
     "baidu_ocr_live": EvidenceLevel.REAL_SERVICE,
     "qwen_live": EvidenceLevel.REAL_SERVICE,
-    "pyannote_live": EvidenceLevel.REAL_SERVICE,
     "five_language_models": EvidenceLevel.REAL_SERVICE,
     "m1_durability": EvidenceLevel.PERFORMANCE,
 }
@@ -695,7 +664,6 @@ _ALLOWED_EVIDENCE_KINDS: dict[str, frozenset[EvidenceKind]] = {
     "real_media_chain": frozenset({EvidenceKind.COMMAND_REPORT}),
     "baidu_ocr_live": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
     "qwen_live": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
-    "pyannote_live": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
     "five_language_models": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
     "m1_durability": frozenset({EvidenceKind.PERFORMANCE_REPORT}),
 }
@@ -788,7 +756,6 @@ def _derive_machine_gate_status(
         "real_media_chain": RealMediaDetails,
         "baidu_ocr_live": BaiduLiveDetails,
         "qwen_live": QwenLiveDetails,
-        "pyannote_live": PyannoteLiveDetails,
         "five_language_models": FiveLanguageModelsDetails,
         "m1_durability": PerformanceDetails,
     }
@@ -820,10 +787,6 @@ def _derive_machine_gate_status(
         passed = _verify_qwen_live(
             details, report, artifacts, workspace_root, settings=settings
         )
-    elif isinstance(details, PyannoteLiveDetails):
-        passed = _verify_pyannote_live(
-            details, report, artifacts, workspace_root, settings=settings
-        )
     elif isinstance(details, FiveLanguageModelsDetails):
         passed = _verify_five_language_models(
             details,
@@ -836,7 +799,6 @@ def _derive_machine_gate_status(
         expected_service = {
             "baidu_ocr_live": "BAIDU_OCR",
             "qwen_live": "QWEN",
-            "pyannote_live": "PYANNOTE",
             "five_language_models": "FIVE_LANGUAGE_MODELS",
         }[check_id]
         if details.service != expected_service:
@@ -887,7 +849,6 @@ def _derive_machine_gate_status(
         "real_media_chain",
         "baidu_ocr_live",
         "qwen_live",
-        "pyannote_live",
         "five_language_models",
         "m1_durability",
     }:
@@ -1238,33 +1199,6 @@ def _verify_qwen_live(
     return raw.status == GateStatus.PASS
 
 
-def _verify_pyannote_live(
-    details: PyannoteLiveDetails,
-    report: MachineEvidenceReport,
-    artifacts: dict[ArtifactRole, tuple[VerifiedArtifact, ...]],
-    workspace_root: Path,
-    *,
-    settings: Settings | None,
-) -> bool:
-    settings_report = _require_live_settings(settings, workspace_root)
-    raw, _package = _verify_live_common(
-        details,
-        report,
-        artifacts,
-        workspace_root,
-        raw_type=PyannoteLiveRawReport,
-    )
-    _verify_settings_fingerprint(raw, settings_report)
-    _verify_canonical_live_models(raw, settings_report)
-    if raw.status == GateStatus.PASS and (
-        len(raw.executions) != 1
-        or raw.executions[0].model.model_id
-        != "pyannote/speaker-diarization-community-1"
-    ):
-        raise ValueError("pyannote 必须恰好使用固定模型执行一次")
-    return raw.status == GateStatus.PASS
-
-
 def _verify_five_language_models(
     details: FiveLanguageModelsDetails,
     report: MachineEvidenceReport,
@@ -1319,15 +1253,8 @@ def _verify_canonical_live_models(
         required_components = {"baidu_ocr"}
     elif isinstance(raw, QwenLiveRawReport):
         required_components = {"qwen"}
-    elif isinstance(raw, PyannoteLiveRawReport):
-        required_components = {"pyannote"}
     elif isinstance(raw, FiveLanguageModelsRawReport):
-        required_components = {
-            "silero_vad",
-            "faster_whisper",
-            "whisperx",
-            "yamnet",
-        }
+        required_components = {"silero_vad", "cloud_whisper"}
     else:
         raise ValueError("未知 live raw 类型")
     if not required_components.issubset(canonical_components):
@@ -1512,7 +1439,7 @@ def _load_live_package(
 
 
 def _live_samples(raw: _LiveRawReport) -> tuple[LiveSample, ...]:
-    if isinstance(raw, (BaiduLiveRawReport, QwenLiveRawReport, PyannoteLiveRawReport)):
+    if isinstance(raw, (BaiduLiveRawReport, QwenLiveRawReport)):
         return (raw.sample,)
     if isinstance(raw, FiveLanguageModelsRawReport):
         return raw.samples
@@ -1677,15 +1604,11 @@ def _live_execution_stages(
             ("qwen", "capability_probe", None),
             ("qwen", "understand_segment", None),
         )
-    if isinstance(raw, PyannoteLiveRawReport):
-        return (("pyannote", "diarize", None),)
     if isinstance(raw, FiveLanguageModelsRawReport):
         languages = ("zh", "en", "ja", "ko", "es")
         return (
             ("silero_vad", "vad", None),
-            *(("faster_whisper", "transcribe", language) for language in languages),
-            *(("whisperx", "align", language) for language in languages),
-            ("yamnet", "detect", None),
+            *(("cloud_whisper", "transcribe", language) for language in languages),
         )
     raise ValueError("未知 live raw 类型")
 
@@ -2484,8 +2407,6 @@ def _verify_performance(
         raise ValueError("M1 性能重验必须提供当前 Settings")
     if (
         settings.worker_concurrency != 1
-        or settings.inference_device != "cpu"
-        or settings.whisper_compute_type != "int8"
     ):
         raise ValueError("M1 性能当前设置不是 CPU/int8/单并发")
     raw_reports = artifacts.get("PERFORMANCE_REPORT", ())

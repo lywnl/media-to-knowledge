@@ -200,14 +200,20 @@ class SettingsTest(unittest.TestCase):
                 settings.runtime_root,
                 workspace.resolve() / ".codex" / "video-rag-demo",
             )
-            self.assertEqual(settings.inference_device, "cpu")
-            self.assertEqual(settings.whisper_compute_type, "int8")
+            self.assertTrue(
+                {
+                    "inference_device",
+                    "whisper_compute_type",
+                    "whisper_model_id",
+                    "speech_enrichment_timeout_seconds",
+                    "huggingface_token",
+                }.isdisjoint(Settings.model_fields)
+            )
             self.assertEqual(settings.worker_concurrency, 1)
             self.assertEqual(settings.qwen_max_video_bytes, 64 * 1024 * 1024)
             self.assertEqual(settings.qwen_max_video_duration_ms, 30_000)
             self.assertEqual(settings.qwen_timeout_seconds, 300.0)
-            self.assertEqual(settings.speech_subprocess_timeout_seconds, 1_800)
-            self.assertEqual(settings.speech_enrichment_timeout_seconds, 600)
+            self.assertEqual(settings.speech_subprocess_timeout_seconds, 3_600)
             self.assertEqual(settings.oss_prefix, "video-demo/qwen-clips")
             self.assertEqual(settings.oss_signed_url_ttl_seconds, 3_600)
             self.assertFalse(settings.has_complete_oss_configuration())
@@ -231,21 +237,41 @@ class SettingsTest(unittest.TestCase):
             self.assertNotIn("test-access-key-id", serialized)
             self.assertNotIn("test-access-key-secret", serialized)
 
-    def test_speech_enrichment_timeout_changes_settings_fingerprint(self) -> None:
+    def test_cloud_timeout_and_retry_change_settings_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
+            common = {
+                "workspace_root": workspace,
+                "openai_base_url": "https://ai-proxy.example.test/v1",
+                "openai_api_key": "test-openai-key",
+                "openai_model": "openai/whisper",
+                "_env_file": None,
+            }
             baseline = build_production_model_identity_report(
-                Settings(workspace_root=workspace, _env_file=None),
+                Settings(**common),
             )
-            changed = build_production_model_identity_report(
-                Settings(
-                    workspace_root=workspace,
-                    speech_enrichment_timeout_seconds=601,
-                    _env_file=None,
-                ),
+            timeout_changed = build_production_model_identity_report(
+                Settings(**common, openai_asr_timeout_seconds=301),
+            )
+            retry_changed = build_production_model_identity_report(
+                Settings(**common, openai_asr_max_attempts=4),
+            )
+            key_changed = build_production_model_identity_report(
+                Settings(**{**common, "openai_api_key": "different-test-key"}),
             )
 
-            self.assertNotEqual(baseline.settings_fingerprint, changed.settings_fingerprint)
+            self.assertNotEqual(
+                baseline.settings_fingerprint,
+                timeout_changed.settings_fingerprint,
+            )
+            self.assertNotEqual(
+                baseline.settings_fingerprint,
+                retry_changed.settings_fingerprint,
+            )
+            self.assertEqual(
+                baseline.settings_fingerprint,
+                key_changed.settings_fingerprint,
+            )
 
     def test_partial_oss_configuration_is_rejected(self) -> None:
         with (
@@ -325,7 +351,7 @@ class SettingsTest(unittest.TestCase):
                 qwen_api_key=secret,
                 baidu_api_key="baidu-api-secret",
                 baidu_secret_key="baidu-secret-value",
-                huggingface_token="hf-secret-value",
+                openai_api_key="openai-secret-value",
             )
 
             serialized = settings.model_dump_json()
@@ -333,7 +359,7 @@ class SettingsTest(unittest.TestCase):
             self.assertNotIn(secret, serialized)
             self.assertNotIn("baidu-api-secret", serialized)
             self.assertNotIn("baidu-secret-value", serialized)
-            self.assertNotIn("hf-secret-value", serialized)
+            self.assertNotIn("openai-secret-value", serialized)
 
 
 if __name__ == "__main__":

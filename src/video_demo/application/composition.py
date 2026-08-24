@@ -79,13 +79,10 @@ _QWEN_MODEL_ID_PATTERN = re.compile(
     r"qwen(?:2(?:\.5)?|3)-vl-(?:plus|max|flash)"
     r"(?:-[0-9]{4}-[0-9]{2}-[0-9]{2})?\Z",
 )
-_VALIDATION_LANGUAGES = ("zh", "en", "ja", "ko", "es")
-
-
 class ProductionModelIdentityReport(FrozenModel):
     """由唯一生产组合根确定且不含敏感值的模型身份。"""
 
-    schema_version: Literal["1.0.0"]
+    schema_version: Literal["1.0.0", "2.0.0"]
     models: tuple[ModelIdentity, ...]
     settings_fingerprint: Sha256
 
@@ -166,6 +163,7 @@ def build_production_model_identity_report(
 ) -> ProductionModelIdentityReport:
     """只从生产设置和固定组件契约生成稳定、可序列化的模型身份。"""
 
+    cloud_asr = settings.require_cloud_asr_configuration()
     models = [
         _local_model_identity(
             "silero_vad",
@@ -173,32 +171,10 @@ def build_production_model_identity_report(
             package="silero-vad",
             device="cpu",
         ),
-        _local_model_identity(
-            "faster_whisper",
-            settings.whisper_model_id,
-            package="faster-whisper",
-            device=settings.inference_device,
-        ),
-        *(
-            _local_model_identity(
-                "whisperx",
-                f"whisperx-align-{language}",
-                package="whisperx",
-                device="cpu",
-            )
-            for language in _VALIDATION_LANGUAGES
-        ),
-        _local_model_identity(
-            "pyannote",
-            "pyannote/speaker-diarization-community-1",
-            package="pyannote.audio",
-            device="cpu",
-        ),
-        _local_model_identity(
-            "yamnet",
-            "yamnet",
-            package="tensorflow-hub",
-            device="cpu",
+        ModelIdentity(
+            component="cloud_whisper",
+            provider="openai_compatible",
+            model_id=cloud_asr.model,
         ),
         ModelIdentity(
             component="baidu_ocr",
@@ -219,7 +195,7 @@ def build_production_model_identity_report(
             ),
         )
     return ProductionModelIdentityReport(
-        schema_version="1.0.0",
+        schema_version="2.0.0",
         models=tuple(models),
         settings_fingerprint=_settings_fingerprint(settings),
     )
@@ -329,7 +305,7 @@ def _normalized_qwen_model_id(
 def _settings_fingerprint(settings: Settings) -> str:
     assert settings.runtime_root is not None
     runtime_root = settings.runtime_root
-    model_root = runtime_root / "models"
+    cloud_asr = settings.require_cloud_asr_configuration()
     ffmpeg = settings.ffmpeg_path or runtime_root / "tools" / "ffmpeg"
     ffprobe = settings.ffprobe_path or runtime_root / "tools" / "ffprobe"
     payload = {
@@ -338,50 +314,21 @@ def _settings_fingerprint(settings: Settings) -> str:
             "runtime_root": _workspace_relative(settings, runtime_root),
             "ffmpeg": _workspace_relative(settings, ffmpeg),
             "ffprobe": _workspace_relative(settings, ffprobe),
-            "thresholds": _workspace_relative(
-                settings,
-                settings.workspace_root / "src/video_demo/audio/thresholds.json",
-            ),
         },
         "execution": {
-            "inference_device": settings.inference_device,
-            "whisper_compute_type": settings.whisper_compute_type,
-            "whisper_model_id": settings.whisper_model_id,
             "max_video_bytes": settings.max_video_bytes,
             "demo_degraded_mode": settings.demo_degraded_mode,
             "speech_subprocess_timeout_seconds": settings.speech_subprocess_timeout_seconds,
-            "speech_enrichment_timeout_seconds": settings.speech_enrichment_timeout_seconds,
         },
-        "model_cache": {
-            "root": _workspace_relative(settings, model_root),
-            "faster_whisper_root": _workspace_relative(
-                settings,
-                model_root
-                / (
-                    "faster-whisper-medium"
-                    if settings.whisper_model_id == "medium"
-                    else "faster-whisper"
-                ),
-            ),
-            "whisperx_languages": {
-                language: _workspace_relative(
-                    settings,
-                    model_root / "whisperx" / language,
-                )
-                for language in _VALIDATION_LANGUAGES
-            },
-            "pyannote_root": _workspace_relative(
-                settings,
-                model_root / "pyannote",
-            ),
-            "yamnet_model": _workspace_relative(
-                settings,
-                model_root / "yamnet/saved_model",
-            ),
-            "yamnet_class_map": _workspace_relative(
-                settings,
-                model_root / "yamnet/yamnet_class_map.csv",
-            ),
+        "cloud_asr": {
+            "provider": "openai_compatible",
+            "base_url": cloud_asr.base_url,
+            "model_id": cloud_asr.model,
+            "timeout_seconds": cloud_asr.timeout_seconds,
+            "max_attempts": cloud_asr.max_attempts,
+            "max_window_ms": cloud_asr.max_window_ms,
+            "overlap_ms": cloud_asr.overlap_ms,
+            "window_strategy_version": "1.0.0",
         },
         "qwen": {
             "base_url": _normalized_endpoint(settings.qwen_base_url),

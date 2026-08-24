@@ -35,8 +35,6 @@ from video_demo.evaluation.evidence import (
     PreflightIssue,
     PreflightRawReport,
     ProviderResponseSummary,
-    PyannoteLiveDetails,
-    PyannoteLiveRawReport,
     QwenLiveDetails,
     QwenLiveRawReport,
     RealMediaCommand,
@@ -1459,11 +1457,8 @@ def _model_fact(
     operation = {
         "baidu_ocr": "recognize",
         "qwen": "capability_probe",
-        "pyannote": "diarize",
         "silero_vad": "vad",
-        "faster_whisper": "transcribe",
-        "whisperx": "align",
-        "yamnet": "detect",
+        "cloud_whisper": "transcribe",
     }[component]
     return ModelExecutionFact(
         component=component,
@@ -1471,17 +1466,19 @@ def _model_fact(
         evaluation_run_id="run-live",
         model=ModelIdentity(
             component=component,
-            provider="local" if component not in {"baidu_ocr", "qwen"} else component,
+            provider={
+                "baidu_ocr": "baidu_ocr",
+                "qwen": "qwen",
+                "silero_vad": "local",
+                "cloud_whisper": "openai_compatible",
+            }[component],
             model_id={
                 "baidu_ocr": "accurate_basic",
                 "qwen": "qwen3-vl-plus",
-                "pyannote": "pyannote/speaker-diarization-community-1",
                 "silero_vad": "silero-vad",
-                "faster_whisper": "large-v3",
-                "whisperx": f"whisperx-align-{language}",
-                "yamnet": "yamnet",
+                "cloud_whisper": "openai/whisper",
             }[component],
-            device="cpu" if component not in {"baidu_ocr", "qwen"} else None,
+            device="cpu" if component == "silero_vad" else None,
         ),
         sample_id="sample-001",
         language=language,
@@ -1528,7 +1525,6 @@ def _single_sample_live_payload(
             failure_component={
                 "baidu_ocr_live": "baidu_ocr",
                 "qwen_live": "qwen",
-                "pyannote_live": "pyannote",
             }[check_id],
         )
     return payload
@@ -1587,7 +1583,6 @@ def test_live_sample_rejects_reused_derived_path_across_kinds() -> None:
                 ),
             ),
         ),
-        (PyannoteLiveRawReport, "pyannote_live", (_model_fact("pyannote"),)),
     ),
 )
 def test_live_raw_reports_require_started_execution_and_failure_code(
@@ -1680,8 +1675,7 @@ def test_qwen_raw_close_failure_requires_complete_execution_and_system_failure()
     ("report_type", "check_id", "failure_component"),
     (
         (BaiduLiveRawReport, "baidu_ocr_live", "qwen"),
-        (QwenLiveRawReport, "qwen_live", "pyannote"),
-        (PyannoteLiveRawReport, "pyannote_live", "yamnet"),
+        (QwenLiveRawReport, "qwen_live", "cloud_whisper"),
     ),
 )
 def test_live_raw_failure_component_must_belong_to_check(
@@ -1712,7 +1706,7 @@ def test_live_raw_failure_component_must_belong_to_check(
 
 
 def test_model_execution_fact_rejects_service_fields_on_local_component_and_body() -> None:
-    local = _model_fact("faster_whisper")
+    local = _model_fact("silero_vad")
     with pytest.raises(ValidationError):
         ModelExecutionFact.model_validate(
             {
@@ -1924,7 +1918,7 @@ def test_model_execution_fact_validation_error_hides_plaintext_request_id() -> N
 def test_model_execution_fact_revalidates_preconstructed_model_identity(
     revision: object,
 ) -> None:
-    fact = _model_fact("faster_whisper")
+    fact = _model_fact("silero_vad")
     invalid_model = fact.model.model_copy(update={"revision": revision})
 
     with pytest.raises(ValidationError):
@@ -1973,11 +1967,9 @@ def _five_language_report_payload() -> dict[str, object]:
     facts = (
         _model_fact("silero_vad"),
         *tuple(
-            _model_fact("faster_whisper", language=language)
+            _model_fact("cloud_whisper", language=language)
             for language in languages
         ),
-        *tuple(_model_fact("whisperx", language=language) for language in languages),
-        _model_fact("yamnet"),
     )
     facts = tuple(
         fact.model_copy(
@@ -1985,7 +1977,7 @@ def _five_language_report_payload() -> dict[str, object]:
                 "sample_id": (
                     sample := sample_by_language[
                         fact.language
-                        if fact.component in {"faster_whisper", "whisperx"}
+                        if fact.component == "cloud_whisper"
                         else "zh"
                     ]
                 ).sample_id,
@@ -2018,7 +2010,7 @@ def test_five_language_raw_requires_exact_component_and_language_coverage() -> N
     base = _five_language_report_payload()
 
     report = FiveLanguageModelsRawReport.model_validate(base)
-    assert len(report.executions) == 12
+    assert len(report.executions) == 6
     for mutated in (
         {**base, "executions": base["executions"][:-1]},
         {**base, "executions": [*base["executions"], base["executions"][1]]},
@@ -2129,7 +2121,6 @@ def test_five_language_raw_rejects_digest_reused_with_different_path(
             "qwen_live",
             _model_fact("baidu_ocr", input_kind="KEYFRAME"),
         ),
-        (PyannoteLiveRawReport, "pyannote_live", _model_fact("yamnet")),
     ),
 )
 def test_single_sample_live_fail_rejects_foreign_execution_fact(
@@ -2155,7 +2146,6 @@ def test_single_sample_live_fail_rejects_foreign_execution_fact(
         "failure_component": {
             "baidu_ocr_live": "baidu_ocr",
             "qwen_live": "qwen",
-            "pyannote_live": "pyannote",
         }[check_id],
     }
 
@@ -2169,14 +2159,14 @@ def test_five_language_live_fail_rejects_foreign_sample_or_input_digest() -> Non
         **base,
         "status": "FAIL",
         "failure_code": ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
-        "failure_component": "faster_whisper",
+        "failure_component": "cloud_whisper",
     }
     fact = dict(base["executions"][1])  # type: ignore[index]
     for mutated in (
         {**fact, "sample_id": "sample-foreign"},
         {**fact, "input_sha256": "f" * 64},
         {
-            **_model_fact("pyannote").model_dump(mode="python"),
+            **_model_fact("baidu_ocr", input_kind="KEYFRAME").model_dump(mode="python"),
             "sample_id": "sample-zh",
             "input_sha256": base["samples"][0]["audio_sha256"],  # type: ignore[index]
         },
@@ -2280,7 +2270,6 @@ def test_live_raw_revalidates_preconstructed_nested_field_constraints(
     (
         (BaiduLiveRawReport, "baidu_ocr_live", "baidu_ocr"),
         (QwenLiveRawReport, "qwen_live", "qwen"),
-        (PyannoteLiveRawReport, "pyannote_live", "pyannote"),
     ),
 )
 def test_single_sample_live_fail_accepts_empty_partial_facts(
@@ -2386,7 +2375,6 @@ def test_qwen_live_fail_rejects_capability_probe_without_required_capabilities()
     (
         (BaiduLiveDetails, "BAIDU_LIVE"),
         (QwenLiveDetails, "QWEN_LIVE"),
-        (PyannoteLiveDetails, "PYANNOTE_LIVE"),
         (FiveLanguageModelsDetails, "FIVE_LANGUAGE_MODELS"),
     ),
 )
@@ -2435,28 +2423,12 @@ def test_check_specific_live_details_bind_raw_implementation_and_authorization(
             ),
         ),
         (
-            "pyannote_live",
-            "PYANNOTE_MODEL_UNAVAILABLE",
-            (
-                ErrorCode.PYANNOTE_TOKEN_UNAVAILABLE,
-                ErrorCode.PYANNOTE_TERMS_UNAVAILABLE,
-                ErrorCode.PYANNOTE_DEPENDENCY_UNAVAILABLE,
-                ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-                ErrorCode.LIVE_AUTHORIZED_AUDIO_UNAVAILABLE,
-            ),
-        ),
-        (
             "five_language_models",
             "FIVE_LANGUAGE_MODELS_UNAVAILABLE",
             (
                 ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE,
                 ErrorCode.SILERO_MODEL_UNAVAILABLE,
-                ErrorCode.FASTER_WHISPER_DEPENDENCY_UNAVAILABLE,
-                ErrorCode.FASTER_WHISPER_MODEL_UNAVAILABLE,
-                ErrorCode.WHISPERX_DEPENDENCY_UNAVAILABLE,
-                ErrorCode.WHISPERX_MODEL_UNAVAILABLE,
-                ErrorCode.YAMNET_DEPENDENCY_UNAVAILABLE,
-                ErrorCode.YAMNET_MODEL_UNAVAILABLE,
+                ErrorCode.INVALID_CONFIGURATION,
                 ErrorCode.LIVE_FIVE_LANGUAGE_AUDIO_UNAVAILABLE,
             ),
         ),
@@ -3799,22 +3771,10 @@ def _preflight_report(
             "QWEN_MODEL_ID_UNAVAILABLE",
             "LIVE_AUTHORIZED_CLIP_UNAVAILABLE",
         ),
-        "pyannote_live": (
-            "PYANNOTE_TOKEN_UNAVAILABLE",
-            "PYANNOTE_TERMS_UNAVAILABLE",
-            "PYANNOTE_DEPENDENCY_UNAVAILABLE",
-            "PYANNOTE_MODEL_UNAVAILABLE",
-            "LIVE_AUTHORIZED_AUDIO_UNAVAILABLE",
-        ),
         "five_language_models": (
             "SILERO_DEPENDENCY_UNAVAILABLE",
             "SILERO_MODEL_UNAVAILABLE",
-            "FASTER_WHISPER_DEPENDENCY_UNAVAILABLE",
-            "FASTER_WHISPER_MODEL_UNAVAILABLE",
-            "WHISPERX_DEPENDENCY_UNAVAILABLE",
-            "WHISPERX_MODEL_UNAVAILABLE",
-            "YAMNET_DEPENDENCY_UNAVAILABLE",
-            "YAMNET_MODEL_UNAVAILABLE",
+            "INVALID_CONFIGURATION",
             "LIVE_FIVE_LANGUAGE_AUDIO_UNAVAILABLE",
         ),
     }[check_id]
@@ -5548,35 +5508,11 @@ def _annotation(sample_id: str, media_sha256: str, language: str) -> dict[str, o
         "duration_ms": 1000,
         "language": language,
         "reference_text": "测试",
-        "words": [
-            {
-                "word_id": f"word_{sample_id}",
-                "text": "测试",
-                "start_ms": 0,
-                "end_ms": 500,
-            }
-        ],
-        "speaker_turns": [
-            {
-                "turn_id": f"turn_{sample_id}",
-                "speaker_id": "speaker_1",
-                "start_ms": 0,
-                "end_ms": 900,
-            }
-        ],
         "ocr_frames": [
             {
                 "frame_id": f"frame_{sample_id}",
                 "timestamp_ms": 100,
                 "text_lines": ["测试"],
-            }
-        ],
-        "audio_events": [
-            {
-                "event_id": f"event_{sample_id}",
-                "normalized_event": "speech",
-                "start_ms": 0,
-                "end_ms": 500,
             }
         ],
         "scene_boundaries_ms": [100],

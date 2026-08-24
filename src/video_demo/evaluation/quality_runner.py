@@ -5,19 +5,16 @@ import json
 import unicodedata
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from itertools import pairwise
 from typing import Literal
 
 from pydantic import Field, TypeAdapter, field_validator, model_validator
 
 from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.domain.evidence import (
-    AlignedWord,
-    AudioEvent,
     EvidenceItem,
     OcrEvidence,
     SceneBoundary,
-    SpeakerTurn,
+    SpeechSegment,
     SubtitleCue,
 )
 from video_demo.domain.result import VideoUnderstandingResult, validate_evidence_references
@@ -34,14 +31,10 @@ from video_demo.evaluation.dataset import EvaluationSample, ValidationLanguage
 from video_demo.evaluation.metrics import (
     EditCounts,
     MatchCounts,
-    aligned_word_time_errors_ms,
     boundary_match_counts,
     character_edit_counts,
-    diarization_counts_by_overlap,
-    event_match_counts,
     match_counts_f1,
     nfkc_character_edit_counts,
-    percentile_90,
     word_edit_counts,
 )
 from video_demo.evaluation.predictions import VerifiedPrediction, reverify_verified_prediction
@@ -51,7 +44,6 @@ from video_demo.evaluation.report import (
     build_quality_report,
 )
 from video_demo.evaluation.thresholds import (
-    AUDIO_EVENT_TOLERANCE_MS,
     QUALITY_THRESHOLDS,
     SCENE_BOUNDARY_TOLERANCE_MS,
     SEMANTIC_BOUNDARY_TOLERANCE_MS,
@@ -66,55 +58,13 @@ _LANGUAGE_METRICS: Mapping[ValidationLanguage, str] = {
     "es": "es_wer",
 }
 _EVIDENCE_ADAPTER = TypeAdapter(tuple[EvidenceItem, ...])
-_NotRunMetric = Literal[
-    "audio_event_macro_f1",
-    "der_non_overlap",
-    "der_overlap",
-    "speaker_count_accuracy",
-    "word_time_p90_ms",
-]
-_SUBTITLE_NOT_RUN_METRICS: tuple[_NotRunMetric, ...] = (
-    "audio_event_macro_f1",
-    "der_non_overlap",
-    "der_overlap",
-    "speaker_count_accuracy",
-    "word_time_p90_ms",
-)
-
-
 class SampleQualityDetail(FrozenModel):
     sample_id: StableId
     language: ValidationLanguage
     prediction_status: str
     transcript_source: TranscriptSource | None
     metric_inputs: dict[str, int | float]
-    not_run_metrics: tuple[_NotRunMetric, ...] = ()
     failure_code: str | None
-
-    @field_validator("not_run_metrics")
-    @classmethod
-    def require_sorted_unique_not_run_metrics(
-        cls,
-        value: tuple[_NotRunMetric, ...],
-    ) -> tuple[_NotRunMetric, ...]:
-        if value != tuple(sorted(set(value))):
-            raise ValueError("逐样本不适用指标必须排序且不重复")
-        return value
-
-    @model_validator(mode="after")
-    def reject_not_run_metric_inputs(self) -> SampleQualityDetail:
-        conflicting_inputs = {
-            "audio_event_macro_f1": "audio_event_macro_f1",
-            "speaker_count_accuracy": "speaker_count_accuracy",
-            "word_time_p90_ms": "word_time_match_count",
-        }
-        if any(
-            input_name in self.metric_inputs
-            for metric_name, input_name in conflicting_inputs.items()
-            if metric_name in self.not_run_metrics
-        ):
-            raise ValueError("逐样本不适用指标不得携带伪造输入")
-        return self
 
 
 class HintPairEffect(FrozenModel):
@@ -296,12 +246,8 @@ class _Accumulators:
         self.text_counts: dict[str, EditCounts] = {
             name: EditCounts(0, 0) for name in _LANGUAGE_METRICS.values()
         }
-        self.word_times: list[int] = []
-        self.der_errors = [0, 0]
-        self.der_units = [0, 0]
         self.ocr_errors = 0
         self.ocr_units = 0
-        self.audio_counts: dict[str, MatchCounts] = {}
         self.scene_counts = MatchCounts(0, 0, 0)
         self.semantic_boundary_counts = MatchCounts(0, 0, 0)
         self.unknown_evidence_count = 0
@@ -312,27 +258,8 @@ class _Accumulators:
         observations: dict[str, MetricObservation] = {}
         for name, counts in self.text_counts.items():
             observations[name] = _count_observation(counts)
-        observations["word_time_p90_ms"] = (
-            MetricObservation(value=percentile_90(self.word_times))
-            if self.word_times
-            else MetricObservation(value=None, not_run_reason="没有文字匹配的词时间单元")
-        )
-        observations["der_non_overlap"] = _ratio_observation(
-            self.der_errors[0], self.der_units[0], "没有非重叠参考说话人时长"
-        )
-        observations["der_overlap"] = _ratio_observation(
-            self.der_errors[1], self.der_units[1], "没有重叠参考说话人时长"
-        )
         observations["ocr_accuracy"] = _accuracy_observation(
             self.ocr_errors, self.ocr_units, "没有 OCR 参考字符"
-        )
-        observations["audio_event_macro_f1"] = (
-            MetricObservation(
-                value=sum(match_counts_f1(counts) for counts in self.audio_counts.values())
-                / len(self.audio_counts)
-            )
-            if self.audio_counts
-            else MetricObservation(value=None, not_run_reason="没有适用的音频事件样本")
         )
         observations["scene_f1"] = MetricObservation(
             value=match_counts_f1(self.scene_counts)
@@ -360,10 +287,7 @@ def _score_sample(
     annotation = verified_annotation.annotation
     accumulators.attempted_results += 1
     transcript_source = prediction.index.transcript_source
-    aligned_words = tuple(
-        item for item in prediction.evidence if isinstance(item, AlignedWord)
-    )
-    hypothesis_text = _transcript_text(prediction, aligned_words)
+    hypothesis_text = _transcript_text(prediction)
     counts = (
         character_edit_counts(hypothesis_text, annotation.reference_text)
         if annotation.language in _CER_LANGUAGES
@@ -375,37 +299,6 @@ def _score_sample(
         previous.errors + counts.errors,
         previous.reference_units + counts.reference_units,
     )
-    word_time_errors: tuple[int, ...] = ()
-    if transcript_source != "SUBTITLE":
-        word_time_errors = aligned_word_time_errors_ms(
-            reference=tuple(
-                (word.text, word.start_ms, word.end_ms) for word in annotation.words
-            ),
-            hypothesis=tuple(
-                (word.text, word.start_ms, word.end_ms) for word in aligned_words
-            ),
-        )
-        accumulators.word_times.extend(word_time_errors)
-
-    speaker_turns = tuple(
-        item for item in prediction.evidence if isinstance(item, SpeakerTurn)
-    )
-    reference_turns = tuple(
-        (turn.start_ms, turn.end_ms, turn.speaker_id) for turn in annotation.speaker_turns
-    )
-    hypothesis_turns = tuple(
-        (turn.start_ms, turn.end_ms, speaker)
-        for turn in speaker_turns
-        for speaker in {turn.speaker, *turn.overlap_speakers}
-    )
-    if transcript_source != "SUBTITLE":
-        der_counts = diarization_counts_by_overlap(
-            reference=reference_turns, hypothesis=hypothesis_turns
-        )
-        for index, counts_for_partition in enumerate(der_counts):
-            accumulators.der_errors[index] += counts_for_partition.error_speaker_ms
-            accumulators.der_units[index] += counts_for_partition.reference_speaker_ms
-
     reference_ocr = "".join(
         line
         for frame in sorted(annotation.ocr_frames, key=lambda item: item.timestamp_ms)
@@ -423,20 +316,6 @@ def _score_sample(
     accumulators.ocr_errors += ocr_counts.errors
     accumulators.ocr_units += ocr_counts.reference_units
 
-    audio_counts: dict[str, MatchCounts] = {}
-    if transcript_source != "SUBTITLE":
-        audio_reference = _event_intervals(annotation)
-        audio_hypothesis = _predicted_event_intervals(prediction)
-        audio_counts = event_match_counts(
-            reference=audio_reference,
-            hypothesis=audio_hypothesis,
-            tolerance_ms=AUDIO_EVENT_TOLERANCE_MS,
-        )
-        for label, counts_for_label in audio_counts.items():
-            accumulators.audio_counts[label] = _sum_match_counts(
-                accumulators.audio_counts.get(label, MatchCounts(0, 0, 0)),
-                counts_for_label,
-            )
     scene_counts = boundary_match_counts(
         reference_ms=annotation.scene_boundaries_ms,
         hypothesis_ms=tuple(
@@ -467,15 +346,6 @@ def _score_sample(
     unknown_count, is_valid = _schema_time_check(annotation, prediction)
     accumulators.unknown_evidence_count += unknown_count
     accumulators.valid_results += int(is_valid)
-    reference_speaker_count = len({turn.speaker_id for turn in annotation.speaker_turns})
-    predicted_speaker_count = len(
-        {
-            speaker
-            for turn in speaker_turns
-            for speaker in (turn.speaker, *turn.overlap_speakers)
-            if speaker != "SPEAKER_UNKNOWN"
-        }
-    )
     diagnostics: dict[str, int | float] = {
         "text_errors": counts.errors,
         "text_reference_units": counts.reference_units,
@@ -486,45 +356,29 @@ def _score_sample(
         "scene_f1": scene_score,
         "semantic_boundary_f1": semantic_score,
     }
-    not_run_metrics: tuple[_NotRunMetric, ...] = ()
-    if transcript_source == "SUBTITLE":
-        not_run_metrics = _SUBTITLE_NOT_RUN_METRICS
-    else:
-        diagnostics.update(
-            word_time_match_count=len(word_time_errors),
-            speaker_count_accuracy=float(
-                reference_speaker_count == predicted_speaker_count
-            ),
-            audio_event_macro_f1=(
-                sum(
-                    match_counts_f1(counts_for_label)
-                    for counts_for_label in audio_counts.values()
-                )
-                / len(audio_counts)
-            ),
-        )
     return SampleQualityDetail(
         sample_id=annotation.sample_id,
         language=annotation.language,
         prediction_status=prediction.index.terminal_status,
         transcript_source=transcript_source,
         metric_inputs=diagnostics,
-        not_run_metrics=not_run_metrics,
         failure_code=prediction.index.failure_code,
     )
 
 
 def _transcript_text(
     prediction: VerifiedPrediction,
-    aligned_words: tuple[AlignedWord, ...],
 ) -> str:
-    if prediction.index.transcript_source != "SUBTITLE":
-        return " ".join(item.text for item in aligned_words)
-    cues = sorted(
-        (item for item in prediction.evidence if isinstance(item, SubtitleCue)),
+    transcript_type = (
+        SubtitleCue
+        if prediction.index.transcript_source == "SUBTITLE"
+        else SpeechSegment
+    )
+    items = sorted(
+        (item for item in prediction.evidence if isinstance(item, transcript_type)),
         key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),
     )
-    return " ".join(cue.text for cue in cues)
+    return " ".join(item.text for item in items)
 
 
 def _build_hint_effect_report(
@@ -653,10 +507,7 @@ def _score_hint_pair(
 
 
 def _prediction_transcript_text(prediction: VerifiedPrediction) -> str:
-    aligned_words = tuple(
-        item for item in prediction.evidence if isinstance(item, AlignedWord)
-    )
-    return _transcript_text(prediction, aligned_words)
+    return _transcript_text(prediction)
 
 
 def _text_edit_counts(
@@ -776,39 +627,6 @@ def _add_semantic_observations(
     observations["fabricated_name_count"] = MetricObservation(
         value=float(sum(len(judgment.fabricated_names) for judgment in judgments))
     )
-
-
-def _event_intervals(
-    annotation: EvaluationAnnotation,
-) -> dict[str, tuple[tuple[int, int], ...]]:
-    grouped: dict[str, list[tuple[int, int]]] = defaultdict(list)
-    for item in annotation.audio_events:
-        grouped[item.normalized_event].append((item.start_ms, item.end_ms))
-    return {label: tuple(intervals) for label, intervals in grouped.items()}
-
-
-def _predicted_event_intervals(
-    prediction: VerifiedPrediction,
-) -> dict[str, tuple[tuple[int, int], ...]]:
-    grouped: dict[str, list[tuple[int, int]]] = defaultdict(list)
-    for item in prediction.evidence:
-        if isinstance(item, AudioEvent):
-            grouped[item.normalized_event].append((item.start_ms, item.end_ms))
-    return {label: tuple(intervals) for label, intervals in grouped.items()}
-
-
-def _der_reference_units(annotation: EvaluationAnnotation) -> tuple[int, int]:
-    boundaries = sorted(
-        {point for turn in annotation.speaker_turns for point in (turn.start_ms, turn.end_ms)}
-    )
-    units = [0, 0]
-    for start, end in pairwise(boundaries):
-        active = sum(
-            turn.start_ms <= start < turn.end_ms for turn in annotation.speaker_turns
-        )
-        if active:
-            units[int(active >= 2)] += (end - start) * active
-    return units[0], units[1]
 
 
 def _schema_time_check(

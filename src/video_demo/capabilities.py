@@ -37,8 +37,10 @@ class CapabilityReport(BaseModel):
 
     status: CapabilityStatus
     platform: str
-    inference_device: str
-    whisper_compute_type: str
+    cloud_asr_provider: str
+    cloud_asr_model: str | None
+    cloud_asr_base_url: str | None
+    cloud_asr_configured: bool
     binaries: tuple[BinaryCapability, ...]
     issues: tuple[CapabilityIssue, ...]
 
@@ -114,6 +116,11 @@ def probe_runtime_capabilities(settings: Settings) -> CapabilityReport:
 
     binaries: list[BinaryCapability] = []
     issues: list[CapabilityIssue] = []
+    cloud_asr = None
+    try:
+        cloud_asr = settings.require_cloud_asr_configuration()
+    except VideoDemoError as error:
+        issues.append(CapabilityIssue(code=error.code, message="云端语音识别配置不完整"))
     specifications = (
         ("ffmpeg", settings.ffmpeg_path, ErrorCode.VIDEO_FFMPEG_UNAVAILABLE),
         ("ffprobe", settings.ffprobe_path, ErrorCode.VIDEO_FFPROBE_UNAVAILABLE),
@@ -139,8 +146,10 @@ def probe_runtime_capabilities(settings: Settings) -> CapabilityReport:
     return CapabilityReport(
         status=CapabilityStatus.UNAVAILABLE if issues else CapabilityStatus.AVAILABLE,
         platform=f"{system}-{platform.machine()}",
-        inference_device=settings.inference_device,
-        whisper_compute_type=settings.whisper_compute_type,
+        cloud_asr_provider="openai_compatible",
+        cloud_asr_model=cloud_asr.model if cloud_asr is not None else None,
+        cloud_asr_base_url=cloud_asr.base_url if cloud_asr is not None else None,
+        cloud_asr_configured=cloud_asr is not None,
         binaries=tuple(binaries),
         issues=tuple(issues),
     )

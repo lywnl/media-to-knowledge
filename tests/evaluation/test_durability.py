@@ -27,6 +27,15 @@ from video_demo.evaluation.final_runner import (
 from video_demo.evaluation.report import GateStatus
 
 
+def _cloud_settings(tmp_path: Path) -> Settings:
+    return Settings(
+        workspace_root=tmp_path,
+        openai_base_url="https://asr.example/v1",
+        openai_api_key="test-key",
+        openai_model="openai/whisper",
+    )
+
+
 @pytest.fixture(autouse=True)
 def _copy_durability_implementation(tmp_path: Path) -> None:
     """让临时工作区具备 verifier 用来计算当前实现摘要的真实源码。"""
@@ -154,7 +163,7 @@ def test_manifest_with_fewer_than_two_samples_is_not_run_before_execution(
     tmp_path: Path,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     runner = DurabilityRunner(settings, EvidenceStore(tmp_path, settings.runtime_root))
 
     check = runner.run(manifest, evaluation_run_id="durability_one")
@@ -174,7 +183,7 @@ def test_duplicate_media_digest_is_not_run_before_execution(tmp_path: Path) -> N
         "\n".join(json.dumps(item) for item in (first, payload)) + "\n",
         encoding="utf-8",
     )
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
 
     check = DurabilityRunner(
         settings, EvidenceStore(tmp_path, settings.runtime_root)
@@ -197,7 +206,7 @@ def test_invalid_sample_count_duration_or_resolution_is_not_run_before_execution
     expected: str,
 ) -> None:
     manifest = _write_manifest(tmp_path, rows)
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
 
     check = DurabilityRunner(
         settings,
@@ -222,7 +231,7 @@ def test_missing_or_non_covering_authorization_is_not_run_before_execution(
         [_row("a"), _row("b")],
         write_authorization=False,
     )
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
 
     check = DurabilityRunner(
         settings,
@@ -239,7 +248,7 @@ def test_authorization_that_does_not_cover_media_is_not_run(tmp_path: Path) -> N
     authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
     authorization["records"][0]["media_sha256"] = ["0" * 64]
     authorization_path.write_text(json.dumps(authorization), encoding="utf-8")
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
 
     check = DurabilityRunner(
         settings,
@@ -261,7 +270,7 @@ def test_manifest_path_outside_runtime_or_through_symlink_is_not_run(
     linked = runtime / "eval/durability"
     linked.parent.mkdir(parents=True)
     linked.symlink_to(external_manifest.parent, target_is_directory=True)
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
 
     direct = DurabilityRunner(
         settings,
@@ -285,7 +294,7 @@ def test_manifest_digest_tampering_is_not_run_before_execution(tmp_path: Path) -
         "\n".join(json.dumps(row) for row in rows) + "\n",
         encoding="utf-8",
     )
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
 
     check = DurabilityRunner(
         settings,
@@ -301,7 +310,7 @@ def test_probe_facts_must_match_manifest_before_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     monkeypatch.setattr("video_demo.evaluation.durability.psutil", object())
 
     def mismatching_probe(_path: Path, sample: object) -> DurabilityProbe:
@@ -343,7 +352,7 @@ def test_sample_gate_is_evaluated_independently_and_sampler_errors_are_not_swall
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     monkeypatch.setattr("video_demo.evaluation.durability.psutil", object())
 
     class ExplodingSampler(DurabilitySampler):
@@ -376,7 +385,7 @@ def test_background_sampler_error_is_rethrown_on_main_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     monkeypatch.setattr("video_demo.evaluation.durability.psutil", object())
     calls = 0
     failed = threading.Event()
@@ -409,7 +418,7 @@ def test_memory_error_is_classified_as_out_of_memory_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     monkeypatch.setattr("video_demo.evaluation.durability.psutil", object())
 
     def run_out_of_memory(_sample: object) -> DurabilitySample:
@@ -441,7 +450,7 @@ def test_periodic_sampler_captures_peak_between_execution_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     monkeypatch.setattr("video_demo.evaluation.durability.psutil", object())
     calls = 0
     peak_observed = threading.Event()
@@ -485,7 +494,7 @@ def test_python_audit_hook_records_write_outside_sample_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     monkeypatch.setattr("video_demo.evaluation.durability.psutil", object())
     outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
 
@@ -635,7 +644,7 @@ def test_each_sample_failure_condition_produces_fail(
     terminal_failure: bool,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     monkeypatch.setattr("video_demo.evaluation.durability.psutil", object())
 
     runner = DurabilityRunner(
@@ -664,7 +673,7 @@ def test_cleanup_removes_only_database_bound_durability_product_runs(
     cloud_asr_environment: None,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     assert settings.runtime_root is not None
     stage_run_id = stage_evaluation_run_id("eval_cleanup_durability", "durability")
     app = create_app(settings)
@@ -753,7 +762,11 @@ def test_cleanup_removes_only_database_bound_durability_product_runs(
     foreign = settings.runtime_root / "runs" / scope_key / "run_foreign"
     foreign.mkdir(parents=True)
 
-    cleanup_evaluation_run(tmp_path, "eval_cleanup_durability")
+    cleanup_evaluation_run(
+        tmp_path,
+        "eval_cleanup_durability",
+        settings=settings,
+    )
 
     assert all(not path.exists() for path in product_runs)
     assert foreign.is_dir()
@@ -764,7 +777,7 @@ def test_published_durability_report_rejects_changed_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     monkeypatch.setattr("video_demo.evaluation.durability.psutil", object())
     evaluation_run_id = "durability_changed_manifest"
     check = DurabilityRunner(
@@ -794,7 +807,7 @@ def test_missing_psutil_is_specific_not_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     monkeypatch.setattr("video_demo.evaluation.durability.psutil", None)
 
     check = DurabilityRunner(
@@ -810,7 +823,7 @@ def test_injected_successful_execution_cannot_publish_authoritative_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     monkeypatch.setattr("video_demo.evaluation.durability.psutil", object())
 
     runner = DurabilityRunner(

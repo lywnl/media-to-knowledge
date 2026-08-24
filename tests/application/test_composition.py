@@ -685,6 +685,7 @@ def test_worker_starts_without_qwen_configuration_and_fails_at_first_clip(
 
 def test_demo_mode_accepts_unrecognized_qwen_model_for_deterministic_fallback(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     from video_demo.application.composition import build_production_model_identity_report
 
@@ -715,6 +716,75 @@ def test_speech_fingerprint_inputs_bind_cloud_model_and_silero_version(
     assert identities["cloud_whisper"].model_id == "openai/whisper"
     assert inputs.cloud_asr_base_url == "https://ai-proxy.example.test/v1"
     assert (inputs.max_window_ms, inputs.overlap_ms) == (600_000, 1_000)
+
+
+def test_speech_content_fingerprint_ignores_cloud_credentials_and_delivery_policy(
+    tmp_path: Path,
+) -> None:
+    from video_demo.application.composition import _speech_fingerprint_inputs
+    from video_demo.speech.snapshots import asr_fingerprint
+
+    common: dict[str, object] = {
+        "workspace_root": tmp_path,
+        "openai_base_url": "https://asr.example/v1",
+        "openai_model": "openai/whisper",
+        "_env_file": None,
+    }
+
+    def content_fingerprint(settings: Settings) -> str:
+        return asr_fingerprint(
+            audio_sha256="a" * 64,
+            duration_ms=60_000,
+            language_hints=("zh",),
+            hotwords=("Milvus",),
+            core_context="向量数据库课程",
+            inputs=_speech_fingerprint_inputs(settings),
+        )
+
+    fingerprints = {
+        content_fingerprint(
+            Settings(
+                **common,
+                openai_api_key="first-test-key",
+                openai_asr_timeout_seconds=300,
+                openai_asr_max_attempts=3,
+            )
+        ),
+        content_fingerprint(
+            Settings(
+                **common,
+                openai_api_key="second-test-key",
+                openai_asr_timeout_seconds=120,
+                openai_asr_max_attempts=5,
+            )
+        ),
+    }
+
+    assert len(fingerprints) == 1
+
+
+def test_production_model_identity_report_uses_only_current_cloud_speech_stack(
+    tmp_path: Path,
+    cloud_asr_environment: None,
+) -> None:
+    from video_demo.application.composition import build_production_model_identity_report
+
+    report = build_production_model_identity_report(Settings(workspace_root=tmp_path))
+    identities = {item.component: item for item in report.models}
+
+    assert report.schema_version == "2.0.0"
+    assert {"silero_vad", "cloud_whisper"}.issubset(identities)
+    assert {
+        "faster_whisper",
+        "whisperx",
+        "pyannote",
+        "yamnet",
+    }.isdisjoint(identities)
+    cloud = identities["cloud_whisper"]
+    assert cloud.provider == "openai_compatible"
+    assert cloud.model_id == "openai/whisper"
+    assert cloud.revision is None
+    assert cloud.device is None
 
 
 def test_production_speech_factory_reuses_lifecycle_models_across_tasks(

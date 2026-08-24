@@ -23,10 +23,7 @@ from video_demo.evaluation.annotations import (
     AuthorizationFile,
     AuthorizationRecord,
     EvaluationAnnotation,
-    ReferenceAudioEvent,
     ReferenceOcrFrame,
-    ReferenceSpeakerTurn,
-    ReferenceWord,
     SupportedFact,
     ValidatedEvaluationPackage,
     load_evaluation_package,
@@ -62,25 +59,8 @@ def _write_runner_package(
         duration_ms=500,
         language="en",
         reference_text="Hello",
-        words=(ReferenceWord(word_id="word_001", text="Hello", start_ms=0, end_ms=400),),
-        speaker_turns=(
-            ReferenceSpeakerTurn(
-                turn_id="turn_001",
-                speaker_id="speaker_001",
-                start_ms=0,
-                end_ms=400,
-            ),
-        ),
         ocr_frames=(
             ReferenceOcrFrame(frame_id="ocr_001", timestamp_ms=100, text_lines=("Hello",)),
-        ),
-        audio_events=(
-            ReferenceAudioEvent(
-                event_id="audio_001",
-                normalized_event="speech",
-                start_ms=0,
-                end_ms=400,
-            ),
         ),
         scene_boundaries_ms=(100,),
         semantic_boundaries_ms=(200,),
@@ -295,6 +275,9 @@ def test_cleanup_keeps_unbound_placeholder_product_run(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         runtime_root=runtime_root,
         max_video_bytes=1024 * 1024,
+        openai_base_url="https://asr.example/v1",
+        openai_api_key="test-key",
+        openai_model="openai/whisper",
     )
 
     def fail_before_product_run(_settings: Settings) -> FastAPI:

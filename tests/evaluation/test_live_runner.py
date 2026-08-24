@@ -7,7 +7,6 @@ import inspect
 import json
 import re
 import shutil
-import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -30,10 +29,20 @@ from video_demo.evaluation.evidence import (
     FiveLanguageModelsRawReport,
     LiveExecutionSummary,
     PreflightRawReport,
-    PyannoteLiveRawReport,
     QwenLiveRawReport,
 )
 from video_demo.evaluation.report import GateStatus
+
+
+def _cloud_settings(tmp_path: Path, **overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "workspace_root": tmp_path,
+        "openai_base_url": "https://asr.example/v1",
+        "openai_api_key": "test-key",
+        "openai_model": "openai/whisper",
+    }
+    values.update(overrides)
+    return Settings(**values)  # type: ignore[arg-type]
 
 
 def _production_diagnostics(
@@ -65,7 +74,7 @@ def _production_diagnostics(
     )
 
 
-def test_live_validation_runner_exposes_four_check_entries() -> None:
+def test_live_validation_runner_exposes_three_check_entries() -> None:
     assert importlib.util.find_spec("video_demo.evaluation.live_runner") is not None
     module = importlib.import_module("video_demo.evaluation.live_runner")
     runner_type = getattr(module, "LiveValidationRunner", None)
@@ -74,40 +83,8 @@ def test_live_validation_runner_exposes_four_check_entries() -> None:
     assert {
         "run_baidu",
         "run_qwen",
-        "run_pyannote",
         "run_local_model_stack",
     }.issubset(vars(runner_type))
-
-
-def test_live_dependency_probe_keeps_tensorflow_hub_warning_off_stderr(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from video_demo.evaluation import live_runner as live_runner_module
-    from video_demo.evaluation.live_runner import LiveValidationRunner
-
-    runtime_root = tmp_path / ".codex" / "video-rag-demo"
-    runtime_root.mkdir(parents=True)
-    runner = LiveValidationRunner(
-        Settings(workspace_root=tmp_path),
-        EvidenceStore(tmp_path, runtime_root),
-    )
-
-    def import_module(_name: str) -> object:
-        warnings.warn(
-            "pkg_resources is deprecated as an API. See upstream migration guidance.",
-            UserWarning,
-            stacklevel=2,
-        )
-        return object()
-
-    monkeypatch.setattr(live_runner_module.importlib.util, "find_spec", lambda _name: object())
-    monkeypatch.setattr(live_runner_module.importlib, "import_module", import_module)
-    with warnings.catch_warnings(record=True) as captured:
-        warnings.simplefilter("always")
-        assert runner._module_available("tensorflow_hub") is True
-
-    assert captured == []
 
 
 def _runner_package(
@@ -138,35 +115,11 @@ def _runner_package(
             "duration_ms": 1_000,
             "language": language,
             "reference_text": "你好",
-            "words": [
-                {
-                    "word_id": "word-001",
-                    "text": "你",
-                    "start_ms": 0,
-                    "end_ms": 500,
-                }
-            ],
-            "speaker_turns": [
-                {
-                    "turn_id": "turn-001",
-                    "speaker_id": "speaker-001",
-                    "start_ms": 0,
-                    "end_ms": 500,
-                }
-            ],
             "ocr_frames": [
                 {
                     "frame_id": "frame-001",
                     "timestamp_ms": 100,
                     "text_lines": ["你好"],
-                }
-            ],
-            "audio_events": [
-                {
-                    "event_id": "event-001",
-                    "normalized_event": "speech",
-                    "start_ms": 0,
-                    "end_ms": 500,
                 }
             ],
             "scene_boundaries_ms": [500],
@@ -240,52 +193,6 @@ def _write_local_stack_preflight_models(runtime_root: Path) -> None:
     silero = model_root / "silero/model-id.txt"
     silero.parent.mkdir(parents=True, exist_ok=True)
     silero.write_bytes(b"silero-vad\n")
-    faster_whisper = model_root / "faster-whisper"
-    faster_whisper.mkdir(parents=True)
-    for filename in (
-        "config.json",
-        "model.bin",
-        "preprocessor_config.json",
-        "tokenizer.json",
-        "vocabulary.json",
-    ):
-        (faster_whisper / filename).write_bytes(b"model")
-    for language in ("zh", "en", "ja", "ko", "es"):
-        whisperx = model_root / "whisperx" / language
-        whisperx.mkdir(parents=True)
-        (whisperx / "model.bin").write_bytes(b"model")
-    yamnet = model_root / "yamnet/saved_model/saved_model.pb"
-    yamnet.parent.mkdir(parents=True)
-    yamnet.write_bytes(b"model")
-    (model_root / "yamnet/yamnet_class_map.csv").write_bytes(b"index,label\n0,speech\n")
-
-
-def test_local_stack_preflight_rejects_incomplete_faster_whisper_model(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from video_demo.evaluation.live_runner import LiveValidationRunner
-
-    _package, runtime_root = _runner_package(tmp_path)
-    _write_local_stack_preflight_models(runtime_root)
-    (runtime_root / "models/faster-whisper/tokenizer.json").unlink()
-    runner = LiveValidationRunner(
-        Settings(workspace_root=tmp_path),
-        EvidenceStore(tmp_path, runtime_root),
-    )
-    monkeypatch.setattr(runner, "_module_available", lambda _name: True, raising=False)
-    issues: list[ErrorCode] = []
-
-    runner._collect_local_stack_environment_issues(issues)
-
-    assert issues == [ErrorCode.FASTER_WHISPER_MODEL_UNAVAILABLE]
-
-
-def _write_pyannote_preflight_files(runtime_root: Path, terms: bytes) -> None:
-    model_root = runtime_root / "models/pyannote"
-    model_root.mkdir(parents=True)
-    (model_root / "terms-accepted.json").write_bytes(terms)
-    (model_root / "model.bin").write_bytes(b"model")
 
 
 def test_invalid_run_id_is_rejected_before_package_reverification(tmp_path: Path) -> None:
@@ -440,8 +347,8 @@ def test_claimed_run_replacement_during_execution_never_writes_replacement(
     from video_demo.evaluation.live_runner import LiveValidationRunner
 
     package, runtime_root = _runner_package(tmp_path)
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         qwen_base_url="https://qwen.example/v1",
         qwen_api_key="qwen-secret",
         qwen_model_id="qwen3-vl-plus",
@@ -742,25 +649,11 @@ def test_complete_not_run_report_is_reverified_without_preflight_or_package_acce
             ),
         ),
         (
-            "run_pyannote",
-            (
-                ErrorCode.PYANNOTE_TOKEN_UNAVAILABLE,
-                ErrorCode.PYANNOTE_TERMS_UNAVAILABLE,
-                ErrorCode.PYANNOTE_DEPENDENCY_UNAVAILABLE,
-                ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-            ),
-        ),
-        (
             "run_local_model_stack",
             (
                 ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE,
                 ErrorCode.SILERO_MODEL_UNAVAILABLE,
-                ErrorCode.FASTER_WHISPER_DEPENDENCY_UNAVAILABLE,
-                ErrorCode.FASTER_WHISPER_MODEL_UNAVAILABLE,
-                ErrorCode.WHISPERX_DEPENDENCY_UNAVAILABLE,
-                ErrorCode.WHISPERX_MODEL_UNAVAILABLE,
-                ErrorCode.YAMNET_DEPENDENCY_UNAVAILABLE,
-                ErrorCode.YAMNET_MODEL_UNAVAILABLE,
+                ErrorCode.INVALID_CONFIGURATION,
                 ErrorCode.LIVE_FIVE_LANGUAGE_AUDIO_UNAVAILABLE,
             ),
         ),
@@ -784,7 +677,9 @@ def test_each_preflight_collects_all_missing_items_in_contract_order(
             qwen_model_id=None,
             baidu_api_key=None,
             baidu_secret_key=None,
-            huggingface_token=None,
+            openai_base_url=None,
+            openai_api_key=None,
+            openai_model=None,
         ),
         EvidenceStore(tmp_path, runtime_root),
         components_factory=lambda _settings: calls.append("called"),  # type: ignore[arg-type]
@@ -817,8 +712,8 @@ def test_new_run_recomputes_preflight_instead_of_reusing_old_not_run(
         EvidenceStore(tmp_path, runtime_root),
     ).run_qwen("run-abc", package)
     second_check = LiveValidationRunner(
-        Settings(
-            workspace_root=tmp_path,
+        _cloud_settings(
+            tmp_path,
             qwen_base_url="https://qwen.example/v1",
         ),
         EvidenceStore(tmp_path, runtime_root),
@@ -851,8 +746,8 @@ def test_preflight_rejects_input_that_cannot_form_complete_live_sample(
     (runtime_root / "eval/live/run-abc/sample-001/keyframe.jpg").unlink()
     calls: list[str] = []
     runner = LiveValidationRunner(
-        Settings(
-            workspace_root=tmp_path,
+        _cloud_settings(
+            tmp_path,
             qwen_base_url="https://qwen.example/v1",
             qwen_api_key="qwen-secret",
             qwen_model_id="qwen3-vl-plus",
@@ -905,8 +800,8 @@ def test_qwen_preflight_rejects_unsafe_or_unusable_clip(
         clip.write_bytes(b"too-large")
     calls: list[str] = []
     runner = LiveValidationRunner(
-        Settings(
-            workspace_root=tmp_path,
+        _cloud_settings(
+            tmp_path,
             qwen_base_url="https://qwen.example/v1",
             qwen_api_key="qwen-secret",
             qwen_model_id="qwen3-vl-plus",
@@ -953,8 +848,8 @@ def test_package_source_change_during_execution_fails_closed(
         sources[source_kind].write_bytes(sources[source_kind].read_bytes() + b"\n")
 
     runner = LiveValidationRunner(
-        Settings(
-            workspace_root=tmp_path,
+        _cloud_settings(
+            tmp_path,
             qwen_base_url="https://qwen.example/v1",
             qwen_api_key="qwen-secret",
             qwen_model_id="qwen3-vl-plus",
@@ -1008,8 +903,8 @@ def test_started_qwen_failure_is_persisted_with_stable_code_and_no_sensitive_tex
         calls.append("executed")
         raise raised
 
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         qwen_base_url="https://qwen.example/v1",
         qwen_api_key="qwen-super-secret",
         qwen_model_id="qwen3-vl-plus",
@@ -1047,8 +942,8 @@ def test_qwen_failure_keeps_only_successful_capability_probe_prefix(tmp_path: Pa
     from video_demo.evaluation.live_runner import LiveValidationRunner
 
     package, runtime_root = _runner_package(tmp_path)
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         qwen_base_url="https://qwen.example/v1",
         qwen_api_key="qwen-secret",
         qwen_model_id="qwen3-vl-plus",
@@ -1105,8 +1000,8 @@ def test_qwen_model_identity_mismatch_is_fail_without_success_fact(tmp_path: Pat
     from video_demo.evaluation.live_runner import LiveValidationRunner
 
     package, runtime_root = _runner_package(tmp_path)
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         qwen_base_url="https://qwen.example/v1",
         qwen_api_key="qwen-secret",
         qwen_model_id="qwen3-vl-plus",
@@ -1170,8 +1065,8 @@ def test_started_baidu_failure_keeps_precise_code_without_success_fact(
         raise VideoDemoError(ErrorCode.OCR_AUTHENTICATION_FAILED, "受控鉴权失败")
 
     check = LiveValidationRunner(
-        Settings(
-            workspace_root=tmp_path,
+        _cloud_settings(
+            tmp_path,
             baidu_api_key="baidu-key",
             baidu_secret_key="baidu-secret",
         ),
@@ -1186,46 +1081,6 @@ def test_started_baidu_failure_keeps_precise_code_without_success_fact(
     )
     assert raw.failure_code == ErrorCode.OCR_AUTHENTICATION_FAILED
     assert raw.failure_component == "baidu_ocr"
-    assert raw.executions == ()
-
-
-def test_started_pyannote_failure_keeps_precise_code_without_success_fact(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from video_demo.evaluation.live_runner import LiveValidationRunner
-
-    package, runtime_root = _runner_package(tmp_path)
-    _write_pyannote_preflight_files(
-        runtime_root,
-        json.dumps(
-            {
-                "schema_version": "1.0.0",
-                "model_id": "pyannote/speaker-diarization-community-1",
-                "accepted": True,
-            }
-        ).encode(),
-    )
-
-    def execute(*_args: object) -> None:
-        raise VideoDemoError(ErrorCode.PYANNOTE_AUTHENTICATION_FAILED, "受控鉴权失败")
-
-    runner = LiveValidationRunner(
-        Settings(workspace_root=tmp_path, huggingface_token="hf-secret"),
-        EvidenceStore(tmp_path, runtime_root),
-        components_factory=lambda _settings: object(),  # type: ignore[arg-type]
-        execution_port=execute,
-    )
-    monkeypatch.setattr(runner, "_module_available", lambda _name: True)
-
-    check = runner.run_pyannote("run-abc", package)
-
-    assert check.status == GateStatus.FAIL
-    raw = PyannoteLiveRawReport.model_validate_json(
-        (runtime_root / "eval/reports/run-abc/raw.json").read_bytes()
-    )
-    assert raw.failure_code == ErrorCode.PYANNOTE_AUTHENTICATION_FAILED
-    assert raw.failure_component == "pyannote"
     assert raw.executions == ()
 
 
@@ -1249,7 +1104,12 @@ def test_local_stack_uses_manifest_first_eligible_sample_and_keeps_success_prefi
     for language in languages:
         (runtime_root / f"eval/live/run-abc/{language}-blocked/audio.wav").unlink()
     _write_local_stack_preflight_models(runtime_root)
-    settings = Settings(workspace_root=tmp_path)
+    settings = Settings(
+        workspace_root=tmp_path,
+        openai_base_url="https://asr.example/v1",
+        openai_api_key="test-key",
+        openai_model="openai/whisper",
+    )
     identities = build_production_model_identity_report(settings).models
     selected: list[tuple[str, str]] = []
 
@@ -1266,7 +1126,7 @@ def test_local_stack_uses_manifest_first_eligible_sample_and_keeps_success_prefi
         zh_sample = samples[0]
         for component, operation in (
             ("silero_vad", "vad"),
-            ("faster_whisper", "transcribe"),
+            ("cloud_whisper", "transcribe"),
         ):
             model = next(item for item in identities if item.component == component)
             journal.record_success(  # type: ignore[attr-defined]
@@ -1307,10 +1167,10 @@ def test_local_stack_uses_manifest_first_eligible_sample_and_keeps_success_prefi
     )
     assert tuple(fact.component for fact in raw.executions) == (
         "silero_vad",
-        "faster_whisper",
+        "cloud_whisper",
     )
     assert raw.failure_code == ErrorCode.SPEECH_MODEL_UNAVAILABLE
-    assert raw.failure_component == "faster_whisper"
+    assert raw.failure_component == "cloud_whisper"
 
 
 def _record_live_failure_matrix_prefix(
@@ -1328,8 +1188,6 @@ def _record_live_failure_matrix_prefix(
             ("qwen", "capability_probe", samples[0]),
             ("qwen", "understand_segment", samples[0]),
         )
-    elif check_id == "pyannote_live":
-        stages = (("pyannote", "diarize", samples[0]),)
     else:
         by_language = {
             sample.language: sample  # type: ignore[attr-defined]
@@ -1340,22 +1198,11 @@ def _record_live_failure_matrix_prefix(
         )
         stages = (
             ("silero_vad", "vad", ordered[0]),
-            *(("faster_whisper", "transcribe", sample) for sample in ordered),
-            *(("whisperx", "align", sample) for sample in ordered),
-            ("yamnet", "detect", ordered[0]),
+            *(("cloud_whisper", "transcribe", sample) for sample in ordered),
         )
     for component, operation, sample in stages[:prefix_count]:
         models = tuple(item for item in identities if item.component == component)
-        model = (
-            next(
-                item
-                for item in models
-                if item.model_id
-                == f"whisperx-align-{sample.language}"  # type: ignore[attr-defined]
-            )
-            if component == "whisperx"
-            else models[0]
-        )
+        model = models[0]
         input_kind = (
             "KEYFRAME"
             if component == "baidu_ocr"
@@ -1442,27 +1289,6 @@ def _record_live_failure_matrix_prefix(
             "baidu_ocr",
         ),
         (
-            "pyannote_auth",
-            "pyannote_live",
-            ErrorCode.PYANNOTE_AUTHENTICATION_FAILED,
-            0,
-            "pyannote",
-        ),
-        (
-            "pyannote_model",
-            "pyannote_live",
-            ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-            0,
-            "pyannote",
-        ),
-        (
-            "pyannote_dependency",
-            "pyannote_live",
-            ErrorCode.SPEECH_DEPENDENCY_UNAVAILABLE,
-            0,
-            "pyannote",
-        ),
-        (
             "silero_load",
             "five_language_models",
             ErrorCode.SPEECH_DEPENDENCY_UNAVAILABLE,
@@ -1484,78 +1310,29 @@ def _record_live_failure_matrix_prefix(
             "silero_vad",
         ),
         (
-            "faster_load",
+            "cloud_load",
             "five_language_models",
             ErrorCode.SPEECH_DEPENDENCY_UNAVAILABLE,
             1,
-            "faster_whisper",
+            "cloud_whisper",
         ),
         (
-            "faster_inference",
+            "cloud_inference",
             "five_language_models",
             ErrorCode.SPEECH_AUDIO_INVALID,
             1,
-            "faster_whisper",
+            "cloud_whisper",
         ),
         (
-            "faster_output",
+            "cloud_output",
             "five_language_models",
             ErrorCode.SPEECH_MODEL_UNAVAILABLE,
             1,
-            "faster_whisper",
-        ),
-        (
-            "whisperx_load",
-            "five_language_models",
-            ErrorCode.SPEECH_DEPENDENCY_UNAVAILABLE,
-            6,
-            "whisperx",
-        ),
-        (
-            "whisperx_inference",
-            "five_language_models",
-            ErrorCode.SPEECH_AUDIO_INVALID,
-            6,
-            "whisperx",
-        ),
-        (
-            "whisperx_output",
-            "five_language_models",
-            ErrorCode.SPEECH_MODEL_UNAVAILABLE,
-            6,
-            "whisperx",
-        ),
-        (
-            "yamnet_load",
-            "five_language_models",
-            ErrorCode.SPEECH_DEPENDENCY_UNAVAILABLE,
-            11,
-            "yamnet",
-        ),
-        (
-            "yamnet_inference",
-            "five_language_models",
-            ErrorCode.SPEECH_AUDIO_INVALID,
-            11,
-            "yamnet",
-        ),
-        (
-            "yamnet_output",
-            "five_language_models",
-            ErrorCode.SPEECH_MODEL_UNAVAILABLE,
-            11,
-            "yamnet",
+            "cloud_whisper",
         ),
         ("unknown", "qwen_live", None, 0, "qwen"),
         ("qwen_construct_allowed", "qwen_live", ErrorCode.QWEN_RESPONSE_INVALID, 0, "qwen"),
         ("baidu_construct_unknown", "baidu_ocr_live", None, 0, "baidu_ocr"),
-        (
-            "pyannote_construct_allowed",
-            "pyannote_live",
-            ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-            0,
-            "pyannote",
-        ),
         (
             "local_construct_allowed",
             "five_language_models",
@@ -1565,8 +1342,7 @@ def _record_live_failure_matrix_prefix(
         ),
         ("baidu_close", "baidu_ocr_live", None, 1, "components_close"),
         ("qwen_close", "qwen_live", None, 2, "components_close"),
-        ("pyannote_close", "pyannote_live", None, 1, "components_close"),
-        ("local_close", "five_language_models", None, 12, "components_close"),
+        ("local_close", "five_language_models", None, 6, "components_close"),
     ),
     ids=lambda value: value if isinstance(value, str) else None,
 )
@@ -1593,7 +1369,12 @@ def test_runner_failure_classification_matrix(
         else (("sample-001", "zh"),)
     )
     package, runtime_root = _runner_package(tmp_path, samples=sample_specs)
-    settings_kwargs: dict[str, object] = {"workspace_root": tmp_path}
+    settings_kwargs: dict[str, object] = {
+        "workspace_root": tmp_path,
+        "openai_base_url": "https://asr.example/v1",
+        "openai_api_key": "test-key",
+        "openai_model": "openai/whisper",
+    }
     if check_id == "qwen_live":
         settings_kwargs.update(
             qwen_base_url="https://qwen.example/v1",
@@ -1604,18 +1385,6 @@ def test_runner_failure_classification_matrix(
         settings_kwargs.update(
             baidu_api_key="baidu-key",
             baidu_secret_key="baidu-secret",
-        )
-    elif check_id == "pyannote_live":
-        settings_kwargs["huggingface_token"] = "hf-secret"
-        _write_pyannote_preflight_files(
-            runtime_root,
-            json.dumps(
-                {
-                    "schema_version": "1.0.0",
-                    "model_id": "pyannote/speaker-diarization-community-1",
-                    "accepted": True,
-                }
-            ).encode(),
         )
     else:
         _write_local_stack_preflight_models(runtime_root)
@@ -1666,12 +1435,11 @@ def test_runner_failure_classification_matrix(
         components_factory=build_components,  # type: ignore[arg-type]
         execution_port=execute,
     )
-    if check_id in {"pyannote_live", "five_language_models"}:
+    if check_id == "five_language_models":
         monkeypatch.setattr(runner, "_module_available", lambda _name: True)
     method = {
         "baidu_ocr_live": runner.run_baidu,
         "qwen_live": runner.run_qwen,
-        "pyannote_live": runner.run_pyannote,
         "five_language_models": runner.run_local_model_stack,
     }[check_id]
 
@@ -1680,7 +1448,6 @@ def test_runner_failure_classification_matrix(
     raw_type = {
         "baidu_ocr_live": BaiduLiveRawReport,
         "qwen_live": QwenLiveRawReport,
-        "pyannote_live": PyannoteLiveRawReport,
         "five_language_models": FiveLanguageModelsRawReport,
     }[check_id]
     raw = raw_type.model_validate_json(
@@ -1757,8 +1524,8 @@ def test_input_change_during_execution_fails_closed_without_sensitive_exception_
         )
 
     runner = LiveValidationRunner(
-        Settings(
-            workspace_root=tmp_path,
+        _cloud_settings(
+            tmp_path,
             qwen_base_url="https://qwen.example/v1",
             qwen_api_key="qwen-secret",
             qwen_model_id="qwen3-vl-plus",
@@ -1789,8 +1556,8 @@ def test_controlled_complete_success_cannot_publish_workspace_pass(tmp_path: Pat
     from video_demo.evaluation.live_runner import LiveValidationRunner
 
     package, runtime_root = _runner_package(tmp_path)
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         qwen_base_url="https://qwen.example/v1",
         qwen_api_key="qwen-secret",
         qwen_model_id="qwen3-vl-plus",
@@ -1856,8 +1623,8 @@ def test_default_production_baidu_execution_publishes_reverifiable_pass(
     package, runtime_root = _runner_package(tmp_path)
     keyframe = runtime_root / "eval/live/run-abc/sample-001/keyframe.jpg"
     keyframe.write_bytes(b"\xff\xd8\xff\xd9")
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         baidu_api_key="baidu-key",
         baidu_secret_key="baidu-secret",
     )
@@ -1909,8 +1676,8 @@ def test_default_production_qwen_execution_records_probe_and_segment_receipts(
     from video_demo.integrations.qwen import QwenCapabilities, QwenProviderReceipt
 
     package, runtime_root = _runner_package(tmp_path)
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         qwen_base_url="https://qwen.example/v1",
         qwen_api_key="qwen-secret",
         qwen_model_id="qwen3-vl-plus",
@@ -1972,59 +1739,13 @@ def test_default_production_qwen_execution_records_probe_and_segment_receipts(
     assert "结构化片段摘要".encode() not in persisted
 
 
-def test_default_production_pyannote_execution_publishes_pass(
+def test_default_production_cloud_models_execute_serial_five_language_sequence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import video_demo.evaluation.live_runner as live_runner_module
     from video_demo.evaluation.live_runner import LiveValidationRunner
-
-    package, runtime_root = _runner_package(tmp_path)
-    _write_pyannote_preflight_files(
-        runtime_root,
-        json.dumps(
-            {
-                "schema_version": "1.0.0",
-                "model_id": "pyannote/speaker-diarization-community-1",
-                "accepted": True,
-            }
-        ).encode(),
-    )
-    settings = Settings(workspace_root=tmp_path, huggingface_token="hf-secret")
-
-    class Diarizer:
-        def diarize(self, _audio: Path, **_kwargs: object) -> tuple[object, ...]:
-            return (object(),)
-
-    speech_models = SimpleNamespace(diarizer=Diarizer())
-    diagnostics = _production_diagnostics(settings, speech_models=speech_models)
-    monkeypatch.setattr(
-        live_runner_module,
-        "build_production_diagnostic_components",
-        lambda received: diagnostics if received is settings else pytest.fail("Settings 不一致"),
-    )
-    runner = LiveValidationRunner(settings, EvidenceStore(tmp_path, runtime_root))
-    monkeypatch.setattr(runner, "_module_available", lambda _name: True)
-
-    check = runner.run_pyannote("run-abc", package)
-
-    assert check.status == GateStatus.PASS
-    raw = PyannoteLiveRawReport.model_validate_json(
-        (runtime_root / "eval/reports/run-abc/raw.json").read_bytes()
-    )
-    assert len(raw.executions) == 1
-    assert raw.executions[0].model.model_id == (
-        "pyannote/speaker-diarization-community-1"
-    )
-
-
-def test_default_production_local_models_execute_complete_five_language_sequence(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import video_demo.evaluation.live_runner as live_runner_module
-    from video_demo.evaluation.live_runner import LiveValidationRunner
-    from video_demo.speech.asr import RawAsrSegment
+    from video_demo.speech.asr import RawAsrSegment, WindowTranscriptionResult
 
     package, runtime_root = _runner_package(
         tmp_path,
@@ -2037,7 +1758,12 @@ def test_default_production_local_models_execute_complete_five_language_sequence
         ),
     )
     _write_local_stack_preflight_models(runtime_root)
-    settings = Settings(workspace_root=tmp_path)
+    settings = Settings(
+        workspace_root=tmp_path,
+        openai_base_url="https://asr.example/v1",
+        openai_api_key="test-key",
+        openai_model="openai/whisper",
+    )
 
     class Vad:
         def detect(self, _audio: Path, *, duration_ms: int) -> object:
@@ -2045,36 +1771,28 @@ def test_default_production_local_models_execute_complete_five_language_sequence
             return SimpleNamespace(speech=(object(),))
 
     class Recognizer:
-        def transcribe_slice(
+        def transcribe_window(
             self,
             _audio: Path,
-            _span: object,
-            **_kwargs: object,
-        ) -> tuple[RawAsrSegment, ...]:
-            return (
-                RawAsrSegment(
+            *,
+            language_hint: str | None,
+            prompt: str | None,
+        ) -> WindowTranscriptionResult:
+            assert language_hint in {"zh", "en", "ja", "ko", "es"}
+            assert prompt is None
+            return WindowTranscriptionResult(
+                language=language_hint,
+                segments=(RawAsrSegment(
                     start_ms=0,
                     end_ms=500,
                     text="transient-provider-text",
                     confidence=0.9,
-                ),
+                ),),
             )
-
-    class Aligner:
-        def align(self, _audio: Path, segments: object) -> object:
-            assert segments
-            return SimpleNamespace(words=(object(),), warning_codes=())
-
-    class AudioEvents:
-        def detect(self, _audio: Path, *, duration_ms: int) -> tuple[object, ...]:
-            assert duration_ms == 1_000
-            return ()
 
     speech_models = SimpleNamespace(
         vad=Vad(),
         recognizer=Recognizer(),
-        aligner=Aligner(),
-        audio_events=AudioEvents(),
     )
     diagnostics = _production_diagnostics(settings, speech_models=speech_models)
     monkeypatch.setattr(
@@ -2091,12 +1809,10 @@ def test_default_production_local_models_execute_complete_five_language_sequence
     raw = FiveLanguageModelsRawReport.model_validate_json(
         (runtime_root / "eval/reports/run-abc/raw.json").read_bytes()
     )
-    assert len(raw.executions) == 12
+    assert len(raw.executions) == 6
     assert tuple(fact.component for fact in raw.executions) == (
         "silero_vad",
-        *("faster_whisper" for _ in range(5)),
-        *("whisperx" for _ in range(5)),
-        "yamnet",
+        *("cloud_whisper" for _ in range(5)),
     )
     persisted = b"\n".join(
         path.read_bytes()
@@ -2111,8 +1827,8 @@ def test_complete_qwen_close_failure_persists_reverifiable_system_failure(
     from video_demo.evaluation.live_runner import LiveValidationRunner
 
     package, runtime_root = _runner_package(tmp_path)
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         qwen_base_url="https://qwen.example/v1",
         qwen_api_key="qwen-secret",
         qwen_model_id="qwen3-vl-plus",
@@ -2208,8 +1924,8 @@ def test_package_source_removal_during_execution_has_no_absolute_path_in_context
         raise RuntimeError("Bearer secret supplier-body")
 
     runner = LiveValidationRunner(
-        Settings(
-            workspace_root=tmp_path,
+        _cloud_settings(
+            tmp_path,
             qwen_base_url="https://qwen.example/v1",
             qwen_api_key="secret",
             qwen_model_id="qwen3-vl-plus",
@@ -2261,8 +1977,8 @@ def test_demo_mode_allows_custom_qwen_model_id_to_reach_capability_probe(
 
     package, runtime_root = _runner_package(tmp_path)
     check = LiveValidationRunner(
-        Settings(
-            workspace_root=tmp_path,
+        _cloud_settings(
+            tmp_path,
             demo_degraded_mode=True,
             qwen_base_url="https://qwen.example/v1",
             qwen_api_key="secret",
@@ -2277,225 +1993,33 @@ def test_demo_mode_allows_custom_qwen_model_id_to_reach_capability_probe(
     assert not (runtime_root / "eval/reports/run-abc/preflight.json").exists()
 
 
-@pytest.mark.parametrize(
-    "terms",
-    (
-        json.dumps(
-            {
-                "schema_version": "1.0.0",
-                "model_id": "pyannote/speaker-diarization-community-1",
-                "accepted": True,
-                "extra": "forbidden",
-            }
-        ).encode(),
-        json.dumps(
-            {
-                "schema_version": "1.0.0",
-                "model_id": "pyannote/speaker-diarization-3.1",
-                "accepted": True,
-            }
-        ).encode(),
-        json.dumps(
-            {
-                "schema_version": "1.0.0",
-                "model_id": "pyannote/speaker-diarization-community-1",
-                "accepted": False,
-            }
-        ).encode(),
-        json.dumps(
-            {
-                "schema_version": "1.0.0",
-                "model_id": "pyannote/speaker-diarization-community-1",
-                "accepted": 1,
-            }
-        ).encode(),
-        b"\xff\xfe",
-    ),
-)
-def test_pyannote_terms_require_exact_strict_json_contract(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    terms: bytes,
-) -> None:
-    from video_demo.evaluation.live_runner import LiveValidationRunner
-
-    package, runtime_root = _runner_package(tmp_path)
-    _write_pyannote_preflight_files(runtime_root, terms)
-    runner = LiveValidationRunner(
-        Settings(workspace_root=tmp_path, huggingface_token="hf-secret"),
-        EvidenceStore(tmp_path, runtime_root),
-    )
-    monkeypatch.setattr(runner, "_module_available", lambda _name: True)
-
-    check = runner.run_pyannote("run-abc", package)
-
-    assert check.status == GateStatus.NOT_RUN
-    raw = PreflightRawReport.model_validate_json(
-        (runtime_root / "eval/reports/run-abc/preflight.json").read_bytes()
-    )
-    assert tuple(issue.code for issue in raw.issues or ()) == (
-        ErrorCode.PYANNOTE_TERMS_UNAVAILABLE,
-    )
-
-
-@pytest.mark.parametrize("cache_kind", ("directories_only", "empty_file"))
-def test_pyannote_model_tree_requires_nonempty_regular_model_file(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    cache_kind: str,
-) -> None:
-    from video_demo.evaluation.live_runner import LiveValidationRunner
-
-    package, runtime_root = _runner_package(tmp_path)
-    model_root = runtime_root / "models/pyannote"
-    model_root.mkdir(parents=True)
-    (model_root / "terms-accepted.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "1.0.0",
-                "model_id": "pyannote/speaker-diarization-community-1",
-                "accepted": True,
-            }
-        ),
-        encoding="utf-8",
-    )
-    if cache_kind == "directories_only":
-        (model_root / "snapshots/revision").mkdir(parents=True)
-    else:
-        (model_root / "empty.bin").write_bytes(b"")
-    runner = LiveValidationRunner(
-        Settings(workspace_root=tmp_path, huggingface_token="hf-secret"),
-        EvidenceStore(tmp_path, runtime_root),
-    )
-    monkeypatch.setattr(runner, "_module_available", lambda _name: True)
-
-    check = runner.run_pyannote("run-abc", package)
-
-    assert check.status == GateStatus.NOT_RUN
-    raw = PreflightRawReport.model_validate_json(
-        (runtime_root / "eval/reports/run-abc/preflight.json").read_bytes()
-    )
-    assert tuple(issue.code for issue in raw.issues or ()) == (
-        ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-    )
-
-
-def test_pyannote_terms_file_alone_is_not_model_cache(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from video_demo.evaluation.live_runner import LiveValidationRunner
-
-    package, runtime_root = _runner_package(tmp_path)
-    model_root = runtime_root / "models/pyannote"
-    model_root.mkdir(parents=True)
-    (model_root / "terms-accepted.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "1.0.0",
-                "model_id": "pyannote/speaker-diarization-community-1",
-                "accepted": True,
-            }
-        ),
-        encoding="utf-8",
-    )
-    runner = LiveValidationRunner(
-        Settings(workspace_root=tmp_path, huggingface_token="hf-secret"),
-        EvidenceStore(tmp_path, runtime_root),
-    )
-    monkeypatch.setattr(runner, "_module_available", lambda _name: True)
-
-    check = runner.run_pyannote("run-abc", package)
-
-    assert check.status == GateStatus.NOT_RUN
-    raw = PreflightRawReport.model_validate_json(
-        (runtime_root / "eval/reports/run-abc/preflight.json").read_bytes()
-    )
-    assert tuple(issue.code for issue in raw.issues or ()) == (
-        ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-    )
-
-
-def test_pyannote_model_tree_rejects_symlink_even_after_regular_cache_file(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from video_demo.evaluation.live_runner import LiveValidationRunner
-
-    package, runtime_root = _runner_package(tmp_path)
-    model_root = runtime_root / "models/pyannote"
-    model_root.mkdir(parents=True)
-    (model_root / "terms-accepted.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "1.0.0",
-                "model_id": "pyannote/speaker-diarization-community-1",
-                "accepted": True,
-            }
-        ),
-        encoding="utf-8",
-    )
-    (model_root / "a-model-cache.bin").write_bytes(b"model")
-    target = runtime_root / "models/symlink-target.bin"
-    target.write_bytes(b"target")
-    (model_root / "z-linked-cache.bin").symlink_to(target)
-    runner = LiveValidationRunner(
-        Settings(workspace_root=tmp_path, huggingface_token="hf-secret"),
-        EvidenceStore(tmp_path, runtime_root),
-    )
-    monkeypatch.setattr(runner, "_module_available", lambda _name: True)
-
-    check = runner.run_pyannote("run-abc", package)
-
-    assert check.status == GateStatus.NOT_RUN
-    raw = PreflightRawReport.model_validate_json(
-        (runtime_root / "eval/reports/run-abc/preflight.json").read_bytes()
-    )
-    assert tuple(issue.code for issue in raw.issues or ()) == (
-        ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-    )
-
-
 def test_production_model_identity_report_is_complete_and_redacted(tmp_path: Path) -> None:
     from importlib.metadata import version
 
     settings = Settings(
         workspace_root=tmp_path,
         runtime_root=Path("runtime/live"),
-        inference_device="mps",
-        whisper_compute_type="float16",
+        openai_base_url="https://asr.example/v1",
+        openai_api_key="cloud-secret",
+        openai_model="openai/whisper",
         qwen_base_url="https://dashscope.example/compatible-mode/v1",
         qwen_model_id="qwen3-vl-plus",
         qwen_api_key="qwen-secret",
         baidu_api_key="baidu-api-secret",
         baidu_secret_key="baidu-secret-secret",
-        huggingface_token="huggingface-secret",
     )
 
     report = build_production_model_identity_report(settings)
 
     assert isinstance(report, ProductionModelIdentityReport)
-    assert report.schema_version == "1.0.0"
+    assert report.schema_version == "2.0.0"
     assert re.fullmatch(r"[0-9a-f]{64}", report.settings_fingerprint)
     assert {
         (model.component, model.provider, model.model_id, model.device, model.revision)
         for model in report.models
     } == {
         ("silero_vad", "local", "silero-vad", "cpu", version("silero-vad")),
-        ("faster_whisper", "local", "large-v3", "mps", version("faster-whisper")),
-        ("whisperx", "local", "whisperx-align-zh", "cpu", version("whisperx")),
-        ("whisperx", "local", "whisperx-align-en", "cpu", version("whisperx")),
-        ("whisperx", "local", "whisperx-align-ja", "cpu", version("whisperx")),
-        ("whisperx", "local", "whisperx-align-ko", "cpu", version("whisperx")),
-        ("whisperx", "local", "whisperx-align-es", "cpu", version("whisperx")),
-        (
-            "pyannote",
-            "local",
-            "pyannote/speaker-diarization-community-1",
-            "cpu",
-            version("pyannote.audio"),
-        ),
-        ("yamnet", "local", "yamnet", "cpu", version("tensorflow-hub")),
+        ("cloud_whisper", "openai_compatible", "openai/whisper", None, None),
         ("baidu_ocr", "baidu_ocr", "accurate_basic", None, None),
         ("qwen", "qwen", "qwen3-vl-plus", None, None),
     }
@@ -2504,7 +2028,7 @@ def test_production_model_identity_report_is_complete_and_redacted(tmp_path: Pat
         "qwen-secret",
         "baidu-api-secret",
         "baidu-secret-secret",
-        "huggingface-secret",
+        "cloud-secret",
         str(tmp_path),
         "data:",
     ):
@@ -2512,7 +2036,12 @@ def test_production_model_identity_report_is_complete_and_redacted(tmp_path: Pat
 
 
 def test_model_identity_report_omits_unconfigured_qwen_identity(tmp_path: Path) -> None:
-    report = build_production_model_identity_report(Settings(workspace_root=tmp_path))
+    report = build_production_model_identity_report(Settings(
+        workspace_root=tmp_path,
+        openai_base_url="https://asr.example/v1",
+        openai_api_key="test-key",
+        openai_model="openai/whisper",
+    ))
 
     assert all(model.component != "qwen" for model in report.models)
     assert any(model.component == "baidu_ocr" for model in report.models)
@@ -2524,8 +2053,7 @@ def test_model_identity_report_omits_unconfigured_qwen_identity(tmp_path: Path) 
         ("runtime_root", Path("runtime/other")),
         ("ffmpeg_path", Path("tools/custom-ffmpeg")),
         ("ffprobe_path", Path("tools/custom-ffprobe")),
-        ("inference_device", "mps"),
-        ("whisper_compute_type", "float32"),
+        ("openai_asr_timeout_seconds", 123.0),
         ("max_video_bytes", 123_456),
         ("qwen_base_url", "https://other.example/compatible-mode/v1"),
         ("qwen_model_id", "qwen3-vl-max"),
@@ -2550,6 +2078,9 @@ def test_settings_fingerprint_changes_with_execution_semantics(
         "ffprobe_path": Path("tools/ffprobe"),
         "qwen_base_url": "https://dashscope.example/compatible-mode/v1",
         "qwen_model_id": "qwen3-vl-plus",
+        "openai_base_url": "https://asr.example/v1",
+        "openai_api_key": "test-key",
+        "openai_model": "openai/whisper",
     }
     changed = dict(base)
     changed[override] = value
@@ -2575,6 +2106,9 @@ def test_settings_fingerprint_ignores_non_model_runner_settings(
     base = {
         "workspace_root": tmp_path,
         "runtime_root": Path("runtime/live"),
+        "openai_base_url": "https://asr.example/v1",
+        "openai_api_key": "test-key",
+        "openai_model": "openai/whisper",
     }
     changed = dict(base)
     changed[override] = value
@@ -2590,16 +2124,16 @@ def test_baidu_endpoint_trailing_slash_changes_settings_fingerprint(
 ) -> None:
     endpoint = "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"
     baseline = build_production_model_identity_report(
-        Settings(workspace_root=tmp_path, baidu_ocr_endpoint=endpoint),
+        _cloud_settings(tmp_path, baidu_ocr_endpoint=endpoint),
     )
     with_slash = build_production_model_identity_report(
-        Settings(workspace_root=tmp_path, baidu_ocr_endpoint=f"{endpoint}/"),
+        _cloud_settings(tmp_path, baidu_ocr_endpoint=f"{endpoint}/"),
     )
 
     assert with_slash.settings_fingerprint != baseline.settings_fingerprint
 
 
-def test_settings_fingerprint_records_faster_whisper_cache_subdirectory(
+def test_settings_fingerprint_records_cloud_asr_semantics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2618,15 +2152,16 @@ def test_settings_fingerprint_records_faster_whisper_cache_subdirectory(
         Settings(
             workspace_root=tmp_path,
             runtime_root=Path("runtime/live"),
+            openai_base_url="https://asr.example/v1",
+            openai_api_key="test-key",
+            openai_model="openai/whisper",
         ),
     )
 
     assert len(encoded_payloads) == 1
     payload = json.loads(encoded_payloads[0])
-    assert payload["model_cache"]["faster_whisper_root"] == (
-        "runtime/live/models/faster-whisper"
-    )
-    assert payload["model_cache"]["pyannote_root"] == "runtime/live/models/pyannote"
+    assert payload["cloud_asr"]["model_id"] == "openai/whisper"
+    assert payload["cloud_asr"]["window_strategy_version"] == "1.0.0"
 
 
 def test_settings_fingerprint_ignores_secrets_and_absolute_workspace_location(
@@ -2640,13 +2175,15 @@ def test_settings_fingerprint_ignores_secrets_and_absolute_workspace_location(
         "ffprobe_path": Path("tools/ffprobe"),
         "qwen_base_url": "https://dashscope.example/compatible-mode/v1/",
         "qwen_model_id": "qwen3-vl-plus",
+        "openai_base_url": "https://asr.example/v1",
+        "openai_model": "openai/whisper",
     }
     first = Settings(
         workspace_root=first_root,
         qwen_api_key="first-qwen-secret",
         baidu_api_key="first-baidu-api",
         baidu_secret_key="first-baidu-secret",
-        huggingface_token="first-hf-secret",
+        openai_api_key="first-cloud-secret",
         **common,
     )
     second = Settings(
@@ -2654,7 +2191,7 @@ def test_settings_fingerprint_ignores_secrets_and_absolute_workspace_location(
         qwen_api_key="second-qwen-secret",
         baidu_api_key="second-baidu-api",
         baidu_secret_key="second-baidu-secret",
-        huggingface_token="second-hf-secret",
+        openai_api_key="second-cloud-secret",
         **common,
     )
 
@@ -2678,7 +2215,7 @@ def test_model_identity_report_rejects_unstable_qwen_model_id(
     tmp_path: Path,
     model_id: str,
 ) -> None:
-    settings = Settings(workspace_root=tmp_path, qwen_model_id=model_id)
+    settings = _cloud_settings(tmp_path, qwen_model_id=model_id)
 
     with pytest.raises((ValueError, ValidationError)):
         build_production_model_identity_report(settings)

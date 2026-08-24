@@ -69,7 +69,6 @@ def dispatch(args: argparse.Namespace, settings: Settings) -> StageExecutionResu
         checks = (
             runner.run_workspace_baidu(stage_evaluation_run_id(run_id, "baidu")),
             runner.run_workspace_qwen(stage_evaluation_run_id(run_id, "qwen")),
-            runner.run_workspace_pyannote(stage_evaluation_run_id(run_id, "pyannote")),
             runner.run_workspace_local_model_stack(
                 stage_evaluation_run_id(run_id, "models")
             ),
@@ -89,7 +88,11 @@ def dispatch(args: argparse.Namespace, settings: Settings) -> StageExecutionResu
     if args.command == "final":
         return FinalValidationRunner(settings, store).final(run_id)
     if args.command == "cleanup":
-        cleanup = cleanup_evaluation_run(settings.workspace_root, run_id)
+        cleanup = cleanup_evaluation_run(
+            settings.workspace_root,
+            run_id,
+            settings=settings,
+        )
         return StageExecutionResult(
             status=GateStatus.PASS,
             report_path=cleanup.manifest_path,

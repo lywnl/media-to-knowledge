@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shutil
-import warnings
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -25,7 +24,6 @@ from video_demo.evaluation.report import GateStatus
         Path("src/video_demo/media/subtitles.py"),
         Path("src/video_demo/speech/isolated.py"),
         Path("src/video_demo/evaluation/quality_runner.py"),
-        Path("src/video_demo/audio/thresholds.json"),
         Path("pyproject.toml"),
         Path("uv.lock"),
     ),
@@ -126,34 +124,6 @@ def test_dependency_probe_rejects_module_that_fails_during_import() -> None:
         assert _has_dependency("whisperx") is False
 
 
-def test_dependency_probe_keeps_tensorflow_hub_warning_off_stderr() -> None:
-    from video_demo.evaluation.prediction_runner import _has_dependency
-
-    def import_module(_name: str) -> object:
-        warnings.warn(
-            "pkg_resources is deprecated as an API. See upstream migration guidance.",
-            UserWarning,
-            stacklevel=2,
-        )
-        return object()
-
-    with (
-        patch(
-            "video_demo.evaluation.prediction_runner.importlib.util.find_spec",
-            return_value=object(),
-        ),
-        patch(
-            "video_demo.evaluation.prediction_runner.importlib.import_module",
-            side_effect=import_module,
-        ),
-        warnings.catch_warnings(record=True) as captured,
-    ):
-        warnings.simplefilter("always")
-        assert _has_dependency("tensorflow_hub") is True
-
-    assert captured == []
-
-
 def test_prediction_index_path_points_to_index_json_not_run_snapshot() -> None:
     assert _prediction_index_path(Path("/runtime/eval"), "eval_001", "sample_001") == (
         Path("/runtime/eval/predictions/eval_001/sample_001/index.json")
@@ -177,8 +147,6 @@ def test_prediction_request_forwards_sample_speech_hints() -> None:
         "object_ref": "obj_001",
         "idempotency_key": "idem_001",
         "language_hints": ["zh"],
-        "min_speakers": None,
-        "max_speakers": None,
         "hotwords": ["Milvus", "WhisperX"],
         "core_context": "这是向量检索课程。",
     }

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,13 +8,11 @@ from pathlib import Path
 import pytest
 
 from video_demo.domain.evidence import (
-    AlignedWord,
-    AudioEvent,
     BoundingBox,
     OcrEvidence,
     OcrLine,
     SceneBoundary,
-    SpeakerTurn,
+    SpeechSegment,
     SubtitleCue,
 )
 from video_demo.domain.result import VideoSegment, VideoSummary, VideoUnderstandingResult
@@ -26,10 +23,7 @@ from video_demo.evaluation.annotations import (
     AuthorizationRecord,
     ClaimJudgment,
     EvaluationAnnotation,
-    ReferenceAudioEvent,
     ReferenceOcrFrame,
-    ReferenceSpeakerTurn,
-    ReferenceWord,
     SemanticJudgment,
     SupportedFact,
     ValidatedEvaluationPackage,
@@ -80,14 +74,14 @@ def _successful_prediction(
     run_id: str = "eval_001",
 ) -> VerifiedPrediction:
     words = tuple(
-        AlignedWord(
-            evidence_id=f"word_{sample_id}_{index}",
+        SpeechSegment(
+            evidence_id=f"speech_{sample_id}_{index}",
             start_ms=index * 500 + 100,
             end_ms=index * 500 + 450,
             text=text,
             language=language,
-            probability=0.9,
-            speaker="SPEAKER_01",
+            confidence=0.9,
+            is_fully_evaluated_language=True,
         )
         for index, text in enumerate(predicted_words)
     )
@@ -130,28 +124,7 @@ def _successful_prediction(
     )
     evidence = (
         *words,
-        SpeakerTurn(
-            evidence_id=f"turn_{sample_id}_1",
-            start_ms=0,
-            end_ms=4_000,
-            speaker="SPEAKER_01",
-        ),
-        SpeakerTurn(
-            evidence_id=f"turn_{sample_id}_2",
-            start_ms=2_000,
-            end_ms=4_000,
-            speaker="SPEAKER_02",
-        ),
         ocr,
-        AudioEvent(
-            evidence_id=f"audio_{sample_id}",
-            start_ms=2_000,
-            end_ms=3_000,
-            audioset_class="Music",
-            normalized_event="music",
-            confidence=0.9,
-            threshold_version="v1",
-        ),
         SceneBoundary(
             evidence_id=f"scene_{sample_id}_1",
             start_ms=0,
@@ -313,7 +286,6 @@ def _none_prediction(sample_id: str, language: str) -> VerifiedPrediction:
 
 
 def _annotation(sample_id: str, language: str, text: str) -> VerifiedAnnotation:
-    tokens = tuple(text.split()) if language in ("en", "es") else tuple(text.replace(" ", ""))
     annotation = EvaluationAnnotation(
         schema_version="1.0.0",
         sample_id=sample_id,
@@ -321,42 +293,11 @@ def _annotation(sample_id: str, language: str, text: str) -> VerifiedAnnotation:
         duration_ms=10_000,
         language=language,
         reference_text=text,
-        words=tuple(
-            ReferenceWord(
-                word_id=f"refword_{sample_id}_{index}",
-                text=token,
-                start_ms=index * 500,
-                end_ms=index * 500 + 400,
-            )
-            for index, token in enumerate(tokens)
-        ),
-        speaker_turns=(
-            ReferenceSpeakerTurn(
-                turn_id=f"refturn_{sample_id}_1",
-                speaker_id=f"speaker_{sample_id}_1",
-                start_ms=0,
-                end_ms=4_000,
-            ),
-            ReferenceSpeakerTurn(
-                turn_id=f"refturn_{sample_id}_2",
-                speaker_id=f"speaker_{sample_id}_2",
-                start_ms=2_000,
-                end_ms=4_000,
-            ),
-        ),
         ocr_frames=(
             ReferenceOcrFrame(
                 frame_id=f"frame_{sample_id}",
                 timestamp_ms=8_000,
                 text_lines=("\uff21",),
-            ),
-        ),
-        audio_events=(
-            ReferenceAudioEvent(
-                event_id=f"refaudio_{sample_id}",
-                normalized_event="music",
-                start_ms=1_000,
-                end_ms=2_000,
             ),
         ),
         scene_boundaries_ms=(3_000,),
@@ -714,35 +655,19 @@ def test_score_quality_micro_averages_languages_and_counts_failed_schema_denomin
     ]
 
 
-def test_score_quality_uses_alignment_der_diagnostics_nfkc_and_fixed_tolerances(
+def test_score_quality_uses_nfkc_and_fixed_boundary_tolerances(
     tmp_path: Path,
 ) -> None:
     package, predictions = _fixture(tmp_path)
 
     artifacts = _score(package, predictions)
     metrics = {metric.name: metric for metric in artifacts.report.metrics}
-    signature = inspect.signature(__import__(
-        "video_demo.evaluation.quality_runner", fromlist=["score_quality"]
-    ).score_quality)
-
-    assert metrics["word_time_p90_ms"].value == 100.0
-    assert metrics["der_non_overlap"].value == pytest.approx(1 / 7)
-    assert metrics["der_overlap"].value == pytest.approx(1 / 7)
     assert metrics["ocr_accuracy"].value == pytest.approx(6 / 7)
-    assert metrics["audio_event_macro_f1"].value == pytest.approx(12 / 13)
     assert metrics["scene_f1"].value == pytest.approx(12 / 13)
     assert metrics["semantic_boundary_f1"].value == pytest.approx(12 / 13)
-    assert "speaker_count_accuracy" in artifacts.sample_details[0].metric_inputs
-    assert "speaker_count_accuracy" not in metrics
-    assert tuple(signature.parameters) == (
-        "package",
-        "predictions",
-        "judgments",
-        "evaluation_run_id",
-    )
 
 
-def test_subtitle_sample_uses_sorted_cues_and_marks_unexecuted_metrics_not_run() -> None:
+def test_subtitle_sample_uses_sorted_cues() -> None:
     from video_demo.evaluation import quality_runner
 
     annotation = _annotation("sample_subtitle", "en", "vector database")
@@ -761,25 +686,7 @@ def test_subtitle_sample_uses_sorted_cues_and_marks_unexecuted_metrics_not_run()
 
     assert observations["en_wer"].value == 0
     assert detail.transcript_source == "SUBTITLE"
-    assert detail.not_run_metrics == (
-        "audio_event_macro_f1",
-        "der_non_overlap",
-        "der_overlap",
-        "speaker_count_accuracy",
-        "word_time_p90_ms",
-    )
-    assert {
-        "audio_event_macro_f1",
-        "speaker_count_accuracy",
-        "word_time_match_count",
-    }.isdisjoint(detail.metric_inputs)
-    for name in (
-        "audio_event_macro_f1",
-        "der_non_overlap",
-        "der_overlap",
-        "word_time_p90_ms",
-    ):
-        assert observations[name].value is None
+    assert "en_wer" in observations
 
 
 def test_hint_effect_report_uses_bound_pairs_and_normalized_exact_terms(
@@ -852,38 +759,6 @@ def test_hint_effect_report_counts_stable_pair_exclusions(
     assert len(report.pairs) == 1
 
 
-def test_mixed_quality_metrics_only_exclude_subtitle_samples() -> None:
-    from video_demo.evaluation import quality_runner
-
-    asr_annotation = _annotation("sample_asr", "en", "one two")
-    asr_prediction = _successful_prediction("sample_asr", "en", ("one", "two"))
-    subtitle_annotation = _annotation("sample_subtitle", "en", "vector database")
-    subtitle_prediction = _subtitle_prediction(
-        "sample_subtitle",
-        "en",
-        (
-            (0, 400, "subtitle_001", "vector"),
-            (500, 900, "subtitle_002", "database"),
-        ),
-    )
-    asr_only = quality_runner._Accumulators()
-    mixed = quality_runner._Accumulators()
-
-    quality_runner._score_sample(asr_annotation, asr_prediction, asr_only)
-    quality_runner._score_sample(subtitle_annotation, subtitle_prediction, mixed)
-    quality_runner._score_sample(asr_annotation, asr_prediction, mixed)
-
-    asr_observations = asr_only.observations()
-    mixed_observations = mixed.observations()
-    for name in (
-        "audio_event_macro_f1",
-        "der_non_overlap",
-        "der_overlap",
-        "word_time_p90_ms",
-    ):
-        assert mixed_observations[name] == asr_observations[name]
-
-
 @pytest.mark.parametrize(
     ("prediction", "expected_source"),
     [
@@ -903,10 +778,7 @@ def test_failed_and_none_samples_keep_existing_metric_denominators(
     detail = quality_runner._score_sample(annotation, prediction, accumulators)
 
     assert detail.transcript_source == expected_source
-    assert detail.not_run_metrics == ()
     assert accumulators.text_counts["en_wer"].reference_units == 2
-    assert sum(accumulators.der_units) > 0
-    assert accumulators.audio_counts
 
 
 def test_semantic_metrics_only_come_from_bound_complete_reviews(tmp_path: Path) -> None:
@@ -983,27 +855,6 @@ def test_unknown_evidence_and_schema_validity_are_recomputed_from_verified_predi
         _score(package, (bad_prediction, *predictions[1:]))
 
 
-def test_speaker_turn_overlap_speakers_participate_in_der_and_count_diagnostic(
-    tmp_path: Path,
-) -> None:
-    package, predictions = _fixture(tmp_path)
-    first = predictions[0]
-    turns = tuple(item for item in first.evidence if isinstance(item, SpeakerTurn))
-    evidence = (
-        *(item for item in first.evidence if not isinstance(item, SpeakerTurn)),
-        turns[0].model_copy(update={"overlap_speakers": ("SPEAKER_02",)}),
-    )
-    prediction = first.model_copy(update={"evidence": evidence})
-
-    from video_demo.evaluation import quality_runner
-
-    detail = quality_runner._score_sample(
-        package.annotations[0], prediction, quality_runner._Accumulators()
-    )
-
-    assert detail.metric_inputs["speaker_count_accuracy"] == 1.0
-
-
 def test_bound_report_digests_use_one_canonical_json_rule_and_bind_details(
     tmp_path: Path,
 ) -> None:
@@ -1028,7 +879,7 @@ def test_bound_report_digests_use_one_canonical_json_rule_and_bind_details(
         [detail.model_dump(mode="json") for detail in artifacts.sample_details]
     )
     tampered = list(detail.model_dump(mode="json") for detail in artifacts.sample_details)
-    tampered[0]["metric_inputs"]["speaker_count_accuracy"] = 0
+    tampered[0]["metric_inputs"]["ocr_errors"] = 999
     assert digest(tampered) != artifacts.report.sample_details_sha256
     assert digest(["f" * 64, *(item.index_sha256 for item in predictions[1:])]) != (
         artifacts.report.prediction_index_sha256
@@ -1084,25 +935,3 @@ def test_loader_source_paths_are_excluded_from_all_serialization(tmp_path: Path)
         encoded = model.model_dump_json()
         assert source_fields.isdisjoint(dumped)
         assert all(f'"{field}"' not in encoded for field in source_fields)
-
-
-def test_score_sample_aligns_word_timing_only_once(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from video_demo.evaluation import quality_runner
-
-    package, predictions = _fixture(tmp_path)
-    original = quality_runner.aligned_word_time_errors_ms
-    call_count = 0
-
-    def counted_alignment(*args: object, **kwargs: object) -> tuple[int, ...]:
-        nonlocal call_count
-        call_count += 1
-        return original(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(quality_runner, "aligned_word_time_errors_ms", counted_alignment)
-    quality_runner._score_sample(
-        package.annotations[0], predictions[0], quality_runner._Accumulators()
-    )
-
-    assert call_count == 1

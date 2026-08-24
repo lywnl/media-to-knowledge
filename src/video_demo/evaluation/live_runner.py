@@ -15,10 +15,9 @@ from video_demo.application.composition import (
     build_production_diagnostic_components,
     build_production_model_identity_report,
 )
-from video_demo.audio.yamnet import import_tensorflow_hub
 from video_demo.config import Settings
 from video_demo.domain.base import stable_identifier
-from video_demo.domain.evidence import SceneBoundary, SpeechSegment
+from video_demo.domain.evidence import SceneBoundary
 from video_demo.domain.run import ModelIdentity, TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.evaluation.annotations import (
@@ -51,13 +50,10 @@ from video_demo.evaluation.evidence import (
     PreflightDetails,
     PreflightIssue,
     PreflightRawReport,
-    PyannoteLiveDetails,
-    PyannoteLiveRawReport,
     QwenLiveDetails,
     QwenLiveRawReport,
     TraceArtifact,
     _assert_snapshot_current,
-    _decode_strict_json,
     _read_file_snapshot,
     _reject_symlink_components,
     build_verified_gate_check,
@@ -71,8 +67,6 @@ from video_demo.evaluation.gate import (
 from video_demo.evaluation.report import GateStatus
 from video_demo.fusion.timeline import build_timeline
 from video_demo.integrations.video_port import SegmentUnderstandingRequest, VideoClipInput
-from video_demo.speech.asr import build_speech_segments, is_complete_faster_whisper_model
-from video_demo.speech.language import LanguageSpan
 from video_demo.storage.workspace import validate_path_component
 from video_demo.visual.ocr import is_supported_ocr_image
 
@@ -87,10 +81,6 @@ _CHECK_REASON: dict[str, tuple[str, str]] = {
         "QWEN_CREDENTIALS_UNAVAILABLE",
         "缺少 Qwen 凭据或真实联调结果",
     ),
-    "pyannote_live": (
-        "PYANNOTE_MODEL_UNAVAILABLE",
-        "缺少 Hugging Face Token、模型授权或真实联调结果",
-    ),
     "five_language_models": (
         "FIVE_LANGUAGE_MODELS_UNAVAILABLE",
         "缺少五语授权素材、模型或真实预测",
@@ -100,11 +90,8 @@ _CHECK_REASON: dict[str, tuple[str, str]] = {
 _MODEL_IDENTITY_FAILURE_CODES: dict[str, ErrorCode] = {
     "baidu_ocr": ErrorCode.OCR_RESPONSE_INVALID,
     "qwen": ErrorCode.QWEN_RESPONSE_INVALID,
-    "pyannote": ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
     "silero_vad": ErrorCode.SPEECH_MODEL_UNAVAILABLE,
-    "faster_whisper": ErrorCode.SPEECH_MODEL_UNAVAILABLE,
-    "whisperx": ErrorCode.SPEECH_MODEL_UNAVAILABLE,
-    "yamnet": ErrorCode.SPEECH_MODEL_UNAVAILABLE,
+    "cloud_whisper": ErrorCode.SPEECH_MODEL_UNAVAILABLE,
 }
 
 
@@ -118,7 +105,6 @@ def collect_production_environment_issues(
     issues: list[ErrorCode] = []
     runner._collect_baidu_environment_issues(issues)
     runner._collect_qwen_environment_issues(issues)
-    runner._collect_pyannote_environment_issues(issues)
     runner._collect_local_stack_environment_issues(issues)
     return tuple(dict.fromkeys(issues))
 
@@ -257,13 +243,6 @@ class LiveValidationRunner:
     ) -> GateCheck:
         return self._run("qwen_live", evaluation_run_id, package)
 
-    def run_pyannote(
-        self,
-        evaluation_run_id: str,
-        package: ValidatedEvaluationPackage,
-    ) -> GateCheck:
-        return self._run("pyannote_live", evaluation_run_id, package)
-
     def run_local_model_stack(
         self,
         evaluation_run_id: str,
@@ -281,13 +260,6 @@ class LiveValidationRunner:
     def run_workspace_qwen(self, evaluation_run_id: str) -> GateCheck:
         return self._run(
             "qwen_live",
-            evaluation_run_id,
-            self._load_workspace_package(),
-        )
-
-    def run_workspace_pyannote(self, evaluation_run_id: str) -> GateCheck:
-        return self._run(
-            "pyannote_live",
             evaluation_run_id,
             self._load_workspace_package(),
         )
@@ -522,8 +494,6 @@ class LiveValidationRunner:
             self._execute_baidu(samples[0], components, journal)
         elif check_id == "qwen_live":
             self._execute_qwen(samples[0], components, journal)
-        elif check_id == "pyannote_live":
-            self._execute_pyannote(samples[0], components, journal)
         else:
             self._execute_local_model_stack(samples, components, journal)
 
@@ -656,37 +626,6 @@ class LiveValidationRunner:
             )
         )
 
-    def _execute_pyannote(
-        self,
-        sample: LiveSample,
-        components: ProductionDiagnosticComponents,
-        journal: _LiveExecutionJournal,
-    ) -> None:
-        audio = self._verified_live_input_path(
-            sample.audio_relative_path,
-            sample.audio_sha256,
-            max_bytes=self._settings.max_video_bytes,
-        )
-        turns = components.speech_models.diarizer.diarize(
-            audio,
-            min_speakers=None,
-            max_speakers=None,
-        )
-        journal.record_success(
-            LiveExecutionSummary(
-                schema_version="1.0.0",
-                component="pyannote",
-                operation="diarize",
-                evaluation_run_id=journal.evaluation_run_id,
-                model=self._production_model(components, "pyannote"),
-                sample_id=sample.sample_id,
-                language=sample.language,
-                input_kind="AUDIO",
-                input_sha256=sample.audio_sha256,
-                output_item_count=len(turns),
-            )
-        )
-
     def _execute_local_model_stack(
         self,
         samples: tuple[LiveSample, ...],
@@ -719,127 +658,56 @@ class LiveValidationRunner:
                 output_item_count=len(vad.speech),
             )
         )
-        segments_by_sample: dict[str, tuple[SpeechSegment, ...]] = {}
         for sample in ordered:
             audio = self._verified_live_input_path(
                 sample.audio_relative_path,
                 sample.audio_sha256,
                 max_bytes=self._settings.max_video_bytes,
             )
-            span = LanguageSpan(
-                evidence_id=stable_identifier(
-                    "live_language",
-                    {
-                        "sample_id": sample.sample_id,
-                        "audio_sha256": sample.audio_sha256,
-                    },
-                ),
-                start_ms=0,
-                end_ms=sample.duration_ms,
-                language=sample.language,
-                confidence=1.0,
-                is_fully_evaluated_language=True,
-            )
-            raw_segments = components.speech_models.recognizer.transcribe_slice(
+            result = components.speech_models.recognizer.transcribe_window(
                 audio,
-                span,
+                language_hint=sample.language,
+                prompt=None,
             )
-            if not raw_segments:
+            if not result.segments:
                 raise VideoDemoError(
                     ErrorCode.SPEECH_MODEL_UNAVAILABLE,
-                    "五语 faster-whisper 未返回可对齐片段",
+                    "五语云端 Whisper 未返回转写片段",
                 )
-            segments = build_speech_segments(span, raw_segments)
-            if not segments:
-                raise VideoDemoError(
-                    ErrorCode.SPEECH_MODEL_UNAVAILABLE,
-                    "五语 faster-whisper 结果为空",
-                )
-            segments_by_sample[sample.sample_id] = segments
-            journal.record_success(
-                LiveExecutionSummary(
-                    schema_version="1.0.0",
-                    component="faster_whisper",
-                    operation="transcribe",
-                    evaluation_run_id=journal.evaluation_run_id,
-                    model=self._production_model(components, "faster_whisper"),
-                    sample_id=sample.sample_id,
-                    language=sample.language,
-                    input_kind="AUDIO",
-                    input_sha256=sample.audio_sha256,
-                    output_item_count=len(segments),
-                )
-            )
-        for sample in ordered:
-            audio = self._verified_live_input_path(
-                sample.audio_relative_path,
-                sample.audio_sha256,
-                max_bytes=self._settings.max_video_bytes,
-            )
-            alignment = components.speech_models.aligner.align(
-                audio,
-                segments_by_sample[sample.sample_id],
-            )
             if any(
-                warning.startswith("ALIGNMENT_MODEL_UNAVAILABLE:")
-                for warning in alignment.warning_codes
+                segment.start_ms < 0
+                or segment.end_ms <= segment.start_ms
+                or segment.end_ms > sample.duration_ms
+                for segment in result.segments
             ):
                 raise VideoDemoError(
-                    ErrorCode.SPEECH_MODEL_UNAVAILABLE,
-                    "五语 WhisperX 对齐模型不可用",
+                    ErrorCode.SPEECH_AUDIO_INVALID,
+                    "五语云端 Whisper 返回了非法时间范围",
                 )
             journal.record_success(
                 LiveExecutionSummary(
                     schema_version="1.0.0",
-                    component="whisperx",
-                    operation="align",
+                    component="cloud_whisper",
+                    operation="transcribe",
                     evaluation_run_id=journal.evaluation_run_id,
-                    model=self._production_model(
-                        components,
-                        "whisperx",
-                        language=sample.language,
-                    ),
+                    model=self._production_model(components, "cloud_whisper"),
                     sample_id=sample.sample_id,
                     language=sample.language,
                     input_kind="AUDIO",
                     input_sha256=sample.audio_sha256,
-                    output_item_count=len(alignment.words),
+                    output_item_count=len(result.segments),
                 )
             )
-        events = components.speech_models.audio_events.detect(
-            first_audio,
-            duration_ms=first.duration_ms,
-        )
-        journal.record_success(
-            LiveExecutionSummary(
-                schema_version="1.0.0",
-                component="yamnet",
-                operation="detect",
-                evaluation_run_id=journal.evaluation_run_id,
-                model=self._production_model(components, "yamnet"),
-                sample_id=first.sample_id,
-                language=first.language,
-                input_kind="AUDIO",
-                input_sha256=first.audio_sha256,
-                output_item_count=len(events),
-            )
-        )
 
     def _production_model(
         self,
         components: ProductionDiagnosticComponents,
         component: str,
-        *,
-        language: ValidationLanguage | None = None,
     ) -> ModelIdentity:
         candidates = tuple(
             model
             for model in components.model_identity_report.models
             if model.component == component
-            and (
-                component != "whisperx"
-                or model.model_id == f"whisperx-align-{language}"
-            )
         )
         if len(candidates) != 1:
             raise VideoDemoError(
@@ -914,7 +782,6 @@ class LiveValidationRunner:
             filename = {
                 "baidu_ocr_live": "keyframe.jpg",
                 "qwen_live": "clip.mp4",
-                "pyannote_live": "audio.wav",
             }[check_id]
             samples = (
                 self._select_single_sample(package, evaluation_run_id, filename),
@@ -1077,8 +944,6 @@ class LiveValidationRunner:
             self._collect_baidu_issues(issues, evaluation_run_id, package)
         elif check_id == "qwen_live":
             self._collect_qwen_issues(issues, evaluation_run_id, package)
-        elif check_id == "pyannote_live":
-            self._collect_pyannote_issues(issues, evaluation_run_id, package)
         else:
             self._collect_local_stack_issues(issues, evaluation_run_id, package)
         ordered = _LIVE_PREFLIGHT_CODES[check_id]
@@ -1092,9 +957,6 @@ class LiveValidationRunner:
         elif check_id == "qwen_live":
             self._collect_qwen_environment_issues(issues)
             issues.append(ErrorCode.LIVE_AUTHORIZED_CLIP_UNAVAILABLE)
-        elif check_id == "pyannote_live":
-            self._collect_pyannote_environment_issues(issues)
-            issues.append(ErrorCode.LIVE_AUTHORIZED_AUDIO_UNAVAILABLE)
         else:
             self._collect_local_stack_environment_issues(issues)
             issues.append(ErrorCode.LIVE_FIVE_LANGUAGE_AUDIO_UNAVAILABLE)
@@ -1144,29 +1006,6 @@ class LiveValidationRunner:
         ):
             issues.append(ErrorCode.QWEN_MODEL_ID_UNAVAILABLE)
 
-    def _collect_pyannote_issues(
-        self,
-        issues: list[ErrorCode],
-        evaluation_run_id: str,
-        package: ValidatedEvaluationPackage,
-    ) -> None:
-        self._collect_pyannote_environment_issues(issues)
-        if not self._has_single_live_input(package, evaluation_run_id, "audio.wav"):
-            issues.append(ErrorCode.LIVE_AUTHORIZED_AUDIO_UNAVAILABLE)
-
-    def _collect_pyannote_environment_issues(self, issues: list[ErrorCode]) -> None:
-        if not _has_secret(self._settings.huggingface_token):
-            issues.append(ErrorCode.PYANNOTE_TOKEN_UNAVAILABLE)
-        if not self._pyannote_terms_accepted():
-            issues.append(ErrorCode.PYANNOTE_TERMS_UNAVAILABLE)
-        if not self._module_available("pyannote.audio"):
-            issues.append(ErrorCode.PYANNOTE_DEPENDENCY_UNAVAILABLE)
-        if not _has_nonempty_model_tree(
-            self._store.runtime_root / "models/pyannote",
-            ignored_relative_paths=frozenset({"terms-accepted.json"}),
-        ):
-            issues.append(ErrorCode.PYANNOTE_MODEL_UNAVAILABLE)
-
     def _collect_local_stack_issues(
         self,
         issues: list[ErrorCode],
@@ -1186,24 +1025,10 @@ class LiveValidationRunner:
             issues.append(ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE)
         if not _has_exact_file(model_root / "silero/model-id.txt", b"silero-vad\n"):
             issues.append(ErrorCode.SILERO_MODEL_UNAVAILABLE)
-        if not self._module_available("faster_whisper"):
-            issues.append(ErrorCode.FASTER_WHISPER_DEPENDENCY_UNAVAILABLE)
-        if not is_complete_faster_whisper_model(model_root / "faster-whisper"):
-            issues.append(ErrorCode.FASTER_WHISPER_MODEL_UNAVAILABLE)
-        if not self._module_available("whisperx"):
-            issues.append(ErrorCode.WHISPERX_DEPENDENCY_UNAVAILABLE)
-        if any(
-            not _has_nonempty_model_tree(model_root / "whisperx" / language)
-            for language in ("zh", "en", "ja", "ko", "es")
-        ):
-            issues.append(ErrorCode.WHISPERX_MODEL_UNAVAILABLE)
-        if not self._module_available("tensorflow_hub"):
-            issues.append(ErrorCode.YAMNET_DEPENDENCY_UNAVAILABLE)
-        if not (
-            _is_nonempty_regular_file(model_root / "yamnet/saved_model/saved_model.pb")
-            and _is_nonempty_regular_file(model_root / "yamnet/yamnet_class_map.csv")
-        ):
-            issues.append(ErrorCode.YAMNET_MODEL_UNAVAILABLE)
+        try:
+            self._settings.require_cloud_asr_configuration()
+        except VideoDemoError:
+            issues.append(ErrorCode.INVALID_CONFIGURATION)
 
     def _has_single_live_input(
         self,
@@ -1263,37 +1088,11 @@ class LiveValidationRunner:
             / filename
         )
 
-    def _pyannote_terms_accepted(self) -> bool:
-        path = self._store.runtime_root / "models/pyannote/terms-accepted.json"
-        try:
-            snapshot = _read_file_snapshot(
-                path,
-                max_bytes=4 * 1024,
-                capture_content=True,
-            )
-            if snapshot.content is None:
-                return False
-            payload = _decode_strict_json(snapshot.content.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError):
-            return False
-        return bool(
-            payload
-            == {
-                "schema_version": "1.0.0",
-                "model_id": "pyannote/speaker-diarization-community-1",
-                "accepted": True,
-            }
-            and payload.get("accepted") is True
-        )
-
     def _module_available(self, name: str) -> bool:
         try:
             if importlib.util.find_spec(name) is None:
                 return False
-            if name == "tensorflow_hub":
-                import_tensorflow_hub(importer=importlib.import_module)
-            else:
-                importlib.import_module(name)
+            importlib.import_module(name)
             return True
         except (ImportError, ModuleNotFoundError, AttributeError, OSError, ValueError):
             return False
@@ -1446,19 +1245,16 @@ class LiveValidationRunner:
         raw: (
             BaiduLiveRawReport
             | QwenLiveRawReport
-            | PyannoteLiveRawReport
             | FiveLanguageModelsRawReport
         )
         details_type: (
             type[BaiduLiveDetails]
             | type[QwenLiveDetails]
-            | type[PyannoteLiveDetails]
             | type[FiveLanguageModelsDetails]
         )
         detail_name: Literal[
             "BAIDU_LIVE",
             "QWEN_LIVE",
-            "PYANNOTE_LIVE",
             "FIVE_LANGUAGE_MODELS",
         ]
         if check_id == "baidu_ocr_live":
@@ -1469,10 +1265,6 @@ class LiveValidationRunner:
             raw = QwenLiveRawReport(sample=prepared.samples[0], **raw_kwargs)
             details_type = QwenLiveDetails
             detail_name = "QWEN_LIVE"
-        elif check_id == "pyannote_live":
-            raw = PyannoteLiveRawReport(sample=prepared.samples[0], **raw_kwargs)
-            details_type = PyannoteLiveDetails
-            detail_name = "PYANNOTE_LIVE"
         else:
             raw = FiveLanguageModelsRawReport(samples=prepared.samples, **raw_kwargs)
             details_type = FiveLanguageModelsDetails
@@ -1704,15 +1496,11 @@ def _execution_stages(
             ("qwen", "capability_probe", samples[0]),
             ("qwen", "understand_segment", samples[0]),
         )
-    if check_id == "pyannote_live":
-        return (("pyannote", "diarize", samples[0]),)
     by_language = {sample.language: sample for sample in samples}
     ordered = tuple(by_language[language] for language in _VALIDATION_LANGUAGES)
     return (
         ("silero_vad", "vad", ordered[0]),
-        *(("faster_whisper", "transcribe", sample) for sample in ordered),
-        *(("whisperx", "align", sample) for sample in ordered),
-        ("yamnet", "detect", ordered[0]),
+        *(("cloud_whisper", "transcribe", sample) for sample in ordered),
     )
 
 

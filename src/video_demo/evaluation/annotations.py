@@ -10,7 +10,6 @@ from typing import Literal, Self
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from video_demo.domain.base import FrozenModel, Sha256, StableId
-from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.evaluation.dataset import (
     EvaluationDataset,
@@ -21,16 +20,6 @@ from video_demo.evaluation.dataset import (
 )
 
 _DEFAULT_MAX_VIDEO_BYTES = 4 * 1024 * 1024 * 1024
-
-
-class ReferenceWord(TimeRange):
-    word_id: StableId
-    text: str = Field(min_length=1)
-
-
-class ReferenceSpeakerTurn(TimeRange):
-    turn_id: StableId
-    speaker_id: StableId
 
 
 class ReferenceOcrFrame(FrozenModel):
@@ -44,11 +33,6 @@ class ReferenceOcrFrame(FrozenModel):
         if any(not line for line in value):
             raise ValueError("OCR 行不得为空")
         return value
-
-
-class ReferenceAudioEvent(TimeRange):
-    event_id: StableId
-    normalized_event: str = Field(min_length=1, max_length=128)
 
 
 class SupportedFact(FrozenModel):
@@ -122,10 +106,7 @@ class EvaluationAnnotation(FrozenModel):
     duration_ms: int = Field(gt=0)
     language: Literal["zh", "en", "ja", "ko", "es"]
     reference_text: str = Field(min_length=1)
-    words: tuple[ReferenceWord, ...] = Field(min_length=1)
-    speaker_turns: tuple[ReferenceSpeakerTurn, ...] = Field(min_length=1)
     ocr_frames: tuple[ReferenceOcrFrame, ...] = Field(min_length=1)
-    audio_events: tuple[ReferenceAudioEvent, ...] = Field(min_length=1)
     scene_boundaries_ms: tuple[int, ...] = Field(min_length=1)
     semantic_boundaries_ms: tuple[int, ...] = Field(min_length=1)
     supported_facts: tuple[SupportedFact, ...] = Field(min_length=1)
@@ -149,9 +130,6 @@ class EvaluationAnnotation(FrozenModel):
     @model_validator(mode="after")
     def validate_annotation_references(self) -> Self:
         self._validate_unique_ids()
-        for item in (*self.words, *self.speaker_turns, *self.audio_events):
-            if item.end_ms > self.duration_ms:
-                raise ValueError("标注时间不得超过媒体时长")
         if any(timestamp >= self.duration_ms for timestamp in self.ocr_timestamps):
             raise ValueError("OCR 帧时间不得超过媒体时长")
         self._validate_boundaries(self.scene_boundaries_ms)
@@ -169,10 +147,7 @@ class EvaluationAnnotation(FrozenModel):
 
     def _validate_unique_ids(self) -> None:
         collections = (
-            tuple(word.word_id for word in self.words),
-            tuple(turn.turn_id for turn in self.speaker_turns),
             tuple(frame.frame_id for frame in self.ocr_frames),
-            tuple(event.event_id for event in self.audio_events),
             tuple(fact.fact_id for fact in self.supported_facts),
             tuple(person.person_id for person in self.known_people),
         )

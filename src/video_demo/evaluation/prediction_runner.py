@@ -19,7 +19,6 @@ from video_demo.application.composition import (
     build_production_model_identity_report,
     build_worker,
 )
-from video_demo.audio.yamnet import import_tensorflow_hub
 from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.domain.evidence import EvidenceItem, KeyframeEvidence
@@ -258,22 +257,13 @@ class PredictionRunner:
             capabilities = probe_runtime_capabilities(self._settings)
             if capabilities.issues:
                 return capabilities.issues[0].code.value
-            if not _has_dependency("faster_whisper"):
-                return "FASTER_WHISPER_DEPENDENCY_UNAVAILABLE"
-            if not _has_dependency("whisperx"):
-                return "WHISPERX_DEPENDENCY_UNAVAILABLE"
-            if not _has_dependency("pyannote.audio"):
-                return "PYANNOTE_DEPENDENCY_UNAVAILABLE"
             if not _has_dependency("silero_vad"):
                 return "SILERO_DEPENDENCY_UNAVAILABLE"
-            if not _has_dependency("tensorflow_hub"):
-                return "YAMNET_DEPENDENCY_UNAVAILABLE"
+            self._settings.require_cloud_asr_configuration()
             if self._settings.qwen_api_key is None or not self._settings.qwen_base_url:
                 return "QWEN_CREDENTIALS_UNAVAILABLE"
             if self._settings.baidu_api_key is None or self._settings.baidu_secret_key is None:
                 return "BAIDU_OCR_CREDENTIALS_UNAVAILABLE"
-            if self._settings.huggingface_token is None:
-                return "PYANNOTE_TOKEN_UNAVAILABLE"
         except (OSError, ValueError, VideoDemoError):
             return "EVALUATION_PREFLIGHT_INVALID"
         return None
@@ -1112,10 +1102,7 @@ def _has_dependency(name: str) -> bool:
     try:
         if importlib.util.find_spec(name) is None:
             return False
-        if name == "tensorflow_hub":
-            import_tensorflow_hub(importer=importlib.import_module)
-        else:
-            importlib.import_module(name)
+        importlib.import_module(name)
         return True
     except (ImportError, ModuleNotFoundError, AttributeError, OSError, ValueError):
         return False
@@ -1143,8 +1130,6 @@ def _create_run_request(
         "object_ref": object_ref,
         "idempotency_key": idempotency_key,
         "language_hints": [sample.language],
-        "min_speakers": None,
-        "max_speakers": None,
         "hotwords": list(sample.hotwords),
         "core_context": sample.core_context,
     }
