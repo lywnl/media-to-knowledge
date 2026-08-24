@@ -250,6 +250,7 @@ def _keyframe(timestamp_ms: int) -> KeyframeEvidence:
         mime_type="image/jpeg",
         sha256=f"{timestamp_ms:064x}",
         perceptual_hash=f"{timestamp_ms:016x}",
+        size_bytes=1,
     )
 
 

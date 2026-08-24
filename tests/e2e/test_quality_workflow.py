@@ -154,6 +154,7 @@ def _fake_worker_factory(app: FastAPI, calls: list[str]):
                     mime_type="image/jpeg",
                     sha256=hashlib.sha256(keyframe_bytes).hexdigest(),
                     perceptual_hash="abcdef12",
+                    size_bytes=len(keyframe_bytes),
                 ),
             )
             segment_text = "类型：VIDEO_SEGMENT"

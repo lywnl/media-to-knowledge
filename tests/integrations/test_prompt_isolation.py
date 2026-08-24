@@ -170,6 +170,7 @@ def test_whole_video_prompt_projects_only_model_relevant_evidence(
             mime_type="image/jpeg",
             sha256="a" * 64,
             perceptual_hash="deadbeef",
+            size_bytes=1,
         ),
         OcrEvidence(
             evidence_id="ocr_001",

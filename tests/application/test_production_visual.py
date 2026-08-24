@@ -714,6 +714,7 @@ def test_keyframe_limit_uses_video_time_instead_of_candidate_density() -> None:
             mime_type="image/jpeg",
             sha256=f"{timestamp_ms:064x}",
             perceptual_hash=f"{timestamp_ms:016x}",
+            size_bytes=1,
         )
         for timestamp_ms in (*range(91), 500, 1_000)
     )

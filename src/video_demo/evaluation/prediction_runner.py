@@ -477,6 +477,7 @@ class PredictionRunner:
                         mime_type=public_item.mime_type,
                         sha256=public_item.sha256,
                         perceptual_hash=public_item.perceptual_hash,
+                        size_bytes=public_item.size_bytes,
                     )
                 )
             else:

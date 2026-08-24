@@ -552,6 +552,7 @@ def test_production_query_chain_checks_job_evidence_page_and_keyframe_content(
                     "mime_type": "image/jpeg",
                     "sha256": keyframe_sha256,
                     "perceptual_hash": "0" * 16,
+                    "size_bytes": len(keyframe_bytes),
                 }
             ],
             "next_cursor": None,

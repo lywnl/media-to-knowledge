@@ -440,6 +440,7 @@ def test_keyframe_bytes_are_digest_checked_and_return_correct_mime(
         mime_type="image/png",
         sha256=hashlib.sha256(keyframe_bytes).hexdigest(),
         perceptual_hash="abcdef12",
+        size_bytes=len(keyframe_bytes),
     )
     service.persist(
         scope,
@@ -477,6 +478,7 @@ def test_keyframe_path_cannot_escape_to_another_run(
         mime_type="image/png",
         sha256=hashlib.sha256(content).hexdigest(),
         perceptual_hash="abcdef12",
+        size_bytes=len(content),
     )
     service.persist(
         scope,

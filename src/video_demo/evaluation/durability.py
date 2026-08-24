@@ -1124,16 +1124,19 @@ def _verify_production_queries(
         or not _evidence_matches_api(artifact.evidence, normalized)
     ):
         raise ValueError("耐久查询结果与生产 Manifest 不一致")
-    for item in public_evidence:
-        if not isinstance(item, PublicKeyframeEvidence):
+    for public_item in public_evidence:
+        if not isinstance(public_item, PublicKeyframeEvidence):
             continue
         content = client.get(
             f"/api/kb/knowledge-bases/evaluation/video-understanding-runs/{run_id}"
-            f"/keyframes/{item.keyframe_id}/content",
+            f"/keyframes/{public_item.keyframe_id}/content",
             headers=_DEFAULT_SCOPE_HEADERS,
         )
         _require_status(content, 200)
         mime = content.headers.get("content-type", "").split(";", 1)[0]
-        if mime != item.mime_type or hashlib.sha256(content.content).hexdigest() != item.sha256:
+        if (
+            mime != public_item.mime_type
+            or hashlib.sha256(content.content).hexdigest() != public_item.sha256
+        ):
             raise ValueError("耐久关键帧内容与证据不一致")
     return manifest_bytes

@@ -382,6 +382,7 @@ class ProductionVisualAnalyzer:
                         mime_type="image/jpeg",
                         sha256=sha256,
                         perceptual_hash=frame.perceptual_hash,
+                        size_bytes=len(payload),
                     ),
                 )
         return tuple(keyframes), warnings

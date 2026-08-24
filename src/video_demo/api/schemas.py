@@ -119,6 +119,7 @@ class PublicKeyframeEvidence(PublicTimedEvidence):
     mime_type: Literal["image/jpeg", "image/png"]
     sha256: str
     perceptual_hash: str
+    size_bytes: int = Field(ge=1)
 
 
 class PublicOcrLine(ApiModel):

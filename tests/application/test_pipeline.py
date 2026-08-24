@@ -333,6 +333,7 @@ def test_pipeline_fuses_asr_ocr_keyframe_scene_with_published_qwen_result(
                 mime_type="image/jpeg",
                 sha256="c" * 64,
                 perceptual_hash="abcdef12",
+                size_bytes=1,
             )
             ocr = OcrEvidence(
                 evidence_id="ocr_001",

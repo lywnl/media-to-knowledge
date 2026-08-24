@@ -104,6 +104,7 @@ def _persist_ready_result(
         mime_type="image/jpeg",
         sha256=hashlib.sha256(keyframe_bytes).hexdigest(),
         perceptual_hash="abcdef12",
+        size_bytes=len(keyframe_bytes),
     )
     segment_text = "类型：VIDEO_SEGMENT"
     segment = VideoSegment(
@@ -314,6 +315,7 @@ def _fake_production_pipeline(
                 mime_type="image/jpeg",
                 sha256=hashlib.sha256(keyframe_bytes).hexdigest(),
                 perceptual_hash="abcdef12",
+                size_bytes=len(keyframe_bytes),
             )
             ranges = (
                 ((0, 1_000),)

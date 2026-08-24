@@ -1,0 +1,77 @@
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from video_demo.domain.document_plan import (
+    BaseSegment,
+    ChapterDraft,
+    ChapterPlan,
+    FrameCandidateArtifact,
+    VisualSearchTarget,
+)
+
+
+def test_chapter_plan_contains_only_program_owned_time_and_ids() -> None:
+    segment = BaseSegment(
+        segment_id="segment_001",
+        start_ms=0,
+        end_ms=10_000,
+        evidence_refs=("asr_001",),
+        transcript_source="ASR",
+    )
+    target = VisualSearchTarget(
+        target_id="target_001",
+        purpose="SEMANTIC",
+        query_zh="屏幕上的配置参数",
+        anchor_evidence_refs=("asr_001",),
+    )
+    plan = ChapterPlan(
+        chapter_id="chapter_001",
+        start_ms=0,
+        end_ms=10_000,
+        segment_refs=(segment.segment_id,),
+        title_hint="配置参数",
+        visual_mode="SINGLE",
+        semantic_targets=(target,),
+        base_coverage_targets=(),
+    )
+
+    assert plan.segment_refs == ("segment_001",)
+    assert "start_ms" not in ChapterDraft.model_fields
+    assert "chapter_id" not in ChapterDraft.model_fields
+
+
+def test_semantic_target_requires_one_to_three_transcript_anchors() -> None:
+    with pytest.raises(ValidationError):
+        VisualSearchTarget(
+            target_id="target_001",
+            purpose="SEMANTIC",
+            query_zh="参数",
+            anchor_evidence_refs=(),
+        )
+
+
+def test_base_coverage_target_cannot_use_transcript_anchor() -> None:
+    with pytest.raises(ValidationError, match=r"scene_refs|锚点"):
+        VisualSearchTarget(
+            target_id="target_001",
+            purpose="BASE_COVERAGE",
+            query_zh="代表性画面",
+            anchor_evidence_refs=("asr_001",),
+            scene_refs=(),
+        )
+
+
+def test_frame_candidate_has_bounded_identity_and_positive_size() -> None:
+    candidate = FrameCandidateArtifact(
+        frame_id="frame_001",
+        timestamp_ms=2_000,
+        sha256="a" * 64,
+        size_bytes=128,
+        relative_path="visual/candidates/a.jpg",
+        perceptual_hash="0123456789abcdef",
+        target_ids=("target_001",),
+    )
+
+    assert candidate.size_bytes == 128
