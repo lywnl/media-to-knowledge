@@ -404,6 +404,96 @@ def test_client_classifies_http_errors_and_retries_only_temporary_failures(
     assert "private prompt" not in rendered
 
 
+def test_client_retries_proxy_no_available_model_branch_without_leaking_message(
+    tmp_path: Path,
+) -> None:
+    audio = _audio(tmp_path)
+    responses = (
+        httpx.Response(
+            400,
+            json={
+                "message": (
+                    "Model is invalid: no available branch for policy group: "
+                    "openai/whisper"
+                ),
+            },
+        ),
+        httpx.Response(200, json=_valid_payload()),
+    )
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        response = responses[attempts]
+        attempts += 1
+        response.request = request
+        return response
+
+    client, _http_client = _client(tmp_path, handler, sleeper=sleeps.append)
+
+    result = client.transcribe_window(audio, language_hint=None, prompt=None)
+
+    assert result.segments[0].text == "Hello world"
+    assert attempts == 2
+    assert sleeps == [60]
+
+
+def test_client_does_not_retry_other_top_level_400_messages(tmp_path: Path) -> None:
+    audio = _audio(tmp_path)
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            400,
+            json={
+                "message": (
+                    "Model is invalid: no available branch for policy group: "
+                    "another/model"
+                ),
+            },
+            request=request,
+        )
+
+    client, _http_client = _client(tmp_path, handler)
+
+    with pytest.raises(VideoDemoError) as raised:
+        client.transcribe_window(audio, language_hint=None, prompt=None)
+
+    assert raised.value.code == ErrorCode.SPEECH_MODEL_UNAVAILABLE
+    assert attempts == 1
+    assert raised.value.details == {"status_code": 400}
+
+
+def test_client_hides_proxy_message_after_model_branch_retries_are_exhausted(
+    tmp_path: Path,
+) -> None:
+    audio = _audio(tmp_path)
+    provider_message = (
+        "Model is invalid: no available branch for policy group: openai/whisper"
+    )
+    sleeps: list[float] = []
+    client, _http_client = _client(
+        tmp_path,
+        lambda request: httpx.Response(
+            400,
+            json={"message": provider_message},
+            request=request,
+        ),
+        sleeper=sleeps.append,
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        client.transcribe_window(audio, language_hint=None, prompt=None)
+
+    assert raised.value.code == ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
+    assert raised.value.details == {"status_code": 400}
+    assert sleeps == [60, 60]
+    assert provider_message not in "".join(traceback.format_exception(raised.value))
+
+
 def test_client_retries_transport_errors_and_reopens_file_from_start(
     tmp_path: Path,
 ) -> None:

@@ -16,6 +16,7 @@ from video_demo.storage.workspace import reject_symlink_components
 
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+_MODEL_BRANCH_EXHAUSTION_DELAY_SECONDS = 60.0
 _PROVIDER_ERROR_CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _LANGUAGE_CODE = re.compile(r"^[a-z]{2,3}$")
 
@@ -136,6 +137,10 @@ _LANGUAGES = {
 }
 
 
+class _TemporaryModelBranchExhaustion(VideoDemoError):
+    pass
+
+
 class CloudWhisperClient:
     """同步 OpenAI 兼容 Whisper 客户端；不拥有传入的 HTTP Client。"""
 
@@ -180,7 +185,11 @@ class CloudWhisperClient:
                     timeout=self._configuration.timeout_seconds,
                 ) as response:
                     content = _bounded_response_content(response)
-                    _raise_for_status(response, content)
+                    _raise_for_status(
+                        response,
+                        content,
+                        model=self._configuration.model,
+                    )
                 return _parse_response(content)
             except httpx.RequestError:
                 last_error = VideoDemoError(
@@ -192,7 +201,12 @@ class CloudWhisperClient:
                     raise
                 last_error = error
             if attempt < self._configuration.max_attempts:
-                self._sleeper(min(2 ** (attempt - 1), 4))
+                delay = (
+                    _MODEL_BRANCH_EXHAUSTION_DELAY_SECONDS
+                    if isinstance(last_error, _TemporaryModelBranchExhaustion)
+                    else min(2 ** (attempt - 1), 4)
+                )
+                self._sleeper(delay)
         if last_error is None:
             raise RuntimeError("云端语音识别重试状态非法")
         raise last_error from None
@@ -240,14 +254,23 @@ def _validated_audio_path(root: Path, candidate: Path) -> Path:
     return path
 
 
-def _raise_for_status(response: httpx.Response, content: bytes) -> None:
+def _raise_for_status(
+    response: httpx.Response,
+    content: bytes,
+    *,
+    model: str,
+) -> None:
     if response.status_code < 400:
         return
     details: dict[str, object] = {"status_code": response.status_code}
     provider_error_code = _provider_error_code(content)
     if provider_error_code is not None:
         details["provider_error_code"] = provider_error_code
-    if response.status_code in {408, 429} or response.status_code >= 500:
+    if (
+        response.status_code in {408, 429}
+        or response.status_code >= 500
+        or _is_temporary_model_branch_exhaustion(response.status_code, content, model)
+    ):
         code = ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
         message = "云端语音识别服务暂时不可用"
     elif response.status_code in {401, 403}:
@@ -259,7 +282,27 @@ def _raise_for_status(response: httpx.Response, content: bytes) -> None:
     else:
         code = ErrorCode.SPEECH_MODEL_UNAVAILABLE
         message = "云端语音识别请求被拒绝"
+    if _is_temporary_model_branch_exhaustion(response.status_code, content, model):
+        raise _TemporaryModelBranchExhaustion(code, message, details)
     raise VideoDemoError(code, message, details)
+
+
+def _is_temporary_model_branch_exhaustion(
+    status_code: int,
+    content: bytes,
+    model: str,
+) -> bool:
+    if status_code != 400:
+        return False
+    try:
+        payload: object = json.loads(content)
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("message") == (
+        f"Model is invalid: no available branch for policy group: {model}"
+    )
 
 
 def _provider_error_code(content: bytes) -> str | None:
