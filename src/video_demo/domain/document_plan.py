@@ -15,7 +15,7 @@ _CANDIDATE_PATH_PATTERN = re.compile(r"^visual/candidates/([0-9a-f]{64})\.jpg$")
 class BaseSegment(TimeRange):
     segment_id: StableId
     evidence_refs: tuple[StableId, ...] = Field(max_length=256)
-    scene_refs: tuple[StableId, ...] = Field(default=(), max_length=8)
+    scene_refs: tuple[StableId, ...] = Field(default=(), max_length=256)
     transcript_source: TranscriptSource
 
     @model_validator(mode="after")

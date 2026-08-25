@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import logging
 import re
@@ -16,11 +17,13 @@ from typing import Protocol
 import httpx
 
 from video_demo.application.adaptive_ocr import AdaptiveOcrRunner, ocr_language
-from video_demo.application.pipeline import (
+from video_demo.application.pipeline import VisualAnalysis, VisualPreparation
+from video_demo.application.pipeline_contracts import (
+    EvidencePreparationLimits,
     PreparedMedia,
+    SceneIndex,
     SpeechAnalysis,
-    VisualAnalysis,
-    VisualPreparation,
+    scene_index_sha256,
 )
 from video_demo.domain.base import stable_identifier
 from video_demo.domain.evidence import (
@@ -57,6 +60,13 @@ from video_demo.visual.windows import (
 _SPACE_AND_PUNCTUATION = re.compile(r"[^\w\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
 _EMPTY_SPEECH_ANALYSIS = SpeechAnalysis(transcript_source="NONE")
 _LOGGER = logging.getLogger(__name__)
+_MIN_NORMALIZED_SCENE_MS = 1_200
+_LEGACY_EVIDENCE_LIMITS = EvidencePreparationLimits(
+    max_transcript_evidence_items=20_000,
+    max_transcript_chars=2_000_000,
+    max_scene_boundaries=20_000,
+    max_base_segments=20_000,
+)
 
 
 class ClipClient(Protocol):
@@ -112,6 +122,7 @@ class ProductionVisualAnalyzer:
         *,
         max_video_bytes: int = 4 * 1024 * 1024 * 1024,
         ocr_budget_timeout_seconds: float = 30.0,
+        evidence_limits: EvidencePreparationLimits | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
         if max_video_bytes < 1:
@@ -121,6 +132,7 @@ class ProductionVisualAnalyzer:
         self._runtime_root = runtime_root.expanduser().resolve(strict=False)
         self._component_factory = component_factory
         self._max_video_bytes = max_video_bytes
+        self._evidence_limits = evidence_limits or _LEGACY_EVIDENCE_LIMITS
         self._adaptive_ocr = (
             AdaptiveOcrRunner(
                 self._runtime_root,
@@ -158,6 +170,36 @@ class ProductionVisualAnalyzer:
         *,
         is_cancel_requested: Callable[[], bool] = lambda: False,
     ) -> VisualPreparation:
+        scene_index = self.prepare_scene_index(
+            media,
+            limits=self._evidence_limits,
+            is_cancel_requested=is_cancel_requested,
+        )
+        run_relative_root = media.source.asset.run_relative_root
+        return VisualPreparation(
+            proxy_sha256=scene_index.proxy_sha256,
+            proxy_size_bytes=media.proxy_size_bytes,
+            run_relative_root=run_relative_root,
+            duration_ms=scene_index.duration_ms,
+            frame_tolerance_ms=scene_index.frame_tolerance_ms,
+            scenes=scene_index.scenes,
+            preparation_sha256=_preparation_sha256(
+                proxy_sha256=scene_index.proxy_sha256,
+                proxy_size_bytes=media.proxy_size_bytes,
+                run_relative_root=run_relative_root,
+                duration_ms=scene_index.duration_ms,
+                frame_tolerance_ms=scene_index.frame_tolerance_ms,
+                scenes=scene_index.scenes,
+            ),
+        )
+
+    def prepare_scene_index(
+        self,
+        media: PreparedMedia,
+        *,
+        limits: EvidencePreparationLimits,
+        is_cancel_requested: Callable[[], bool] = lambda: False,
+    ) -> SceneIndex:
         run_relative_root = media.source.asset.run_relative_root
         proxy = verified_mp4_file(
             self._runtime_root,
@@ -175,7 +217,7 @@ class ProductionVisualAnalyzer:
             media.source.manifest.video_stream.average_frame_rate,
             is_variable_frame_rate=media.source.manifest.video_stream.is_variable_frame_rate,
         )
-        scenes = _validate_scenes(
+        raw_scenes = _validate_scenes(
             components.scene_detector.detect(
                 proxy,
                 duration_ms=duration_ms,
@@ -184,18 +226,19 @@ class ProductionVisualAnalyzer:
             ),
             duration_ms,
         )
+        scenes = _normalize_scenes(
+            raw_scenes,
+            source_sha256=media.proxy_sha256,
+            maximum=limits.max_scene_boundaries,
+        )
         self._check_cancelled(is_cancel_requested)
-        return VisualPreparation(
+        return SceneIndex(
             proxy_sha256=media.proxy_sha256,
-            proxy_size_bytes=media.proxy_size_bytes,
-            run_relative_root=run_relative_root,
             duration_ms=duration_ms,
             frame_tolerance_ms=frame_tolerance_ms,
             scenes=scenes,
-            preparation_sha256=_preparation_sha256(
+            index_sha256=scene_index_sha256(
                 proxy_sha256=media.proxy_sha256,
-                proxy_size_bytes=media.proxy_size_bytes,
-                run_relative_root=run_relative_root,
                 duration_ms=duration_ms,
                 frame_tolerance_ms=frame_tolerance_ms,
                 scenes=scenes,
@@ -537,6 +580,143 @@ def _validate_scenes(
         if index == 0 and scene.transition == "hard_cut":
             raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "首个镜头不能伪造前置硬切")
     return ordered
+
+
+def _normalize_scenes(
+    scenes: Sequence[SceneBoundary],
+    *,
+    source_sha256: str,
+    maximum: int,
+) -> tuple[SceneBoundary, ...]:
+    ranges = _merge_transient_scene_runs(scenes)
+    ranges = _compress_scene_ranges(ranges, maximum)
+    return tuple(
+        SceneBoundary(
+            evidence_id=stable_identifier(
+                "scene",
+                {
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "transition": transition,
+                    "source_sha256": source_sha256,
+                },
+            ),
+            start_ms=start_ms,
+            end_ms=end_ms,
+            transition=transition,
+            score=1.0,
+        )
+        for start_ms, end_ms, transition in ranges
+    )
+
+
+def _compress_scene_ranges(
+    ranges: list[tuple[int, int, str]],
+    maximum: int,
+) -> list[tuple[int, int, str]]:
+    """按最短相邻组合压缩场景，并以原始左边界稳定解决同分。"""
+
+    if maximum < 1:
+        raise ValueError("规范场景数量上限必须大于 0")
+    if len(ranges) <= maximum:
+        return ranges
+
+    starts = [item[0] for item in ranges]
+    ends = [item[1] for item in ranges]
+    transitions = [item[2] for item in ranges]
+    previous: list[int | None] = [None, *range(len(ranges) - 1)]
+    following: list[int | None] = [*range(1, len(ranges)), None]
+    versions = [0] * len(ranges)
+    active = [True] * len(ranges)
+    heap: list[tuple[int, int, int, int, int]] = []
+
+    def push_pair(left: int | None) -> None:
+        if left is None or not active[left]:
+            return
+        right = following[left]
+        if right is None or not active[right]:
+            return
+        heapq.heappush(
+            heap,
+            (
+                ends[left] - starts[left] + ends[right] - starts[right],
+                left,
+                versions[left],
+                right,
+                versions[right],
+            ),
+        )
+
+    for left in range(len(ranges) - 1):
+        push_pair(left)
+
+    remaining = len(ranges)
+    while remaining > maximum:
+        _duration, left, left_version, right, right_version = heapq.heappop(heap)
+        if (
+            not active[left]
+            or not active[right]
+            or following[left] != right
+            or previous[right] != left
+            or versions[left] != left_version
+            or versions[right] != right_version
+        ):
+            continue
+
+        right_neighbor = following[right]
+        ends[left] = ends[right]
+        following[left] = right_neighbor
+        versions[left] += 1
+        active[right] = False
+        versions[right] += 1
+        if right_neighbor is not None:
+            previous[right_neighbor] = left
+        remaining -= 1
+
+        push_pair(previous[left])
+        push_pair(left)
+
+    compressed: list[tuple[int, int, str]] = []
+    current: int | None = 0
+    while current is not None:
+        if active[current]:
+            compressed.append((starts[current], ends[current], transitions[current]))
+        current = following[current]
+    return compressed
+
+
+def _merge_transient_scene_runs(
+    scenes: Sequence[SceneBoundary],
+) -> list[tuple[int, int, str]]:
+    normalized: list[tuple[int, int, str]] = []
+    index = 0
+    while index < len(scenes):
+        scene = scenes[index]
+        if scene.duration_ms >= _MIN_NORMALIZED_SCENE_MS:
+            normalized.append((scene.start_ms, scene.end_ms, scene.transition))
+            index += 1
+            continue
+        run_start = scene.start_ms
+        run_end = scene.end_ms
+        run_transition = scene.transition
+        index += 1
+        while (
+            index < len(scenes)
+            and run_end - run_start < _MIN_NORMALIZED_SCENE_MS
+        ):
+            run_end = scenes[index].end_ms
+            index += 1
+        if run_end - run_start >= _MIN_NORMALIZED_SCENE_MS:
+            normalized.append((run_start, run_end, run_transition))
+        elif normalized:
+            previous_start, _previous_end, previous_transition = normalized[-1]
+            normalized[-1] = (previous_start, run_end, previous_transition)
+        else:
+            normalized.append((run_start, run_end, run_transition))
+    if len(normalized) > 1 and normalized[-1][1] - normalized[-1][0] < _MIN_NORMALIZED_SCENE_MS:
+        previous_start, _previous_end, previous_transition = normalized[-2]
+        normalized[-2:] = [(previous_start, normalized[-1][1], previous_transition)]
+    return normalized
 
 
 def _preparation_sha256(

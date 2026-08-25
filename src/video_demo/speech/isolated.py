@@ -15,7 +15,7 @@ from typing import Literal
 
 from pydantic import ValidationError
 
-from video_demo.application.pipeline import PreparedMedia, SpeechAnalysis, StageMetric
+from video_demo.application.pipeline_contracts import PreparedMedia, SpeechAnalysis, StageMetric
 from video_demo.application.production_speech import (
     analysis_from_asr_snapshot,
     transcript_shortcut,

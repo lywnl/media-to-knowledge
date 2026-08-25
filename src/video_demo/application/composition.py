@@ -23,6 +23,7 @@ from video_demo.application.pipeline import (
     VideoUnderstandingPipeline,
     VisualAnalyzer,
 )
+from video_demo.application.pipeline_contracts import EvidencePreparationLimits
 from video_demo.application.production_media import (
     ProductionAssetProbe,
     ProductionAssetRegistrar,
@@ -461,6 +462,14 @@ def build_production_pipeline(
                 settings.runtime_root,
                 visual_factory,
                 max_video_bytes=settings.max_video_bytes,
+                evidence_limits=EvidencePreparationLimits(
+                    max_transcript_evidence_items=(
+                        settings.max_transcript_evidence_items
+                    ),
+                    max_transcript_chars=settings.max_transcript_chars,
+                    max_scene_boundaries=settings.max_scene_boundaries,
+                    max_base_segments=settings.max_base_segments,
+                ),
             ),
             understanding,
             owned_resources=(visual_factory.http_client, qwen_http_client),

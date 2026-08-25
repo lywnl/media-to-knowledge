@@ -7,7 +7,7 @@ from typing import cast
 
 import httpx
 
-from video_demo.application.pipeline import PreparedMedia
+from video_demo.application.pipeline_contracts import PreparedMedia
 from video_demo.application.production_media import TranscodeClient, build_ffmpeg_factory
 from video_demo.application.production_speech import (
     AsrComponents,

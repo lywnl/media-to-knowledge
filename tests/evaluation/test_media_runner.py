@@ -3189,6 +3189,69 @@ def test_real_media_digest_does_not_claim_subtitle_or_speech_execution() -> None
     assert Path("src/video_demo/speech/isolated.py") not in _REAL_MEDIA_IMPLEMENTATION_FILES
 
 
+def test_implementation_import_closure_ignores_type_checking_only_imports(
+    tmp_path: Path,
+) -> None:
+    from video_demo.implementation import implementation_import_closure
+
+    package = tmp_path / "src/video_demo"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "runtime_dependency.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (package / "runtime_else_dependency.py").write_text("VALUE = 3\n", encoding="utf-8")
+    (package / "type_dependency.py").write_text("VALUE = 2\n", encoding="utf-8")
+    entry = package / "entry.py"
+    entry.write_text(
+        "import typing\n"
+        "from typing import TYPE_CHECKING\n"
+        "from video_demo.runtime_dependency import VALUE\n"
+        "if TYPE_CHECKING:\n"
+        "    from video_demo.type_dependency import VALUE as TYPE_VALUE\n"
+        "if typing.TYPE_CHECKING:\n"
+        "    from video_demo.type_dependency import VALUE as ATTRIBUTE_TYPE_VALUE\n"
+        "else:\n"
+        "    from video_demo.runtime_else_dependency import VALUE as ELSE_VALUE\n",
+        encoding="utf-8",
+    )
+
+    closure = implementation_import_closure(
+        tmp_path,
+        (Path("src/video_demo/entry.py"),),
+        extra_files=(),
+    )
+
+    assert Path("src/video_demo/runtime_dependency.py") in closure
+    assert Path("src/video_demo/runtime_else_dependency.py") in closure
+    assert Path("src/video_demo/type_dependency.py") not in closure
+
+
+def test_implementation_import_closure_does_not_trust_shadowed_type_checking(
+    tmp_path: Path,
+) -> None:
+    from video_demo.implementation import implementation_import_closure
+
+    package = tmp_path / "src/video_demo"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "runtime_dependency.py").write_text("VALUE = 1\n", encoding="utf-8")
+    entry = package / "entry.py"
+    entry.write_text(
+        "from typing import TYPE_CHECKING\n"
+        "TYPE_CHECKING = True\n"
+        "if TYPE_CHECKING:\n"
+        "    from video_demo.runtime_dependency import VALUE\n",
+        encoding="utf-8",
+    )
+
+    closure = implementation_import_closure(
+        tmp_path,
+        (Path("src/video_demo/entry.py"),),
+        extra_files=(),
+    )
+
+    assert Path("src/video_demo/runtime_dependency.py") in closure
+
+
 @pytest.mark.parametrize(
     "unsafe_output",
     (

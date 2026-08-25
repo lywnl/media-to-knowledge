@@ -7,8 +7,8 @@ from typing import Protocol, cast
 
 from pydantic import ValidationError
 
-from video_demo.application.pipeline import (
-    PipelineContext,
+from video_demo.application.pipeline import PipelineContext
+from video_demo.application.pipeline_contracts import (
     PipelineRunConfig,
     PreparedMedia,
     ProbedAsset,

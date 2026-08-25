@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import Literal, Protocol, Self, TypeVar
+from typing import Protocol, TypeVar
 
-from pydantic import model_validator
-
+from video_demo.application.pipeline_contracts import PipelineRunConfig as PipelineRunConfig
+from video_demo.application.pipeline_contracts import PreparedMedia as PreparedMedia
+from video_demo.application.pipeline_contracts import ProbedAsset as ProbedAsset
+from video_demo.application.pipeline_contracts import RegisteredAsset as RegisteredAsset
+from video_demo.application.pipeline_contracts import SpeechAnalysis as SpeechAnalysis
+from video_demo.application.pipeline_contracts import (
+    SpeechBoundaryCandidate as SpeechBoundaryCandidate,
+)
+from video_demo.application.pipeline_contracts import StageMetric as StageMetric
+from video_demo.application.pipeline_contracts import (
+    pipeline_run_config_from_snapshot as pipeline_run_config_from_snapshot,
+)
 from video_demo.application.queries import ResultQueryService, ResultWriteFence
-from video_demo.domain.base import FrozenModel, LanguageCode, stable_identifier
+from video_demo.domain.base import stable_identifier
 from video_demo.domain.evidence import (
     EvidenceItem,
     KeyframeEvidence,
@@ -19,7 +29,6 @@ from video_demo.domain.evidence import (
     SceneBoundary,
     TimelineEvidence,
 )
-from video_demo.domain.manifest import VideoAssetManifest
 from video_demo.domain.result import (
     SummaryChapter,
     VideoUnderstandingResult,
@@ -27,7 +36,6 @@ from video_demo.domain.result import (
 )
 from video_demo.domain.result_artifact import TranscriptSource
 from video_demo.domain.run import RunStatus, TimeRange
-from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
 from video_demo.errors import ErrorCode, VideoDemoError, is_retryable_error_code
 from video_demo.fusion.merge import (
     BoundaryPoint,
@@ -43,8 +51,6 @@ from video_demo.integrations.video_port import (
     WholeVideoUnderstandingRequest,
     WholeVideoWindowInput,
 )
-from video_demo.media.probe import ProbeLimits, SupportedMime
-from video_demo.media.subtitles import ParsedSubtitle
 from video_demo.persistence.database import Database
 from video_demo.persistence.models import RunStatusValue
 from video_demo.persistence.repositories import ClaimedJob, JobRepository, Scope
@@ -54,106 +60,12 @@ StageOutput = TypeVar("StageOutput")
 
 _MAX_QWEN_FULL_VIDEO_BYTES = 128 * 1024 * 1024
 
-
 @dataclass(frozen=True, slots=True)
 class PipelineContext:
     run_id: str
     scope: Scope | None = None
     is_cancel_requested: Callable[[], bool] = lambda: False
     on_stage_start: Callable[[str], None] = lambda _stage: None
-
-
-@dataclass(frozen=True, slots=True)
-class RegisteredAsset:
-    source_path: Path
-    source_sha256: str
-    object_ref: str
-    source_size_bytes: int
-    source_mime: SupportedMime
-    run_relative_root: Path
-    config: PipelineRunConfig
-
-
-class PipelineRunConfig(FrozenModel):
-    language_hints: tuple[LanguageCode, ...] = ()
-    hotwords: tuple[str, ...] = ()
-    core_context: str | None = None
-
-    @model_validator(mode="after")
-    def normalize_speech_configuration(self) -> Self:
-        if len(self.language_hints) != len(set(self.language_hints)):
-            raise ValueError("language_hints 不得重复")
-        object.__setattr__(self, "hotwords", normalize_hotwords(self.hotwords))
-        object.__setattr__(self, "core_context", normalize_core_context(self.core_context))
-        return self
-
-
-_RETIRED_SPEECH_CONFIG_FIELDS = frozenset(
-    {"speech_enrichment_mode", "min_speakers", "max_speakers"}
-)
-
-
-def pipeline_run_config_from_snapshot(
-    snapshot: Mapping[str, object],
-) -> PipelineRunConfig:
-    """只在读取历史数据库快照时丢弃三个已退役语音字段。"""
-
-    normalized = {
-        key: value
-        for key, value in snapshot.items()
-        if key not in _RETIRED_SPEECH_CONFIG_FIELDS
-    }
-    return PipelineRunConfig.model_validate(normalized)
-
-
-@dataclass(frozen=True, slots=True)
-class ProbedAsset:
-    asset: RegisteredAsset
-    manifest: VideoAssetManifest
-    limits: ProbeLimits
-    warnings: tuple[str, ...] = ()
-    timeline_duration_ms: int | None = None
-
-    @property
-    def duration_ms(self) -> int:
-        if self.timeline_duration_ms is not None:
-            return self.timeline_duration_ms
-        return self.manifest.duration_ms
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedMedia:
-    source: ProbedAsset
-    proxy_path: Path
-    proxy_sha256: str
-    proxy_size_bytes: int
-    audio_path: Path | None
-    audio_sha256: str | None
-    subtitle: ParsedSubtitle | None = None
-    warnings: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class SpeechBoundaryCandidate:
-    timestamp_ms: int
-    source: Literal["silence", "sentence_end", "language_change"]
-    score: float = 1.0
-
-
-@dataclass(frozen=True, slots=True)
-class StageMetric:
-    stage: str
-    duration_ms: int
-
-
-@dataclass(frozen=True, slots=True)
-class SpeechAnalysis:
-    transcript_source: TranscriptSource
-    evidence: tuple[EvidenceItem, ...] = ()
-    warnings: tuple[str, ...] = ()
-    boundary_candidates: tuple[SpeechBoundaryCandidate, ...] = ()
-    stage_metrics: tuple[StageMetric, ...] = ()
-    stage_cache_hits: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

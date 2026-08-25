@@ -11,7 +11,7 @@ from typing import Any, cast
 import httpx
 from pydantic import SecretStr, ValidationError
 
-from video_demo.application.pipeline import PreparedMedia
+from video_demo.application.pipeline_contracts import PreparedMedia
 from video_demo.application.production_speech import run_asr_stage
 from video_demo.config import CloudAsrConfiguration
 from video_demo.errors import ErrorCode, VideoDemoError

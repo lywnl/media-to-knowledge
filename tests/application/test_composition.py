@@ -374,6 +374,18 @@ def test_worker_builds_real_production_media_adapters(
 
         assert isinstance(pipeline.speech_analyzer, IsolatedSpeechAnalyzer)
         assert isinstance(pipeline.visual_analyzer, ProductionVisualAnalyzer)
+        assert pipeline.visual_analyzer._evidence_limits.max_transcript_evidence_items == (
+            settings.max_transcript_evidence_items
+        )
+        assert pipeline.visual_analyzer._evidence_limits.max_transcript_chars == (
+            settings.max_transcript_chars
+        )
+        assert pipeline.visual_analyzer._evidence_limits.max_scene_boundaries == (
+            settings.max_scene_boundaries
+        )
+        assert pipeline.visual_analyzer._evidence_limits.max_base_segments == (
+            settings.max_base_segments
+        )
         assert isinstance(pipeline.understanding, QwenVideoClient)
     finally:
         pipeline.close()

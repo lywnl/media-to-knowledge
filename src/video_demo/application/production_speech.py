@@ -7,7 +7,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Protocol
 
-from video_demo.application.pipeline import (
+from video_demo.application.pipeline_contracts import (
     PreparedMedia,
     SpeechAnalysis,
     SpeechBoundaryCandidate,

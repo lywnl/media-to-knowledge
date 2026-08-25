@@ -55,6 +55,24 @@ def test_base_segment_without_transcript_allows_empty_evidence_refs() -> None:
     assert segment.evidence_refs == ()
 
 
+def test_base_segment_accepts_at_most_256_scene_refs() -> None:
+    scene_refs = tuple(f"scene_{index}" for index in range(256))
+    segment = BaseSegment(
+        segment_id="segment_001",
+        start_ms=0,
+        end_ms=10_000,
+        evidence_refs=(),
+        scene_refs=scene_refs,
+        transcript_source="NONE",
+    )
+
+    assert segment.scene_refs == scene_refs
+    with pytest.raises(ValidationError):
+        BaseSegment.model_validate(
+            {**segment.model_dump(), "scene_refs": (*scene_refs, "scene_256")},
+        )
+
+
 def test_semantic_target_requires_one_to_three_transcript_anchors() -> None:
     with pytest.raises(ValidationError):
         VisualSearchTarget(

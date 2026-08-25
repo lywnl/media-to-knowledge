@@ -4,12 +4,16 @@ import hashlib
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import replace
+from itertools import product
 from pathlib import Path
+from time import perf_counter
 
 import httpx
 import pytest
 
+import video_demo.application.pipeline_contracts as pipeline_contracts
 from video_demo.application import adaptive_ocr as adaptive_ocr_module
+from video_demo.application.chapter_planning import build_base_segments
 from video_demo.application.pipeline import (
     PipelineRunConfig,
     PreparedMedia,
@@ -26,6 +30,7 @@ from video_demo.application.production_visual import (
     VisualComponents,
     WindowFrameCandidates,
     _limit_keyframes,
+    _normalize_scenes,
     frame_tolerance_ms_for_rate,
 )
 from video_demo.domain.evidence import (
@@ -103,6 +108,275 @@ def test_visual_preparation_uses_task_cap_for_vfr_manifest(tmp_path: Path) -> No
     preparation = analyzer.prepare(media)
 
     assert preparation.frame_tolerance_ms == 100
+
+
+def test_scene_index_preparation_does_not_extract_frames_or_call_ocr(tmp_path: Path) -> None:
+    media = _media(tmp_path, duration_ms=4_000)
+    calls: list[str] = []
+
+    class Scenes:
+        def detect(self, *_args: object, **_kwargs: object) -> tuple[SceneBoundary, ...]:
+            calls.append("scene")
+            return (
+                _scene(0, 2_000, transition="candidate"),
+                _scene(2_000, 4_000, transition="hard_cut"),
+            )
+
+    class Frames:
+        def extract(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("场景准备不得抽帧")
+
+    class Ocr:
+        def recognize(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("场景准备不得调用 OCR")
+
+    analyzer = ProductionVisualAnalyzer(
+        tmp_path,
+        lambda _media, _cancel: VisualComponents(
+            scene_detector=Scenes(),
+            frame_extractor=Frames(),  # type: ignore[arg-type]
+            keyframe_selector=KeyframeSelector(),
+            ocr_client=Ocr(),  # type: ignore[arg-type]
+            clip_client=object(),  # type: ignore[arg-type]
+        ),
+    )
+
+    index = analyzer.prepare_scene_index(media, limits=_evidence_limits())
+
+    assert isinstance(index, pipeline_contracts.SceneIndex)
+    assert calls == ["scene"]
+    assert [(item.start_ms, item.end_ms) for item in index.scenes] == [
+        (0, 2_000),
+        (2_000, 4_000),
+    ]
+    assert not list((tmp_path / media.source.asset.run_relative_root).rglob("*.jpg"))
+
+
+def test_scene_index_compresses_adjacent_short_scenes_deterministically(tmp_path: Path) -> None:
+    media = _media(tmp_path, duration_ms=4_000)
+    raw = (
+        _scene(0, 500, transition="candidate"),
+        _scene(500, 1_300, transition="hard_cut"),
+        _scene(1_300, 3_300, transition="hard_cut"),
+        _scene(3_300, 4_000, transition="hard_cut"),
+    )
+
+    analyzer = ProductionVisualAnalyzer(
+        tmp_path,
+        lambda _media, _cancel: VisualComponents(
+            scene_detector=type("Scenes", (), {"detect": lambda *_args, **_kwargs: raw})(),
+            frame_extractor=object(),  # type: ignore[arg-type]
+            keyframe_selector=KeyframeSelector(),
+            ocr_client=object(),  # type: ignore[arg-type]
+            clip_client=object(),  # type: ignore[arg-type]
+        ),
+    )
+
+    first = analyzer.prepare_scene_index(media, limits=_evidence_limits(scene_boundaries=2))
+    second = analyzer.prepare_scene_index(media, limits=_evidence_limits(scene_boundaries=2))
+
+    assert first == second
+    assert len(first.scenes) == 2
+    assert first.scenes[0].start_ms == 0
+    assert first.scenes[-1].end_ms == 4_000
+    assert first.scenes[0].end_ms == first.scenes[1].start_ms
+
+
+def test_scene_index_merges_three_hundred_one_second_scenes_without_splitting(
+    tmp_path: Path,
+) -> None:
+    duration_ms = 300_000
+    media = _media(tmp_path, duration_ms=duration_ms)
+    raw = tuple(
+        _scene(
+            index * 1_000,
+            (index + 1) * 1_000,
+            transition="candidate" if index == 0 else "hard_cut",
+        )
+        for index in range(300)
+    )
+    analyzer = ProductionVisualAnalyzer(
+        tmp_path,
+        lambda _media, _cancel: VisualComponents(
+            scene_detector=type("Scenes", (), {"detect": lambda *_args, **_kwargs: raw})(),
+            frame_extractor=object(),  # type: ignore[arg-type]
+            keyframe_selector=KeyframeSelector(),
+            ocr_client=object(),  # type: ignore[arg-type]
+            clip_client=object(),  # type: ignore[arg-type]
+        ),
+    )
+
+    index = analyzer.prepare_scene_index(media, limits=_evidence_limits())
+    repeated = analyzer.prepare_scene_index(media, limits=_evidence_limits())
+
+    assert index == repeated
+    assert len(index.scenes) == 150
+    assert all(item.duration_ms == 2_000 for item in index.scenes)
+    assert index.scenes[0].start_ms == 0
+    assert index.scenes[-1].end_ms == duration_ms
+    segments = build_base_segments(
+        asset_sha256=media.source.asset.source_sha256,
+        duration_ms=duration_ms,
+        transcript_evidence=(
+            SubtitleCue(
+                evidence_id="subtitle_001",
+                start_ms=0,
+                end_ms=duration_ms,
+                text="完整长字幕",
+                language="zh",
+                stream_index=0,
+            ),
+        ),
+        scenes=index.scenes,
+        speech_boundaries=(),
+        limits=_evidence_limits(),
+    )
+    assert len(segments) == 1
+    assert len(segments[0].scene_refs) == 150
+
+
+def test_scene_normalization_does_not_invent_boundary_inside_raw_scene(
+    tmp_path: Path,
+) -> None:
+    duration_ms = 4_000
+    media = _media(tmp_path, duration_ms=duration_ms)
+    raw = (
+        _scene(0, 1_000, transition="candidate"),
+        _scene(1_000, 2_000, transition="gradual"),
+        _scene(2_000, 4_000, transition="hard_cut"),
+    )
+    analyzer = ProductionVisualAnalyzer(
+        tmp_path,
+        lambda _media, _cancel: VisualComponents(
+            scene_detector=type("Scenes", (), {"detect": lambda *_args, **_kwargs: raw})(),
+            frame_extractor=object(),  # type: ignore[arg-type]
+            keyframe_selector=KeyframeSelector(),
+            ocr_client=object(),  # type: ignore[arg-type]
+            clip_client=object(),  # type: ignore[arg-type]
+        ),
+    )
+
+    index = analyzer.prepare_scene_index(media, limits=_evidence_limits())
+
+    assert [(scene.start_ms, scene.end_ms, scene.transition) for scene in index.scenes] == [
+        (0, 2_000, "candidate"),
+        (2_000, 4_000, "hard_cut"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("durations", "maximum"),
+    [
+        ((1_200,), 1),
+        ((1_200, 1_200, 1_200), 1),
+        ((1_200, 1_200, 1_200, 1_200), 2),
+        ((1_200, 2_400, 1_200, 2_400, 1_200), 3),
+        ((2_400, 1_200, 1_200, 2_400, 1_200, 1_200), 2),
+        ((1_201, 1_200, 1_201, 1_200, 1_201, 1_200), 3),
+    ],
+)
+def test_scene_budget_compression_matches_naive_reference(
+    durations: tuple[int, ...],
+    maximum: int,
+) -> None:
+    raw = _scenes_from_durations(durations)
+    expected = _naive_compress_scene_ranges(
+        [(item.start_ms, item.end_ms, item.transition) for item in raw],
+        maximum,
+    )
+
+    actual = _normalize_scenes(raw, source_sha256="a" * 64, maximum=maximum)
+
+    assert [(item.start_ms, item.end_ms, item.transition) for item in actual] == expected
+
+
+def test_scene_budget_compression_matches_naive_reference_exhaustively() -> None:
+    durations = (1_200, 1_201, 2_400)
+
+    for scene_count in range(1, 8):
+        for sample in product(durations, repeat=scene_count):
+            raw = _scenes_from_durations(sample)
+            for maximum in range(1, scene_count + 1):
+                expected = _naive_compress_scene_ranges(
+                    [(item.start_ms, item.end_ms, item.transition) for item in raw],
+                    maximum,
+                )
+                actual = _normalize_scenes(
+                    raw,
+                    source_sha256="a" * 64,
+                    maximum=maximum,
+                )
+
+                assert [
+                    (item.start_ms, item.end_ms, item.transition) for item in actual
+                ] == expected
+
+
+def test_scene_budget_compression_handles_reachable_two_hour_worst_case_quickly() -> None:
+    raw = _scenes_from_durations((1_200,) * 6_000)
+
+    started_at = perf_counter()
+    compressed = _normalize_scenes(raw, source_sha256="a" * 64, maximum=1)
+    elapsed_seconds = perf_counter() - started_at
+
+    assert len(compressed) == 1
+    assert compressed[0].start_ms == 0
+    assert compressed[0].end_ms == 7_200_000
+    assert elapsed_seconds < 1.0
+
+
+def _scenes_from_durations(durations: tuple[int, ...]) -> tuple[SceneBoundary, ...]:
+    scenes: list[SceneBoundary] = []
+    start_ms = 0
+    for index, duration_ms in enumerate(durations):
+        end_ms = start_ms + duration_ms
+        scenes.append(
+            _scene(
+                start_ms,
+                end_ms,
+                transition="candidate" if index == 0 else "hard_cut",
+            ),
+        )
+        start_ms = end_ms
+    return tuple(scenes)
+
+
+def _naive_compress_scene_ranges(
+    ranges: list[tuple[int, int, str]],
+    maximum: int,
+) -> list[tuple[int, int, str]]:
+    compressed = list(ranges)
+    while len(compressed) > maximum:
+        merge_at = min(
+            range(len(compressed) - 1),
+            key=lambda index: (
+                compressed[index][1]
+                - compressed[index][0]
+                + compressed[index + 1][1]
+                - compressed[index + 1][0],
+                index,
+            ),
+        )
+        compressed[merge_at : merge_at + 2] = [
+            (
+                compressed[merge_at][0],
+                compressed[merge_at + 1][1],
+                compressed[merge_at][2],
+            ),
+        ]
+    return compressed
+
+
+def _evidence_limits(
+    *,
+    scene_boundaries: int = 20_000,
+) -> pipeline_contracts.EvidencePreparationLimits:
+    return pipeline_contracts.EvidencePreparationLimits(
+        max_transcript_evidence_items=20_000,
+        max_transcript_chars=2_000_000,
+        max_scene_boundaries=scene_boundaries,
+        max_base_segments=20_000,
+    )
 
 
 def test_complete_visual_chain_returns_merged_windows_without_creating_clips(
