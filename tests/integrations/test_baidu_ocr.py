@@ -54,7 +54,39 @@ def test_baidu_ocr_maps_validation_languages(language: str, provider_value: str)
     ocr_request = requests[1]
     body = ocr_request.content.decode()
     assert f"language_type={provider_value}" in body
+    assert "paragraph=true" in body
     assert base64.b64encode(b"image-bytes").decode().replace("=", "%3D") in body
+
+
+def test_accurate_basic_accepts_words_without_location() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/2.0/token"):
+            return httpx.Response(200, json={"access_token": "token-safe", "expires_in": 3600})
+        return httpx.Response(
+            200,
+            json={
+                "log_id": 12345,
+                "words_result": [
+                    {
+                        "words": "格式化段落文本",
+                        "probability": {"average": 0.98},
+                    },
+                ],
+                "paragraphs_result": [{"words_result_idx": [0]}],
+            },
+        )
+
+    client = BaiduOcrClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        BaiduOcrCredentials(api_key="api-secret", secret_key="secret-value"),
+        endpoint="https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic",
+    )
+
+    response = client.recognize(b"image-bytes", "zh")
+
+    assert response.lines[0].text == "格式化段落文本"
+    assert response.lines[0].bounding_box is None
+    assert response.lines[0].confidence == 0.98
 
 
 def test_oauth_token_is_cached_until_expiry() -> None:

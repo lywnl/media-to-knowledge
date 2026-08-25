@@ -30,6 +30,7 @@ class CloudAsrWindow:
     upload_range: TimeRange
     owned_range: TimeRange
     speech_interval: SpeechInterval
+    source_intervals: tuple[SpeechInterval, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,41 +62,153 @@ def build_cloud_asr_windows(
     *,
     max_window_ms: int,
     overlap_ms: int,
+    merge_gap_ms: int = 2_000,
+    max_upload_bytes: int = 25 * 1024 * 1024,
 ) -> tuple[CloudAsrWindow, ...]:
-    """按 VAD 区间建立串行上传窗口，并为重叠区域分配唯一所有权。"""
+    """合并相邻 VAD 区间，建立串行上传窗口并分配唯一所有权。"""
 
-    _validate_cloud_asr_window_parameters(max_window_ms, overlap_ms)
+    _validate_cloud_asr_window_parameters(
+        max_window_ms,
+        overlap_ms,
+        merge_gap_ms,
+        max_upload_bytes,
+    )
     _validate_ordered_speech_intervals(speech_intervals)
     windows: list[CloudAsrWindow] = []
-    for speech_interval in speech_intervals:
-        if speech_interval.duration_ms <= max_window_ms:
-            windows.append(
-                CloudAsrWindow(
-                    upload_range=speech_interval,
-                    owned_range=speech_interval,
-                    speech_interval=speech_interval,
-                )
-            )
-            continue
+    max_duration_ms = min(max_window_ms, (max_upload_bytes - 44) // 32)
+    if max_duration_ms < 1:
+        raise ValueError("max_upload_bytes 不足以容纳有效音频")
+    for merged, sources in _merge_speech_intervals(
+        speech_intervals,
+        merge_gap_ms,
+        max_duration_ms=max_duration_ms,
+        max_upload_bytes=max_upload_bytes,
+    ):
         windows.extend(
-            _split_cloud_asr_interval(
-                speech_interval,
+            _build_windows_for_interval(
+                merged,
+                sources,
                 max_window_ms=max_window_ms,
                 overlap_ms=overlap_ms,
+                max_upload_bytes=max_upload_bytes,
             )
         )
     return tuple(windows)
 
 
-def _validate_cloud_asr_window_parameters(max_window_ms: int, overlap_ms: int) -> None:
+def _validate_cloud_asr_window_parameters(
+    max_window_ms: int,
+    overlap_ms: int,
+    merge_gap_ms: int,
+    max_upload_bytes: int,
+) -> None:
     if isinstance(max_window_ms, bool) or not isinstance(max_window_ms, int):
         raise ValueError("max_window_ms 必须是整数")
     if isinstance(overlap_ms, bool) or not isinstance(overlap_ms, int):
         raise ValueError("overlap_ms 必须是整数")
+    if isinstance(merge_gap_ms, bool) or not isinstance(merge_gap_ms, int):
+        raise ValueError("merge_gap_ms 必须是整数")
+    if isinstance(max_upload_bytes, bool) or not isinstance(max_upload_bytes, int):
+        raise ValueError("max_upload_bytes 必须是整数")
     if max_window_ms < 1:
         raise ValueError("max_window_ms 必须大于 0")
     if not 0 <= overlap_ms < max_window_ms:
         raise ValueError("overlap_ms 必须大于等于 0 且小于 max_window_ms")
+    if merge_gap_ms < 0:
+        raise ValueError("merge_gap_ms 必须大于等于 0")
+    if max_upload_bytes <= 44:
+        raise ValueError("max_upload_bytes 必须大于 WAV 头大小")
+
+
+def _merge_speech_intervals(
+    speech_intervals: Sequence[SpeechInterval],
+    merge_gap_ms: int,
+    *,
+    max_duration_ms: int,
+    max_upload_bytes: int,
+) -> tuple[tuple[SpeechInterval, tuple[SpeechInterval, ...]], ...]:
+    merged: list[tuple[SpeechInterval, tuple[SpeechInterval, ...]]] = []
+    current_sources: list[SpeechInterval] = []
+    for interval in speech_intervals:
+        if not current_sources:
+            current_sources.append(interval)
+            continue
+        current = current_sources[-1]
+        candidate_start = current_sources[0].start_ms
+        candidate_end = interval.end_ms
+        candidate_duration = candidate_end - candidate_start
+        if (
+            interval.start_ms - current.end_ms <= merge_gap_ms
+            and candidate_duration <= max_duration_ms
+            and _estimate_pcm16_wav_bytes(candidate_duration) <= max_upload_bytes
+        ):
+            current_sources.append(interval)
+            continue
+        merged.append(_merged_speech_interval(tuple(current_sources)))
+        current_sources = [interval]
+    if current_sources:
+        merged.append(_merged_speech_interval(tuple(current_sources)))
+    return tuple(merged)
+
+
+def _merged_speech_interval(
+    source_intervals: tuple[SpeechInterval, ...],
+) -> tuple[SpeechInterval, tuple[SpeechInterval, ...]]:
+    if len(source_intervals) == 1:
+        return source_intervals[0], source_intervals
+    start_ms = source_intervals[0].start_ms
+    end_ms = source_intervals[-1].end_ms
+    total_duration = sum(item.duration_ms for item in source_intervals)
+    confidence = sum(
+        item.confidence * item.duration_ms for item in source_intervals
+    ) / total_duration
+    speech_interval = SpeechInterval(
+        evidence_id=stable_identifier(
+            "vad-window",
+            {
+                "source_evidence_ids": tuple(item.evidence_id for item in source_intervals),
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+            },
+        ),
+        start_ms=start_ms,
+        end_ms=end_ms,
+        confidence=confidence,
+    )
+    return speech_interval, source_intervals
+
+
+def _build_windows_for_interval(
+    speech_interval: SpeechInterval,
+    source_intervals: tuple[SpeechInterval, ...],
+    *,
+    max_window_ms: int,
+    overlap_ms: int,
+    max_upload_bytes: int,
+) -> tuple[CloudAsrWindow, ...]:
+    max_duration_ms = min(
+        max_window_ms,
+        (max_upload_bytes - 44) // 32,
+    )
+    if max_duration_ms < 1:
+        raise ValueError("max_upload_bytes 不足以容纳有效音频")
+    if speech_interval.duration_ms <= max_duration_ms:
+        return (
+            CloudAsrWindow(
+                upload_range=speech_interval,
+                owned_range=speech_interval,
+                speech_interval=speech_interval,
+                source_intervals=source_intervals,
+            ),
+        )
+    effective_overlap_ms = min(overlap_ms, max_duration_ms - 1)
+    return _split_cloud_asr_interval(
+        speech_interval,
+        source_intervals=source_intervals,
+        max_window_ms=max_duration_ms,
+        overlap_ms=effective_overlap_ms,
+        max_upload_bytes=max_upload_bytes,
+    )
 
 
 def _validate_ordered_speech_intervals(
@@ -111,8 +224,10 @@ def _validate_ordered_speech_intervals(
 def _split_cloud_asr_interval(
     speech_interval: SpeechInterval,
     *,
+    source_intervals: tuple[SpeechInterval, ...],
     max_window_ms: int,
     overlap_ms: int,
+    max_upload_bytes: int,
 ) -> tuple[CloudAsrWindow, ...]:
     minimum_count = math.ceil(
         speech_interval.duration_ms / (max_window_ms - overlap_ms)
@@ -121,12 +236,21 @@ def _split_cloud_asr_interval(
     while True:
         owned_ranges = _balanced_owned_ranges(speech_interval, window_count)
         upload_ranges = _overlapping_upload_ranges(owned_ranges, overlap_ms)
-        if all(item.duration_ms <= max_window_ms for item in upload_ranges):
+        if all(
+            item.duration_ms <= max_window_ms
+            and _estimate_pcm16_wav_bytes(item.duration_ms) <= max_upload_bytes
+            for item in upload_ranges
+        ):
             return tuple(
                 CloudAsrWindow(
                     upload_range=upload_range,
                     owned_range=owned_range,
                     speech_interval=speech_interval,
+                    source_intervals=tuple(
+                        source
+                        for source in source_intervals
+                        if source.overlaps(upload_range)
+                    ),
                 )
                 for upload_range, owned_range in zip(
                     upload_ranges,
@@ -135,6 +259,10 @@ def _split_cloud_asr_interval(
                 )
             )
         window_count += 1
+
+
+def _estimate_pcm16_wav_bytes(duration_ms: int) -> int:
+    return 44 + math.ceil(duration_ms * 32)
 
 
 def _balanced_owned_ranges(

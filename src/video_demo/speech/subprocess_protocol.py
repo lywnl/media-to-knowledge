@@ -45,6 +45,8 @@ class SpeechRuntimeConfig(FrozenModel):
     max_attempts: int = Field(ge=1, le=5)
     max_window_ms: int = Field(gt=0)
     overlap_ms: int = Field(ge=0)
+    merge_gap_ms: int = Field(default=2_000, ge=0)
+    max_upload_bytes: int = Field(default=25 * 1024 * 1024, gt=44)
     model_identities: tuple[ModelIdentity, ...]
     vad_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     vad_merge_gap_ms: int = Field(default=200, ge=0)
@@ -63,6 +65,8 @@ class SpeechRuntimeConfig(FrozenModel):
             cloud_asr_base_url=self.base_url,
             max_window_ms=self.max_window_ms,
             overlap_ms=self.overlap_ms,
+            merge_gap_ms=self.merge_gap_ms,
+            max_upload_bytes=self.max_upload_bytes,
             vad_threshold=self.vad_threshold,
             vad_merge_gap_ms=self.vad_merge_gap_ms,
         )

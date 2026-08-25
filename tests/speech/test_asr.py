@@ -43,14 +43,103 @@ def test_cloud_asr_windows_keep_short_vad_intervals_independent() -> None:
         overlap_ms=1_000,
     )
 
-    assert windows == tuple(
-        CloudAsrWindow(
-            upload_range=item,
-            owned_range=item,
-            speech_interval=item,
-        )
-        for item in speech
+    assert len(windows) == 2
+    assert [window.speech_interval.start_ms for window in windows] == [1_000, 15_000]
+    assert [window.source_intervals for window in windows] == [(speech[0],), (speech[1],)]
+
+
+def test_cloud_asr_windows_merge_intervals_within_two_seconds_and_keep_sources() -> None:
+    speech = (
+        _speech_interval("vad_001", 0, 10_000),
+        _speech_interval("vad_002", 12_000, 20_000),
+        _speech_interval("vad_003", 21_500, 30_000),
+        _speech_interval("vad_004", 37_000, 40_000),
     )
+
+    windows = build_cloud_asr_windows(
+        speech,
+        max_window_ms=600_000,
+        overlap_ms=1_000,
+        merge_gap_ms=2_000,
+    )
+
+    assert [(item.upload_range.start_ms, item.upload_range.end_ms) for item in windows] == [
+        (0, 30_000),
+        (37_000, 40_000),
+    ]
+    assert [
+        tuple(item.evidence_id for item in window.source_intervals)
+        for window in windows
+    ] == [("vad_001", "vad_002", "vad_003"), ("vad_004",)]
+
+
+def test_cloud_asr_windows_do_not_merge_gap_over_two_seconds() -> None:
+    speech = (
+        _speech_interval("vad_001", 0, 10_000),
+        _speech_interval("vad_002", 12_001, 20_000),
+    )
+
+    windows = build_cloud_asr_windows(
+        speech,
+        max_window_ms=600_000,
+        overlap_ms=1_000,
+        merge_gap_ms=2_000,
+    )
+
+    assert len(windows) == 2
+
+
+def test_cloud_asr_windows_respect_pcm_upload_size_limit() -> None:
+    speech = (
+        _speech_interval("vad_001", 0, 1_000),
+        _speech_interval("vad_002", 1_500, 2_000),
+    )
+
+    windows = build_cloud_asr_windows(
+        speech,
+        max_window_ms=600_000,
+        overlap_ms=1_000,
+        merge_gap_ms=2_000,
+        max_upload_bytes=44 + 32_000,
+    )
+
+    assert len(windows) == 2
+
+
+def test_cloud_asr_windows_merge_the_previous_demo_seven_windows_into_three() -> None:
+    speech = (
+        _speech_interval("vad_001", 98, 120_190),
+        _speech_interval("vad_002", 127_682, 448_830),
+        _speech_interval("vad_003", 449_986, 453_182),
+        _speech_interval("vad_004", 454_370, 455_838),
+        _speech_interval("vad_005", 456_482, 458_462),
+        _speech_interval("vad_006", 459_522, 461_822),
+        _speech_interval("vad_007", 462_050, 921_400),
+    )
+
+    windows = build_cloud_asr_windows(
+        speech,
+        max_window_ms=600_000,
+        overlap_ms=1_000,
+        merge_gap_ms=2_000,
+    )
+
+    assert [
+        (window.upload_range.start_ms, window.upload_range.end_ms)
+        for window in windows
+    ] == [
+        (98, 120_190),
+        (127_682, 461_822),
+        (462_050, 921_400),
+    ]
+    assert [
+        tuple(item.evidence_id for item in window.source_intervals)
+        for window in windows
+    ] == [
+        ("vad_001",),
+        ("vad_002", "vad_003", "vad_004", "vad_005", "vad_006"),
+        ("vad_007",),
+    ]
 
 
 def test_cloud_asr_window_does_not_split_exact_ten_minutes() -> None:
@@ -62,13 +151,9 @@ def test_cloud_asr_window_does_not_split_exact_ten_minutes() -> None:
         overlap_ms=1_000,
     )
 
-    assert windows == (
-        CloudAsrWindow(
-            upload_range=speech,
-            owned_range=speech,
-            speech_interval=speech,
-        ),
-    )
+    assert len(windows) == 1
+    assert windows[0].upload_range == speech
+    assert windows[0].source_intervals == (speech,)
 
 
 @pytest.mark.parametrize(
@@ -122,8 +207,10 @@ def test_cloud_asr_windows_keep_114_regular_intervals_as_114_requests() -> None:
         overlap_ms=1_000,
     )
 
-    assert len(windows) == 114
-    assert tuple(window.speech_interval for window in windows) == speech
+    assert len(windows) == 1
+    assert windows[0].speech_interval.start_ms == speech[0].start_ms
+    assert windows[0].speech_interval.end_ms == speech[-1].end_ms
+    assert windows[0].source_intervals == speech
 
 
 @pytest.mark.parametrize(

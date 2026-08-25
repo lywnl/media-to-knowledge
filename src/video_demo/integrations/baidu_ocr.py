@@ -104,6 +104,9 @@ class BaiduOcrClient:
                         "image": base64.b64encode(image).decode("ascii"),
                         "language_type": provider_language,
                         "detect_direction": "true",
+                        # accurate_basic 的段落结构由该参数启用；行级结果仍作为
+                        # 兼容主结果解析，避免改变现有证据和 RAG 文本格式。
+                        "paragraph": "true",
                         "probability": "true",
                     },
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -289,22 +292,22 @@ def _parse_ocr_response(
         for result in results:
             if not isinstance(result, dict):
                 raise ValueError("文字结果必须是对象")
-            location = result["location"]
             probability = result["probability"]
-            if not isinstance(location, dict) or not isinstance(probability, dict):
-                raise ValueError("bbox 或 probability 类型非法")
+            if not isinstance(probability, dict):
+                raise ValueError("probability 类型非法")
             words = result["words"]
             if not isinstance(words, str) or not words or len(words) > 10_000:
                 raise ValueError("文字必须是受限非空字符串")
+            location = result.get("location")
+            bounding_box = (
+                _parse_bounding_box(location)
+                if location is not None
+                else None
+            )
             lines.append(
                 OcrLine(
                     text=words,
-                    bounding_box=BoundingBox(
-                        x=_integer(location["left"]),
-                        y=_integer(location["top"]),
-                        width=_integer(location["width"]),
-                        height=_integer(location["height"]),
-                    ),
+                    bounding_box=bounding_box,
                     confidence=_number(probability["average"]),
                 ),
             )
@@ -315,6 +318,17 @@ def _parse_ocr_response(
         )
     except (KeyError, TypeError, ValueError, ValidationError):
         raise VideoDemoError(ErrorCode.OCR_RESPONSE_INVALID, "百度 OCR 文字结果非法") from None
+
+
+def _parse_bounding_box(value: object) -> BoundingBox:
+    if not isinstance(value, dict):
+        raise ValueError("bbox 类型非法")
+    return BoundingBox(
+        x=_integer(value["left"]),
+        y=_integer(value["top"]),
+        width=_integer(value["width"]),
+        height=_integer(value["height"]),
+    )
 
 
 def _raise_for_provider_error(payload: dict[str, Any]) -> None:

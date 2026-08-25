@@ -50,10 +50,11 @@ def test_asr_window_snapshot_has_strict_minimal_payload() -> None:
     window = _window()
     payload = _window_payload(window)
 
-    assert payload.schema_version == "1.0.0"
+    assert payload.schema_version == "1.1.0"
     assert payload.upload_range == window.upload_range
     assert payload.owned_range == window.owned_range
     assert payload.speech_interval == window.speech_interval
+    assert payload.source_intervals == window.source_intervals
     assert tuple(item.text for item in payload.segments) == ("窗口缓存文本",)
 
 
@@ -121,10 +122,11 @@ def test_asr_fingerprint_binds_cloud_content_inputs() -> None:
             "inputs": inputs.model_copy(update={"overlap_ms": 2_000}),
         }  # type: ignore[arg-type]
     )
+    assert inputs.window_strategy_version == "2.0.0"
     assert base != asr_fingerprint(
         **{
             **arguments,
-            "inputs": inputs.model_copy(update={"window_strategy_version": "2.0.0"}),
+            "inputs": inputs.model_copy(update={"merge_gap_ms": 3_000}),
         }  # type: ignore[arg-type]
     )
     assert base != asr_fingerprint(
@@ -171,6 +173,7 @@ def _window() -> CloudAsrWindow:
         upload_range=TimeRange(start_ms=10_000, end_ms=370_500),
         owned_range=TimeRange(start_ms=10_000, end_ms=370_000),
         speech_interval=speech,
+        source_intervals=(speech,),
     )
 
 
@@ -179,6 +182,7 @@ def _window_payload(window: CloudAsrWindow) -> AsrWindowSnapshotPayload:
         upload_range=window.upload_range,
         owned_range=window.owned_range,
         speech_interval=window.speech_interval,
+        source_intervals=window.source_intervals,
         language_span=LanguageSpan(
             evidence_id="lid_window",
             start_ms=window.owned_range.start_ms,

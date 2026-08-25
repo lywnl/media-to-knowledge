@@ -17,6 +17,8 @@ from video_demo.errors import ErrorCode, VideoDemoError
 
 _CLOUD_ASR_MAX_WINDOW_MS = 600_000
 _CLOUD_ASR_OVERLAP_MS = 1_000
+_CLOUD_ASR_MERGE_GAP_MS = 2_000
+_CLOUD_ASR_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 _RETIRED_LOCAL_MODEL_DOTENV_KEYS = frozenset(
     {
         "video_demo_inference_device",
@@ -82,6 +84,8 @@ class CloudAsrConfiguration(FrozenModel):
     max_attempts: int
     max_window_ms: int
     overlap_ms: int
+    merge_gap_ms: int = _CLOUD_ASR_MERGE_GAP_MS
+    max_upload_bytes: int = _CLOUD_ASR_MAX_UPLOAD_BYTES
 
 
 class Settings(BaseSettings):
@@ -240,6 +244,8 @@ class Settings(BaseSettings):
             max_attempts=self.openai_asr_max_attempts,
             max_window_ms=_CLOUD_ASR_MAX_WINDOW_MS,
             overlap_ms=_CLOUD_ASR_OVERLAP_MS,
+            merge_gap_ms=_CLOUD_ASR_MERGE_GAP_MS,
+            max_upload_bytes=_CLOUD_ASR_MAX_UPLOAD_BYTES,
         )
 
     def _validate_oss_configuration(self) -> None:

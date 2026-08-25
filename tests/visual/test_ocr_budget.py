@@ -20,16 +20,17 @@ from video_demo.visual.ocr_budget import (
 @pytest.mark.parametrize(
     ("duration_ms", "expected"),
     [
-        (30_000, (3, 4, 7)),
-        (60_000, (3, 6, 9)),
-        (180_000, (5, 10, 15)),
-        (300_000, (6, 13, 20)),
-        (600_000, (8, 18, 27)),
-        (1_200_000, (12, 25, 39)),
-        (1_800_000, (12, 31, 47)),
+        (30_000, (3, 3, 6)),
+        (60_000, (3, 5, 7)),
+        (180_000, (4, 8, 12)),
+        (300_000, (5, 10, 15)),
+        (600_000, (6, 14, 21)),
+        (1_200_000, (9, 19, 30)),
+        (1_800_000, (9, 24, 36)),
+        (921_400, (8, 17, 26)),
     ],
 )
-def test_ocr_budget_grows_by_square_root_with_bounded_tiers(
+def test_ocr_budget_scales_original_square_root_tiers_down_by_about_25_percent(
     duration_ms: int,
     expected: tuple[int, int, int],
 ) -> None:

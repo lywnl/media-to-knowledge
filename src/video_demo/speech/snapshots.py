@@ -14,7 +14,7 @@ from video_demo.speech.language import LanguageSpan
 from video_demo.speech.vad import SpeechInterval
 
 _ASR_COMPONENTS = frozenset({"silero_vad", "cloud_whisper"})
-_CLOUD_ASR_WINDOW_STRATEGY_VERSION: Literal["1.0.0"] = "1.0.0"
+_CLOUD_ASR_WINDOW_STRATEGY_VERSION: Literal["2.0.0"] = "2.0.0"
 
 
 class AsrSnapshotPayload(FrozenModel):
@@ -28,10 +28,11 @@ class AsrSnapshotPayload(FrozenModel):
 
 
 class AsrWindowSnapshotPayload(FrozenModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     upload_range: TimeRange
     owned_range: TimeRange
     speech_interval: SpeechInterval
+    source_intervals: tuple[SpeechInterval, ...] = ()
     language_span: LanguageSpan
     segments: tuple[SpeechSegment, ...]
     warnings: tuple[str, ...] = ()
@@ -42,9 +43,11 @@ class SpeechFingerprintInputs(FrozenModel):
     cloud_asr_base_url: str = Field(min_length=1, max_length=2048)
     max_window_ms: int = Field(gt=0)
     overlap_ms: int = Field(ge=0)
-    window_strategy_version: Literal["1.0.0"] = _CLOUD_ASR_WINDOW_STRATEGY_VERSION
+    window_strategy_version: Literal["2.0.0"] = _CLOUD_ASR_WINDOW_STRATEGY_VERSION
     vad_threshold: float = 0.5
     vad_merge_gap_ms: int = 200
+    merge_gap_ms: int = 2_000
+    max_upload_bytes: int = 25 * 1024 * 1024
 
 
 def asr_fingerprint(
@@ -70,6 +73,8 @@ def asr_fingerprint(
             "cloud_asr_base_url": inputs.cloud_asr_base_url,
             "max_window_ms": inputs.max_window_ms,
             "overlap_ms": inputs.overlap_ms,
+            "merge_gap_ms": inputs.merge_gap_ms,
+            "max_upload_bytes": inputs.max_upload_bytes,
             "window_strategy_version": inputs.window_strategy_version,
             "vad_threshold": inputs.vad_threshold,
             "vad_merge_gap_ms": inputs.vad_merge_gap_ms,
@@ -99,6 +104,10 @@ def asr_window_fingerprint(
             "speech_interval": window.speech_interval.model_dump(
                 mode="json",
                 exclude_computed_fields=True,
+            ),
+            "source_intervals": tuple(
+                item.model_dump(mode="json", exclude_computed_fields=True)
+                for item in window.source_intervals
             ),
         }
     )

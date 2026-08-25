@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import datetime
 import json
+import logging
 import math
 import re
 import time
 from collections.abc import Callable
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import httpx
@@ -15,10 +18,11 @@ from video_demo.speech.asr import RawAsrSegment, WindowTranscriptionResult
 from video_demo.storage.workspace import reject_symlink_components
 
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
-_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
-_MODEL_BRANCH_EXHAUSTION_DELAY_SECONDS = 60.0
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+_DEFAULT_MAX_UPLOAD_BYTES = _MAX_UPLOAD_BYTES
 _PROVIDER_ERROR_CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _LANGUAGE_CODE = re.compile(r"^[a-z]{2,3}$")
+_LOGGER = logging.getLogger(__name__)
 
 # OpenAI Whisper 的官方语言名称映射。项目响应只保留稳定语言代码。
 _LANGUAGES = {
@@ -164,9 +168,16 @@ class CloudWhisperClient:
         language_hint: str | None,
         prompt: str | None,
     ) -> WindowTranscriptionResult:
-        path = _validated_audio_path(self._allowed_audio_root, audio_slice)
+        path = _validated_audio_path(
+            self._allowed_audio_root,
+            audio_slice,
+            max_upload_bytes=self._configuration.max_upload_bytes,
+        )
         last_error: VideoDemoError | None = None
         for attempt in range(1, self._configuration.max_attempts + 1):
+            started_at = time.monotonic()
+            retry_after_seconds: float | None = None
+            status_code: int | None = None
             try:
                 with path.open("rb") as stream, self._http_client.stream(
                     "POST",
@@ -184,31 +195,75 @@ class CloudWhisperClient:
                     files={"file": (path.name, stream, "audio/wav")},
                     timeout=self._configuration.timeout_seconds,
                 ) as response:
+                    status_code = response.status_code
+                    retry_after_seconds = _parse_retry_after(
+                        response.headers.get("Retry-After")
+                    )
                     content = _bounded_response_content(response)
                     _raise_for_status(
                         response,
                         content,
                         model=self._configuration.model,
+                        retry_after_seconds=retry_after_seconds,
                     )
-                return _parse_response(content)
+                parsed = _parse_response(content)
+                _LOGGER.info(
+                    "云端 ASR 请求成功: file=%s attempt=%d status=%s elapsed=%.3fs",
+                    path.name,
+                    attempt,
+                    status_code if status_code is not None else "无响应",
+                    time.monotonic() - started_at,
+                )
+                return parsed
             except httpx.RequestError:
+                _log_request_failure(
+                    path,
+                    attempt=attempt,
+                    status_code=status_code,
+                    elapsed_seconds=time.monotonic() - started_at,
+                    error_category="network",
+                )
                 last_error = VideoDemoError(
                     ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
                     "云端语音识别网络请求失败",
                 )
             except VideoDemoError as error:
                 if error.code != ErrorCode.DEPENDENCY_TEMPORARY_FAILURE:
+                    _log_request_failure(
+                        path,
+                        attempt=attempt,
+                        status_code=status_code,
+                        elapsed_seconds=time.monotonic() - started_at,
+                        error_category="permanent_failure",
+                    )
                     raise
+                _log_request_failure(
+                    path,
+                    attempt=attempt,
+                    status_code=status_code,
+                    elapsed_seconds=time.monotonic() - started_at,
+                    error_category="temporary_dependency",
+                )
                 last_error = error
             if attempt < self._configuration.max_attempts:
-                delay = (
-                    _MODEL_BRANCH_EXHAUSTION_DELAY_SECONDS
-                    if isinstance(last_error, _TemporaryModelBranchExhaustion)
-                    else min(2 ** (attempt - 1), 4)
+                delay = retry_after_seconds
+                if delay is None:
+                    delay = float(2 ** (attempt - 1))
+                _LOGGER.info(
+                    "云端 ASR 请求重试: file=%s attempt=%d status=%s wait=%.3fs",
+                    path.name,
+                    attempt,
+                    status_code if status_code is not None else "无响应",
+                    delay,
                 )
                 self._sleeper(delay)
         if last_error is None:
             raise RuntimeError("云端语音识别重试状态非法")
+        _LOGGER.error(
+            "云端 ASR 请求最终失败: file=%s attempts=%d category=temporary_dependency",
+            path.name,
+            self._configuration.max_attempts,
+        )
         raise last_error from None
 
 
@@ -234,7 +289,12 @@ def _multipart_fields(
     return fields
 
 
-def _validated_audio_path(root: Path, candidate: Path) -> Path:
+def _validated_audio_path(
+    root: Path,
+    candidate: Path,
+    *,
+    max_upload_bytes: int = _DEFAULT_MAX_UPLOAD_BYTES,
+) -> Path:
     path = reject_symlink_components(
         root,
         candidate,
@@ -246,7 +306,7 @@ def _validated_audio_path(root: Path, candidate: Path) -> Path:
             "云端语音切片不是普通文件",
         )
     size_bytes = path.stat().st_size
-    if size_bytes < 1 or size_bytes > _MAX_UPLOAD_BYTES:
+    if size_bytes < 1 or size_bytes > max_upload_bytes:
         raise VideoDemoError(
             ErrorCode.SPEECH_AUDIO_INVALID,
             "云端语音切片大小非法",
@@ -254,11 +314,46 @@ def _validated_audio_path(root: Path, candidate: Path) -> Path:
     return path
 
 
+def _parse_retry_after(value: str | None) -> float | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if re.fullmatch(r"[0-9]+", normalized):
+        return float(normalized)
+    try:
+        retry_at = parsedate_to_datetime(normalized)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=datetime.UTC)
+    delay = retry_at.timestamp() - time.time()
+    return max(0.0, delay)
+
+
+def _log_request_failure(
+    path: Path,
+    *,
+    attempt: int,
+    status_code: int | None,
+    elapsed_seconds: float,
+    error_category: str,
+) -> None:
+    _LOGGER.warning(
+        "云端 ASR 请求失败: file=%s attempt=%d status=%s elapsed=%.3fs category=%s",
+        path.name,
+        attempt,
+        status_code if status_code is not None else "无响应",
+        elapsed_seconds,
+        error_category,
+    )
+
+
 def _raise_for_status(
     response: httpx.Response,
     content: bytes,
     *,
     model: str,
+    retry_after_seconds: float | None = None,
 ) -> None:
     if response.status_code < 400:
         return
@@ -266,6 +361,8 @@ def _raise_for_status(
     provider_error_code = _provider_error_code(content)
     if provider_error_code is not None:
         details["provider_error_code"] = provider_error_code
+    if retry_after_seconds is not None:
+        details["retry_after_seconds"] = retry_after_seconds
     if (
         response.status_code in {408, 429}
         or response.status_code >= 500

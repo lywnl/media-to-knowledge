@@ -126,6 +126,8 @@ def _execute_request(
         max_attempts=request.runtime.max_attempts,
         max_window_ms=request.runtime.max_window_ms,
         overlap_ms=request.runtime.overlap_ms,
+        merge_gap_ms=request.runtime.merge_gap_ms,
+        max_upload_bytes=request.runtime.max_upload_bytes,
     )
     artifact_store = AtomicArtifactStore(runtime_root)
     with httpx.Client() as http_client:
@@ -151,6 +153,8 @@ def _execute_request(
             asr_fingerprint=request.asr_fingerprint,
             max_window_ms=request.runtime.max_window_ms,
             overlap_ms=request.runtime.overlap_ms,
+            merge_gap_ms=request.runtime.merge_gap_ms,
+            max_upload_bytes=request.runtime.max_upload_bytes,
         )
     snapshots = SnapshotStore(artifact_store)
     snapshots.publish(

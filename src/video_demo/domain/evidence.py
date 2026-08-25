@@ -72,7 +72,8 @@ class BoundingBox(FrozenModel):
 
 class OcrLine(FrozenModel):
     text: str = Field(min_length=1)
-    bounding_box: BoundingBox
+    # accurate_basic 默认返回文字和置信度；位置字段只有含位置版接口才提供。
+    bounding_box: BoundingBox | None = None
     confidence: Probability
 
 

@@ -18,6 +18,7 @@ _MINIMUM_EFFECTIVE_CHARS = 12
 _DENSE_MEDIAN_CHARS = 24
 _TEXT_CHANGE_THRESHOLD = 0.65
 _SPACE_AND_PUNCTUATION = re.compile(r"[^\w\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
+_OCR_BUDGET_SCALE = 0.75
 
 FixedLineKey = tuple[str, int, int]
 
@@ -60,9 +61,14 @@ def calculate_ocr_budget(duration_ms: int) -> OcrBudget:
         raise ValueError("视频时长必须大于 0")
     minutes = duration_ms / 60_000
     root = math.sqrt(minutes)
-    probe = max(3, min(12, math.ceil(2.5 * root)))
-    base = max(probe, min(36, math.ceil(5.5 * root)))
-    hard_limit = max(base, min(50, math.ceil(8.5 * root)))
+    # 先按原有平方根预算计算，再统一缩减 25%。这样只改变成本档位，
+    # 不改变不同视频时长之间的增长关系；向上取整避免少量视频被过度削减。
+    original_probe = max(3, min(12, math.ceil(2.5 * root)))
+    original_base = max(original_probe, min(36, math.ceil(5.5 * root)))
+    original_hard_limit = max(original_base, min(50, math.ceil(8.5 * root)))
+    probe = max(3, math.ceil(original_probe * _OCR_BUDGET_SCALE))
+    base = max(probe, math.ceil(original_base * _OCR_BUDGET_SCALE))
+    hard_limit = max(base, math.ceil(original_hard_limit * _OCR_BUDGET_SCALE))
     return OcrBudget(probe=probe, base=base, hard_limit=hard_limit)
 
 
@@ -286,6 +292,8 @@ def _is_subtitle_line(
 ) -> bool:
     if not has_subtitle_track or len(text) >= _DENSE_MEDIAN_CHARS:
         return False
+    if line.bounding_box is None:
+        return False
     if observation.image_height is None or observation.image_height < 1:
         return False
     center_y = line.bounding_box.y + line.bounding_box.height / 2
@@ -298,6 +306,8 @@ def _fixed_line_key(
     text: str,
 ) -> FixedLineKey | None:
     if (
+        line.bounding_box is None
+        or
         observation.image_width is None
         or observation.image_width < 1
         or observation.image_height is None

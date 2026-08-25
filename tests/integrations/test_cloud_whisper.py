@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import traceback
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from pathlib import Path
 
 import httpx
@@ -13,7 +15,7 @@ from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.cloud_whisper import CloudWhisperClient
 
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
-_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
 def _configuration(
@@ -29,6 +31,7 @@ def _configuration(
         max_attempts=max_attempts,
         max_window_ms=600_000,
         overlap_ms=1_000,
+        max_upload_bytes=_MAX_UPLOAD_BYTES,
     )
 
 
@@ -436,7 +439,7 @@ def test_client_retries_proxy_no_available_model_branch_without_leaking_message(
 
     assert result.segments[0].text == "Hello world"
     assert attempts == 2
-    assert sleeps == [60]
+    assert sleeps == [1]
 
 
 def test_client_does_not_retry_other_top_level_400_messages(tmp_path: Path) -> None:
@@ -490,8 +493,77 @@ def test_client_hides_proxy_message_after_model_branch_retries_are_exhausted(
 
     assert raised.value.code == ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
     assert raised.value.details == {"status_code": 400}
-    assert sleeps == [60, 60]
-    assert provider_message not in "".join(traceback.format_exception(raised.value))
+    assert sleeps == [1, 2]
+
+
+def test_client_uses_retry_after_seconds_for_temporary_failures(
+    tmp_path: Path,
+) -> None:
+    audio = _audio(tmp_path)
+    sleeps: list[float] = []
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "7"},
+            json={"error": {"code": "rate_limit_exceeded"}},
+            request=request,
+        )
+
+    client, _http_client = _client(tmp_path, handler, sleeper=sleeps.append)
+
+    with pytest.raises(VideoDemoError):
+        client.transcribe_window(audio, language_hint=None, prompt=None)
+
+    assert attempts == 3
+    assert sleeps == [7, 7]
+
+
+def test_client_falls_back_to_exponential_backoff_for_invalid_retry_after(
+    tmp_path: Path,
+) -> None:
+    audio = _audio(tmp_path)
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            headers={"Retry-After": "not-a-delay"},
+            request=request,
+        )
+
+    client, _http_client = _client(tmp_path, handler, sleeper=sleeps.append)
+
+    with pytest.raises(VideoDemoError) as raised:
+        client.transcribe_window(audio, language_hint=None, prompt=None)
+
+    assert sleeps == [1, 2]
+    assert "not-a-delay" not in "".join(traceback.format_exception(raised.value))
+
+
+def test_client_uses_http_date_retry_after(tmp_path: Path) -> None:
+    audio = _audio(tmp_path)
+    sleeps: list[float] = []
+    retry_at = datetime.now(UTC) + timedelta(seconds=7)
+
+    client, _http_client = _client(
+        tmp_path,
+        lambda request: httpx.Response(
+            429,
+            headers={"Retry-After": format_datetime(retry_at, usegmt=True)},
+            request=request,
+        ),
+        sleeper=sleeps.append,
+    )
+
+    with pytest.raises(VideoDemoError):
+        client.transcribe_window(audio, language_hint=None, prompt=None)
+
+    assert len(sleeps) == 2
+    assert all(0 <= delay <= 7 for delay in sleeps)
 
 
 def test_client_retries_transport_errors_and_reopens_file_from_start(

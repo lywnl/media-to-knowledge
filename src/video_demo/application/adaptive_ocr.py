@@ -80,7 +80,7 @@ class AdaptiveOcrRunner:
         self,
         keyframes: Sequence[KeyframeEvidence],
         *,
-        speech: SpeechAnalysis,
+        speech: SpeechAnalysis | None,
         media: PreparedMedia,
         run_relative_root: Path,
         client: OcrClient,
@@ -110,7 +110,7 @@ class AdaptiveOcrRunner:
         assessment = assess_probe_text(
             probe_result.observations,
             duration_ms=media.source.duration_ms,
-            has_subtitle_track=speech.transcript_source == "SUBTITLE",
+            has_subtitle_track=speech is not None and speech.transcript_source == "SUBTITLE",
         )
         _check_cancelled(is_cancel_requested)
         selected = list(probe_result.keyframes)
@@ -206,7 +206,7 @@ class AdaptiveOcrRunner:
         self,
         keyframes: Sequence[KeyframeEvidence],
         *,
-        speech: SpeechAnalysis,
+        speech: SpeechAnalysis | None,
         media: PreparedMedia,
         processor: OcrProcessor,
         deadline: float,
@@ -298,7 +298,7 @@ class AdaptiveOcrRunner:
         observations: list[OcrFrameObservation],
         warnings: list[str],
         base_limit: int,
-        speech: SpeechAnalysis,
+        speech: SpeechAnalysis | None,
         media: PreparedMedia,
         processor: OcrProcessor,
         deadline: float,
@@ -340,7 +340,7 @@ class AdaptiveOcrRunner:
         warnings: list[str],
         assessment: OcrTextAssessment,
         hard_limit: int,
-        speech: SpeechAnalysis,
+        speech: SpeechAnalysis | None,
         media: PreparedMedia,
         processor: OcrProcessor,
         deadline: float,
@@ -349,7 +349,7 @@ class AdaptiveOcrRunner:
         image_request_count: int,
     ) -> tuple[str, int, int]:
         seen_texts = list(assessment.frame_texts)
-        has_subtitle_track = speech.transcript_source == "SUBTITLE"
+        has_subtitle_track = speech is not None and speech.transcript_source == "SUBTITLE"
         while len(selected) < hard_limit:
             batch_size = min(3, hard_limit - len(selected))
             target = extend_keyframes(keyframes, selected, count=batch_size)
@@ -404,18 +404,24 @@ class AdaptiveOcrRunner:
 
 def ocr_language(
     timestamp_ms: int,
-    speech: SpeechAnalysis,
+    speech: SpeechAnalysis | None,
     media: PreparedMedia,
 ) -> tuple[str | None, str | None]:
-    timed_languages = sorted(
-        (
+    timed_languages: list[SubtitleCue | SpeechSegment] = []
+    if speech is not None:
+        timed_languages.extend(
             item
             for item in speech.evidence
             if isinstance(item, (SubtitleCue, SpeechSegment))
             and item.start_ms <= timestamp_ms < item.end_ms
-        ),
-        key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),
-    )
+        )
+    if media.subtitle is not None:
+        timed_languages.extend(
+            item
+            for item in media.subtitle.cues
+            if item.start_ms <= timestamp_ms < item.end_ms
+        )
+    timed_languages.sort(key=lambda item: (item.start_ms, item.end_ms, item.evidence_id))
     language = timed_languages[0].language if timed_languages else None
     if language is None:
         language = next(

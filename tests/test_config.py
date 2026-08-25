@@ -96,6 +96,8 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(configuration.max_attempts, 4)
             self.assertEqual(configuration.max_window_ms, 600_000)
             self.assertEqual(configuration.overlap_ms, 1_000)
+            self.assertEqual(configuration.merge_gap_ms, 2_000)
+            self.assertEqual(configuration.max_upload_bytes, 25 * 1024 * 1024)
 
     def test_cloud_asr_environment_uses_exact_openai_names(self) -> None:
         values = {

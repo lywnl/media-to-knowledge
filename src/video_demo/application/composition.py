@@ -328,7 +328,9 @@ def _settings_fingerprint(settings: Settings) -> str:
             "max_attempts": cloud_asr.max_attempts,
             "max_window_ms": cloud_asr.max_window_ms,
             "overlap_ms": cloud_asr.overlap_ms,
-            "window_strategy_version": "1.0.0",
+            "merge_gap_ms": cloud_asr.merge_gap_ms,
+            "max_upload_bytes": cloud_asr.max_upload_bytes,
+            "window_strategy_version": "2.0.0",
         },
         "qwen": {
             "base_url": _normalized_endpoint(settings.qwen_base_url),
@@ -505,6 +507,8 @@ def _speech_fingerprint_inputs(settings: Settings) -> SpeechFingerprintInputs:
         cloud_asr_base_url=configuration.base_url,
         max_window_ms=configuration.max_window_ms,
         overlap_ms=configuration.overlap_ms,
+        merge_gap_ms=configuration.merge_gap_ms,
+        max_upload_bytes=configuration.max_upload_bytes,
     )
 
 
@@ -518,6 +522,8 @@ def _speech_runtime_config(settings: Settings, ffmpeg: Path) -> SpeechRuntimeCon
         max_attempts=configuration.max_attempts,
         max_window_ms=configuration.max_window_ms,
         overlap_ms=configuration.overlap_ms,
+        merge_gap_ms=configuration.merge_gap_ms,
+        max_upload_bytes=configuration.max_upload_bytes,
         model_identities=inputs.model_identities,
         vad_threshold=inputs.vad_threshold,
         vad_merge_gap_ms=inputs.vad_merge_gap_ms,

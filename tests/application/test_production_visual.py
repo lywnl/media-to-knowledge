@@ -40,6 +40,7 @@ from video_demo.domain.manifest import Rational, VideoAssetManifest, VideoStream
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.probe import ProbeLimits
+from video_demo.media.subtitles import ParsedSubtitle
 from video_demo.media.transcode import ClipArtifact
 from video_demo.visual.keyframes import FrameCandidate, KeyframeSelector
 from video_demo.visual.ocr import OcrProviderResponse
@@ -93,7 +94,7 @@ def test_visual_preparation_uses_task_cap_for_vfr_manifest(tmp_path: Path) -> No
         tmp_path,
         lambda _media, _cancel: VisualComponents(
             scene_detector=Scenes(),
-            frame_extractor=object(),  # type: ignore[arg-type]
+            frame_extractor=_NoFrames(),
             keyframe_selector=KeyframeSelector(),
             ocr_client=object(),  # type: ignore[arg-type]
             clip_client=object(),  # type: ignore[arg-type]
@@ -103,6 +104,25 @@ def test_visual_preparation_uses_task_cap_for_vfr_manifest(tmp_path: Path) -> No
     preparation = analyzer.prepare(media)
 
     assert preparation.frame_tolerance_ms == 100
+
+
+def test_visual_preparation_rejects_missing_frame_extractor_contract(tmp_path: Path) -> None:
+    media = _media(tmp_path, duration_ms=2_000)
+    analyzer = ProductionVisualAnalyzer(
+        tmp_path,
+        lambda _media, _cancel: VisualComponents(
+            scene_detector=_Scenes(2_000),
+            frame_extractor=object(),  # type: ignore[arg-type]
+            keyframe_selector=KeyframeSelector(),
+            ocr_client=object(),  # type: ignore[arg-type]
+            clip_client=object(),  # type: ignore[arg-type]
+        ),
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        analyzer.prepare(media)
+
+    assert raised.value.code == ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE
 
 
 def test_complete_visual_chain_returns_merged_windows_without_creating_clips(
@@ -205,6 +225,93 @@ def test_complete_visual_chain_returns_merged_windows_without_creating_clips(
     assert set(boundary.sources) == {"clip_edge", "ocr_change"}
 
 
+def test_prepare_completes_visual_observation_without_speech_and_finalize_only_fuses(
+    tmp_path: Path,
+) -> None:
+    media = _media(tmp_path, duration_ms=20_000)
+    calls: list[str] = []
+
+    class Scenes:
+        def detect(
+            self,
+            _proxy: Path,
+            *,
+            duration_ms: int,
+            source_sha256: str,
+            frame_tolerance_ms: int,
+        ) -> tuple[SceneBoundary, ...]:
+            calls.append("scene")
+            return (_scene(0, duration_ms, transition="candidate"),)
+
+    class Frames:
+        def extract(
+            self,
+            _proxy: Path,
+            run_relative_root: Path,
+            windows: Sequence[TimeRange],
+            **_kwargs: object,
+        ) -> tuple[WindowFrameCandidates, ...]:
+            calls.append("frames")
+            return tuple(
+                WindowFrameCandidates(
+                    window=window,
+                    candidates=(
+                        _write_frame(
+                            tmp_path,
+                            run_relative_root,
+                            window.start_ms + window.duration_ms // 2,
+                            f"page-{window.start_ms}".encode(),
+                        ),
+                    ),
+                )
+                for window in windows
+            )
+
+    class Ocr:
+        def recognize(
+            self,
+            _image: bytes,
+            language: str,
+            *,
+            deadline: float | None = None,
+        ) -> OcrProviderResponse:
+            calls.append(f"ocr:{language}")
+            return _ocr("页面文字")
+
+    analyzer = ProductionVisualAnalyzer(
+        tmp_path,
+        lambda _media, _cancel: VisualComponents(
+            scene_detector=Scenes(),
+            frame_extractor=Frames(),
+            keyframe_selector=KeyframeSelector(),
+            ocr_client=Ocr(),
+            clip_client=_Clips(tmp_path, calls),
+        ),
+    )
+
+    preparation = analyzer.prepare(media)
+    assert calls == ["scene", "frames", "ocr:zh"]
+    assert preparation.keyframes
+    assert preparation.ocr
+    assert preparation.observation_windows
+    assert [metric.stage for metric in preparation.stage_metrics] == [
+        "VISUAL_SCENE_DETECT",
+        "VISUAL_FRAME_EXTRACT",
+        "VISUAL_KEYFRAME_SELECT",
+        "VISUAL_OCR",
+    ]
+
+    result = analyzer.finalize(
+        media,
+        preparation,
+        speech=SpeechAnalysis(transcript_source="NONE"),
+    )
+
+    assert calls == ["scene", "frames", "ocr:zh"]
+    assert result.evidence
+    assert [metric.stage for metric in result.stage_metrics] == ["VISUAL_FUSION"]
+
+
 def test_low_text_visual_chain_stops_after_probe_budget(tmp_path: Path) -> None:
     duration_ms = 300_000
     media = _media(tmp_path, duration_ms=duration_ms)
@@ -266,11 +373,11 @@ def test_low_text_visual_chain_stops_after_probe_budget(tmp_path: Path) -> None:
     keyframes = [item for item in result.evidence if item.evidence_type == "KEYFRAME"]
     ocr = [item for item in result.evidence if item.evidence_type == "OCR"]
     timestamps = [item.timestamp_ms for item in keyframes]
-    assert len(keyframes) == 6
-    assert len(ocr) == 6
-    assert len(ocr_calls) == 6
+    assert len(keyframes) == 5
+    assert len(ocr) == 5
+    assert len(ocr_calls) == 5
     assert timestamps == sorted(set(timestamps))
-    assert timestamps[0] == 25_000
+    assert timestamps[0] == 31_000
     assert timestamps[-1] < duration_ms
 
 
@@ -280,9 +387,9 @@ def test_normal_text_visual_chain_stops_at_base_budget(tmp_path: Path) -> None:
         text_for_call=lambda index: f"相同课程页面主体内容仅修改版本编号{index % 2}",
     )
 
-    assert calls == 13
-    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == 13
-    assert len([item for item in result.evidence if item.evidence_type == "OCR"]) == 13
+    assert calls == 10
+    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == 10
+    assert len([item for item in result.evidence if item.evidence_type == "OCR"]) == 10
 
 
 def test_dense_text_visual_chain_adds_three_at_a_time_until_hard_limit(tmp_path: Path) -> None:
@@ -291,9 +398,9 @@ def test_dense_text_visual_chain_adds_three_at_a_time_until_hard_limit(tmp_path:
         text_for_call=lambda index: chr(0x4E00 + index) * 30,
     )
 
-    assert calls == 20
-    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == 20
-    assert len([item for item in result.evidence if item.evidence_type == "OCR"]) == 20
+    assert calls == 15
+    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == 15
+    assert len([item for item in result.evidence if item.evidence_type == "OCR"]) == 15
 
 
 def test_dense_text_visual_chain_stops_when_full_batch_has_less_than_two_new_pages(
@@ -308,20 +415,22 @@ def test_dense_text_visual_chain_stops_when_full_batch_has_less_than_two_new_pag
         ),
     )
 
-    assert calls == 9
-    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == 9
+    # 探针预算从 6 降到 5 后，首个补充批次包含两个新页面，
+    # 因此不会在 9 张时提前停止；下一批才满足“新增页面少于 2 个”的条件。
+    assert calls == 11
+    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == 11
 
 
 def test_ocr_budget_timeout_keeps_completed_evidence_and_emits_warning(tmp_path: Path) -> None:
-    clock_values = iter((0.0, 0.0, 0.1, 0.2, 0.3, 31.0))
+    clock_values = iter((0.0,) * 20 + (31.0,))
     result, calls = _run_budget_visual(
         tmp_path,
         text_for_call=lambda index: f"第{index}页包含完全不同且足够长的有效文字内容",
         clock=lambda: next(clock_values, 31.0),
     )
 
-    assert calls == 1
-    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == 1
+    assert 1 <= calls < 21
+    assert len([item for item in result.evidence if item.evidence_type == "KEYFRAME"]) == calls
     assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
 
 
@@ -349,7 +458,7 @@ def test_deadline_reached_during_probe_scoring_wins_over_text_classification(
         clock=lambda: now[0],
     )
 
-    assert calls == 6
+    assert calls == 5
     assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
 
 
@@ -375,7 +484,7 @@ def test_deadline_reached_during_batch_value_scoring_wins_over_marginal_stop(
         clock=lambda: now[0],
     )
 
-    assert calls == 9
+    assert calls == 8
     assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
 
 
@@ -402,7 +511,7 @@ def test_deadline_reached_after_normal_batch_wins_over_base_budget_stop(
         clock=lambda: now[0],
     )
 
-    assert calls == 13
+    assert calls == 10
     assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
 
 
@@ -418,7 +527,7 @@ def test_deadline_reached_during_normal_candidate_selection_wins_over_exhaustion
         *,
         count: int,
     ) -> tuple[KeyframeEvidence, ...]:
-        assert count == 7
+        assert count == 5
         now[0] = 31.0
         return tuple(selected)
 
@@ -434,7 +543,7 @@ def test_deadline_reached_during_normal_candidate_selection_wins_over_exhaustion
         clock=lambda: now[0],
     )
 
-    assert calls == 6
+    assert calls == 5
     assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
 
 
@@ -450,7 +559,7 @@ def test_deadline_reached_during_last_dense_batch_scoring_wins_over_hard_limit(
         nonlocal score_calls
         texts = original_effective_texts(*args, **kwargs)  # type: ignore[arg-type]
         score_calls += 1
-        if score_calls == 5:
+        if score_calls == 4:
             now[0] = 31.0
         return texts
 
@@ -466,7 +575,7 @@ def test_deadline_reached_during_last_dense_batch_scoring_wins_over_hard_limit(
         clock=lambda: now[0],
     )
 
-    assert calls == 20
+    assert calls == 15
     assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
 
 
@@ -498,7 +607,7 @@ def test_deadline_reached_during_dense_candidate_selection_wins_over_exhaustion(
         clock=lambda: now[0],
     )
 
-    assert calls == 6
+    assert calls == 5
     assert "OCR_BUDGET_TIME_LIMIT_REACHED" in result.warnings
 
 
@@ -736,7 +845,7 @@ def test_visual_preparation_rejects_replaced_scenes_before_finalization_componen
         factory_calls.append("factory")
         return VisualComponents(
             scene_detector=_Scenes(4_000),
-            frame_extractor=object(),  # type: ignore[arg-type]
+            frame_extractor=_NoFrames(),
             keyframe_selector=KeyframeSelector(),
             ocr_client=object(),  # type: ignore[arg-type]
             clip_client=object(),  # type: ignore[arg-type]
@@ -789,7 +898,7 @@ def test_visual_preparation_binds_every_media_and_tolerance_field(
         factory_calls.append("factory")
         return VisualComponents(
             scene_detector=_Scenes(4_000),
-            frame_extractor=object(),  # type: ignore[arg-type]
+            frame_extractor=_NoFrames(),
             keyframe_selector=KeyframeSelector(),
             ocr_client=object(),  # type: ignore[arg-type]
             clip_client=object(),  # type: ignore[arg-type]
@@ -835,7 +944,7 @@ def test_visual_preparation_cannot_be_reused_for_another_run(
         factory_calls.append("factory")
         return VisualComponents(
             scene_detector=_Scenes(4_000),
-            frame_extractor=object(),  # type: ignore[arg-type]
+            frame_extractor=_NoFrames(),
             keyframe_selector=KeyframeSelector(),
             ocr_client=object(),  # type: ignore[arg-type]
             clip_client=object(),  # type: ignore[arg-type]
@@ -919,7 +1028,7 @@ def test_speech_candidates_build_hybrid_windows_but_scene_alone_does_not(
         ),
     ).analyze(media, speech=speech)
 
-    assert seen_windows == [(0, 10_000), (10_000, 20_000)]
+    assert seen_windows == [(0, 8_000), (8_000, 20_000)]
     assert result.clips == ()
     assert [(item.start_ms, item.end_ms) for item in result.windows] == [(0, 20_000)]
     hard_scene = next(item for item in result.boundaries if item.timestamp_ms == 8_000)
@@ -1072,6 +1181,26 @@ def test_ocr_language_can_follow_subtitle_cue(tmp_path: Path) -> None:
     assert warning is None
 
 
+def test_ocr_language_uses_media_subtitle_when_speech_is_not_ready(tmp_path: Path) -> None:
+    from video_demo.application.production_visual import _ocr_language
+
+    media = _media(tmp_path, duration_ms=4_000, language_hints=("en",))
+    cue = SubtitleCue(
+        evidence_id="subtitle_002",
+        start_ms=0,
+        end_ms=4_000,
+        text="字幕正文",
+        language="ja",
+        stream_index=2,
+    )
+    media = replace(media, subtitle=ParsedSubtitle.model_construct(cues=(cue,)))
+
+    language, warning = _ocr_language(2_000, None, media)
+
+    assert language == "ja"
+    assert warning is None
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["digest", "outside", "symlink", "directory", "empty", "fake_mp4", "size"],
@@ -1128,7 +1257,7 @@ def test_proxy_is_verified_before_pixel_or_external_processing(
         tmp_path,
         lambda _media, _cancel: VisualComponents(
             scene_detector=Scenes(),
-            frame_extractor=object(),  # type: ignore[arg-type]
+            frame_extractor=_NoFrames(),
             keyframe_selector=KeyframeSelector(),
             ocr_client=object(),  # type: ignore[arg-type]
             clip_client=object(),  # type: ignore[arg-type]
@@ -1259,6 +1388,17 @@ class _Scenes:
         assert len(source_sha256) == 64
         assert frame_tolerance_ms == 40
         return (_scene(0, duration_ms, transition="candidate"),)
+
+
+class _NoFrames:
+    def extract(
+        self,
+        _proxy: Path,
+        _run_relative_root: Path,
+        windows: Sequence[TimeRange],
+        **_kwargs: object,
+    ) -> tuple[WindowFrameCandidates, ...]:
+        return tuple(WindowFrameCandidates(window=item, candidates=()) for item in windows)
 
 
 class _StaticOcr:

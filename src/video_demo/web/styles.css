@@ -114,6 +114,78 @@ svg {
   margin-bottom: 28px;
 }
 
+.history-panel .section-heading {
+  align-items: center;
+}
+
+.secondary-button {
+  margin-left: auto;
+  min-height: 36px;
+  padding: 6px 13px;
+  color: var(--signal);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  font-size: 0.84rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.secondary-button:hover {
+  border-color: var(--signal);
+  background: var(--signal-soft);
+}
+
+.history-status {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 0.9rem;
+}
+
+.history-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.history-item {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  padding: 13px 15px;
+  color: var(--ink);
+  text-align: left;
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  cursor: pointer;
+  transition: border-color 180ms ease, background-color 180ms ease;
+}
+
+.history-item:hover,
+.history-item:focus-visible {
+  background: var(--signal-soft);
+  border-color: var(--signal);
+  outline: none;
+}
+
+.history-item-name {
+  overflow: hidden;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-item-meta {
+  color: var(--ink-muted);
+  font-size: 0.82rem;
+}
+
+.result-source {
+  margin: 0 0 10px;
+  color: rgba(255, 255, 255, 0.76);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
+
 .step-number {
   margin-top: 3px;
   color: var(--signal);

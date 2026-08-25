@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
@@ -31,6 +32,8 @@ from video_demo.speech.snapshots import (
 from video_demo.speech.vad import VadResult
 from video_demo.storage.snapshots import AsrWindowSnapshotStore
 from video_demo.storage.workspace import safe_runtime_path
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class VadPort(Protocol):
@@ -89,6 +92,8 @@ def run_asr_stage(
     asr_fingerprint: str,
     max_window_ms: int,
     overlap_ms: int,
+    merge_gap_ms: int = 2_000,
+    max_upload_bytes: int = 25 * 1024 * 1024,
 ) -> AsrSnapshotPayload:
     """严格串行识别 VAD 窗口，并在每个成功窗口后立即持久化。"""
 
@@ -99,6 +104,8 @@ def run_asr_stage(
         vad.speech,
         max_window_ms=max_window_ms,
         overlap_ms=overlap_ms,
+        merge_gap_ms=merge_gap_ms,
+        max_upload_bytes=max_upload_bytes,
     )
     language_spans = []
     segments: list[SpeechSegment] = []
@@ -108,7 +115,18 @@ def run_asr_stage(
         media.source.asset.config.core_context,
     )
     language_hint = _single_language_hint(media.source.asset.config.language_hints)
-    for window in windows:
+    for index, window in enumerate(windows, start=1):
+        _LOGGER.info(
+            "云端 ASR 窗口: index=%d/%d upload=%d-%dms owned=%d-%dms duration=%dms sources=%d",
+            index,
+            len(windows),
+            window.upload_range.start_ms,
+            window.upload_range.end_ms,
+            window.owned_range.start_ms,
+            window.owned_range.end_ms,
+            window.upload_range.duration_ms,
+            len(window.source_intervals),
+        )
         fingerprint = asr_window_fingerprint(
             asr_fingerprint=asr_fingerprint,
             window=window,
@@ -174,6 +192,12 @@ def _recognize_window(
         window.upload_range,
     )
     try:
+        _LOGGER.info(
+            "云端 ASR 切片: upload=%d-%dms size_bytes=%d",
+            window.upload_range.start_ms,
+            window.upload_range.end_ms,
+            audio_slice.stat().st_size,
+        )
         result = components.recognizer.transcribe_window(
             audio_slice,
             language_hint=language_hint,
@@ -189,6 +213,7 @@ def _recognize_window(
             upload_range=window.upload_range,
             owned_range=window.owned_range,
             speech_interval=window.speech_interval,
+            source_intervals=window.source_intervals,
             language_span=projection.language_span,
             segments=projection.segments,
             warnings=projection.warnings,

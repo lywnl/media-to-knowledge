@@ -2161,7 +2161,7 @@ def test_settings_fingerprint_records_cloud_asr_semantics(
     assert len(encoded_payloads) == 1
     payload = json.loads(encoded_payloads[0])
     assert payload["cloud_asr"]["model_id"] == "openai/whisper"
-    assert payload["cloud_asr"]["window_strategy_version"] == "1.0.0"
+    assert payload["cloud_asr"]["window_strategy_version"] == "2.0.0"
 
 
 def test_settings_fingerprint_ignores_secrets_and_absolute_workspace_location(
