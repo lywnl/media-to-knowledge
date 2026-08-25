@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import stat
 import traceback
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.visual.keyframes import FrameCandidate, KeyframeSelector, OpenCvFrameExtractor
+from video_demo.visual.candidate_artifacts import CandidateArtifactSession
+from video_demo.visual.keyframes import (
+    FrameCandidate,
+    FrameSample,
+    KeyframeSelector,
+    OpenCvFrameExtractor,
+)
 
 
 def _frame(
@@ -24,6 +32,15 @@ def _frame(
         black_ratio=black_ratio,
         perceptual_hash=perceptual_hash or f"{timestamp_ms:016x}",
         relative_path=Path(f"visual/candidates/{timestamp_ms}.jpg"),
+    )
+
+
+def _artifact_session(runtime_root: Path) -> CandidateArtifactSession:
+    return CandidateArtifactSession(
+        runtime_root=runtime_root,
+        max_unique_bytes=1024 * 1024,
+        max_files=100,
+        max_file_bytes=1024 * 1024,
     )
 
 
@@ -135,9 +152,7 @@ def test_opencv_extractor_reuses_one_capture_seeks_and_atomically_encodes_jpeg(
         def get(self, prop: int) -> float:
             calls.append(("position", prop))
             seek = next(
-                item
-                for item in reversed(calls)
-                if isinstance(item, tuple) and item[0] == "seek"
+                item for item in reversed(calls) if isinstance(item, tuple) and item[0] == "seek"
             )
             return float(seek[2])
 
@@ -594,3 +609,612 @@ def test_opencv_actual_timestamp_is_unique_across_windows_in_one_extract(
     candidate = result[0].candidates[0]
     assert encoded_markers == [1]
     assert (runtime / candidate.relative_path).read_bytes() == b"\xff\xd8\xff1\xff\xd9"
+
+
+def test_exact_sampling_decodes_equal_timestamp_once_and_rebinds_sample_ids(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    jpeg = b"\xff\xd8\xffexact\xff\xd9"
+
+    class Array:
+        def __le__(self, _value: int) -> Array:
+            return self
+
+        def mean(self) -> float:
+            return 0.0
+
+        def var(self) -> float:
+            return 10.0
+
+        def reshape(self, _size: int) -> Array:
+            return self
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter([0, 255] * 32)
+
+    class Encoded:
+        def tobytes(self) -> bytes:
+            return jpeg
+
+    class Capture:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, _prop: int, _value: float) -> bool:
+            calls.append("seek")
+            return True
+
+        def read(self) -> tuple[bool, Array]:
+            calls.append("read")
+            return True, Array()
+
+        def get(self, _prop: int) -> float:
+            return 500.0
+
+        def release(self) -> None:
+            calls.append("release")
+
+    class Cv2:
+        CAP_PROP_POS_MSEC = 10
+        COLOR_BGR2GRAY = 20
+        CV_64F = 30
+        INTER_AREA = 40
+        IMWRITE_JPEG_QUALITY = 50
+        VideoCapture = Capture
+        cvtColor = staticmethod(lambda pixels, _mode: pixels)
+        Laplacian = staticmethod(lambda gray, _kind: gray)
+        resize = staticmethod(lambda gray, _size, **_kwargs: gray)
+        imencode = staticmethod(lambda _ext, _pixels, _params: (True, Encoded()))
+
+    runtime = tmp_path / "runtime"
+    artifact_session = _artifact_session(runtime)
+    results = OpenCvFrameExtractor(runtime, module_loader=lambda: Cv2).extract_samples(
+        runtime / "runs/scope/run_001/media/proxy.mp4",
+        Path("runs/scope/run_001"),
+        (
+            FrameSample(sample_id="sample_a", timestamp_ms=500),
+            FrameSample(sample_id="sample_b", timestamp_ms=500),
+        ),
+        is_cancel_requested=lambda: False,
+        frame_tolerance_ms=40,
+        artifact_session=artifact_session,
+    )
+    artifact_session.close()
+
+    assert [item.sample_id for item in results] == ["sample_a", "sample_b"]
+    assert [item.status for item in results] == ["SUCCEEDED", "SUCCEEDED"]
+    assert results[0].candidate == results[1].candidate
+    assert calls.count("read") == calls.count("seek") == 1
+    assert results[0].candidate is not None
+    assert results[0].candidate.relative_path.name == (f"{hashlib.sha256(jpeg).hexdigest()}.jpg")
+    destination = runtime / results[0].candidate.relative_path
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+
+
+def test_exact_sampling_executes_primary_tier_before_earlier_supplement(
+    tmp_path: Path,
+) -> None:
+    seeks: list[int] = []
+
+    class Array:
+        def __le__(self, _value: int) -> Array:
+            return self
+
+        def mean(self) -> float:
+            return 0.0
+
+        def var(self) -> float:
+            return 1.0
+
+        def reshape(self, _size: int) -> Array:
+            return self
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter([0, 255] * 32)
+
+    class Encoded:
+        def tobytes(self) -> bytes:
+            return b"\xff\xd8\xffpriority\xff\xd9"
+
+    class Capture:
+        position_ms = 0
+
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, _prop: int, value: float) -> bool:
+            self.position_ms = round(value)
+            seeks.append(self.position_ms)
+            return True
+
+        def read(self) -> tuple[bool, Array]:
+            return True, Array()
+
+        def get(self, _prop: int) -> float:
+            return float(self.position_ms)
+
+        def release(self) -> None:
+            pass
+
+    class Cv2:
+        CAP_PROP_POS_MSEC = 10
+        COLOR_BGR2GRAY = 20
+        CV_64F = 30
+        INTER_AREA = 40
+        IMWRITE_JPEG_QUALITY = 50
+        VideoCapture = Capture
+        cvtColor = staticmethod(lambda pixels, _mode: pixels)
+        Laplacian = staticmethod(lambda gray, _kind: gray)
+        resize = staticmethod(lambda gray, _size, **_kwargs: gray)
+        imencode = staticmethod(lambda _ext, _pixels, _params: (True, Encoded()))
+
+    session = _artifact_session(tmp_path)
+    results = OpenCvFrameExtractor(tmp_path, module_loader=lambda: Cv2).extract_samples(
+        tmp_path / "runs/scope/run_001/media/proxy.mp4",
+        Path("runs/scope/run_001"),
+        (
+            FrameSample(
+                sample_id="base_supplement",
+                timestamp_ms=100,
+                admission_tier="BASE_SUPPLEMENT",
+            ),
+            FrameSample(
+                sample_id="semantic_primary",
+                timestamp_ms=1_000,
+                admission_tier="SEMANTIC_PRIMARY",
+            ),
+        ),
+        is_cancel_requested=lambda: False,
+        frame_tolerance_ms=20,
+        artifact_session=session,
+    )
+    session.close()
+
+    assert seeks == [1_000, 100]
+    assert [result.sample_id for result in results] == ["base_supplement", "semantic_primary"]
+
+
+def test_exact_sampling_rejects_black_frame_before_encoding_or_budget(
+    tmp_path: Path,
+) -> None:
+    encoded = False
+
+    class Array:
+        def __le__(self, _value: int) -> Array:
+            return self
+
+        def mean(self) -> float:
+            return 0.96
+
+        def var(self) -> float:
+            return 1.0
+
+    class Capture:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, _prop: int, _value: float) -> bool:
+            return True
+
+        def read(self) -> tuple[bool, Array]:
+            return True, Array()
+
+        def get(self, _prop: int) -> float:
+            return 500.0
+
+        def release(self) -> None:
+            pass
+
+    def encode(*_args: object) -> tuple[bool, object]:
+        nonlocal encoded
+        encoded = True
+        raise AssertionError("黑帧不应编码")
+
+    class Cv2:
+        CAP_PROP_POS_MSEC = 10
+        COLOR_BGR2GRAY = 20
+        CV_64F = 30
+        VideoCapture = Capture
+        cvtColor = staticmethod(lambda pixels, _mode: pixels)
+        Laplacian = staticmethod(lambda gray, _kind: gray)
+        imencode = staticmethod(encode)
+
+    session = _artifact_session(tmp_path)
+    result = OpenCvFrameExtractor(tmp_path, module_loader=lambda: Cv2).extract_samples(
+        tmp_path / "runs/scope/run_001/media/proxy.mp4",
+        Path("runs/scope/run_001"),
+        (FrameSample(sample_id="black", timestamp_ms=500),),
+        is_cancel_requested=lambda: False,
+        frame_tolerance_ms=20,
+        artifact_session=session,
+    )[0]
+    session.close()
+
+    assert result.status == "QUALITY_REJECTED"
+    assert result.candidate is None
+    assert result.artifact_status is None
+    assert encoded is False
+    assert session.unique_bytes == 0
+
+
+def test_exact_sampling_reports_single_image_budget_rejection_without_file(
+    tmp_path: Path,
+) -> None:
+    jpeg = b"\xff\xd8\xfftoo-large\xff\xd9"
+
+    class Array:
+        def __le__(self, _value: int) -> Array:
+            return self
+
+        def mean(self) -> float:
+            return 0.0
+
+        def var(self) -> float:
+            return 1.0
+
+        def reshape(self, _size: int) -> Array:
+            return self
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter([0, 255] * 32)
+
+    class Encoded:
+        def tobytes(self) -> bytes:
+            return jpeg
+
+    class Capture:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, _prop: int, _value: float) -> bool:
+            return True
+
+        def read(self) -> tuple[bool, Array]:
+            return True, Array()
+
+        def get(self, _prop: int) -> float:
+            return 500.0
+
+        def release(self) -> None:
+            pass
+
+    class Cv2:
+        CAP_PROP_POS_MSEC = 10
+        COLOR_BGR2GRAY = 20
+        CV_64F = 30
+        INTER_AREA = 40
+        IMWRITE_JPEG_QUALITY = 50
+        VideoCapture = Capture
+        cvtColor = staticmethod(lambda pixels, _mode: pixels)
+        Laplacian = staticmethod(lambda gray, _kind: gray)
+        resize = staticmethod(lambda gray, _size, **_kwargs: gray)
+        imencode = staticmethod(lambda _ext, _pixels, _params: (True, Encoded()))
+
+    session = CandidateArtifactSession(
+        runtime_root=tmp_path,
+        max_unique_bytes=1024,
+        max_files=100,
+        max_file_bytes=len(jpeg) - 1,
+    )
+    result = OpenCvFrameExtractor(tmp_path, module_loader=lambda: Cv2).extract_samples(
+        tmp_path / "runs/scope/run_001/media/proxy.mp4",
+        Path("runs/scope/run_001"),
+        (FrameSample(sample_id="too_large", timestamp_ms=500),),
+        is_cancel_requested=lambda: False,
+        frame_tolerance_ms=20,
+        artifact_session=session,
+    )[0]
+    session.close()
+
+    assert result.status == "SUCCEEDED"
+    assert result.artifact_status == "BUDGET_REJECTED"
+    assert result.candidate is None
+    candidate_root = tmp_path / "runs/scope/run_001/visual/candidates"
+    assert not tuple(candidate_root.iterdir())
+
+
+def test_exact_sampling_reads_forward_to_nearby_timestamp_without_second_seek(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    class Array:
+        def __le__(self, _value: int) -> Array:
+            return self
+
+        def mean(self) -> float:
+            return 0.0
+
+        def var(self) -> float:
+            return 10.0
+
+        def reshape(self, _size: int) -> Array:
+            return self
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter([0, 255] * 32)
+
+    class Encoded:
+        def tobytes(self) -> bytes:
+            return b"\xff\xd8\xffnearby\xff\xd9"
+
+    class Capture:
+        position_ms = 0
+
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, _prop: int, value: float) -> bool:
+            calls.append("seek")
+            self.position_ms = round(value) - 40
+            return True
+
+        def read(self) -> tuple[bool, Array]:
+            calls.append("read")
+            self.position_ms += 40
+            return True, Array()
+
+        def get(self, _prop: int) -> float:
+            return float(self.position_ms)
+
+        def release(self) -> None:
+            calls.append("release")
+
+    class Cv2:
+        CAP_PROP_POS_MSEC = 10
+        COLOR_BGR2GRAY = 20
+        CV_64F = 30
+        INTER_AREA = 40
+        IMWRITE_JPEG_QUALITY = 50
+        VideoCapture = Capture
+        cvtColor = staticmethod(lambda pixels, _mode: pixels)
+        Laplacian = staticmethod(lambda gray, _kind: gray)
+        resize = staticmethod(lambda gray, _size, **_kwargs: gray)
+        imencode = staticmethod(lambda _ext, _pixels, _params: (True, Encoded()))
+
+    runtime = tmp_path / "runtime"
+    artifact_session = _artifact_session(runtime)
+    results = OpenCvFrameExtractor(runtime, module_loader=lambda: Cv2).extract_samples(
+        runtime / "runs/scope/run_001/media/proxy.mp4",
+        Path("runs/scope/run_001"),
+        (
+            FrameSample(sample_id="sample_first", timestamp_ms=100),
+            FrameSample(sample_id="sample_nearby", timestamp_ms=500),
+        ),
+        is_cancel_requested=lambda: False,
+        frame_tolerance_ms=20,
+        artifact_session=artifact_session,
+    )
+    artifact_session.close()
+
+    assert [item.status for item in results] == ["SUCCEEDED", "SUCCEEDED"]
+    assert [item.candidate.timestamp_ms for item in results if item.candidate] == [100, 500]
+    assert calls.count("seek") == 1
+    assert calls.count("read") == 11
+
+
+def test_exact_sampling_reuses_overshot_frame_for_next_nearby_target(tmp_path: Path) -> None:
+    class Array:
+        def __le__(self, _value: int) -> Array:
+            return self
+
+        def mean(self) -> float:
+            return 0.0
+
+        def var(self) -> float:
+            return 1.0
+
+        def reshape(self, _size: int) -> Array:
+            return self
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter([0, 255] * 32)
+
+    class Encoded:
+        def tobytes(self) -> bytes:
+            return b"\xff\xd8\xfflookahead\xff\xd9"
+
+    class Capture:
+        timestamps = iter((500.0, 540.0))
+        current = 0.0
+
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, _prop: int, _value: float) -> bool:
+            return True
+
+        def read(self) -> tuple[bool, Array]:
+            self.current = next(self.timestamps)
+            return True, Array()
+
+        def get(self, _prop: int) -> float:
+            return self.current
+
+        def release(self) -> None:
+            pass
+
+    class Cv2:
+        CAP_PROP_POS_MSEC = 10
+        COLOR_BGR2GRAY = 20
+        CV_64F = 30
+        INTER_AREA = 40
+        IMWRITE_JPEG_QUALITY = 50
+        VideoCapture = Capture
+        cvtColor = staticmethod(lambda pixels, _mode: pixels)
+        Laplacian = staticmethod(lambda gray, _kind: gray)
+        resize = staticmethod(lambda gray, _size, **_kwargs: gray)
+        imencode = staticmethod(lambda _ext, _pixels, _params: (True, Encoded()))
+
+    artifact_session = _artifact_session(tmp_path)
+    results = OpenCvFrameExtractor(tmp_path, module_loader=lambda: Cv2).extract_samples(
+        tmp_path / "runs/scope/run_001/media/proxy.mp4",
+        Path("runs/scope/run_001"),
+        (
+            FrameSample(sample_id="sample_early", timestamp_ms=100),
+            FrameSample(sample_id="sample_next", timestamp_ms=500),
+        ),
+        is_cancel_requested=lambda: False,
+        frame_tolerance_ms=20,
+        artifact_session=artifact_session,
+    )
+    artifact_session.close()
+
+    assert [result.status for result in results] == ["OUT_OF_TOLERANCE", "SUCCEEDED"]
+    assert results[1].candidate is not None
+    assert results[1].candidate.timestamp_ms == 500
+
+
+def test_exact_sampling_reuses_matching_content_addressed_jpeg(tmp_path: Path) -> None:
+    jpeg = b"\xff\xd8\xffexisting\xff\xd9"
+    digest = hashlib.sha256(jpeg).hexdigest()
+    runtime = tmp_path / "runtime"
+    destination = runtime / f"runs/scope/run_001/visual/candidates/{digest}.jpg"
+    destination.parent.mkdir(parents=True, mode=0o700)
+    destination.write_bytes(jpeg)
+    destination.chmod(0o600)
+
+    class Array:
+        def __le__(self, _value: int) -> Array:
+            return self
+
+        def mean(self) -> float:
+            return 0.0
+
+        def var(self) -> float:
+            return 1.0
+
+        def reshape(self, _size: int) -> Array:
+            return self
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter([0, 255] * 32)
+
+    class Encoded:
+        def tobytes(self) -> bytes:
+            return jpeg
+
+    class Capture:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, _prop: int, _value: float) -> bool:
+            return True
+
+        def read(self) -> tuple[bool, Array]:
+            return True, Array()
+
+        def get(self, _prop: int) -> float:
+            return 500.0
+
+        def release(self) -> None:
+            pass
+
+    class Cv2:
+        CAP_PROP_POS_MSEC = 10
+        COLOR_BGR2GRAY = 20
+        CV_64F = 30
+        INTER_AREA = 40
+        IMWRITE_JPEG_QUALITY = 50
+        VideoCapture = Capture
+        cvtColor = staticmethod(lambda pixels, _mode: pixels)
+        Laplacian = staticmethod(lambda gray, _kind: gray)
+        resize = staticmethod(lambda gray, _size, **_kwargs: gray)
+        imencode = staticmethod(lambda _ext, _pixels, _params: (True, Encoded()))
+
+    artifact_session = _artifact_session(runtime)
+    result = OpenCvFrameExtractor(runtime, module_loader=lambda: Cv2).extract_samples(
+        runtime / "runs/scope/run_001/media/proxy.mp4",
+        Path("runs/scope/run_001"),
+        (FrameSample(sample_id="sample_existing", timestamp_ms=500),),
+        is_cancel_requested=lambda: False,
+        frame_tolerance_ms=40,
+        artifact_session=artifact_session,
+    )
+    artifact_session.close()
+
+    assert result[0].status == "SUCCEEDED"
+    assert result[0].candidate is not None
+    assert result[0].candidate.created_by_call is False
+    assert destination.read_bytes() == jpeg
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        ("seek", "SEEK_FAILED"),
+        ("decode", "DECODE_FAILED"),
+        ("timestamp", "INVALID_TIMESTAMP"),
+        ("tolerance", "OUT_OF_TOLERANCE"),
+    ],
+)
+def test_exact_sampling_returns_explicit_recoverable_failure_status(
+    tmp_path: Path,
+    failure: str,
+    expected_status: Literal[
+        "SEEK_FAILED",
+        "DECODE_FAILED",
+        "INVALID_TIMESTAMP",
+        "OUT_OF_TOLERANCE",
+    ],
+) -> None:
+    class Capture:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, _prop: int, _value: float) -> bool:
+            return failure != "seek"
+
+        def read(self) -> tuple[bool, object | None]:
+            return failure != "decode", object()
+
+        def get(self, _prop: int) -> float:
+            if failure == "timestamp":
+                return float("nan")
+            if failure == "tolerance":
+                return 900.0
+            return 500.0
+
+        def release(self) -> None:
+            pass
+
+    class Cv2:
+        CAP_PROP_POS_MSEC = 10
+        VideoCapture = Capture
+
+    result = OpenCvFrameExtractor(tmp_path, module_loader=lambda: Cv2).extract_samples(
+        tmp_path / "runs/scope/run_001/media/proxy.mp4",
+        Path("runs/scope/run_001"),
+        (FrameSample(sample_id="sample_failure", timestamp_ms=500),),
+        is_cancel_requested=lambda: False,
+        frame_tolerance_ms=40,
+    )
+
+    assert result[0].status == expected_status
+    assert result[0].candidate is None

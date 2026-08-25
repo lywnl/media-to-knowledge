@@ -170,6 +170,12 @@ class Settings(BaseSettings):
     max_document_chapters: int = Field(default=240, ge=1)
     max_result_evidence_items: int = Field(default=25_000, ge=1)
     max_candidate_frame_bytes_per_run: int = Field(default=512 * 1024 * 1024, ge=1)
+    max_candidate_frame_files_per_run: int = Field(default=20_000, ge=1)
+    candidate_directory_lock_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
     max_published_keyframe_bytes_per_run: int = Field(default=256 * 1024 * 1024, ge=1)
     max_result_bundle_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
     max_document_bytes: int = Field(default=16 * 1024 * 1024, ge=1)

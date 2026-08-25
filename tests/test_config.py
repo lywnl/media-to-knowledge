@@ -14,6 +14,25 @@ from video_demo.errors import ErrorCode, VideoDemoError
 
 
 class SettingsTest(unittest.TestCase):
+    def test_candidate_artifact_limits_have_safe_defaults_and_reject_invalid_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            settings = Settings(workspace_root=workspace, _env_file=None)
+
+            self.assertEqual(settings.max_candidate_frame_files_per_run, 20_000)
+            self.assertEqual(settings.candidate_directory_lock_timeout_seconds, 300.0)
+            for field, value in (
+                ("max_candidate_frame_files_per_run", 0),
+                ("candidate_directory_lock_timeout_seconds", 0),
+                ("candidate_directory_lock_timeout_seconds", float("inf")),
+            ):
+                with self.subTest(field=field, value=value), self.assertRaises(ValidationError):
+                    Settings(
+                        workspace_root=workspace,
+                        _env_file=None,
+                        **{field: value},
+                    )
+
     def test_text_llm_and_vlm_configuration_are_independent_and_vlm_has_default_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(
