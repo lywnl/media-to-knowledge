@@ -13,7 +13,14 @@ import pytest
 from pydantic import SecretStr
 
 import video_demo.integrations.qwen as qwen_module
-from video_demo.domain.evidence import AlignedWord, SpeechSegment, SubtitleCue
+from video_demo.domain.evidence import (
+    BoundingBox,
+    OcrEvidence,
+    OcrLine,
+    SceneBoundary,
+    SpeechSegment,
+    SubtitleCue,
+)
 from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
@@ -206,13 +213,16 @@ def test_flash_maps_variable_coarse_summaries_back_to_every_local_window(
         f"window_{index:03d}" for index in range(32)
     ]
     assert [item.understanding.summary_zh for item in result.windows] == [
-        f"第 {index // 4 + 1} 组视觉语义；本地证据：第 {index + 1} 个本地窗口"
-        for index in range(32)
+        f"第 {index + 1} 个本地窗口" for index in range(32)
     ]
     assert [item.understanding.evidence_refs for item in result.windows] == [
         (f"asr_{index:03d}",) for index in range(32)
     ]
-    assert result.summary.summary_zh == "完整视频包含三十二个本地证据窗口。"
+    assert result.summary.summary_zh == (
+        "完整视频包含三十二个本地证据窗口。；"
+        "第 1 组视觉语义；第 2 组视觉语义；第 3 组视觉语义；第 4 组视觉语义；"
+        "第 5 组视觉语义；第 6 组视觉语义；第 7 组视觉语义；第 8 组视觉语义"
+    )
     assert len(payloads) == 1
     evidence_text = payloads[0]["messages"][1]["content"][1]["text"]  # type: ignore[index]
     evidence_document = json.loads(
@@ -263,10 +273,11 @@ def test_whole_video_understanding_uses_one_video_url_and_one_http_post(
     result = client.understand_video(_whole_request(remote_url))
 
     assert result.summary.title == "摘要"
+    assert result.summary.summary_zh == "完整视频包含一段问候。；讲者向观众问好。"
     assert result.summary.topics == ("问候",)
     assert result.summary.keywords == ("问候",)
     assert result.windows[0].understanding.title == "Hello"
-    assert result.windows[0].understanding.summary_zh == "讲者向观众问好。；本地证据：Hello"
+    assert result.windows[0].understanding.summary_zh == "Hello"
     assert result.windows[0].understanding.evidence_refs == ("asr_001",)
     assert len(payloads) == 1
     assert payloads[0]["response_format"] == {"type": "json_object"}
@@ -280,6 +291,96 @@ def test_whole_video_understanding_uses_one_video_url_and_one_http_post(
     assert "JSON Schema" not in serialized
 
 
+def test_flash_group_summaries_only_enrich_video_summary_and_deduplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote_url = "https://private-bucket.oss-cn-hangzhou.aliyuncs.com/full.mp4?signed=1"
+    monkeypatch.setattr(
+        qwen_module.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("8.8.8.8", 443))],
+    )
+    client = QwenVideoClient(
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _request: _provider_response(
+                    {
+                        "group_summaries": ["重复分组", "  重复分组 ", "新增分组"],
+                        "title": "摘要",
+                        "summary_zh": "  紧凑摘要  ",
+                    },
+                    model="qwen3-vl-flash",
+                ),
+            ),
+        ),
+        base_url="https://ai-proxy.example/v1",
+        api_key="qwen-secret",
+        model_id="qwen3-vl-flash",
+        allowed_video_root=tmp_path,
+        allowed_remote_video_hosts=frozenset(
+            {"private-bucket.oss-cn-hangzhou.aliyuncs.com"},
+        ),
+    )
+    request = _multi_window_whole_request(remote_url, window_count=3)
+
+    result = client.understand_video(request)
+
+    assert result.summary.summary_zh == "紧凑摘要；重复分组；新增分组"
+    assert all(
+        "重复分组" not in item.understanding.summary_zh
+        and "新增分组" not in item.understanding.summary_zh
+        for item in result.windows
+    )
+
+
+def test_normal_whole_video_preserves_visual_facts_in_window_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote_url = "https://private-bucket.oss-cn-hangzhou.aliyuncs.com/full.mp4?signed=1"
+    request = _whole_request(remote_url)
+
+    monkeypatch.setattr(
+        qwen_module.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("8.8.8.8", 443))],
+    )
+    client = QwenVideoClient(
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _request: _provider_response(
+                    {
+                        "windows": [
+                            {
+                                "window_id": "window_001",
+                                "understanding": {
+                                    "title": "窗口",
+                                    "summary_zh": "局部摘要",
+                                    "visual_facts": ["画面中的软件界面"],
+                                    "evidence_refs": ["asr_001"],
+                                },
+                            },
+                        ],
+                        "summary": {"title": "视频", "summary_zh": "整体摘要"},
+                    },
+                ),
+            ),
+        ),
+        base_url="https://ai-proxy.example/v1",
+        api_key="qwen-secret",
+        model_id="qwen3-vl-plus",
+        allowed_video_root=tmp_path,
+        allowed_remote_video_hosts=frozenset(
+            {"private-bucket.oss-cn-hangzhou.aliyuncs.com"},
+        ),
+    )
+
+    result = client.understand_video(request)
+
+    assert result.windows[0].understanding.visual_facts == ("画面中的软件界面",)
+
+
 def test_whole_video_binds_all_local_evidence_even_when_prompt_projects_a_subset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -287,15 +388,19 @@ def test_whole_video_binds_all_local_evidence_even_when_prompt_projects_a_subset
     remote_url = "https://private-bucket.oss-cn-hangzhou.aliyuncs.com/full.mp4?signed=1"
     base_request = _whole_request(remote_url)
     speech = base_request.windows[0].evidence[0]
-    aligned_word = AlignedWord(
-        evidence_id="word_001",
-        start_ms=100,
-        end_ms=200,
-        text="H",
-        language="en",
-        probability=0.9,
+    extra_speech = tuple(
+        SpeechSegment(
+            evidence_id=f"asr_{index:03d}",
+            start_ms=100 + index * 50,
+            end_ms=140 + index * 50,
+            text=f"补充文本 {index}",
+            language="en",
+            confidence=0.9,
+            is_fully_evaluated_language=True,
+        )
+        for index in range(2, 5)
     )
-    evidence = (speech, aligned_word)
+    evidence = (speech, *extra_speech)
     request = base_request.model_copy(
         update={
             "windows": (
@@ -338,9 +443,18 @@ def test_whole_video_binds_all_local_evidence_even_when_prompt_projects_a_subset
 
     result = client.understand_video(request)
 
-    assert result.windows[0].understanding.evidence_refs == ("asr_001", "word_001")
+    assert result.windows[0].understanding.evidence_refs == (
+        "asr_001",
+        "asr_002",
+        "asr_003",
+        "asr_004",
+    )
     assert result.windows[0].understanding.title == "Hello"
-    assert result.windows[0].understanding.keywords == ("Hello",)
+    assert result.windows[0].understanding.keywords == (
+        "Hello",
+        "补充文本 3",
+        "补充文本 4",
+    )
 
 
 def test_whole_video_transport_failure_never_retries_full_video_request(
@@ -554,6 +668,8 @@ def test_demo_fallback_builds_deterministic_semantics_when_qwen_is_unavailable(
     assert result.title == "Hello demo"
     assert result.summary_zh == "Hello demo"
     assert result.evidence_refs == ("asr_001",)
+    assert result.speakers == ()
+    assert result.original_keywords == ()
     assert fallback.degraded_warnings == ("DEMO_DEGRADED_QWEN",)
 
     summary = fallback.summarize_video(
@@ -642,6 +758,62 @@ def test_demo_fallback_builds_all_whole_video_windows_and_summary(
     assert fallback.degraded_warnings == ("DEMO_DEGRADED_QWEN",)
 
 
+def test_demo_fallback_keeps_ocr_out_of_visual_facts(tmp_path: Path) -> None:
+    speech = SpeechSegment(
+        evidence_id="asr_001",
+        start_ms=100,
+        end_ms=400,
+        text="讲解画面",
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    ocr = OcrEvidence(
+        evidence_id="ocr_001",
+        start_ms=100,
+        end_ms=400,
+        keyframe_id="keyframe_001",
+        timestamp_ms=200,
+        language="zh",
+        lines=(
+            OcrLine(
+                text="页面标题",
+                bounding_box=BoundingBox(x=0, y=0, width=10, height=10),
+                confidence=0.9,
+            ),
+        ),
+        provider_request_id="ocr-request-001",
+    )
+    scene = SceneBoundary(
+        evidence_id="scene_001",
+        start_ms=100,
+        end_ms=400,
+        transition="candidate",
+        score=0.8,
+    )
+    request = _segment_request(tmp_path).model_copy(
+        update={
+            "timeline": build_timeline((speech, ocr, scene)),
+            "evidence": (speech, ocr, scene),
+        },
+    )
+
+    result = qwen_module._fallback_segment_understanding(request)
+
+    assert result.visual_facts == ("画面场景",)
+    assert "画面文字：页面标题" not in result.visual_facts
+
+
+def test_merge_summary_units_deduplicates_and_caps_video_summary() -> None:
+    units = ("重复摘要", "重复摘要", "新的摘要" * 2_000)
+
+    result = qwen_module._merge_summary_units(units, "主摘要")
+
+    assert result.startswith("主摘要；重复摘要；新的摘要")
+    assert len(result) == 4_000
+    assert result.endswith("…")
+
+
 def test_first_segment_uses_current_verified_clip_for_probe_then_understanding(
     tmp_path: Path,
 ) -> None:
@@ -674,6 +846,35 @@ def test_first_segment_uses_current_verified_clip_for_probe_then_understanding(
     segment_video = payloads[1]["messages"][1]["content"][0]["video_url"]["url"]  # type: ignore[index]
     assert probe_video == segment_video
     assert str(probe_video).endswith("dmlkZW8tYnl0ZXM=")
+
+
+def test_qwen_normalizes_and_deduplicates_keywords_before_returning_semantics(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if _is_probe_request(request):
+            return _provider_response({"supported": True})
+        return _provider_response(
+            {
+                **_valid_segment(),
+                "keywords": [" AI  共创社群 ", "Codex"],
+                "original_keywords": ["ai 共创社群", "codex", "HNSW"],
+            },
+        )
+
+    client = QwenVideoClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://dashscope.example/compatible-mode/v1",
+        api_key="qwen-secret",
+        model_id="qwen3-vl-plus",
+        allowed_video_root=tmp_path,
+        sleeper=lambda _delay: None,
+    )
+
+    result = client.understand_segment(_segment_request(tmp_path))
+
+    assert result.keywords == ("AI 共创社群", "Codex")
+    assert result.original_keywords == ("HNSW",)
 
 
 def test_diagnostic_calls_expose_only_validated_provider_receipts(

@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 from pydantic import ValidationError
 
-from video_demo.application.pipeline import PipelineRunConfig
+from video_demo.application.pipeline import (
+    PipelineRunConfig,
+    pipeline_run_config_from_snapshot,
+)
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.models import (
@@ -33,6 +37,21 @@ class RunView:
 
 
 @dataclass(frozen=True, slots=True)
+class RunHistoryView:
+    run_id: str
+    object_ref: str
+    original_filename: str
+    detected_mime: str
+    size_bytes: int
+    status: RunStatusValue
+    current_stage: str
+    warning_codes: tuple[str, ...]
+    error_code: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class JobView:
     job_id: str
     resource_id: str
@@ -53,15 +72,11 @@ class RunService:
         object_ref: str,
         idempotency_key: str,
         language_hints: tuple[str, ...],
-        min_speakers: int | None,
-        max_speakers: int | None,
         hotwords: tuple[str, ...] = (),
         core_context: str | None = None,
     ) -> RunView:
         config = PipelineRunConfig(
             language_hints=language_hints,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
             hotwords=hotwords,
             core_context=core_context,
         )
@@ -112,7 +127,7 @@ class RunService:
     @staticmethod
     def _same_config(snapshot: dict[str, object], expected: PipelineRunConfig) -> bool:
         try:
-            existing = PipelineRunConfig.model_validate(snapshot)
+            existing = pipeline_run_config_from_snapshot(snapshot)
         except ValidationError:
             return False
         return existing == expected
@@ -125,6 +140,26 @@ class RunService:
             job = JobRepository(session).get_by_resource(scope, run_id)
             assert job is not None
             return _run_view(run, job.job_id)
+
+    def list_history(self, scope: Scope) -> tuple[RunHistoryView, ...]:
+        with self._database.session() as session:
+            records = VideoRunRepository(session).list_with_objects(scope)
+            return tuple(
+                RunHistoryView(
+                    run_id=run.run_id,
+                    object_ref=run.object_ref,
+                    original_filename=video.original_filename,
+                    detected_mime=video.detected_mime,
+                    size_bytes=video.size_bytes,
+                    status=run.status,
+                    current_stage=run.current_stage,
+                    warning_codes=tuple(run.warning_codes),
+                    error_code=run.error_code,
+                    created_at=run.created_at,
+                    updated_at=run.updated_at,
+                )
+                for run, video in records
+            )
 
     def require_result_ready(self, scope: Scope, run_id: str) -> RunView:
         view = self.get(scope, run_id)

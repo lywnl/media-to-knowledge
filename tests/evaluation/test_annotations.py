@@ -41,19 +41,7 @@ def _annotation(media_sha256: str, *, duration_ms: int = 1_000) -> dict[str, obj
         "duration_ms": duration_ms,
         "language": "zh",
         "reference_text": "你好",
-        "words": [{"word_id": "word_001", "text": "你", "start_ms": 0, "end_ms": 500}],
-        "speaker_turns": [
-            {"turn_id": "turn_001", "speaker_id": "speaker_001", "start_ms": 0, "end_ms": 500}
-        ],
         "ocr_frames": [{"frame_id": "frame_001", "timestamp_ms": 100, "text_lines": ["你好"]}],
-        "audio_events": [
-            {
-                "event_id": "event_001",
-                "normalized_event": "speech",
-                "start_ms": 0,
-                "end_ms": 500,
-            }
-        ],
         "scene_boundaries_ms": [500],
         "semantic_boundaries_ms": [500],
         "supported_facts": [{"fact_id": "fact_001", "canonical_text": "有人问好"}],
@@ -112,17 +100,17 @@ def _write_package(tmp_path: Path) -> tuple[Path, Path, str]:
 
 def test_annotation_contract_rejects_time_overrun() -> None:
     payload = _annotation("a" * 64)
-    payload["words"][0]["end_ms"] = 1_001
+    payload["ocr_frames"][0]["timestamp_ms"] = 1_001
 
-    with pytest.raises(ValueError, match="标注时间"):
+    with pytest.raises(ValueError, match="OCR 帧时间"):
         EvaluationAnnotation.model_validate(payload)
 
 
 def test_annotation_contract_rejects_duplicate_id() -> None:
     payload = _annotation("a" * 64)
-    payload["speaker_turns"] = [
-        {"turn_id": "turn_001", "speaker_id": "speaker_001", "start_ms": 0, "end_ms": 500},
-        {"turn_id": "turn_001", "speaker_id": "speaker_002", "start_ms": 500, "end_ms": 800},
+    payload["ocr_frames"] = [
+        {"frame_id": "frame_001", "timestamp_ms": 100, "text_lines": ["你好"]},
+        {"frame_id": "frame_001", "timestamp_ms": 200, "text_lines": ["世界"]},
     ]
 
     with pytest.raises(ValueError, match="稳定 ID"):

@@ -1,9 +1,27 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+from video_demo.api.app import create_app
+from video_demo.config import Settings
+from video_demo.errors import ErrorCode, VideoDemoError
+
+
+def test_api_rejects_missing_cloud_asr_configuration_before_writing_runtime(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(workspace_root=tmp_path, _env_file=None)
+    assert settings.runtime_root is not None
+
+    with pytest.raises(VideoDemoError) as raised:
+        create_app(settings)
+
+    assert raised.value.code == ErrorCode.INVALID_CONFIGURATION
+    assert not settings.runtime_root.exists()
 
 def test_frontend_page_exposes_local_video_file_workflow(client: TestClient) -> None:
     response = client.get("/")
@@ -22,6 +40,8 @@ def test_frontend_page_exposes_local_video_file_workflow(client: TestClient) -> 
     assert "tenant-id" not in html
     assert "application-id" not in html
     assert "knowledge-base-id" not in html
+    assert 'id="history-panel"' in html
+    assert 'id="history-list"' in html
 
 
 def test_frontend_static_resources_are_available(client: TestClient) -> None:
@@ -64,6 +84,12 @@ def test_frontend_script_uses_existing_async_api_contract(client: TestClient) ->
     assert "isRetryablePollingError(error)" in script
     assert 'signal.removeEventListener("abort", rejectOnAbort)' in script
     assert 'updateStatus("处理未完成"' in script
+    assert "loadHistory()" in script
+    assert "/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs" in script
+    assert "original_filename" in script
+    assert "min_speakers" not in script
+    assert "max_speakers" not in script
+    assert "speech_enrichment_mode" not in script
 
 
 def test_frontend_script_renders_untrusted_result_as_text(client: TestClient) -> None:

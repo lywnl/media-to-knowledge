@@ -15,7 +15,6 @@ def test_failure_matrix_contains_all_design_scenarios() -> None:
         "no_audio",
         "no_speech",
         "black_frames",
-        "overlapping_speakers",
         "five_language_switch",
         "ocr_401",
         "ocr_429",

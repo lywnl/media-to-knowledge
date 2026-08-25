@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-import traceback
 from pathlib import Path
 
-import pytest
-
-from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.speech.language import (
-    FasterWhisperLanguageDetector,
     LanguageDetection,
     SegmentLanguageIdentifier,
 )
@@ -84,100 +79,3 @@ def test_language_identifier_tracks_all_five_validation_languages(tmp_path: Path
     assert tuple(span.language for span in result.spans) == ("zh", "en", "ja", "ko", "es")
     assert result.change_boundaries_ms == (1_000, 2_000, 3_000, 4_000)
     assert all(span.is_fully_evaluated_language for span in result.spans)
-
-
-def test_faster_whisper_language_detector_uses_slice_and_supported_hint(tmp_path: Path) -> None:
-    calls: list[object] = []
-
-    class Info:
-        language = "en"
-        language_probability = 0.87
-
-    class Backend:
-        def transcribe(self, audio: Path, **kwargs: object) -> tuple[object, Info]:
-            calls.append((audio, kwargs))
-            return ((), Info())
-
-    audio_slice = tmp_path / "speech-slice.wav"
-    detector = FasterWhisperLanguageDetector(Backend())
-    result = detector(
-        audio_slice,
-        SpeechInterval(evidence_id="vad_local", start_ms=0, end_ms=1_000, confidence=1.0),
-        ("zh", "en"),
-    )
-
-    assert result == LanguageDetection(language="en", confidence=0.87)
-    assert calls == [
-        (
-            audio_slice,
-            {
-                "task": "transcribe",
-                "beam_size": 1,
-                "vad_filter": False,
-                "word_timestamps": False,
-                "condition_on_previous_text": False,
-            },
-        )
-    ]
-
-
-def test_faster_whisper_language_detector_uses_single_supported_hint(tmp_path: Path) -> None:
-    calls: list[dict[str, object]] = []
-
-    class Info:
-        language = "ja"
-        language_probability = 0.99
-
-    class Backend:
-        def transcribe(self, _audio: Path, **kwargs: object) -> tuple[object, Info]:
-            calls.append(kwargs)
-            return ((), Info())
-
-    FasterWhisperLanguageDetector(Backend())(
-        tmp_path / "slice.wav",
-        SpeechInterval(evidence_id="vad_local", start_ms=0, end_ms=1_000, confidence=1.0),
-        ("ja",),
-    )
-
-    assert calls[0]["language"] == "ja"
-
-
-def test_faster_whisper_language_detector_rejects_invalid_info(tmp_path: Path) -> None:
-    class Backend:
-        def transcribe(self, audio: Path, **kwargs: object) -> tuple[object, object]:
-            return ((), object())
-
-    with pytest.raises(VideoDemoError) as raised:
-        FasterWhisperLanguageDetector(Backend())(
-            tmp_path / "slice.wav",
-            SpeechInterval(evidence_id="vad_local", start_ms=0, end_ms=1_000, confidence=1.0),
-            (),
-        )
-
-    assert raised.value.code == ErrorCode.SPEECH_MODEL_UNAVAILABLE
-
-
-def test_faster_whisper_language_detector_drops_sensitive_info_traceback(
-    tmp_path: Path,
-) -> None:
-    secret = "faster-whisper-info-secret"
-
-    class Info:
-        @property
-        def language(self) -> str:
-            raise RuntimeError(secret)
-
-    class Backend:
-        def transcribe(self, _audio: Path, **_kwargs: object) -> tuple[object, Info]:
-            return ((), Info())
-
-    with pytest.raises(VideoDemoError) as raised:
-        FasterWhisperLanguageDetector(Backend())(
-            tmp_path / "slice.wav",
-            SpeechInterval(evidence_id="vad_local", start_ms=0, end_ms=1_000, confidence=1.0),
-            (),
-        )
-
-    assert raised.value.code == ErrorCode.SPEECH_MODEL_UNAVAILABLE
-    assert raised.value.__cause__ is None
-    assert secret not in "".join(traceback.format_exception(raised.value))

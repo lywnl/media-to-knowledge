@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 
+from video_demo.domain.evidence import SceneBoundary
 from video_demo.domain.run import TimeRange
 
 
@@ -17,7 +18,6 @@ class BoundaryCandidate:
 _SOURCE_WEIGHTS = {
     "sentence_end": 1.0,
     "silence": 1.0,
-    "speaker_change": 0.9,
     "language_change": 1.0,
     "scene": 0.45,
     "ocr_change": 1.0,
@@ -26,9 +26,8 @@ _SOURCE_PRIORITY = {
     "silence": 0,
     "language_change": 1,
     "sentence_end": 2,
-    "speaker_change": 3,
-    "ocr_change": 4,
-    "scene": 5,
+    "ocr_change": 3,
+    "scene": 4,
 }
 
 
@@ -56,6 +55,171 @@ def build_provisional_windows(
         max_window_ms=max_window_ms,
     )
     return _boundaries_to_windows(duration_ms, boundaries)
+
+
+def build_visual_observation_windows(
+    *,
+    duration_ms: int,
+    scenes: Sequence[SceneBoundary],
+    target_window_ms: int = 15_000,
+    min_window_ms: int = 8_000,
+    max_window_ms: int = 30_000,
+) -> tuple[TimeRange, ...]:
+    """在没有语音边界时，为视觉观察建立稳定、低成本的时间窗口。"""
+    if duration_ms <= 0:
+        raise ValueError("duration_ms 必须大于 0")
+    if not 0 < min_window_ms <= target_window_ms <= max_window_ms:
+        raise ValueError("视觉窗口长度约束非法")
+
+    candidates: list[tuple[int, str]] = [
+        (timestamp_ms, "fixed")
+        for timestamp_ms in range(target_window_ms, duration_ms, target_window_ms)
+    ]
+    candidates.extend(
+        (scene.start_ms, "scene")
+        for scene in scenes
+        if 0 < scene.start_ms < duration_ms
+    )
+    clustered = _cluster_observation_boundaries(candidates)
+    boundaries = _select_observation_boundaries(
+        clustered,
+        duration_ms=duration_ms,
+        min_window_ms=min_window_ms,
+    )
+    boundaries = _split_long_observation_gaps(
+        boundaries,
+        duration_ms=duration_ms,
+        min_window_ms=min_window_ms,
+        max_window_ms=max_window_ms,
+    )
+    windows = _boundaries_to_windows(
+        duration_ms,
+        boundaries,
+    )
+    validate_contiguous_windows(windows, duration_ms=duration_ms)
+    if duration_ms >= min_window_ms and any(
+        not min_window_ms <= item.duration_ms <= max_window_ms for item in windows
+    ):
+        raise ValueError("视觉窗口无法满足长度约束")
+    return windows
+
+
+def validate_contiguous_windows(
+    windows: Sequence[TimeRange],
+    *,
+    duration_ms: int,
+) -> None:
+    if duration_ms <= 0 or not windows:
+        raise ValueError("窗口和视频时长必须有效")
+    if windows[0].start_ms != 0:
+        raise ValueError("窗口必须从 0 开始")
+    if windows[-1].end_ms != duration_ms:
+        raise ValueError("窗口必须覆盖到视频结束")
+    for previous, current in pairwise(windows):
+        if current.start_ms != previous.end_ms:
+            raise ValueError("窗口存在空档或重叠")
+    if any(item.start_ms >= item.end_ms for item in windows):
+        raise ValueError("窗口必须是非空区间")
+
+
+def _cluster_observation_boundaries(
+    candidates: Sequence[tuple[int, str]],
+    *,
+    tolerance_ms: int = 300,
+) -> tuple[tuple[int, str], ...]:
+    ordered = sorted(candidates, key=lambda item: item[0])
+    clusters: list[list[tuple[int, str]]] = []
+    for candidate in ordered:
+        if clusters and candidate[0] - clusters[-1][-1][0] <= tolerance_ms:
+            clusters[-1].append(candidate)
+        else:
+            clusters.append([candidate])
+    representatives: list[tuple[int, str]] = []
+    for cluster in clusters:
+        scene_candidates = [item for item in cluster if item[1] == "scene"]
+        representatives.append(scene_candidates[0] if scene_candidates else cluster[0])
+    return tuple(representatives)
+
+
+def _select_observation_boundaries(
+    candidates: Sequence[tuple[int, str]],
+    *,
+    duration_ms: int,
+    min_window_ms: int,
+) -> list[int]:
+    """用动态规划选择边界，优先保留场景边界且不制造短窗口。"""
+    if duration_ms < min_window_ms:
+        return []
+    ordered = tuple(
+        (timestamp_ms, source)
+        for timestamp_ms, source in candidates
+        if 0 < timestamp_ms < duration_ms
+    )
+    if not ordered:
+        return []
+
+    scores: list[float] = []
+    paths: list[tuple[int, ...]] = []
+    for index, (timestamp_ms, source) in enumerate(ordered):
+        weight = 3.0 if source == "scene" else 1.0
+        best_score = weight if timestamp_ms >= min_window_ms else float("-inf")
+        best_path: tuple[int, ...] = (timestamp_ms,) if best_score != float("-inf") else ()
+        for previous_index in range(index):
+            previous_timestamp = ordered[previous_index][0]
+            if timestamp_ms - previous_timestamp < min_window_ms:
+                continue
+            if scores[previous_index] == float("-inf"):
+                continue
+            candidate_score = scores[previous_index] + weight
+            candidate_path = (*paths[previous_index], timestamp_ms)
+            if (candidate_score, len(candidate_path), candidate_path) > (
+                best_score,
+                len(best_path),
+                best_path,
+            ):
+                best_score = candidate_score
+                best_path = candidate_path
+        scores.append(best_score)
+        paths.append(best_path)
+
+    eligible = [
+        index
+        for index, (timestamp_ms, _source) in enumerate(ordered)
+        if duration_ms - timestamp_ms >= min_window_ms and scores[index] != float("-inf")
+    ]
+    if not eligible:
+        return []
+    selected = max(
+        eligible,
+        key=lambda index: (scores[index], len(paths[index]), paths[index]),
+    )
+    return list(paths[selected])
+
+
+def _split_long_observation_gaps(
+    boundaries: Sequence[int],
+    *,
+    duration_ms: int,
+    min_window_ms: int,
+    max_window_ms: int,
+) -> list[int]:
+    """把超过上限的区间均分，避免尾段重新变成小窗口。"""
+    points = [0, *sorted(set(boundaries)), duration_ms]
+    result: list[int] = []
+    for start, end in pairwise(points):
+        length = end - start
+        if length <= max_window_ms:
+            if end < duration_ms:
+                result.append(end)
+            continue
+        segment_count = (length + max_window_ms - 1) // max_window_ms
+        if length // segment_count < min_window_ms:
+            raise ValueError("视觉窗口长度约束无法同时满足")
+        for index in range(1, segment_count):
+            result.append(start + (length * index) // segment_count)
+        if end < duration_ms:
+            result.append(end)
+    return result
 
 
 def refine_windows_with_ocr(

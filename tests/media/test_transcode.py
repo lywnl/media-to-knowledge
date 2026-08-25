@@ -140,7 +140,12 @@ def test_extract_audio_builds_16khz_mono_pcm_command(
     runner = WritingRunner(output=b"wav")
     transcoder = _transcoder(tmp_path, runner)
 
-    artifact = transcoder.extract_audio(source, Path("runs/run_001"), has_audio=True)
+    artifact = transcoder.extract_audio(
+        source,
+        Path("runs/run_001"),
+        has_audio=True,
+        duration_ms=921_400,
+    )
 
     command = runner.calls[0]
     assert command[:4] == ["/tools/ffmpeg", "-nostdin", "-hide_banner", "-loglevel"]
@@ -151,6 +156,10 @@ def test_extract_audio_builds_16khz_mono_pcm_command(
     assert command[
         command.index("-c:a") : command.index("-c:a") + 2
     ] == ["-c:a", "pcm_s16le"]
+    assert command[command.index("-t") : command.index("-t") + 2] == [
+        "-t",
+        "921.400",
+    ]
     assert "asetpts=PTS-STARTPTS" in command
     assert artifact.relative_path == "runs/run_001/media/audio.wav"
     assert artifact.sample_rate_hz == 16_000
@@ -168,10 +177,45 @@ def test_extract_audio_without_track_returns_explicit_no_audio(
         source,
         Path("runs/run_001"),
         has_audio=False,
+        duration_ms=1_000,
     )
 
     assert artifact == NoAudioArtifact(warning_code="NO_AUDIO_TRACK")
     assert runner.calls == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fd 输出契约仅适用于 POSIX")
+def test_extract_audio_applies_timeline_to_preopened_output(
+    tmp_path: Path,
+    source: Path,
+) -> None:
+    runner = WritingRunner(output=b"wav")
+    source_descriptor = os.open(source, os.O_RDONLY)
+    output_path = tmp_path / "audio-output.wav"
+    output_descriptor = os.open(
+        output_path,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        _transcoder(tmp_path, runner).extract_audio(
+            source,
+            Path("runs/run_001"),
+            has_audio=True,
+            duration_ms=302_101,
+            input_fd=source_descriptor,
+            output_fd=output_descriptor,
+        )
+    finally:
+        os.close(source_descriptor)
+        os.close(output_descriptor)
+
+    command = runner.calls[0]
+    assert command[command.index("-t") : command.index("-t") + 2] == [
+        "-t",
+        "302.101",
+    ]
+    assert output_path.read_bytes() == b"wav"
 
 
 def test_create_proxy_limits_long_edge_and_normalizes_pts(
@@ -460,7 +504,12 @@ def test_transcode_applies_process_output_limit_to_every_ffmpeg_output(
     runner = WritingRunner()
     transcoder = _transcoder(tmp_path, runner, max_output_bytes=1024)
 
-    transcoder.extract_audio(source, Path("runs/run_001"), has_audio=True)
+    transcoder.extract_audio(
+        source,
+        Path("runs/run_001"),
+        has_audio=True,
+        duration_ms=1_000,
+    )
     transcoder.create_proxy(source, Path("runs/run_001"))
     transcoder.create_clip(
         source,

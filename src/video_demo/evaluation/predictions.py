@@ -11,7 +11,11 @@ from pydantic import Field, TypeAdapter, ValidationError, field_validator, model
 from video_demo.domain.base import FrozenModel, Sha256, StableId, stable_identifier
 from video_demo.domain.evidence import EvidenceItem
 from video_demo.domain.result import VideoUnderstandingResult, validate_evidence_references
-from video_demo.domain.result_artifact import ResultArtifactPayload, TranscriptSource
+from video_demo.domain.result_artifact import (
+    ARTIFACT_ENVELOPE_SCHEMA_VERSION,
+    ResultArtifactPayload,
+    TranscriptSource,
+)
 from video_demo.domain.run import ModelIdentity
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.evaluation.dataset import (
@@ -324,7 +328,10 @@ def _validate_manifest(
         "payload",
     }:
         raise ValueError("生产产物 Manifest envelope 非法")
-    if envelope["schema_version"] != "1.0.0" or envelope["upstream_sha256"] != index.media_sha256:
+    if (
+        envelope["schema_version"] != ARTIFACT_ENVELOPE_SCHEMA_VERSION
+        or envelope["upstream_sha256"] != index.media_sha256
+    ):
         raise ValueError("生产产物 Manifest 上游绑定不匹配")
     payload = ResultArtifactPayload.model_validate(envelope["payload"])
     if payload.status != index.terminal_status:

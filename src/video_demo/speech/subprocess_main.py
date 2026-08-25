@@ -8,17 +8,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
-from pydantic import ValidationError
+import httpx
+from pydantic import SecretStr, ValidationError
 
 from video_demo.application.pipeline import PreparedMedia
-from video_demo.application.production_speech import ProductionSpeechAnalyzer
+from video_demo.application.production_speech import run_asr_stage
+from video_demo.config import CloudAsrConfiguration
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.speech.runtime import build_subprocess_component_factory
-from video_demo.speech.snapshots import (
-    AsrSnapshotPayload,
-    SpeechAnalysisSnapshotPayload,
-    speech_fingerprint,
-)
+from video_demo.integrations.cloud_whisper import CloudWhisperClient
+from video_demo.speech.runtime import build_subprocess_asr_components
+from video_demo.speech.snapshots import AsrSnapshotPayload, asr_fingerprint
 from video_demo.speech.subprocess_protocol import (
     ALLOWED_SPEECH_SUBPROCESS_FAILURE_CODES,
     SpeechSubprocessFailure,
@@ -27,14 +26,13 @@ from video_demo.speech.subprocess_protocol import (
     SpeechSubprocessSuccess,
     speech_subprocess_failure_message,
 )
-from video_demo.storage.artifacts import (
-    AtomicArtifactStore,
-    canonical_artifact_envelope_bytes,
-)
-from video_demo.storage.snapshots import SnapshotStore
+from video_demo.storage.artifacts import AtomicArtifactStore, canonical_artifact_envelope_bytes
+from video_demo.storage.snapshots import AsrWindowSnapshotStore, SnapshotStore
 from video_demo.storage.workspace import reject_symlink_components, verified_run_file
 
 _MAX_REQUEST_BYTES = 64 * 1024
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--workspace-root", required=True)
@@ -71,6 +69,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             response = SpeechSubprocessFailure(
                 request_id=request.request_id,
+                asr_fingerprint=request.asr_fingerprint,
                 error_code=code,
                 message=speech_subprocess_failure_message(code),
             )
@@ -100,10 +99,7 @@ def _execute_request(
         digest=_sha256_file,
         message="语音音频必须位于当前运行目录内",
     )
-    actual_asr_fingerprint = __import__(
-        "video_demo.speech.snapshots",
-        fromlist=["asr_fingerprint"],
-    ).asr_fingerprint(
+    actual_asr_fingerprint = asr_fingerprint(
         audio_sha256=request.audio_sha256,
         duration_ms=request.duration_ms,
         language_hints=request.config.language_hints,
@@ -121,19 +117,72 @@ def _execute_request(
         workspace_root / request.runtime.ffmpeg_relative_path,
         message="FFmpeg 路径非法",
     )
-    component_factory = build_subprocess_component_factory(
-        workspace_root=workspace_root,
-        runtime_root=runtime_root,
-        ffmpeg_path=ffmpeg,
-        inference_device=request.runtime.inference_device,
-        whisper_compute_type=request.runtime.whisper_compute_type,
-        huggingface_token=(
-            request.credentials.huggingface_token.get_secret_value()
-            if request.credentials.huggingface_token is not None
-            else None
-        ),
+    media = _prepared_media(request, audio)
+    configuration = CloudAsrConfiguration(
+        base_url=request.runtime.base_url,
+        api_key=SecretStr(request.credentials.openai_api_key.get_secret_value()),
+        model=request.runtime.model,
+        timeout_seconds=request.runtime.timeout_seconds,
+        max_attempts=request.runtime.max_attempts,
+        max_window_ms=request.runtime.max_window_ms,
+        overlap_ms=request.runtime.overlap_ms,
+        merge_gap_ms=request.runtime.merge_gap_ms,
+        max_upload_bytes=request.runtime.max_upload_bytes,
     )
-    media = cast(
+    artifact_store = AtomicArtifactStore(runtime_root)
+    with httpx.Client() as http_client:
+        recognizer = CloudWhisperClient(
+            http_client,
+            configuration,
+            allowed_audio_root=runtime_root / request.run_relative_root / "speech" / "slices",
+        )
+        components = build_subprocess_asr_components(
+            media,
+            workspace_root=workspace_root,
+            runtime_root=runtime_root,
+            ffmpeg_path=ffmpeg,
+            recognizer=recognizer,
+            slice_namespace=request.request_id,
+            vad_threshold=request.runtime.vad_threshold,
+            vad_merge_gap_ms=request.runtime.vad_merge_gap_ms,
+        )
+        payload = run_asr_stage(
+            media,
+            components,
+            window_store=AsrWindowSnapshotStore(artifact_store),
+            asr_fingerprint=request.asr_fingerprint,
+            max_window_ms=request.runtime.max_window_ms,
+            overlap_ms=request.runtime.overlap_ms,
+            merge_gap_ms=request.runtime.merge_gap_ms,
+            max_upload_bytes=request.runtime.max_upload_bytes,
+        )
+    snapshots = SnapshotStore(artifact_store)
+    snapshots.publish(
+        Path(request.run_relative_root),
+        "asr",
+        request.asr_fingerprint,
+        payload,
+    )
+    cached = snapshots.load(
+        Path(request.run_relative_root),
+        "asr",
+        request.asr_fingerprint,
+        AsrSnapshotPayload,
+    )
+    if cached is None or cached[0] != payload:
+        raise VideoDemoError(
+            ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID,
+            "语音子进程未发布一致的 ASR 快照",
+        )
+    return SpeechSubprocessSuccess(
+        request_id=request.request_id,
+        asr_fingerprint=request.asr_fingerprint,
+        payload_receipt=cached[1],
+    )
+
+
+def _prepared_media(request: SpeechSubprocessRequest, audio: Path) -> PreparedMedia:
+    return cast(
         PreparedMedia,
         SimpleNamespace(
             source=SimpleNamespace(
@@ -148,51 +197,6 @@ def _execute_request(
             subtitle=None,
             warnings=request.media_warnings,
         ),
-    )
-    artifact_store = AtomicArtifactStore(runtime_root)
-    snapshots = SnapshotStore(artifact_store)
-    analyzer = ProductionSpeechAnalyzer(
-        component_factory,
-        snapshot_store=snapshots,
-        fingerprint_inputs=request.runtime.fingerprint_inputs(),
-        allow_speaker_fallback=request.allow_speaker_fallback,
-    )
-    analyzer.analyze(media)
-    cached_asr = snapshots.load(
-        Path(request.run_relative_root),
-        "asr",
-        request.asr_fingerprint,
-        AsrSnapshotPayload,
-    )
-    if cached_asr is None:
-        raise VideoDemoError(
-            ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID,
-            "语音子进程未发布 ASR 快照",
-        )
-    speech_key = speech_fingerprint(
-        processing_mode="ASR",
-        transcript_payload_sha256=cached_asr[1].sha256,
-        media_warnings=request.media_warnings,
-        min_speakers=request.config.min_speakers,
-        max_speakers=request.config.max_speakers,
-        allow_speaker_fallback=request.allow_speaker_fallback,
-        inputs=request.runtime.fingerprint_inputs(),
-    )
-    cached_speech = snapshots.load(
-        Path(request.run_relative_root),
-        "speech",
-        speech_key,
-        SpeechAnalysisSnapshotPayload,
-    )
-    if cached_speech is None:
-        raise VideoDemoError(
-            ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID,
-            "语音子进程未发布完整快照",
-        )
-    return SpeechSubprocessSuccess(
-        request_id=request.request_id,
-        speech_fingerprint=speech_key,
-        payload_receipt=cached_speech[1],
     )
 
 

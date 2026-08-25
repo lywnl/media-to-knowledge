@@ -10,12 +10,22 @@ from video_demo.config import Settings
 from video_demo.errors import ErrorCode
 
 
+def _settings(workspace: Path) -> Settings:
+    return Settings(
+        workspace_root=workspace,
+        openai_base_url="https://ai-proxy.example.test/v1",
+        openai_api_key="test-openai-key",
+        openai_model="openai/whisper",
+        _env_file=None,
+    )
+
+
 class RuntimeCapabilitiesTest(unittest.TestCase):
     def test_missing_binaries_are_reported_as_explicit_errors(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            report = probe_runtime_capabilities(Settings(workspace_root=Path(directory)))
+            report = probe_runtime_capabilities(_settings(Path(directory)))
 
         self.assertEqual(report.status, CapabilityStatus.UNAVAILABLE)
         self.assertEqual(
@@ -40,7 +50,7 @@ class RuntimeCapabilitiesTest(unittest.TestCase):
             workspace = root / "workspace"
             workspace.mkdir()
 
-            report = probe_runtime_capabilities(Settings(workspace_root=workspace))
+            report = probe_runtime_capabilities(_settings(workspace))
 
         self.assertEqual(report.status, CapabilityStatus.UNAVAILABLE)
         self.assertEqual(report.binaries, ())
@@ -63,7 +73,7 @@ class RuntimeCapabilitiesTest(unittest.TestCase):
                 binary.chmod(0o755)
             (runtime / "tools").symlink_to(external_tools, target_is_directory=True)
 
-            report = probe_runtime_capabilities(Settings(workspace_root=workspace))
+            report = probe_runtime_capabilities(_settings(workspace))
 
         self.assertEqual(report.status, CapabilityStatus.UNAVAILABLE)
         self.assertEqual(report.binaries, ())
@@ -85,7 +95,7 @@ class RuntimeCapabilitiesTest(unittest.TestCase):
                 )
                 binary.chmod(0o755)
 
-            report = probe_runtime_capabilities(Settings(workspace_root=workspace))
+            report = probe_runtime_capabilities(_settings(workspace))
 
         self.assertEqual(report.status, CapabilityStatus.UNAVAILABLE)
         self.assertEqual(report.binaries, ())
@@ -97,7 +107,7 @@ class RuntimeCapabilitiesTest(unittest.TestCase):
     @patch("video_demo.capabilities.platform.machine", return_value="arm64")
     @patch("video_demo.capabilities.platform.system", return_value="Darwin")
     @patch("video_demo.capabilities._read_binary_version", return_value="7.1")
-    def test_apple_silicon_report_keeps_cpu_as_default(
+    def test_apple_silicon_report_exposes_cloud_asr_configuration_without_secrets(
         self,
         _version: object,
         _system: object,
@@ -112,12 +122,20 @@ class RuntimeCapabilitiesTest(unittest.TestCase):
                 binary.write_bytes(b"binary")
                 binary.chmod(0o755)
 
-            report = probe_runtime_capabilities(Settings(workspace_root=workspace))
+            report = probe_runtime_capabilities(
+                _settings(workspace)
+            )
 
         self.assertEqual(report.status, CapabilityStatus.AVAILABLE)
         self.assertEqual(report.platform, "macOS-arm64")
-        self.assertEqual(report.inference_device, "cpu")
-        self.assertEqual(report.whisper_compute_type, "int8")
+        self.assertEqual(report.cloud_asr_provider, "openai_compatible")
+        self.assertEqual(report.cloud_asr_model, "openai/whisper")
+        self.assertEqual(report.cloud_asr_base_url, "https://ai-proxy.example.test/v1")
+        self.assertTrue(report.cloud_asr_configured)
+        serialized = report.model_dump_json()
+        self.assertNotIn("test-openai-key", serialized)
+        self.assertNotIn("inference_device", serialized)
+        self.assertNotIn("whisper_compute_type", serialized)
 
     @patch(
         "video_demo.capabilities._read_binary_version",
@@ -136,7 +154,7 @@ class RuntimeCapabilitiesTest(unittest.TestCase):
                 binary.write_bytes(b"binary")
                 binary.chmod(0o755)
 
-            report = probe_runtime_capabilities(Settings(workspace_root=workspace))
+            report = probe_runtime_capabilities(_settings(workspace))
 
         self.assertEqual(report.status, CapabilityStatus.UNAVAILABLE)
         self.assertEqual(report.binaries, ())

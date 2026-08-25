@@ -36,8 +36,6 @@ from video_demo.evaluation.evidence import (
     PreflightDetails,
     PreflightIssue,
     PreflightRawReport,
-    PyannoteLiveDetails,
-    PyannoteLiveRawReport,
     QwenLiveDetails,
     QwenLiveRawReport,
     build_verified_gate_check,
@@ -58,6 +56,17 @@ from video_demo.evaluation.gate import (
 )
 from video_demo.evaluation.report import GateStatus, build_quality_report
 from video_demo.evaluation.thresholds import QUALITY_THRESHOLDS
+
+
+def _cloud_settings(workspace_root: Path, **overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "workspace_root": workspace_root,
+        "openai_base_url": "https://asr.example/v1",
+        "openai_api_key": "test-key",
+        "openai_model": "openai/whisper",
+    }
+    values.update(overrides)
+    return Settings(**values)  # type: ignore[arg-type]
 
 
 def test_gate_keeps_legacy_evidence_model_imports() -> None:
@@ -343,7 +352,6 @@ def _forged_live_evidence(tmp_path: Path) -> EvidenceReference:
     (
         ("baidu_ocr_live", BaiduLiveDetails, "BAIDU_LIVE", "_verify_baidu_live"),
         ("qwen_live", QwenLiveDetails, "QWEN_LIVE", "_verify_qwen_live"),
-        ("pyannote_live", PyannoteLiveDetails, "PYANNOTE_LIVE", "_verify_pyannote_live"),
         (
             "five_language_models",
             FiveLanguageModelsDetails,
@@ -472,35 +480,11 @@ def _live_annotation(
         "duration_ms": 1_000,
         "language": language,
         "reference_text": "测试",
-        "words": [
-            {
-                "word_id": "word-001",
-                "text": "测试",
-                "start_ms": 0,
-                "end_ms": 500,
-            }
-        ],
-        "speaker_turns": [
-            {
-                "turn_id": "turn-001",
-                "speaker_id": "speaker-001",
-                "start_ms": 0,
-                "end_ms": 900,
-            }
-        ],
         "ocr_frames": [
             {
                 "frame_id": "frame-001",
                 "timestamp_ms": 100,
                 "text_lines": ["测试"],
-            }
-        ],
-        "audio_events": [
-            {
-                "event_id": "event-001",
-                "normalized_event": "speech",
-                "start_ms": 0,
-                "end_ms": 500,
             }
         ],
         "scene_boundaries_ms": [100],
@@ -658,8 +642,8 @@ def _write_baidu_live_report(
         request_id_sha256=request_id_sha256,
         http_status=200,
     )
-    settings = production_settings or Settings(
-        workspace_root=tmp_path,
+    settings = production_settings or _cloud_settings(
+        tmp_path,
         qwen_model_id="qwen3-vl-plus",
     )
     if settings.workspace_root != tmp_path.resolve(strict=True):
@@ -748,7 +732,7 @@ def test_baidu_live_verifier_accepts_bound_authorized_execution(
     tmp_path: Path,
 ) -> None:
     report_path = _write_baidu_live_report(tmp_path)
-    settings = Settings(workspace_root=tmp_path, qwen_model_id="qwen3-vl-plus")
+    settings = _cloud_settings(tmp_path, qwen_model_id="qwen3-vl-plus")
 
     check = build_verified_gate_check(
         "baidu_ocr_live",
@@ -781,16 +765,16 @@ def test_live_verifier_rejects_settings_with_foreign_workspace(tmp_path: Path) -
             "baidu_ocr_live",
             report_path,
             workspace_root=tmp_path,
-            settings=Settings(
-                workspace_root=foreign,
+            settings=_cloud_settings(
+                foreign,
                 qwen_model_id="qwen3-vl-plus",
             ),
         )
 
 
 def test_live_verifier_rejects_noncanonical_runtime_root(tmp_path: Path) -> None:
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         runtime_root=Path(".codex/other-runtime"),
         qwen_model_id="qwen3-vl-plus",
     )
@@ -932,8 +916,8 @@ def test_live_authority_link_is_the_publication_linearization_point(
         "baidu_ocr_live",
         report_path,
         workspace_root=tmp_path,
-        settings=Settings(
-            workspace_root=tmp_path,
+        settings=_cloud_settings(
+            tmp_path,
             qwen_model_id="qwen3-vl-plus",
         ),
     )
@@ -1529,8 +1513,8 @@ def test_qwen_live_verifier_accepts_probe_then_segment_on_same_clip(
     tmp_path: Path,
 ) -> None:
     report_path = _write_qwen_live_report(tmp_path)
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         qwen_model_id="qwen3-vl-plus",
     )
 
@@ -1573,8 +1557,8 @@ def test_qwen_live_fail_accepts_successful_probe_prefix_at_gate(
         "qwen_live",
         report_path,
         workspace_root=tmp_path,
-        settings=Settings(
-            workspace_root=tmp_path,
+        settings=_cloud_settings(
+            tmp_path,
             qwen_model_id="qwen3-vl-plus",
         ),
     )
@@ -1585,7 +1569,7 @@ def test_qwen_live_fail_accepts_successful_probe_prefix_at_gate(
 def test_qwen_executed_fail_without_facts_requires_configured_model(
     tmp_path: Path,
 ) -> None:
-    settings = Settings(workspace_root=tmp_path)
+    settings = _cloud_settings(tmp_path)
     report_path = _write_qwen_live_report(
         tmp_path,
         status=GateStatus.FAIL,
@@ -1638,138 +1622,6 @@ def test_qwen_live_verifier_rejects_summary_model_mismatch_after_rehash(
         )
 
 
-def _write_pyannote_live_report(
-    tmp_path: Path,
-    *,
-    device: str = "cpu",
-) -> Path:
-    baidu_report_path = _write_baidu_live_report(tmp_path)
-    runtime_root = tmp_path / ".codex/video-rag-demo"
-    store = EvidenceStore(tmp_path, runtime_root)
-    baidu_machine = MachineEvidenceReport.model_validate_json(
-        baidu_report_path.read_bytes()
-    )
-    baidu_raw = BaiduLiveRawReport.model_validate_json(
-        (runtime_root / "eval/reports/run-live/raw.json").read_bytes()
-    )
-    model = next(
-        item
-        for item in build_production_model_identity_report(
-            Settings(workspace_root=tmp_path)
-        ).models
-        if item.component == "pyannote"
-    ).model_copy(update={"device": device})
-    summary = LiveExecutionSummary(
-        schema_version="1.0.0",
-        component="pyannote",
-        operation="diarize",
-        evaluation_run_id="run-live",
-        model=model,
-        sample_id=baidu_raw.sample.sample_id,
-        language=baidu_raw.sample.language,
-        input_kind="AUDIO",
-        input_sha256=baidu_raw.sample.audio_sha256,
-        output_item_count=1,
-    )
-    response = store.write_artifact(
-        Path("eval/reports/run-live/pyannote-0.json"),
-        "PROVIDER_RESPONSE",
-        summary.model_dump_json(exclude_none=True).encode("utf-8"),
-    )
-    fact = ModelExecutionFact(
-        component="pyannote",
-        operation="diarize",
-        evaluation_run_id="run-live",
-        model=model,
-        sample_id=baidu_raw.sample.sample_id,
-        language=baidu_raw.sample.language,
-        input_kind="AUDIO",
-        input_sha256=baidu_raw.sample.audio_sha256,
-        output_sha256=response.sha256,
-    )
-    raw = PyannoteLiveRawReport(
-        schema_version="1.0.0",
-        check_id="pyannote_live",
-        status=GateStatus.PASS,
-        execution_started=True,
-        evaluation_run_id=baidu_raw.evaluation_run_id,
-        sample=baidu_raw.sample,
-        inputs=baidu_raw.inputs,
-        dataset_sha256=baidu_raw.dataset_sha256,
-        authorization_sha256=baidu_raw.authorization_sha256,
-        settings_fingerprint=baidu_raw.settings_fingerprint,
-        implementation_sha256=baidu_raw.implementation_sha256,
-        executions=(fact,),
-    )
-    raw_artifact = store.write_artifact(
-        Path("eval/reports/run-live/pyannote-raw.json"),
-        "AUDIT_REPORT",
-        raw.model_dump_json(exclude_none=True).encode("utf-8"),
-    )
-    shared_artifacts = tuple(
-        artifact
-        for artifact in baidu_machine.artifacts
-        if artifact.role not in {"AUDIT_REPORT", "PROVIDER_RESPONSE"}
-    )
-    report = MachineEvidenceReport(
-        schema_version="1.0.0",
-        check_id="pyannote_live",
-        status=GateStatus.PASS,
-        kind=EvidenceKind.LIVE_SERVICE_REPORT,
-        level=EvidenceLevel.REAL_SERVICE,
-        covered_items=("pyannote_live",),
-        summary="pyannote 固定模型真实调用通过",
-        producer="live-runner",
-        started_at="2026-08-18T01:00:00Z",
-        finished_at="2026-08-18T01:00:01Z",
-        artifacts=(*shared_artifacts, raw_artifact, response),
-        details=PyannoteLiveDetails(
-            type="PYANNOTE_LIVE",
-            trace=baidu_machine.details.trace,
-            raw_report_sha256=raw_artifact.sha256,
-            implementation_sha256=raw.implementation_sha256,
-            settings_fingerprint=raw.settings_fingerprint,
-            dataset_sha256=raw.dataset_sha256,
-            authorization_sha256=raw.authorization_sha256,
-        ),
-    )
-    report_path = runtime_root / "eval/reports/run-live/pyannote_live.json"
-    store.write_json(report_path.relative_to(runtime_root), report)
-    return report_path
-
-
-def test_pyannote_live_verifier_accepts_fixed_model_and_authorized_audio(
-    tmp_path: Path,
-) -> None:
-    report_path = _write_pyannote_live_report(tmp_path)
-
-    check = build_verified_gate_check(
-        "pyannote_live",
-        report_path,
-        workspace_root=tmp_path,
-        settings=Settings(workspace_root=tmp_path, qwen_model_id="qwen3-vl-plus"),
-    )
-
-    assert check.status == GateStatus.PASS
-
-
-def test_pyannote_live_verifier_rejects_noncanonical_mps_device(
-    tmp_path: Path,
-) -> None:
-    report_path = _write_pyannote_live_report(tmp_path, device="mps")
-
-    with pytest.raises(ValueError, match="可信门禁检查"):
-        build_verified_gate_check(
-            "pyannote_live",
-            report_path,
-            workspace_root=tmp_path,
-            settings=Settings(
-                workspace_root=tmp_path,
-                qwen_model_id="qwen3-vl-plus",
-            ),
-        )
-
-
 def _local_model_identity(
     component: str,
     language: str,
@@ -1778,25 +1630,13 @@ def _local_model_identity(
 ) -> ModelIdentity:
     from importlib.metadata import version
 
-    model_id = {
-        "silero_vad": "silero-vad",
-        "faster_whisper": "large-v3",
-        "whisperx": f"whisperx-align-{language}",
-        "yamnet": "yamnet",
-    }[component]
+    model_id = {"silero_vad": "silero-vad", "cloud_whisper": "openai/whisper"}[component]
     return ModelIdentity(
         component=component,
-        provider="local",
+        provider="local" if component == "silero_vad" else "openai_compatible",
         model_id=model_id,
-        device=device,
-        revision=version(
-            {
-                "silero_vad": "silero-vad",
-                "faster_whisper": "faster-whisper",
-                "whisperx": "whisperx",
-                "yamnet": "tensorflow-hub",
-            }[component]
-        ),
+        device=device if component == "silero_vad" else None,
+        revision=version("silero-vad") if component == "silero_vad" else None,
     )
 
 
@@ -1813,6 +1653,9 @@ def _write_five_language_live_report(
     settings = settings or Settings(
         workspace_root=tmp_path,
         qwen_model_id="qwen3-vl-plus",
+        openai_base_url="https://asr.example/v1",
+        openai_api_key="test-key",
+        openai_model="openai/whisper",
     )
     device_overrides = device_overrides or {}
     eval_root = runtime_root / "eval"
@@ -1922,9 +1765,7 @@ def _write_five_language_live_report(
     sample_by_language = {sample.language: sample for sample in samples}
     stages = (
         ("silero_vad", "vad", "zh"),
-        *(("faster_whisper", "transcribe", language) for language in languages),
-        *(("whisperx", "align", language) for language in languages),
-        ("yamnet", "detect", "zh"),
+        *(("cloud_whisper", "transcribe", language) for language in languages),
     )
     facts: list[ModelExecutionFact] = []
     response_artifacts = []
@@ -1933,10 +1774,7 @@ def _write_five_language_live_report(
         model = _local_model_identity(
             component,
             language,
-            device=device_overrides.get(
-                component,
-                settings.inference_device if component == "faster_whisper" else "cpu",
-            ),
+            device=device_overrides.get(component, "cpu"),
         )
         summary = LiveExecutionSummary(
             schema_version="1.0.0",
@@ -2048,56 +1886,43 @@ def _write_five_language_live_report(
     return report_path
 
 
-def test_five_language_live_verifier_accepts_exact_local_stack_coverage(
+def test_five_language_live_verifier_accepts_cloud_asr_coverage(
     tmp_path: Path,
 ) -> None:
-    report_path = _write_five_language_live_report(tmp_path)
+    settings = _cloud_settings(
+        tmp_path,
+        qwen_model_id="qwen3-vl-plus",
+        openai_base_url="https://asr.example/v1",
+        openai_api_key="test-key",
+        openai_model="openai/whisper",
+    )
+    report_path = _write_five_language_live_report(tmp_path, settings=settings)
 
     check = build_verified_gate_check(
         "five_language_models",
         report_path,
         workspace_root=tmp_path,
-        settings=Settings(workspace_root=tmp_path, qwen_model_id="qwen3-vl-plus"),
+        settings=settings,
     )
 
     assert check.status == GateStatus.PASS
 
 
-@pytest.mark.parametrize("component", ("silero_vad", "whisperx", "yamnet"))
-def test_local_stack_verifier_rejects_noncanonical_mps_device(
+@pytest.mark.parametrize("component", ("silero_vad",))
+def test_silero_verifier_rejects_noncanonical_mps_device(
     tmp_path: Path,
     component: str,
 ) -> None:
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         qwen_model_id="qwen3-vl-plus",
+        openai_base_url="https://asr.example/v1",
+        openai_api_key="test-key",
+        openai_model="openai/whisper",
     )
     report_path = _write_five_language_live_report(
         tmp_path,
         device_overrides={component: "mps"},
-        settings=settings,
-    )
-
-    with pytest.raises(ValueError, match="可信门禁检查"):
-        build_verified_gate_check(
-            "five_language_models",
-            report_path,
-            workspace_root=tmp_path,
-            settings=settings,
-        )
-
-
-def test_faster_whisper_device_must_follow_settings_inference_device(
-    tmp_path: Path,
-) -> None:
-    settings = Settings(
-        workspace_root=tmp_path,
-        qwen_model_id="qwen3-vl-plus",
-        inference_device="mps",
-    )
-    report_path = _write_five_language_live_report(
-        tmp_path,
-        device_overrides={"faster_whisper": "cpu"},
         settings=settings,
     )
 
@@ -2140,6 +1965,9 @@ def test_five_language_live_verifier_rejects_reordered_language_stage(
             settings=Settings(
                 workspace_root=tmp_path,
                 qwen_model_id="qwen3-vl-plus",
+                openai_base_url="https://asr.example/v1",
+                openai_api_key="test-key",
+                openai_model="openai/whisper",
             ),
         )
 
@@ -2297,8 +2125,8 @@ def test_final_gate_fills_missing_authoritative_checks_as_not_run(tmp_path: Path
 
 
 def test_final_gate_revalidates_live_check_with_same_settings(tmp_path: Path) -> None:
-    settings = Settings(
-        workspace_root=tmp_path,
+    settings = _cloud_settings(
+        tmp_path,
         qwen_model_id="qwen3-vl-plus",
     )
     report_path = _write_baidu_live_report(tmp_path)
@@ -2328,8 +2156,8 @@ def test_final_gate_revalidates_live_check_with_same_settings(tmp_path: Path) ->
             quality=build_quality_report({}, QUALITY_THRESHOLDS),
             checks=(live_check,),
             workspace_root=tmp_path,
-            settings=Settings(
-                workspace_root=tmp_path,
+            settings=_cloud_settings(
+                tmp_path,
                 qwen_model_id="qwen3-vl-plus",
                 qwen_timeout_seconds=31.0,
             ),

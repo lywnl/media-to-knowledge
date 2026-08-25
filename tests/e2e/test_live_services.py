@@ -60,7 +60,6 @@ def test_workspace_live_services_emit_authoritative_results() -> None:
     checks = {
         "baidu_ocr_live": runner.run_workspace_baidu(f"workspace-baidu-{suffix}"),
         "qwen_live": runner.run_workspace_qwen(f"workspace-qwen-{suffix}"),
-        "pyannote_live": runner.run_workspace_pyannote(f"workspace-pyannote-{suffix}"),
         "five_language_models": runner.run_workspace_local_model_stack(
             f"workspace-local-{suffix}"
         ),
@@ -69,7 +68,6 @@ def test_workspace_live_services_emit_authoritative_results() -> None:
     assert set(checks) == {
         "baidu_ocr_live",
         "qwen_live",
-        "pyannote_live",
         "five_language_models",
     }
     for check_id, check in checks.items():

@@ -62,8 +62,6 @@ def _upload_and_create(
             "object_ref": uploaded["object_ref"],
             "idempotency_key": "result-query-0001",
             "language_hints": ["en"],
-            "min_speakers": None,
-            "max_speakers": None,
         },
     ).json()
     return created, str(uploaded["sha256"])
@@ -620,6 +618,18 @@ def test_result_and_evidence_openapi_schemas_are_closed_and_path_free(
 
     assert components["VideoUnderstandingResult"]["additionalProperties"] is False
     assert components["EvidencePageResponse"]["additionalProperties"] is False
+    assert {
+        "PublicSpeechSegment",
+        "PublicSubtitleCue",
+        "PublicSceneBoundary",
+        "PublicKeyframeEvidence",
+        "PublicOcrEvidence",
+    }.issubset(components)
+    assert {
+        "PublicAlignedWord",
+        "PublicSpeakerTurn",
+        "PublicAudioEvent",
+    }.isdisjoint(components)
     serialized = str(
         {
             "result": components["VideoUnderstandingResult"],
@@ -628,6 +638,9 @@ def test_result_and_evidence_openapi_schemas_are_closed_and_path_free(
     )
     assert "relative_path" not in serialized
     assert "local_path" not in serialized
+    assert "ALIGNED_WORD" not in serialized
+    assert "SPEAKER_TURN" not in serialized
+    assert "AUDIO_EVENT" not in serialized
 
 
 def test_error_response_does_not_expose_internal_paths(

@@ -260,7 +260,12 @@ def execute_real_media(
             timeout_seconds=settings.process_timeout_seconds,
         ),
     )
-    extractor = OpenCvFrameExtractor(settings.runtime_root, module_loader=_load_cv2)
+    # 评测链路保留固定六帧采样，避免历史评测样本的解码计数与生产成本策略耦合。
+    extractor = OpenCvFrameExtractor(
+        settings.runtime_root,
+        module_loader=_load_cv2,
+        samples_per_window=6,
+    )
     scene_detector = PySceneDetectAdapter(module_loader=_load_scenedetect)
     selector = KeyframeSelector()
     samples: list[RealMediaSample] = []
@@ -597,6 +602,7 @@ def _audio_phase(
                 probed.asset.source_path,
                 probed.asset.run_relative_root,
                 has_audio=True,
+                duration_ms=probed.duration_ms,
                 input_fd=source_descriptor,
                 output_fd=staged.descriptor,
             )
@@ -612,6 +618,7 @@ def _audio_phase(
             probed.asset.source_path,
             probed.asset.run_relative_root,
             has_audio=False,
+            duration_ms=probed.duration_ms,
         )
     warnings = list(probed.warnings)
     audio_path: Path | None = None

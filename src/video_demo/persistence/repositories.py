@@ -8,7 +8,12 @@ from sqlalchemy import Select, and_, delete, exists, or_, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
-from video_demo.domain.result import VideoSegment, VideoSummary, VideoUnderstandingResult
+from video_demo.domain.result import (
+    SUPPORTED_RESULT_SCHEMA_VERSIONS,
+    VideoSegment,
+    VideoSummary,
+    VideoUnderstandingResult,
+)
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.models import (
     JobModel,
@@ -220,6 +225,39 @@ class VideoRunRepository:
                 VideoUnderstandingRunModel.run_id == run_id,
             ),
         )
+
+    def list_with_objects(
+        self,
+        scope: Scope,
+    ) -> list[tuple[VideoUnderstandingRunModel, VideoObjectModel]]:
+        """按创建时间倒序返回当前知识库的任务及其上传文件信息。"""
+        statement = (
+            select(VideoUnderstandingRunModel, VideoObjectModel)
+            .join(
+                VideoObjectModel,
+                and_(
+                    VideoObjectModel.tenant_id == VideoUnderstandingRunModel.tenant_id,
+                    VideoObjectModel.application_id
+                    == VideoUnderstandingRunModel.application_id,
+                    VideoObjectModel.knowledge_base_id
+                    == VideoUnderstandingRunModel.knowledge_base_id,
+                    VideoObjectModel.object_ref == VideoUnderstandingRunModel.object_ref,
+                ),
+            )
+            .where(
+                VideoUnderstandingRunModel.tenant_id == scope.tenant_id,
+                VideoUnderstandingRunModel.application_id == scope.application_id,
+                VideoUnderstandingRunModel.knowledge_base_id == scope.knowledge_base_id,
+            )
+            .order_by(
+                VideoUnderstandingRunModel.created_at.desc(),
+                VideoUnderstandingRunModel.id.desc(),
+            )
+        )
+        return [
+            (run, video)
+            for run, video in self._session.execute(statement).all()
+        ]
 
     def get_by_idempotency(
         self,
@@ -933,7 +971,14 @@ class ResultRepository:
         )
         if not segments or summary is None:
             return None
+        versions = {str(item.schema_version) for item in segments} | {str(summary.schema_version)}
+        if not versions.issubset(SUPPORTED_RESULT_SCHEMA_VERSIONS) or len(versions) != 1:
+            raise VideoDemoError(
+                ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                "结果行 Schema 版本非法或不一致",
+            )
         return VideoUnderstandingResult(
+            # 旧结果行仍可按 1.0.0 双读，新写入结果由领域模型默认升级到 2.0.0。
             schema_version=summary.schema_version,
             run_id=run_id,
             asset_sha256=asset_sha256,

@@ -12,7 +12,7 @@ from pydantic import SecretStr, ValidationError
 
 from video_demo.domain.evidence import BoundingBox, OcrLine
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.visual.ocr import OcrProviderResponse
+from video_demo.visual.ocr import OcrDeadlineExceeded, OcrProviderResponse
 
 _LANGUAGE_MAP = {
     "zh": "CHN_ENG",
@@ -63,7 +63,13 @@ class BaiduOcrClient:
         self._access_token: SecretStr | None = None
         self._access_token_expires_at = 0.0
 
-    def recognize(self, image: bytes, language: str) -> OcrProviderResponse:
+    def recognize(
+        self,
+        image: bytes,
+        language: str,
+        *,
+        deadline: float | None = None,
+    ) -> OcrProviderResponse:
         provider_language = _LANGUAGE_MAP.get(language)
         if provider_language is None:
             raise VideoDemoError(
@@ -71,17 +77,25 @@ class BaiduOcrClient:
                 "百度 OCR 不支持该语言",
                 {"language": language},
             )
-        token = self._token()
-        return self._post_with_retry(image, provider_language, token)
+        token = self._token(deadline=deadline)
+        return self._post_with_retry(
+            image,
+            provider_language,
+            token,
+            deadline=deadline,
+        )
 
     def _post_with_retry(
         self,
         image: bytes,
         provider_language: str,
         token: SecretStr,
+        *,
+        deadline: float | None,
     ) -> OcrProviderResponse:
         last_error: VideoDemoError | None = None
         for attempt in range(1, self._max_attempts + 1):
+            timeout = self._request_timeout(deadline)
             try:
                 response = self._client.post(
                     self._endpoint,
@@ -90,19 +104,41 @@ class BaiduOcrClient:
                         "image": base64.b64encode(image).decode("ascii"),
                         "language_type": provider_language,
                         "detect_direction": "true",
+                        # accurate_basic 的段落结构由该参数启用；行级结果仍作为
+                        # 兼容主结果解析，避免改变现有证据和 RAG 文本格式。
+                        "paragraph": "true",
                         "probability": "true",
                     },
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=self._timeout_seconds,
+                    timeout=timeout,
+                )
+                self._raise_if_deadline_reached(
+                    deadline,
+                    provider_attempt_count=attempt,
                 )
                 self._raise_for_status(response)
                 payload = _json_object(response)
+                self._raise_if_deadline_reached(
+                    deadline,
+                    provider_attempt_count=attempt,
+                )
                 _raise_for_provider_error(payload)
-                return _parse_ocr_response(
+                response_payload = _parse_ocr_response(
                     payload,
                     http_status=response.status_code,
                 )
+                self._raise_if_deadline_reached(
+                    deadline,
+                    provider_attempt_count=attempt,
+                )
+                return response_payload.model_copy(
+                    update={"provider_attempt_count": attempt},
+                )
             except httpx.RequestError:
+                self._raise_if_deadline_reached(
+                    deadline,
+                    provider_attempt_count=attempt,
+                )
                 last_error = VideoDemoError(
                     ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
                     "百度 OCR 网络请求失败",
@@ -112,12 +148,21 @@ class BaiduOcrClient:
                     raise
                 last_error = error
             if attempt < self._max_attempts:
-                self._sleeper(self._retry_backoff_seconds * (2 ** (attempt - 1)))
+                delay = self._retry_backoff_seconds * (2 ** (attempt - 1))
+                self._sleep_before_retry(
+                    delay,
+                    deadline=deadline,
+                    provider_attempt_count=attempt,
+                )
         if last_error is None:
             raise RuntimeError("百度 OCR 重试状态非法")
+        self._raise_if_deadline_reached(
+            deadline,
+            provider_attempt_count=self._max_attempts,
+        )
         raise last_error from None
 
-    def _token(self) -> SecretStr:
+    def _token(self, *, deadline: float | None) -> SecretStr:
         now = self._clock()
         if self._access_token is not None and now < self._access_token_expires_at:
             return self._access_token
@@ -129,15 +174,18 @@ class BaiduOcrClient:
                     "client_id": self._credentials.api_key.get_secret_value(),
                     "client_secret": self._credentials.secret_key.get_secret_value(),
                 },
-                timeout=self._timeout_seconds,
+                timeout=self._request_timeout(deadline),
             )
         except httpx.RequestError:
+            self._raise_if_deadline_reached(deadline)
             raise VideoDemoError(
                 ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
                 "百度 OCR Token 网络请求失败",
             ) from None
+        self._raise_if_deadline_reached(deadline)
         self._raise_for_status(response)
         payload = _json_object(response)
+        self._raise_if_deadline_reached(deadline)
         access_token = payload.get("access_token")
         expires_in = payload.get("expires_in")
         if not isinstance(access_token, str) or not access_token:
@@ -153,9 +201,44 @@ class BaiduOcrClient:
             ) from None
         if not math.isfinite(expires_in_seconds) or expires_in_seconds <= 0:
             raise VideoDemoError(ErrorCode.OCR_RESPONSE_INVALID, "百度 OCR Token 有效期非法")
+        self._raise_if_deadline_reached(deadline)
         self._access_token = SecretStr(access_token)
         self._access_token_expires_at = now + max(0.0, expires_in_seconds - 10.0)
         return self._access_token
+
+    def _request_timeout(self, deadline: float | None) -> float:
+        if deadline is None:
+            return self._timeout_seconds
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise OcrDeadlineExceeded("OCR 全局截止时间已到")
+        return min(self._timeout_seconds, remaining)
+
+    def _sleep_before_retry(
+        self,
+        delay: float,
+        *,
+        deadline: float | None,
+        provider_attempt_count: int,
+    ) -> None:
+        if deadline is not None and self._clock() + delay >= deadline:
+            raise OcrDeadlineExceeded(
+                "OCR 全局截止时间已到",
+                provider_attempt_count=provider_attempt_count,
+            )
+        self._sleeper(delay)
+
+    def _raise_if_deadline_reached(
+        self,
+        deadline: float | None,
+        *,
+        provider_attempt_count: int = 0,
+    ) -> None:
+        if deadline is not None and self._clock() >= deadline:
+            raise OcrDeadlineExceeded(
+                "OCR 全局截止时间已到",
+                provider_attempt_count=provider_attempt_count,
+            )
 
     @staticmethod
     def _raise_for_status(response: httpx.Response) -> None:
@@ -209,22 +292,22 @@ def _parse_ocr_response(
         for result in results:
             if not isinstance(result, dict):
                 raise ValueError("文字结果必须是对象")
-            location = result["location"]
             probability = result["probability"]
-            if not isinstance(location, dict) or not isinstance(probability, dict):
-                raise ValueError("bbox 或 probability 类型非法")
+            if not isinstance(probability, dict):
+                raise ValueError("probability 类型非法")
             words = result["words"]
             if not isinstance(words, str) or not words or len(words) > 10_000:
                 raise ValueError("文字必须是受限非空字符串")
+            location = result.get("location")
+            bounding_box = (
+                _parse_bounding_box(location)
+                if location is not None
+                else None
+            )
             lines.append(
                 OcrLine(
                     text=words,
-                    bounding_box=BoundingBox(
-                        x=_integer(location["left"]),
-                        y=_integer(location["top"]),
-                        width=_integer(location["width"]),
-                        height=_integer(location["height"]),
-                    ),
+                    bounding_box=bounding_box,
                     confidence=_number(probability["average"]),
                 ),
             )
@@ -235,6 +318,17 @@ def _parse_ocr_response(
         )
     except (KeyError, TypeError, ValueError, ValidationError):
         raise VideoDemoError(ErrorCode.OCR_RESPONSE_INVALID, "百度 OCR 文字结果非法") from None
+
+
+def _parse_bounding_box(value: object) -> BoundingBox:
+    if not isinstance(value, dict):
+        raise ValueError("bbox 类型非法")
+    return BoundingBox(
+        x=_integer(value["left"]),
+        y=_integer(value["top"]),
+        width=_integer(value["width"]),
+        height=_integer(value["height"]),
+    )
 
 
 def _raise_for_provider_error(payload: dict[str, Any]) -> None:

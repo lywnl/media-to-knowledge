@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
@@ -12,73 +13,31 @@ from video_demo.application.pipeline import (
     SpeechAnalysis,
     SpeechBoundaryCandidate,
 )
-from video_demo.domain.evidence import (
-    AlignedWord,
-    AudioEvent,
-    EvidenceItem,
-    SpeakerTurn,
-    SpeechSegment,
-)
+from video_demo.domain.base import StableId
+from video_demo.domain.evidence import SpeechSegment
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.transcode import AudioSliceArtifact
-from video_demo.speech.alignment import AlignmentResult
-from video_demo.speech.asr import RawAsrSegment, build_speech_segments
-from video_demo.speech.language import LanguageIdentificationResult, LanguageSpan
+from video_demo.speech.asr import (
+    WindowRecognizerPort,
+    build_cloud_asr_windows,
+    project_cloud_asr_window,
+    remove_adjacent_cloud_asr_duplicates,
+)
 from video_demo.speech.snapshots import (
     AsrSnapshotPayload,
-    SpeechAnalysisSnapshotPayload,
-    SpeechFingerprintInputs,
-    asr_fingerprint,
-    speech_fingerprint,
-    subtitle_transcript_payload_sha256,
+    AsrWindowSnapshotPayload,
+    asr_window_fingerprint,
 )
-from video_demo.speech.speaker_assignment import assign_speakers
-from video_demo.speech.vad import SpeechInterval, VadResult
-from video_demo.storage.snapshots import SnapshotStore
+from video_demo.speech.vad import VadResult
+from video_demo.storage.snapshots import AsrWindowSnapshotStore
 from video_demo.storage.workspace import safe_runtime_path
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class VadPort(Protocol):
     def detect(self, audio: Path, *, duration_ms: int) -> VadResult: ...
-
-
-class LanguagePort(Protocol):
-    def identify(
-        self,
-        audio: Path,
-        speech: Sequence[SpeechInterval],
-        hints: tuple[str, ...],
-    ) -> LanguageIdentificationResult: ...
-
-
-class RecognizerPort(Protocol):
-    def transcribe_slice(
-        self,
-        audio_slice: Path,
-        language_span: LanguageSpan,
-        *,
-        hotwords: tuple[str, ...] = (),
-        core_context: str | None = None,
-    ) -> tuple[RawAsrSegment, ...]: ...
-
-
-class AlignerPort(Protocol):
-    def align(self, audio: Path, segments: Sequence[SpeechSegment]) -> AlignmentResult: ...
-
-
-class DiarizerPort(Protocol):
-    def diarize(
-        self,
-        audio: Path,
-        *,
-        min_speakers: int | None,
-        max_speakers: int | None,
-    ) -> tuple[SpeakerTurn, ...]: ...
-
-
-class AudioEventPort(Protocol):
-    def detect(self, audio: Path, *, duration_ms: int) -> tuple[AudioEvent, ...]: ...
 
 
 class AudioSlicer(Protocol):
@@ -91,298 +50,212 @@ class AudioSlicer(Protocol):
     ) -> Path: ...
 
 
-@dataclass(frozen=True)
-class SpeechComponents:
+@dataclass(frozen=True, slots=True)
+class AsrComponents:
     vad: VadPort
-    language_identifier: LanguagePort
-    recognizer: RecognizerPort
-    aligner: AlignerPort
-    diarizer: DiarizerPort
-    audio_events: AudioEventPort
+    recognizer: WindowRecognizerPort
     slicer: AudioSlicer
+    slice_namespace: StableId
 
 
-ComponentFactory = Callable[[PreparedMedia, Callable[[], bool]], SpeechComponents]
+AsrComponentFactory = Callable[[PreparedMedia, Callable[[], bool]], AsrComponents]
 
 
-class ProductionSpeechAnalyzer:
-    """只编排生产语音 Port，不在构造时导入或加载重模型。"""
+def transcript_shortcut(media: PreparedMedia) -> SpeechAnalysis | None:
+    """处理无需模型的字幕优先和无音频路径。"""
 
-    def __init__(
-        self,
-        component_factory: ComponentFactory,
-        *,
-        snapshot_store: SnapshotStore,
-        fingerprint_inputs: SpeechFingerprintInputs,
-        allow_speaker_fallback: bool = False,
-    ) -> None:
-        self._component_factory = component_factory
-        self._snapshot_store = snapshot_store
-        self._fingerprint_inputs = fingerprint_inputs
-        self._allow_speaker_fallback = allow_speaker_fallback
+    if media.subtitle is not None:
+        return SpeechAnalysis(
+            transcript_source="SUBTITLE",
+            evidence=media.subtitle.cues,
+            warnings=tuple(dict.fromkeys((*media.warnings, "TRANSCRIPT_SOURCE_SUBTITLE"))),
+            boundary_candidates=tuple(
+                SpeechBoundaryCandidate(cue.end_ms, "sentence_end", 1.0)
+                for cue in media.subtitle.cues
+                if 0 < cue.end_ms < media.source.duration_ms
+            ),
+        )
+    if media.audio_path is None:
+        return SpeechAnalysis(
+            transcript_source="NONE",
+            evidence=(),
+            warnings=tuple(dict.fromkeys((*media.warnings, "NO_AUDIO_TRACK"))),
+        )
+    return None
 
-    def analyze(
-        self,
-        media: PreparedMedia,
-        *,
-        is_cancel_requested: Callable[[], bool] = lambda: False,
-    ) -> SpeechAnalysis:
-        if media.subtitle is not None:
-            analysis = SpeechAnalysis(
-                transcript_source="SUBTITLE",
-                evidence=media.subtitle.cues,
-                warnings=tuple(
-                    dict.fromkeys((*media.warnings, "TRANSCRIPT_SOURCE_SUBTITLE"))
-                ),
-                boundary_candidates=tuple(
-                    SpeechBoundaryCandidate(cue.end_ms, "sentence_end", 1.0)
-                    for cue in media.subtitle.cues
-                    if 0 < cue.end_ms < media.source.duration_ms
-                ),
-            )
-            fingerprint = speech_fingerprint(
-                processing_mode="SUBTITLE",
-                transcript_payload_sha256=subtitle_transcript_payload_sha256(
-                    analysis,
-                    media.subtitle.artifact.sha256,
-                ),
-                media_warnings=media.warnings,
-                min_speakers=media.source.asset.config.min_speakers,
-                max_speakers=media.source.asset.config.max_speakers,
-                allow_speaker_fallback=self._allow_speaker_fallback,
-                inputs=self._fingerprint_inputs,
-            )
-            cached = self._snapshot_store.load(
-                media.source.asset.run_relative_root,
-                "speech",
-                fingerprint,
-                SpeechAnalysisSnapshotPayload,
-            )
-            if cached is not None:
-                return cached[0].to_analysis()
-            self._snapshot_store.publish(
-                media.source.asset.run_relative_root,
-                "speech",
-                fingerprint,
-                SpeechAnalysisSnapshotPayload.from_analysis(analysis),
-            )
-            return analysis
-        if media.audio_path is None:
-            return SpeechAnalysis(
-                transcript_source="NONE",
-                evidence=(),
-                warnings=tuple(dict.fromkeys((*media.warnings, "NO_AUDIO_TRACK"))),
-            )
-        try:
-            return self._analyze_asr(
+
+def run_asr_stage(
+    media: PreparedMedia,
+    components: AsrComponents,
+    *,
+    window_store: AsrWindowSnapshotStore,
+    asr_fingerprint: str,
+    max_window_ms: int,
+    overlap_ms: int,
+    merge_gap_ms: int = 2_000,
+    max_upload_bytes: int = 25 * 1024 * 1024,
+) -> AsrSnapshotPayload:
+    """严格串行识别 VAD 窗口，并在每个成功窗口后立即持久化。"""
+
+    if media.audio_path is None:
+        raise VideoDemoError(ErrorCode.SPEECH_AUDIO_INVALID, "云端 ASR 缺少音频")
+    vad = components.vad.detect(media.audio_path, duration_ms=media.source.duration_ms)
+    windows = build_cloud_asr_windows(
+        vad.speech,
+        max_window_ms=max_window_ms,
+        overlap_ms=overlap_ms,
+        merge_gap_ms=merge_gap_ms,
+        max_upload_bytes=max_upload_bytes,
+    )
+    language_spans = []
+    segments: list[SpeechSegment] = []
+    warnings: list[str] = []
+    prompt = cloud_asr_prompt(
+        media.source.asset.config.hotwords,
+        media.source.asset.config.core_context,
+    )
+    language_hint = _single_language_hint(media.source.asset.config.language_hints)
+    for index, window in enumerate(windows, start=1):
+        _LOGGER.info(
+            "云端 ASR 窗口: index=%d/%d upload=%d-%dms owned=%d-%dms duration=%dms sources=%d",
+            index,
+            len(windows),
+            window.upload_range.start_ms,
+            window.upload_range.end_ms,
+            window.owned_range.start_ms,
+            window.owned_range.end_ms,
+            window.upload_range.duration_ms,
+            len(window.source_intervals),
+        )
+        fingerprint = asr_window_fingerprint(
+            asr_fingerprint=asr_fingerprint,
+            window=window,
+        )
+        cached = window_store.load(media.source.asset.run_relative_root, fingerprint)
+        if cached is None:
+            payload = _recognize_window(
                 media,
-                is_cancel_requested,
-            )
-        except VideoDemoError:
-            raise
-        except (ModuleNotFoundError, ImportError):
-            raise VideoDemoError(
-                ErrorCode.SPEECH_DEPENDENCY_UNAVAILABLE,
-                "语音分析可选依赖不可用",
-            ) from None
-        except PermissionError:
-            raise VideoDemoError(
-                ErrorCode.SPEECH_AUTHENTICATION_FAILED,
-                "语音模型鉴权失败",
-            ) from None
-        except (LookupError, OSError, RuntimeError):
-            raise VideoDemoError(
-                ErrorCode.SPEECH_MODEL_UNAVAILABLE,
-                "语音模型不可用",
-            ) from None
-
-    def _analyze_asr(
-        self,
-        media: PreparedMedia,
-        is_cancel_requested: Callable[[], bool],
-    ) -> SpeechAnalysis:
-        assert media.audio_sha256 is not None
-        run_root = media.source.asset.run_relative_root
-        config = media.source.asset.config
-        asr_key = asr_fingerprint(
-            audio_sha256=media.audio_sha256,
-            duration_ms=media.source.duration_ms,
-            language_hints=config.language_hints,
-            hotwords=config.hotwords,
-            core_context=config.core_context,
-            inputs=self._fingerprint_inputs,
-        )
-        cached_asr = self._snapshot_store.load(
-            run_root,
-            "asr",
-            asr_key,
-            AsrSnapshotPayload,
-        )
-        components: SpeechComponents | None = None
-        if cached_asr is None:
-            components = self._component_factory(media, is_cancel_requested)
-            asr_payload = self._run_asr(media, components)
-            asr_receipt = self._snapshot_store.publish(
-                run_root,
-                "asr",
-                asr_key,
-                asr_payload,
+                components,
+                window_store,
+                window,
+                fingerprint,
+                language_hint=language_hint,
+                prompt=prompt,
             )
         else:
-            asr_payload, asr_receipt = cached_asr
+            payload = cached[0]
+        language_spans.append(payload.language_span)
+        segments.extend(payload.segments)
+        warnings.extend(payload.warnings)
+    ordered_spans = tuple(
+        sorted(language_spans, key=lambda item: (item.start_ms, item.end_ms, item.evidence_id))
+    )
+    ordered_segments = tuple(
+        sorted(segments, key=lambda item: (item.start_ms, item.end_ms, item.evidence_id))
+    )
+    deduplicated = remove_adjacent_cloud_asr_duplicates(ordered_segments)
+    if windows and not deduplicated:
+        warnings.append("ASR_NO_VALID_SEGMENTS")
+    return AsrSnapshotPayload(
+        language_spans=ordered_spans,
+        segments=deduplicated,
+        vad_warnings=vad.warnings,
+        silence_boundaries_ms=vad.long_silence_boundaries_ms,
+        language_change_boundaries_ms=tuple(
+            current.start_ms
+            for previous, current in pairwise(ordered_spans)
+            if previous.language != current.language
+        ),
+        asr_warnings=tuple(dict.fromkeys(warnings)),
+    )
 
-        speech_key = speech_fingerprint(
-            processing_mode="ASR",
-            transcript_payload_sha256=asr_receipt.sha256,
-            media_warnings=media.warnings,
-            min_speakers=config.min_speakers,
-            max_speakers=config.max_speakers,
-            allow_speaker_fallback=self._allow_speaker_fallback,
-            inputs=self._fingerprint_inputs,
-        )
-        cached_speech = self._snapshot_store.load(
-            run_root,
-            "speech",
-            speech_key,
-            SpeechAnalysisSnapshotPayload,
-        )
-        if cached_speech is not None:
-            return cached_speech[0].to_analysis()
-        if components is None:
-            components = self._component_factory(media, is_cancel_requested)
-        analysis = self._complete_asr(
-            media,
-            components,
-            asr_payload,
-            allow_speaker_fallback=self._allow_speaker_fallback,
-        )
-        self._snapshot_store.publish(
-            run_root,
-            "speech",
-            speech_key,
-            SpeechAnalysisSnapshotPayload.from_analysis(analysis),
-        )
-        return analysis
 
-    @staticmethod
-    def _run_asr(
-        media: PreparedMedia,
-        components: SpeechComponents,
-    ) -> AsrSnapshotPayload:
-        assert media.audio_path is not None
-        audio = media.audio_path
-        duration_ms = media.source.duration_ms
-        vad = components.vad.detect(audio, duration_ms=duration_ms)
-        if not vad.speech:
-            return AsrSnapshotPayload(
-                language_spans=(),
-                segments=(),
-                vad_warnings=vad.warnings,
-                silence_boundaries_ms=vad.long_silence_boundaries_ms,
-                language_change_boundaries_ms=(),
-            )
+def _recognize_window(
+    media: PreparedMedia,
+    components: AsrComponents,
+    window_store: AsrWindowSnapshotStore,
+    window: object,
+    fingerprint: str,
+    *,
+    language_hint: str | None,
+    prompt: str | None,
+) -> AsrWindowSnapshotPayload:
+    from video_demo.speech.asr import CloudAsrWindow
 
-        languages = _identify_languages(media, components, vad.speech)
-        segments: list[SpeechSegment] = []
-        for language_span in languages.spans:
-            audio_slice = components.slicer.create(
-                audio,
-                media.source.asset.run_relative_root,
-                f"asr_{language_span.evidence_id}",
-                language_span,
-            )
-            raw_segments = components.recognizer.transcribe_slice(
-                audio_slice,
-                language_span,
-                hotwords=media.source.asset.config.hotwords,
-                core_context=media.source.asset.config.core_context,
-            )
-            segments.extend(build_speech_segments(language_span, raw_segments))
-        return AsrSnapshotPayload(
-            language_spans=languages.spans,
-            segments=tuple(segments),
-            vad_warnings=vad.warnings,
-            silence_boundaries_ms=vad.long_silence_boundaries_ms,
-            language_change_boundaries_ms=languages.change_boundaries_ms,
+    if not isinstance(window, CloudAsrWindow):
+        raise TypeError("云端 ASR 窗口类型非法")
+    assert media.audio_path is not None
+    audio_slice = components.slicer.create(
+        media.audio_path,
+        media.source.asset.run_relative_root,
+        f"{components.slice_namespace}_{fingerprint[:24]}",
+        window.upload_range,
+    )
+    try:
+        _LOGGER.info(
+            "云端 ASR 切片: upload=%d-%dms size_bytes=%d",
+            window.upload_range.start_ms,
+            window.upload_range.end_ms,
+            audio_slice.stat().st_size,
         )
+        result = components.recognizer.transcribe_window(
+            audio_slice,
+            language_hint=language_hint,
+            prompt=prompt,
+        )
+        projection = project_cloud_asr_window(
+            window,
+            language=result.language,
+            raw_segments=result.segments,
+            warnings=result.warnings,
+        )
+        payload = AsrWindowSnapshotPayload(
+            upload_range=window.upload_range,
+            owned_range=window.owned_range,
+            speech_interval=window.speech_interval,
+            source_intervals=window.source_intervals,
+            language_span=projection.language_span,
+            segments=projection.segments,
+            warnings=projection.warnings,
+        )
+        window_store.publish(media.source.asset.run_relative_root, fingerprint, payload)
+        return payload
+    finally:
+        _discard_audio_slice(audio_slice)
 
-    @staticmethod
-    def _complete_asr(
-        media: PreparedMedia,
-        components: SpeechComponents,
-        asr_payload: AsrSnapshotPayload,
-        *,
-        allow_speaker_fallback: bool = False,
-    ) -> SpeechAnalysis:
-        assert media.audio_path is not None
-        audio = media.audio_path
-        duration_ms = media.source.duration_ms
-        if not asr_payload.language_spans:
-            audio_events = components.audio_events.detect(audio, duration_ms=duration_ms)
-            return SpeechAnalysis(
-                transcript_source="ASR",
-                evidence=_sort_evidence(audio_events),
-                warnings=tuple(
-                    dict.fromkeys(
-                        (
-                            *media.warnings,
-                            *asr_payload.vad_warnings,
-                            "NO_SPEECH_DETECTED",
-                        )
-                    )
-                ),
-                boundary_candidates=_boundary_candidates(
-                    duration_ms,
-                    silence=asr_payload.silence_boundaries_ms,
-                ),
-            )
 
-        alignment = components.aligner.align(audio, asr_payload.segments)
-        speaker_warnings: tuple[str, ...] = ()
-        try:
-            turns = components.diarizer.diarize(
-                audio,
-                min_speakers=media.source.asset.config.min_speakers,
-                max_speakers=media.source.asset.config.max_speakers,
-            )
-        except VideoDemoError as error:
-            if not allow_speaker_fallback or error.code not in {
-                ErrorCode.PYANNOTE_AUTHENTICATION_FAILED,
-                ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-                ErrorCode.SPEECH_DEPENDENCY_UNAVAILABLE,
-            }:
-                raise
-            turns = ()
-            speaker_warnings = ("DEMO_DEGRADED_SPEAKER_UNKNOWN",)
-        assigned_words = assign_speakers(alignment.words, turns)
-        audio_events = components.audio_events.detect(audio, duration_ms=duration_ms)
-        evidence: tuple[EvidenceItem, ...] = (
-            *alignment.preserved_segments,
-            *assigned_words,
-            *turns,
-            *audio_events,
-        )
-        return SpeechAnalysis(
-            transcript_source="ASR",
-            evidence=_sort_evidence(evidence),
-            warnings=tuple(
-                dict.fromkeys(
-                    (
-                        *media.warnings,
-                        *asr_payload.vad_warnings,
-                        *alignment.warning_codes,
-                        *speaker_warnings,
-                    )
-                )
-            ),
-            boundary_candidates=_boundary_candidates(
-                duration_ms,
-                silence=asr_payload.silence_boundaries_ms,
-                sentence_ends=tuple(item.end_ms for item in alignment.preserved_segments),
-                speaker_changes=tuple(item.start_ms for item in turns),
-                language_changes=asr_payload.language_change_boundaries_ms,
-            ),
-        )
+def analysis_from_asr_snapshot(
+    media: PreparedMedia,
+    payload: AsrSnapshotPayload,
+) -> SpeechAnalysis:
+    warnings = tuple(
+        dict.fromkeys((*media.warnings, *payload.vad_warnings, *payload.asr_warnings))
+    )
+    if not payload.language_spans:
+        warnings = tuple(dict.fromkeys((*warnings, "NO_SPEECH_DETECTED")))
+    return SpeechAnalysis(
+        transcript_source="ASR",
+        evidence=tuple(payload.segments),
+        warnings=warnings,
+        boundary_candidates=_boundary_candidates(
+            media.source.duration_ms,
+            silence=payload.silence_boundaries_ms,
+            sentence_ends=tuple(item.end_ms for item in payload.segments),
+            language_changes=payload.language_change_boundaries_ms,
+        ),
+    )
+
+
+def cloud_asr_prompt(
+    hotwords: tuple[str, ...],
+    core_context: str | None,
+) -> str | None:
+    parts: list[str] = []
+    if core_context:
+        parts.append(core_context)
+    if hotwords:
+        parts.append(" ".join(hotwords))
+    return "\n".join(parts) or None
 
 
 class VerifiedAudioSlicer:
@@ -431,65 +304,23 @@ class AudioSliceClient(Protocol):
     ) -> AudioSliceArtifact: ...
 
 
-def _identify_languages(
-    media: PreparedMedia,
-    components: SpeechComponents,
-    speech_intervals: Sequence[SpeechInterval],
-) -> LanguageIdentificationResult:
-    assert media.audio_path is not None
-    spans: list[LanguageSpan] = []
-    for interval in speech_intervals:
-        slice_path = components.slicer.create(
-            media.audio_path,
-            media.source.asset.run_relative_root,
-            f"lid_{interval.evidence_id}",
-            interval,
-        )
-        local_speech = SpeechInterval(
-            evidence_id=interval.evidence_id,
-            start_ms=0,
-            end_ms=interval.duration_ms,
-            confidence=interval.confidence,
-        )
-        local = components.language_identifier.identify(
-            slice_path,
-            (local_speech,),
-            tuple(media.source.asset.config.language_hints),
-        )
-        for span in local.spans:
-            spans.append(
-                span.model_copy(
-                    update={
-                        "start_ms": interval.start_ms + span.start_ms,
-                        "end_ms": interval.start_ms + span.end_ms,
-                    },
-                ),
+def _single_language_hint(hints: Sequence[str]) -> str | None:
+    return hints[0] if len(hints) == 1 and hints[0] != "und" else None
+
+
+def _discard_audio_slice(path: Path) -> None:
+    try:
+        if path.is_symlink():
+            raise VideoDemoError(
+                ErrorCode.WORKSPACE_PATH_ESCAPE,
+                "云端 ASR 音频切片不能是符号链接",
             )
-    ordered = tuple(sorted(spans, key=lambda item: (item.start_ms, item.end_ms, item.evidence_id)))
-    boundaries = tuple(
-        current.start_ms
-        for previous, current in pairwise(ordered)
-        if previous.language != current.language
-    )
-    return LanguageIdentificationResult(spans=ordered, change_boundaries_ms=boundaries)
-
-
-def _sort_evidence(items: Sequence[EvidenceItem]) -> tuple[EvidenceItem, ...]:
-    rank = {AudioEvent: 0, SpeakerTurn: 1, SpeechSegment: 2, AlignedWord: 3}
-    allowed = (SpeechSegment, AlignedWord, SpeakerTurn, AudioEvent)
-    if any(not isinstance(item, allowed) for item in items):
-        raise VideoDemoError(ErrorCode.SPEECH_MODEL_UNAVAILABLE, "语音阶段返回了非法证据类型")
-    return tuple(
-        sorted(
-            items,
-            key=lambda item: (
-                item.start_ms,
-                rank[type(item)],
-                item.end_ms,
-                item.evidence_id,
-            ),
-        ),
-    )
+        path.unlink(missing_ok=True)
+    except OSError:
+        raise VideoDemoError(
+            ErrorCode.VIDEO_PROCESS_FAILED,
+            "云端 ASR 音频切片清理失败",
+        ) from None
 
 
 def _boundary_candidates(
@@ -497,21 +328,26 @@ def _boundary_candidates(
     *,
     silence: Sequence[int] = (),
     sentence_ends: Sequence[int] = (),
-    speaker_changes: Sequence[int] = (),
     language_changes: Sequence[int] = (),
 ) -> tuple[SpeechBoundaryCandidate, ...]:
-    values = (
-        *((timestamp, "silence") for timestamp in silence),
-        *((timestamp, "sentence_end") for timestamp in sentence_ends),
-        *((timestamp, "speaker_change") for timestamp in speaker_changes),
-        *((timestamp, "language_change") for timestamp in language_changes),
+    candidates = {
+        (timestamp_ms, "silence", 1.0)
+        for timestamp_ms in silence
+        if 0 < timestamp_ms < duration_ms
+    }
+    candidates.update(
+        (timestamp_ms, "sentence_end", 0.8)
+        for timestamp_ms in sentence_ends
+        if 0 < timestamp_ms < duration_ms
+    )
+    candidates.update(
+        (timestamp_ms, "language_change", 1.0)
+        for timestamp_ms in language_changes
+        if 0 < timestamp_ms < duration_ms
     )
     return tuple(
-        SpeechBoundaryCandidate(timestamp_ms=timestamp, source=source, score=1.0)  # type: ignore[arg-type]
-        for timestamp, source in sorted(
-            {(timestamp, source) for timestamp, source in values if 0 < timestamp < duration_ms},
-            key=lambda item: (item[0], item[1]),
-        )
+        SpeechBoundaryCandidate(timestamp_ms, source, score)  # type: ignore[arg-type]
+        for timestamp_ms, source, score in sorted(candidates)
     )
 
 

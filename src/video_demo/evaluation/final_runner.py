@@ -94,11 +94,7 @@ REQUIREMENT_SPECS: tuple[RequirementSpec, ...] = (
     RequirementSpec(12, "FFmpeg 标准化链真实执行并校验产物", ("real_media_chain",)),
     RequirementSpec(13, "Silero VAD 使用真实模型和授权音频", ("five_language_models",)),
     RequirementSpec(14, "五语识别覆盖中英日韩西", ("five_language_models",)),
-    RequirementSpec(15, "faster-whisper large-v3 执行五语 ASR", ("five_language_models",)),
-    RequirementSpec(16, "WhisperX 对五语执行词时间对齐", ("five_language_models",)),
-    RequirementSpec(17, "pyannote 使用已授权模型执行说话人分离", ("pyannote_live",)),
-    RequirementSpec(18, "说话人分配保留重叠并使用稳定身份", ("pyannote_live",)),
-    RequirementSpec(19, "YAMNet 执行真实音频事件识别", ("five_language_models",)),
+    RequirementSpec(15, "云端 Whisper 严格串行执行五语 ASR", ("five_language_models",)),
     RequirementSpec(20, "真实 scene 检测生成候选边界", ("real_media_chain",)),
     RequirementSpec(21, "音画证据构造确定性混合窗口", ("real_media_chain",)),
     RequirementSpec(22, "关键帧选择过滤黑帧并去重", ("real_media_chain",)),
@@ -116,7 +112,7 @@ REQUIREMENT_SPECS: tuple[RequirementSpec, ...] = (
     RequirementSpec(34, "质量指标由绑定预测和人工审阅重算", ("five_language_models",)),
     RequirementSpec(
         35,
-        "十八项质量与资源阈值全部满足",
+        "十四项质量与资源阈值全部满足",
         ("authorized_dataset", "five_language_models", "m1_durability"),
     ),
     RequirementSpec(
@@ -158,14 +154,14 @@ class RequirementEvidenceReport(FrozenModel):
     schema_version: Literal["1.0.0"]
     evaluation_run_id: StableId
     final_report_sha256: Sha256
-    rows: tuple[RequirementEvidenceRow, ...] = Field(min_length=37, max_length=37)
+    rows: tuple[RequirementEvidenceRow, ...] = Field(min_length=33, max_length=33)
 
     @model_validator(mode="after")
     def validate_complete_matrix(self) -> RequirementEvidenceReport:
         expected = {spec.requirement_id: spec for spec in REQUIREMENT_SPECS}
         supplied = {row.requirement_id: row for row in self.rows}
-        if len(supplied) != 37 or set(supplied) != set(range(1, 38)):
-            raise ValueError("要求证据必须恰好覆盖原计划 01 至 37")
+        if len(supplied) != len(expected) or set(supplied) != set(expected):
+            raise ValueError("要求证据必须恰好覆盖当前保留的固定规格编号")
         for requirement_id, row in supplied.items():
             spec = expected[requirement_id]
             if row.requirement != spec.requirement or row.check_ids != spec.check_ids:
@@ -256,7 +252,7 @@ class LiveValidationSummary(FrozenModel):
     schema_version: Literal["1.0.0"]
     evaluation_run_id: StableId
     status: GateStatus
-    checks: tuple[LiveCheckSummary, LiveCheckSummary, LiveCheckSummary, LiveCheckSummary]
+    checks: tuple[LiveCheckSummary, LiveCheckSummary, LiveCheckSummary]
     created_at: datetime
 
     @model_validator(mode="after")
@@ -264,11 +260,10 @@ class LiveValidationSummary(FrozenModel):
         expected = (
             "baidu_ocr_live",
             "qwen_live",
-            "pyannote_live",
             "five_language_models",
         )
         if tuple(item.check_id for item in self.checks) != expected:
-            raise ValueError("live 汇总必须按固定顺序覆盖四项检查")
+            raise ValueError("live 汇总必须按固定顺序覆盖三项检查")
         if self.status != _aggregate_status(tuple(item.status for item in self.checks)):
             raise ValueError("live 汇总状态与检查状态不一致")
         return self
@@ -558,10 +553,6 @@ class FinalValidationRunner:
             "qwen_live": (
                 stage_evaluation_run_id(evaluation_run_id, "qwen"),
                 "qwen_live.json",
-            ),
-            "pyannote_live": (
-                stage_evaluation_run_id(evaluation_run_id, "pyannote"),
-                "pyannote_live.json",
             ),
             "five_language_models": (
                 stage_evaluation_run_id(evaluation_run_id, "models"),
@@ -875,7 +866,7 @@ def build_requirement_evidence_report(
 def write_live_validation_summary(
     *,
     evaluation_run_id: str,
-    checks: tuple[GateCheck, GateCheck, GateCheck, GateCheck],
+    checks: tuple[GateCheck, GateCheck, GateCheck],
     workspace_root: Path,
 ) -> StageExecutionResult:
     validate_path_component(evaluation_run_id, "evaluation_run_id")
@@ -970,7 +961,12 @@ def stage_evaluation_run_id(evaluation_run_id: str, stage: str) -> str:
     return f"{prefix}_{stage}_{digest}"
 
 
-def cleanup_evaluation_run(workspace_root: Path, evaluation_run_id: str) -> CleanupResult:
+def cleanup_evaluation_run(
+    workspace_root: Path,
+    evaluation_run_id: str,
+    *,
+    settings: Settings | None = None,
+) -> CleanupResult:
     try:
         validate_path_component(evaluation_run_id, "evaluation_run_id")
     except Exception:
@@ -982,7 +978,12 @@ def cleanup_evaluation_run(workspace_root: Path, evaluation_run_id: str) -> Clea
     targets = _deduplicate_paths(
         (
             *_cleanup_targets(runtime, evaluation_run_id),
-            *_bound_product_run_targets(workspace, runtime, evaluation_run_id),
+            *_bound_product_run_targets(
+                workspace,
+                runtime,
+                evaluation_run_id,
+                settings=settings,
+            ),
         )
     )
     for target in targets:
@@ -1139,7 +1140,7 @@ def _reject_symlink_path(root: Path, candidate: Path) -> None:
 def _cleanup_targets(runtime: Path, evaluation_run_id: str) -> tuple[Path, ...]:
     stage_ids = {
         stage: stage_evaluation_run_id(evaluation_run_id, stage)
-        for stage in ("media", "baidu", "qwen", "pyannote", "models", "durability")
+        for stage in ("media", "baidu", "qwen", "models", "durability")
     }
     candidates = (
         runtime / "eval/reports" / evaluation_run_id,
@@ -1147,7 +1148,7 @@ def _cleanup_targets(runtime: Path, evaluation_run_id: str) -> tuple[Path, ...]:
         *(runtime / "eval/reports" / run_id for run_id in stage_ids.values()),
         *(
             runtime / "eval/live-authority" / stage_ids[stage]
-            for stage in ("baidu", "qwen", "pyannote", "models")
+            for stage in ("baidu", "qwen", "models")
         ),
     )
     return tuple(path for path in candidates if path.exists() or path.is_symlink())
@@ -1157,10 +1158,17 @@ def _bound_product_run_targets(
     workspace: Path,
     runtime: Path,
     evaluation_run_id: str,
+    *,
+    settings: Settings | None,
 ) -> tuple[Path, ...]:
     run_ids = {
         *_verified_prediction_run_ids(workspace, runtime, evaluation_run_id),
-        *_verified_durability_run_ids(workspace, runtime, evaluation_run_id),
+        *_verified_durability_run_ids(
+            workspace,
+            runtime,
+            evaluation_run_id,
+            settings=settings,
+        ),
     }
     scope_key = hashlib.sha256(
         b"evaluation\x00video-demo\x00evaluation"
@@ -1259,13 +1267,16 @@ def _verified_durability_run_ids(
     workspace: Path,
     runtime: Path,
     evaluation_run_id: str,
+    *,
+    settings: Settings | None,
 ) -> tuple[str, ...]:
     durability_run_id = stage_evaluation_run_id(evaluation_run_id, "durability")
     report_path = runtime / "eval/reports" / durability_run_id / "durability.json"
     if not (report_path.exists() or report_path.is_symlink()):
         return ()
     try:
-        settings = Settings(workspace_root=workspace, runtime_root=runtime)
+        if settings is None:
+            raise ValueError("耐久清理必须提供生成报告时的 Settings")
         check = build_verified_gate_check(
             "m1_durability",
             report_path,

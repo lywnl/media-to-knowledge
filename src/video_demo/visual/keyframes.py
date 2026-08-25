@@ -57,14 +57,13 @@ class OpenCvFrameExtractor:
         runtime_root: Path,
         *,
         module_loader: Callable[[], Any] | None = None,
-        samples_per_window: int = 6,
+        samples_per_window: int | None = None,
         max_frame_bytes: int = 20 * 1024 * 1024,
         jpeg_quality: int = 90,
     ) -> None:
-        if (
-            samples_per_window < 1
-            or max_frame_bytes < 1
-        ):
+        if samples_per_window is not None and samples_per_window < 1:
+            raise ValueError("帧采样数必须大于 0")
+        if max_frame_bytes < 1:
             raise ValueError("帧采样数与字节上限必须大于 0")
         self._runtime_root = runtime_root.expanduser().resolve(strict=False)
         self._module_loader = module_loader or _load_cv2
@@ -301,7 +300,14 @@ def _load_cv2() -> Any:
     return cv2
 
 
-def _sample_timestamps(window: TimeRange, count: int) -> tuple[int, ...]:
+def _sample_timestamps(window: TimeRange, count: int | None = None) -> tuple[int, ...]:
+    if count is None:
+        if window.duration_ms <= 8_000:
+            return (window.start_ms + window.duration_ms // 2,)
+        return (
+            window.start_ms + window.duration_ms // 3,
+            window.start_ms + (window.duration_ms * 2) // 3,
+        )
     actual_count = min(count, max(1, window.duration_ms))
     return tuple(
         min(

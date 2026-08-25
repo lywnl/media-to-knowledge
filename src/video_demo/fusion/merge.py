@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from itertools import pairwise
 from typing import Self
 
 from pydantic import Field, model_validator
 
 from video_demo.domain.base import FrozenModel, stable_identifier
+from video_demo.domain.evidence import OcrEvidence, SpeechSegment, SubtitleCue, TimedEvidence
 from video_demo.domain.result import SegmentUnderstanding, VideoSegment
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
@@ -69,6 +70,8 @@ def merge_segment_understandings(
     boundaries: Sequence[BoundaryPoint],
     max_snap_distance_ms: int = 300,
     semantic_merge_threshold: float = 0.6,
+    evidence: Iterable[TimedEvidence] = (),
+    video_title: str = "",
 ) -> tuple[VideoSegment, ...]:
     if not 0 <= semantic_merge_threshold <= 1:
         raise ValueError("semantic_merge_threshold 必须在 0 到 1 之间")
@@ -110,7 +113,11 @@ def merge_segment_understandings(
             merged[-1] = _merge_pair(merged[-1], current)
         else:
             merged.append(current)
-    return tuple(_build_segment(item) for item in merged)
+    evidence_by_id = {item.evidence_id: item for item in evidence}
+    return tuple(
+        _build_segment(item, evidence_by_id=evidence_by_id, video_title=video_title)
+        for item in merged
+    )
 
 
 class _SnappedWindow(TimeRange):
@@ -196,6 +203,10 @@ def _merge_pair(left: _SnappedWindow, right: _SnappedWindow) -> _SnappedWindow:
                 left.understanding.original_keywords,
                 right.understanding.original_keywords,
             ),
+            visual_facts=_ordered_union(
+                left.understanding.visual_facts,
+                right.understanding.visual_facts,
+            ),
             evidence_refs=_ordered_union(
                 left.understanding.evidence_refs,
                 right.understanding.evidence_refs,
@@ -220,9 +231,20 @@ def _merge_summary(left: str, right: str) -> str:
     normalized_right = normalize_retrieval_value(right)
     if normalized_left == normalized_right:
         return normalized_left
-    return _truncate_merged_text(
-        f"{normalized_left}{normalized_right}",
-        _MAX_SUMMARY_LENGTH,
+    sentences: list[str] = []
+    for sentence in (*_split_sentences(normalized_left), *_split_sentences(normalized_right)):
+        if sentence not in sentences:
+            sentences.append(sentence)
+    return _truncate_merged_text("".join(sentences), _MAX_SUMMARY_LENGTH)
+
+
+def _split_sentences(value: str) -> tuple[str, ...]:
+    import re
+
+    return tuple(
+        part
+        for part in re.findall(r"[^。！？!?；;]+[。！？!?；;]?", value)  # noqa: RUF001
+        if part
     )
 
 
@@ -234,13 +256,25 @@ def _ordered_union(left: Sequence[str], right: Sequence[str]) -> tuple[str, ...]
     return tuple(dict.fromkeys((*left, *right)))
 
 
-def _build_segment(window: _SnappedWindow) -> VideoSegment:
+def _build_segment(
+    window: _SnappedWindow,
+    *,
+    evidence_by_id: dict[str, TimedEvidence],
+    video_title: str,
+) -> VideoSegment:
     understanding = window.understanding
+    projected = _project_evidence(understanding.evidence_refs, evidence_by_id)
     retrieval_text = render_segment_fields(
         start_ms=window.start_ms,
         end_ms=window.end_ms,
         semantics=understanding,
+        video_title=video_title,
+        transcript_text=projected[0],
+        ocr_text=projected[1],
+        visual_facts=understanding.visual_facts,
+        transcript_source=projected[2],
     )
+    semantic_values = understanding.model_dump(exclude={"visual_facts"})
     return VideoSegment(
         segment_id=stable_identifier(
             "segment",
@@ -252,7 +286,58 @@ def _build_segment(window: _SnappedWindow) -> VideoSegment:
         ),
         start_ms=window.start_ms,
         end_ms=window.end_ms,
-        **understanding.model_dump(),
+        **semantic_values,
         retrieval_text=retrieval_text,
         retrieval_hash=hashlib.sha256(retrieval_text.encode("utf-8")).hexdigest(),
+        video_title=video_title,
+        transcript_text=projected[0],
+        ocr_text=projected[1],
+        visual_facts=understanding.visual_facts,
+        transcript_source=projected[2],
     )
+
+
+def _project_evidence(
+    evidence_refs: Sequence[str],
+    evidence_by_id: dict[str, TimedEvidence],
+) -> tuple[str, tuple[str, ...], str]:
+    items = tuple(
+        sorted(
+            {
+                evidence_by_id[ref]
+                for ref in evidence_refs
+                if ref in evidence_by_id
+            },
+            key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),
+        )
+    )
+    subtitles = tuple(item for item in items if isinstance(item, SubtitleCue) and item.text.strip())
+    speech = tuple(item for item in items if isinstance(item, SpeechSegment) and item.text.strip())
+    transcript_items = _remove_overlapping_duplicate_transcripts(subtitles or speech)
+    source = "SUBTITLE" if subtitles else "ASR" if speech else "NONE"
+    transcript = " ".join(" ".join(item.text.split()) for item in transcript_items)
+    ocr_text = tuple(
+        " ".join(line.text.split())
+        for item in items
+        if isinstance(item, OcrEvidence)
+        for line in item.lines
+        if line.text.strip()
+    )
+    return transcript, tuple(dict.fromkeys(ocr_text)), source
+
+
+def _remove_overlapping_duplicate_transcripts(
+    items: Sequence[SubtitleCue | SpeechSegment],
+) -> tuple[SubtitleCue | SpeechSegment, ...]:
+    kept: list[SubtitleCue | SpeechSegment] = []
+    for item in items:
+        normalized = " ".join(item.text.split())
+        if any(
+            item.start_ms < previous.end_ms
+            and previous.start_ms < item.end_ms
+            and normalized == " ".join(previous.text.split())
+            for previous in kept
+        ):
+            continue
+        kept.append(item)
+    return tuple(kept)

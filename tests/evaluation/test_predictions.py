@@ -9,14 +9,30 @@ from pydantic import TypeAdapter, ValidationError
 
 from video_demo.domain.evidence import EvidenceItem
 from video_demo.domain.result import VideoUnderstandingResult
-from video_demo.domain.result_artifact import ResultArtifactPayload
+from video_demo.domain.result_artifact import (
+    ARTIFACT_ENVELOPE_SCHEMA_VERSION,
+    ResultArtifactPayload,
+)
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.evaluation import prediction_runner as prediction_runner_module
+from video_demo.evaluation import predictions as predictions_module
 from video_demo.evaluation.annotations import VerifiedAnnotation, load_semantic_judgment
 from video_demo.evaluation.dataset import EvaluationSample
-from video_demo.evaluation.predictions import EvaluationPrediction, load_verified_prediction
+from video_demo.evaluation.predictions import (
+    EvaluationPrediction,
+    load_verified_prediction,
+)
 from video_demo.storage.artifacts import AtomicArtifactStore
 
 _EVIDENCE_ADAPTER = TypeAdapter(tuple[EvidenceItem, ...])
+
+
+def test_evaluation_manifest_uses_shared_artifact_envelope_version() -> None:
+    assert predictions_module.ARTIFACT_ENVELOPE_SCHEMA_VERSION == ARTIFACT_ENVELOPE_SCHEMA_VERSION
+    assert (
+        prediction_runner_module.ARTIFACT_ENVELOPE_SCHEMA_VERSION
+        == ARTIFACT_ENVELOPE_SCHEMA_VERSION
+    )
 
 
 def _prediction_kwargs(tmp_path: Path) -> dict[str, Path]:
@@ -280,34 +296,29 @@ def test_verified_prediction_rejects_index_and_manifest_transcript_source_mismat
     assert raised.value.__cause__ is None
 
 
-@pytest.mark.parametrize("mutation", ["word", "ocr", "event", "summary", "claims", "run"])
+@pytest.mark.parametrize("mutation", ["speech", "ocr", "summary", "claims", "run"])
 def test_reverify_prediction_rejects_schema_valid_in_memory_replacement(
     mutation: str,
     tmp_path: Path,
 ) -> None:
-    from video_demo.domain.evidence import (
-        AlignedWord,
-        AudioEvent,
-        BoundingBox,
-        OcrEvidence,
-        OcrLine,
-    )
+    from video_demo.domain.evidence import BoundingBox, OcrEvidence, OcrLine, SpeechSegment
     from video_demo.evaluation.predictions import PredictionClaim, reverify_verified_prediction
 
     index, sample = _write_prediction(tmp_path)
     prediction = load_verified_prediction(index, **_prediction_kwargs(tmp_path), sample=sample)
     assert prediction.result is not None
-    if mutation == "word":
+    if mutation == "speech":
         altered = prediction.model_copy(
             update={
                 "evidence": (
-                    AlignedWord(
-                        evidence_id="word_altered",
+                    SpeechSegment(
+                        evidence_id="speech_altered",
                         start_ms=0,
                         end_ms=100,
                         text="合法替换",
                         language="zh",
-                        probability=0.9,
+                        confidence=0.9,
+                        is_fully_evaluated_language=True,
                     ),
                 )
             }
@@ -331,22 +342,6 @@ def test_reverify_prediction_rejects_schema_valid_in_memory_replacement(
                             ),
                         ),
                         provider_request_id="request-001",
-                    ),
-                )
-            }
-        )
-    elif mutation == "event":
-        altered = prediction.model_copy(
-            update={
-                "evidence": (
-                    AudioEvent(
-                        evidence_id="event_altered",
-                        start_ms=0,
-                        end_ms=100,
-                        audioset_class="Music",
-                        normalized_event="music",
-                        confidence=0.9,
-                        threshold_version="v1",
                     ),
                 )
             }
@@ -729,25 +724,8 @@ def _verified_annotation_for_prediction_test() -> VerifiedAnnotation:
                 "duration_ms": 500,
                 "language": "zh",
                 "reference_text": "你好",
-                "words": [{"word_id": "word_001", "text": "你", "start_ms": 0, "end_ms": 100}],
-                "speaker_turns": [
-                    {
-                        "turn_id": "turn_001",
-                        "speaker_id": "speaker_001",
-                        "start_ms": 0,
-                        "end_ms": 100,
-                    }
-                ],
                 "ocr_frames": [
                     {"frame_id": "frame_001", "timestamp_ms": 10, "text_lines": ["你好"]}
-                ],
-                "audio_events": [
-                    {
-                        "event_id": "event_001",
-                        "normalized_event": "speech",
-                        "start_ms": 0,
-                        "end_ms": 100,
-                    }
                 ],
                 "scene_boundaries_ms": [100],
                 "semantic_boundaries_ms": [100],

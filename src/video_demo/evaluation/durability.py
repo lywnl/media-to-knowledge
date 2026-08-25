@@ -99,21 +99,11 @@ _PREFLIGHT_ORDER = (
     ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE,
     ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE,
     ErrorCode.SILERO_MODEL_UNAVAILABLE,
-    ErrorCode.FASTER_WHISPER_DEPENDENCY_UNAVAILABLE,
-    ErrorCode.FASTER_WHISPER_MODEL_UNAVAILABLE,
-    ErrorCode.WHISPERX_DEPENDENCY_UNAVAILABLE,
-    ErrorCode.WHISPERX_MODEL_UNAVAILABLE,
-    ErrorCode.PYANNOTE_DEPENDENCY_UNAVAILABLE,
-    ErrorCode.PYANNOTE_TERMS_UNAVAILABLE,
-    ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-    ErrorCode.YAMNET_DEPENDENCY_UNAVAILABLE,
-    ErrorCode.YAMNET_MODEL_UNAVAILABLE,
     ErrorCode.QWEN_ENDPOINT_UNAVAILABLE,
     ErrorCode.QWEN_API_KEY_UNAVAILABLE,
     ErrorCode.QWEN_MODEL_ID_UNAVAILABLE,
     ErrorCode.BAIDU_API_KEY_UNAVAILABLE,
     ErrorCode.BAIDU_SECRET_KEY_UNAVAILABLE,
-    ErrorCode.PYANNOTE_TOKEN_UNAVAILABLE,
 )
 
 _AUDIT_WRITE_EVENTS: dict[str, tuple[int, ...]] = {
@@ -575,11 +565,7 @@ class DurabilityRunner:
         )
 
     def _append_runtime_issues(self, issues: list[ErrorCode]) -> None:
-        if (
-            self._settings.worker_concurrency != 1
-            or self._settings.inference_device != "cpu"
-            or self._settings.whisper_compute_type != "int8"
-        ):
+        if self._settings.worker_concurrency != 1:
             issues.append(ErrorCode.INVALID_CONFIGURATION)
         if psutil is None:
             issues.append(ErrorCode.M1_PSUTIL_UNAVAILABLE)
@@ -952,8 +938,6 @@ class DurabilityRunner:
             implementation_sha256=implementation,
             settings_fingerprint=settings_fingerprint,
             worker_concurrency=1,
-            inference_device="cpu",
-            whisper_compute_type="int8",
             sample_report_sha256s=sample_report_sha256s,
             samples=samples,
         )

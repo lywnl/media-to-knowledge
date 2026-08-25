@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 import video_demo.application.pipeline as pipeline_module
 from video_demo.application.pipeline import (
@@ -17,6 +18,7 @@ from video_demo.application.pipeline import (
     VideoUnderstandingPipeline,
     VisualAnalysis,
     VisualPreparation,
+    pipeline_run_config_from_snapshot,
 )
 from video_demo.domain.evidence import (
     BoundingBox,
@@ -31,7 +33,7 @@ from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
 from video_demo.domain.run import RunStatus, TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.fusion.merge import BoundaryPoint
-from video_demo.integrations.oss import PublishedVideoUnderstanding
+from video_demo.integrations.oss import PublishedVideo, PublishedVideoUnderstanding
 from video_demo.integrations.video_port import (
     VideoClipInput,
     WholeVideoUnderstanding,
@@ -256,12 +258,14 @@ def test_pipeline_runs_all_stages_and_returns_metrics(tmp_path: Path) -> None:
     assert set(calls[3:5]) == {"SPEECH", "VISUAL"}
     assert calls[5:] == ["UNDERSTANDING"]
     assert outcome.status == RunStatus.SUCCEEDED
-    assert outcome.result.segments[0].retrieval_text.startswith("标题：")
+    assert outcome.result.segments[0].retrieval_text.startswith("文档类型：VIDEO_SEGMENT")
     assert [metric.stage for metric in outcome.stage_metrics] == [
         "REGISTER",
         "PROBE",
         "TRANSCODE",
         "SPEECH",
+        "VISUAL_WAIT_SPEECH",
+        "VISUAL_FUSION",
         "VISUAL",
         "FUSION",
         "UNDERSTANDING",
@@ -360,19 +364,25 @@ def test_pipeline_fuses_asr_ocr_keyframe_scene_with_published_qwen_result(
         def remote_host(self) -> str:
             return "private-video-bucket.oss-cn-hangzhou.aliyuncs.com"
 
-        def publish(self, local_clip: VideoClipInput) -> VideoClipInput:
+        def publish(self, local_clip: VideoClipInput) -> PublishedVideo:
             published.append(local_clip)
-            return VideoClipInput(
-                clip_id=local_clip.clip_id,
-                start_ms=local_clip.start_ms,
-                end_ms=local_clip.end_ms,
-                source_url=(
-                    "https://private-video-bucket.oss-cn-hangzhou.aliyuncs.com/"
-                    "video-demo/qwen-clips/clip.mp4?Signature=redacted"
+            return PublishedVideo(
+                published_clip=VideoClipInput(
+                    clip_id=local_clip.clip_id,
+                    start_ms=local_clip.start_ms,
+                    end_ms=local_clip.end_ms,
+                    source_url=(
+                        "https://private-video-bucket.oss-cn-hangzhou.aliyuncs.com/"
+                        "video-demo/qwen-clips/clip.mp4?Signature=redacted"
+                    ),
+                    mime_type=local_clip.mime_type,
+                    sha256=local_clip.sha256,
                 ),
-                mime_type=local_clip.mime_type,
-                sha256=local_clip.sha256,
+                object_key="video-demo/qwen-clips/owner/publish-clip.mp4",
             )
+
+        def delete(self, _object_key: str) -> None:
+            return None
 
     class Qwen:
         def understand_video(
@@ -921,3 +931,43 @@ def test_incomplete_whole_video_window_set_fails_the_entire_pipeline(
         pipeline.run(PipelineContext(run_id="run_001"))
 
     assert raised.value.code == ErrorCode.QWEN_RESPONSE_INVALID
+@pytest.mark.parametrize(
+    "retired_fields",
+    [
+        {"speech_enrichment_mode": "text"},
+        {"speech_enrichment_mode": "full"},
+        {"min_speakers": 1, "max_speakers": 2},
+        {"min_speakers": None, "max_speakers": None},
+    ],
+)
+def test_pipeline_run_config_loads_retired_snapshot_fields_without_mutation(
+    retired_fields: dict[str, object],
+) -> None:
+    snapshot = {
+        "language_hints": ["zh"],
+        "hotwords": ["Milvus"],
+        "core_context": "向量数据库课程",
+        **retired_fields,
+    }
+    original = snapshot.copy()
+
+    config = pipeline_run_config_from_snapshot(snapshot)
+
+    assert config == PipelineRunConfig(
+        language_hints=("zh",),
+        hotwords=("Milvus",),
+        core_context="向量数据库课程",
+    )
+    assert snapshot == original
+
+
+def test_pipeline_run_config_rejects_unknown_historical_snapshot_field() -> None:
+    with pytest.raises(ValidationError):
+        pipeline_run_config_from_snapshot(
+            {
+                "language_hints": [],
+                "hotwords": [],
+                "core_context": None,
+                "unexpected": True,
+            }
+        )

@@ -13,6 +13,7 @@ from video_demo.application.pipeline import (
     PreparedMedia,
     ProbedAsset,
     RegisteredAsset,
+    pipeline_run_config_from_snapshot,
 )
 from video_demo.domain.manifest import SubtitleStream
 from video_demo.errors import ErrorCode, VideoDemoError
@@ -63,6 +64,7 @@ class TranscodeClient(Protocol):
         run_relative_root: Path,
         *,
         has_audio: bool,
+        duration_ms: int,
     ) -> AudioArtifact | NoAudioArtifact: ...
 
     def extract_subtitle(
@@ -118,7 +120,7 @@ class ProductionAssetRegistrar:
     @staticmethod
     def _run_config(snapshot: dict[str, object]) -> PipelineRunConfig:
         try:
-            return PipelineRunConfig.model_validate(snapshot)
+            return pipeline_run_config_from_snapshot(snapshot)
         except ValidationError as error:
             raise VideoDemoError(
                 ErrorCode.INVALID_CONFIGURATION,
@@ -194,6 +196,7 @@ class ProductionMediaTranscoder:
                 asset.source_path,
                 asset.run_relative_root,
                 has_audio=bool(probed.manifest.audio_streams),
+                duration_ms=probed.duration_ms,
             )
             if isinstance(audio, NoAudioArtifact):
                 warnings.append(audio.warning_code)

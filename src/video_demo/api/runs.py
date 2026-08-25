@@ -10,6 +10,8 @@ from video_demo.api.schemas import (
     CreateRunRequest,
     EvidencePageResponse,
     PublicEvidence,
+    RunHistoryItem,
+    RunHistoryResponse,
     RunResponse,
 )
 from video_demo.application.runs import RunView
@@ -46,10 +48,33 @@ def create_video_run(
             object_ref=payload.object_ref,
             idempotency_key=payload.idempotency_key,
             language_hints=payload.language_hints,
-            min_speakers=payload.min_speakers,
-            max_speakers=payload.max_speakers,
             hotwords=payload.hotwords,
             core_context=payload.core_context,
+        ),
+    )
+
+
+@router.get("", response_model=RunHistoryResponse)
+def list_video_runs(
+    scope: Annotated[Scope, Depends(get_scope)],
+    container: Annotated[AppContainer, Depends(get_container)],
+) -> RunHistoryResponse:
+    return RunHistoryResponse(
+        items=tuple(
+            RunHistoryItem(
+                run_id=item.run_id,
+                object_ref=item.object_ref,
+                original_filename=item.original_filename,
+                detected_mime=item.detected_mime,
+                size_bytes=item.size_bytes,
+                status=item.status.value,
+                current_stage=item.current_stage,
+                warning_codes=item.warning_codes,
+                error_code=item.error_code,
+                created_at=item.created_at,
+                updated_at=item.updated_at,
+            )
+            for item in container.run_service.list_history(scope)
         ),
     )
 

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from video_demo.domain.evidence import AudioEvent, SpeechSegment, SubtitleCue, TimelineEvidence
+from video_demo.domain.evidence import (
+    SceneBoundary,
+    SpeechSegment,
+    SubtitleCue,
+    TimelineEvidence,
+)
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.fusion.timeline import build_timeline, validate_timeline
 
@@ -25,24 +30,22 @@ def _speech(
     )
 
 
-def _audio() -> AudioEvent:
-    return AudioEvent(
-        evidence_id="audio_001",
+def _scene() -> SceneBoundary:
+    return SceneBoundary(
+        evidence_id="scene_001",
         start_ms=100,
         end_ms=400,
-        audioset_class="Music",
-        normalized_event="音乐",
-        confidence=0.8,
-        threshold_version="eval-unvalidated-v1",
+        transition="candidate",
+        score=0.8,
     )
 
 
 def test_timeline_is_stable_across_input_order_and_exact_duplicates() -> None:
     speech = _speech()
-    audio = _audio()
+    scene = _scene()
 
-    first = build_timeline((speech, audio, speech))
-    second = build_timeline((audio, speech))
+    first = build_timeline((speech, scene, speech))
+    second = build_timeline((scene, speech))
 
     assert tuple(item.model_dump_json() for item in first) == tuple(
         item.model_dump_json() for item in second
@@ -50,7 +53,7 @@ def test_timeline_is_stable_across_input_order_and_exact_duplicates() -> None:
     assert len(first) == 1
     assert first[0].start_ms == 100
     assert first[0].end_ms == 400
-    assert first[0].evidence_refs == ("asr_001", "audio_001")
+    assert first[0].evidence_refs == ("asr_001", "scene_001")
     assert first[0].timeline_id.startswith("timeline_")
 
 

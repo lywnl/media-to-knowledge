@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from pydantic import ValidationError
 
 from video_demo.domain.base import FrozenModel, Sha256
-from video_demo.errors import VideoDemoError
+from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.speech.snapshots import AsrWindowSnapshotPayload
 from video_demo.storage.artifacts import (
     ArtifactReceipt,
     AtomicArtifactStore,
@@ -15,10 +17,13 @@ from video_demo.storage.artifacts import (
 )
 from video_demo.storage.workspace import reject_symlink_components
 
-SnapshotKind = Literal["asr", "speech"]
+SnapshotKind = Literal["asr"]
 PayloadT = TypeVar("PayloadT", bound=FrozenModel)
 _MAX_POINTER_BYTES = 64 * 1024
 _MAX_SNAPSHOT_PAYLOAD_BYTES = 64 * 1024 * 1024
+_MAX_ASR_WINDOW_PAYLOAD_BYTES = 16 * 1024 * 1024
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_RUN_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9_-]{3,128}$")
 _CACHE_MISS_ERROR_CODES = frozenset(
     {
         "ARTIFACT_NOT_FOUND",
@@ -34,6 +39,93 @@ class SnapshotPointer(FrozenModel):
     kind: SnapshotKind
     fingerprint: Sha256
     payload_receipt: ArtifactReceipt
+
+
+class AsrWindowSnapshotStore:
+    """按窗口指纹保存不可覆盖的云端 ASR 付费结果。"""
+
+    def __init__(self, artifact_store: AtomicArtifactStore) -> None:
+        self._artifact_store = artifact_store
+
+    def load(
+        self,
+        run_relative_root: Path,
+        fingerprint: str,
+    ) -> tuple[AsrWindowSnapshotPayload, ArtifactReceipt] | None:
+        path = self._window_path(run_relative_root, fingerprint)
+        self._verified_path(path)
+        try:
+            receipt, payload = inspect_artifact(
+                self._artifact_store,
+                path,
+                schema_version="1.1.0",
+                upstream_sha256=fingerprint,
+                max_bytes=_MAX_ASR_WINDOW_PAYLOAD_BYTES,
+            )
+            return AsrWindowSnapshotPayload.model_validate(payload), receipt
+        except VideoDemoError as error:
+            if error.code.value not in _CACHE_MISS_ERROR_CODES:
+                raise
+            return None
+        except (FileNotFoundError, OSError, ValueError, ValidationError):
+            return None
+
+    def publish(
+        self,
+        run_relative_root: Path,
+        fingerprint: str,
+        payload: AsrWindowSnapshotPayload,
+    ) -> ArtifactReceipt:
+        path = self._window_path(run_relative_root, fingerprint)
+        self._verified_path(path)
+        payload_data = payload.model_dump(mode="json", exclude_computed_fields=True)
+        try:
+            return self._artifact_store.write_json(
+                path,
+                payload_data,
+                schema_version=payload.schema_version,
+                upstream_sha256=fingerprint,
+                exclusive=True,
+            )
+        except FileExistsError:
+            existing = self.load(run_relative_root, fingerprint)
+            if existing is None or existing[0] != payload:
+                raise VideoDemoError(
+                    ErrorCode.ARTIFACT_DIGEST_MISMATCH,
+                    "已有云端 ASR 窗口缓存与待发布内容不一致",
+                ) from None
+            return existing[1]
+
+    @staticmethod
+    def _window_path(run_relative_root: Path, fingerprint: str) -> Path:
+        if (
+            run_relative_root.is_absolute()
+            or len(run_relative_root.parts) != 3
+            or run_relative_root.parts[0] != "runs"
+            or not all(
+                _RUN_COMPONENT_PATTERN.fullmatch(component)
+                for component in run_relative_root.parts[1:]
+            )
+            or not _SHA256_PATTERN.fullmatch(fingerprint)
+        ):
+            raise VideoDemoError(
+                ErrorCode.WORKSPACE_PATH_ESCAPE,
+                "云端 ASR 窗口快照路径参数非法",
+            )
+        return (
+            run_relative_root
+            / "speech"
+            / "snapshots"
+            / "asr-windows"
+            / f"window-{fingerprint}.json"
+        )
+
+    def _verified_path(self, relative_path: Path) -> Path:
+        return reject_symlink_components(
+            self._artifact_store.runtime_root,
+            self._artifact_store.runtime_root / relative_path,
+            message="云端 ASR 窗口快照路径必须位于运行目录内且不能包含符号链接",
+        )
 
 
 class SnapshotStore:

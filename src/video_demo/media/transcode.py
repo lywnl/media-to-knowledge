@@ -187,6 +187,7 @@ class FFmpegTranscoder:
         run_relative_root: Path,
         *,
         has_audio: bool,
+        duration_ms: int,
         input_fd: int | None = None,
         output_fd: int | None = None,
     ) -> AudioArtifact | NoAudioArtifact:
@@ -194,6 +195,7 @@ class FFmpegTranscoder:
             return NoAudioArtifact(warning_code="NO_AUDIO_TRACK")
         source = self._trusted_input(source, input_fd)
         relative_path = run_relative_root / "media" / "audio.wav"
+        # 容器允许音轨略长于视频轨；ASR 音频必须截断到统一主视频时间轴。
         if input_fd is not None or output_fd is not None:
             input_descriptor, output_descriptor = _require_descriptor_pair(
                 input_fd,
@@ -201,6 +203,8 @@ class FFmpegTranscoder:
             )
             args = [
                 *self._base_args(Path(f"/dev/fd/{input_descriptor}")),
+                "-t",
+                _seconds(duration_ms),
                 "-map",
                 "0:a:0",
                 "-vn",
@@ -230,6 +234,8 @@ class FFmpegTranscoder:
         final_path = self._destination_path(relative_path)
         args = [
             *self._base_args(source),
+            "-t",
+            _seconds(duration_ms),
             "-map",
             "0:a:0",
             "-vn",

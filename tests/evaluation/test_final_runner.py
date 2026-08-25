@@ -64,35 +64,11 @@ def _annotation(sample_id: str, media_sha256: str, language: str) -> dict[str, o
         "duration_ms": 1_000,
         "language": language,
         "reference_text": "测试",
-        "words": [
-            {
-                "word_id": f"word_{sample_id}",
-                "text": "测试",
-                "start_ms": 0,
-                "end_ms": 500,
-            }
-        ],
-        "speaker_turns": [
-            {
-                "turn_id": f"turn_{sample_id}",
-                "speaker_id": "speaker_001",
-                "start_ms": 0,
-                "end_ms": 500,
-            }
-        ],
         "ocr_frames": [
             {
                 "frame_id": f"frame_{sample_id}",
                 "timestamp_ms": 100,
                 "text_lines": ["测试"],
-            }
-        ],
-        "audio_events": [
-            {
-                "event_id": f"event_{sample_id}",
-                "normalized_event": "speech",
-                "start_ms": 0,
-                "end_ms": 500,
             }
         ],
         "scene_boundaries_ms": [100],
@@ -297,7 +273,7 @@ def test_bind_durability_rejects_sample_that_does_not_meet_gate(
         )
 
 
-def test_requirement_report_contains_exactly_fixed_01_to_37(tmp_path: Path) -> None:
+def test_requirement_report_keeps_stable_ids_after_retired_requirements(tmp_path: Path) -> None:
     final = build_final_gate_report(
         quality=_quality(),
         checks=(),
@@ -314,10 +290,16 @@ def test_requirement_report_contains_exactly_fixed_01_to_37(tmp_path: Path) -> N
         workspace_root=tmp_path,
     )
 
-    assert tuple(row.requirement_id for row in report.rows) == tuple(range(1, 38))
+    assert tuple(row.requirement_id for row in report.rows) == tuple(
+        spec.requirement_id for spec in REQUIREMENT_SPECS
+    )
     assert tuple(row.requirement for row in report.rows) == tuple(
         spec.requirement for spec in REQUIREMENT_SPECS
     )
+    assert len(QUALITY_THRESHOLDS) == 14
+    assert next(
+        spec.requirement for spec in REQUIREMENT_SPECS if spec.requirement_id == 35
+    ) == "十四项质量与资源阈值全部满足"
     assert all(row.status == GateStatus.NOT_RUN for row in report.rows)
     assert set(check for row in report.rows for check in row.check_ids) <= set(
         FINAL_GATE_CHECKS
@@ -337,7 +319,7 @@ def test_requirement_report_rejects_duplicate_or_missing_requirement() -> None:
         for spec in REQUIREMENT_SPECS
     )
 
-    with pytest.raises(ValidationError, match=r"01|37|要求"):
+    with pytest.raises(ValidationError, match=r"固定规格|要求"):
         RequirementEvidenceReport(
             schema_version="1.0.0",
             evaluation_run_id="eval_20260820_001",
@@ -447,7 +429,7 @@ def test_authorized_dataset_runner_fails_closed_for_present_but_invalid_inputs(
     ).exists()
 
 
-def test_final_runner_writes_exact_fifteen_checks_and_is_idempotent(
+def test_final_runner_writes_exact_current_checks_and_is_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -493,8 +475,8 @@ def test_final_runner_writes_exact_fifteen_checks_and_is_idempotent(
     requirements = RequirementEvidenceReport.model_validate_json(paths[1].read_bytes())
     assert first.status == second.status == GateStatus.FAIL
     assert tuple(check.check_id for check in final.checks) == FINAL_GATE_CHECKS
-    assert len(final.checks) == 15
-    assert len(requirements.rows) == 37
+    assert len(final.checks) == 14
+    assert len(requirements.rows) == 33
     assert tuple(path.read_bytes() for path in paths) == first_bytes
     assert (
         settings.runtime_root / "eval/report.schema.json"
@@ -532,13 +514,13 @@ def test_cleanup_only_removes_bound_eval_subtrees_and_writes_manifest(tmp_path: 
     prediction = runtime / "eval/predictions/eval_cleanup"
     stage_ids = tuple(
         stage_evaluation_run_id("eval_cleanup", stage)
-        for stage in ("media", "baidu", "qwen", "pyannote", "models", "durability")
+        for stage in ("media", "baidu", "qwen", "models", "durability")
     )
     stage_reports = tuple(runtime / "eval/reports" / run_id for run_id in stage_ids)
     live_authorities = tuple(
         runtime / "eval/live-authority" / run_id
         for run_id in stage_ids
-        if any(marker in run_id for marker in ("baidu", "qwen", "pyannote", "models"))
+        if any(marker in run_id for marker in ("baidu", "qwen", "models"))
     )
     foreign = runtime / "eval/reports/eval_other"
     product = runtime / "runs/scope/run-unbound"
@@ -650,6 +632,7 @@ def test_durability_cleanup_requires_database_binding_even_with_result_manifest(
         tmp_path,
         runtime,
         evaluation_run_id,
+        settings=Settings(workspace_root=tmp_path),
     )
 
     assert run_ids == ()

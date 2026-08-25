@@ -15,7 +15,11 @@ from sqlalchemy import select
 
 from video_demo.domain.evidence import EvidenceItem, KeyframeEvidence
 from video_demo.domain.result import VideoUnderstandingResult, validate_evidence_references
-from video_demo.domain.result_artifact import ResultArtifactPayload, TranscriptSource
+from video_demo.domain.result_artifact import (
+    ARTIFACT_ENVELOPE_SCHEMA_VERSION,
+    ResultArtifactPayload,
+    TranscriptSource,
+)
 from video_demo.domain.run import RunStatus
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
@@ -49,6 +53,7 @@ class ResultRunMetadata:
     status: RunStatus
     warnings: tuple[str, ...]
     stage_metrics: dict[str, int]
+    stage_cache_hits: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +91,7 @@ class ResultQueryService:
         *,
         evidence: tuple[EvidenceItem, ...],
         stage_metrics: dict[str, int],
+        stage_cache_hits: tuple[str, ...] = (),
         status: RunStatus,
         transcript_source: TranscriptSource,
         fence: ResultWriteFence,
@@ -102,6 +108,7 @@ class ResultQueryService:
             result=result,
             evidence=evidence,
             stage_metrics=stage_metrics,
+            stage_cache_hits=stage_cache_hits,
             status=status.value,
             warnings=warnings,
             transcript_source=transcript_source,
@@ -126,7 +133,8 @@ class ResultQueryService:
         receipt = self._artifact_store.write_json(
             relative_path,
             payload,
-            schema_version=result.schema_version,
+            # 外层产物 envelope 的版本与内部领域结果版本独立。
+            schema_version=ARTIFACT_ENVELOPE_SCHEMA_VERSION,
             upstream_sha256=result.asset_sha256,
         )
         try:
@@ -282,16 +290,19 @@ class ResultQueryService:
         status = bundle.get("status")
         warnings = bundle.get("warnings")
         metrics = bundle.get("stage_metrics")
+        cache_hits = bundle.get("stage_cache_hits", [])
         if (
             not isinstance(status, str)
             or not isinstance(warnings, list)
             or not isinstance(metrics, dict)
+            or not isinstance(cache_hits, list)
         ):
             raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "结果 bundle 元数据非法")
         return ResultRunMetadata(
             status=RunStatus(status),
             warnings=tuple(str(item) for item in warnings),
             stage_metrics={str(key): int(value) for key, value in metrics.items()},
+            stage_cache_hits=tuple(str(item) for item in cache_hits),
         )
 
     def _read_bundle(self, scope: Scope, run_id: str) -> dict[str, object]:
@@ -304,13 +315,20 @@ class ResultQueryService:
             asset_sha = self._asset_sha_for_run(session, scope, run.asset_id)
             receipt = ArtifactReceipt(
                 relative_path=run.artifact_manifest_relative_path,
-                schema_version="1.0.0",
+                schema_version=ARTIFACT_ENVELOPE_SCHEMA_VERSION,
                 sha256=run.artifact_manifest_sha256,
                 upstream_sha256=asset_sha,
             )
         payload = self._artifact_store.read_verified_json(receipt)
         if not isinstance(payload, dict):
             raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "结果 bundle 必须是对象")
+        try:
+            ResultArtifactPayload.model_validate(payload)
+        except ValueError as error:
+            raise VideoDemoError(
+                ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                "结果 bundle payload 非法",
+            ) from error
         return payload
 
     @staticmethod

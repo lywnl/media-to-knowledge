@@ -31,7 +31,7 @@ from video_demo.application.production_media import (
     build_ffmpeg_factory,
     build_ffprobe_factory,
 )
-from video_demo.application.production_speech import ComponentFactory
+from video_demo.application.production_speech import AsrComponentFactory
 from video_demo.application.production_visual import (
     LazyBaiduOcrClient,
     ProductionVisualAnalyzer,
@@ -53,9 +53,11 @@ from video_demo.persistence.database import Database
 from video_demo.speech.isolated import IsolatedSpeechAnalyzer
 from video_demo.speech.runtime import ProductionSpeechModels
 from video_demo.speech.runtime import (
+    build_diagnostic_speech_models as _build_speech_models,
+)
+from video_demo.speech.runtime import (
     build_speech_component_factory as _build_speech_component_factory,
 )
-from video_demo.speech.runtime import build_speech_models as _build_speech_models
 from video_demo.speech.snapshots import SpeechFingerprintInputs
 from video_demo.speech.subprocess_protocol import (
     SpeechRuntimeConfig,
@@ -77,13 +79,10 @@ _QWEN_MODEL_ID_PATTERN = re.compile(
     r"qwen(?:2(?:\.5)?|3)-vl-(?:plus|max|flash)"
     r"(?:-[0-9]{4}-[0-9]{2}-[0-9]{2})?\Z",
 )
-_VALIDATION_LANGUAGES = ("zh", "en", "ja", "ko", "es")
-
-
 class ProductionModelIdentityReport(FrozenModel):
     """由唯一生产组合根确定且不含敏感值的模型身份。"""
 
-    schema_version: Literal["1.0.0"]
+    schema_version: Literal["1.0.0", "2.0.0"]
     models: tuple[ModelIdentity, ...]
     settings_fingerprint: Sha256
 
@@ -95,7 +94,7 @@ class ProductionDiagnosticComponents:
         self,
         *,
         ffmpeg_factory: Callable[[Callable[[], bool]], TranscodeClient],
-        speech_component_factory: ComponentFactory,
+        speech_component_factory: AsrComponentFactory,
         visual_component_factory: ProductionVisualComponentFactory,
         speech_models: ProductionSpeechModels,
         qwen_client: QwenVideoClient,
@@ -164,6 +163,7 @@ def build_production_model_identity_report(
 ) -> ProductionModelIdentityReport:
     """只从生产设置和固定组件契约生成稳定、可序列化的模型身份。"""
 
+    cloud_asr = settings.require_cloud_asr_configuration()
     models = [
         _local_model_identity(
             "silero_vad",
@@ -171,32 +171,10 @@ def build_production_model_identity_report(
             package="silero-vad",
             device="cpu",
         ),
-        _local_model_identity(
-            "faster_whisper",
-            "large-v3",
-            package="faster-whisper",
-            device=settings.inference_device,
-        ),
-        *(
-            _local_model_identity(
-                "whisperx",
-                f"whisperx-align-{language}",
-                package="whisperx",
-                device="cpu",
-            )
-            for language in _VALIDATION_LANGUAGES
-        ),
-        _local_model_identity(
-            "pyannote",
-            "pyannote/speaker-diarization-community-1",
-            package="pyannote.audio",
-            device="cpu",
-        ),
-        _local_model_identity(
-            "yamnet",
-            "yamnet",
-            package="tensorflow-hub",
-            device="cpu",
+        ModelIdentity(
+            component="cloud_whisper",
+            provider="openai_compatible",
+            model_id=cloud_asr.model,
         ),
         ModelIdentity(
             component="baidu_ocr",
@@ -217,7 +195,7 @@ def build_production_model_identity_report(
             ),
         )
     return ProductionModelIdentityReport(
-        schema_version="1.0.0",
+        schema_version="2.0.0",
         models=tuple(models),
         settings_fingerprint=_settings_fingerprint(settings),
     )
@@ -230,6 +208,7 @@ def build_production_diagnostic_components(
 ) -> ProductionDiagnosticComponents:
     """构造唯一生产诊断组合根，Secret 仅在 Adapter 首次真实调用时解封。"""
 
+    settings.require_cloud_asr_configuration()
     assert settings.runtime_root is not None
     ffmpeg = settings.ffmpeg_path or settings.runtime_root / "tools" / "ffmpeg"
     ffmpeg_factory = build_ffmpeg_factory(
@@ -240,6 +219,8 @@ def build_production_diagnostic_components(
     with ExitStack() as pending_resources:
         visual_factory = _build_visual_component_factory(settings, ffmpeg_factory)
         pending_resources.callback(visual_factory.http_client.close)
+        speech_http_client = httpx.Client()
+        pending_resources.callback(speech_http_client.close)
         qwen_http_client = httpx.Client()
         pending_resources.callback(qwen_http_client.close)
 
@@ -258,7 +239,7 @@ def build_production_diagnostic_components(
             timeout_seconds=settings.qwen_timeout_seconds,
             allowed_remote_video_hosts=allowed_remote_video_hosts,
         )
-        speech_models = _build_speech_models(settings)
+        speech_models = _build_speech_models(settings, speech_http_client)
         speech_component_factory = _build_speech_component_factory(
             settings,
             ffmpeg_factory,
@@ -272,8 +253,13 @@ def build_production_diagnostic_components(
             qwen_client=qwen,
             qwen_http_client=qwen_http_client,
             model_identity_report=build_production_model_identity_report(settings),
-            owned_resources=(visual_factory.http_client, qwen_http_client),
+            owned_resources=(
+                visual_factory.http_client,
+                speech_http_client,
+                qwen_http_client,
+            ),
         )
+        # 所有权已经转交给 components，避免 ExitStack 与 owner 双重关闭同一资源。
         pending_resources.pop_all()
     return components
 
@@ -319,7 +305,7 @@ def _normalized_qwen_model_id(
 def _settings_fingerprint(settings: Settings) -> str:
     assert settings.runtime_root is not None
     runtime_root = settings.runtime_root
-    model_root = runtime_root / "models"
+    cloud_asr = settings.require_cloud_asr_configuration()
     ffmpeg = settings.ffmpeg_path or runtime_root / "tools" / "ffmpeg"
     ffprobe = settings.ffprobe_path or runtime_root / "tools" / "ffprobe"
     payload = {
@@ -328,43 +314,23 @@ def _settings_fingerprint(settings: Settings) -> str:
             "runtime_root": _workspace_relative(settings, runtime_root),
             "ffmpeg": _workspace_relative(settings, ffmpeg),
             "ffprobe": _workspace_relative(settings, ffprobe),
-            "thresholds": _workspace_relative(
-                settings,
-                settings.workspace_root / "src/video_demo/audio/thresholds.json",
-            ),
         },
         "execution": {
-            "inference_device": settings.inference_device,
-            "whisper_compute_type": settings.whisper_compute_type,
             "max_video_bytes": settings.max_video_bytes,
             "demo_degraded_mode": settings.demo_degraded_mode,
             "speech_subprocess_timeout_seconds": settings.speech_subprocess_timeout_seconds,
         },
-        "model_cache": {
-            "root": _workspace_relative(settings, model_root),
-            "faster_whisper_root": _workspace_relative(
-                settings,
-                model_root / "faster-whisper",
-            ),
-            "whisperx_languages": {
-                language: _workspace_relative(
-                    settings,
-                    model_root / "whisperx" / language,
-                )
-                for language in _VALIDATION_LANGUAGES
-            },
-            "pyannote_root": _workspace_relative(
-                settings,
-                model_root / "pyannote",
-            ),
-            "yamnet_model": _workspace_relative(
-                settings,
-                model_root / "yamnet/saved_model",
-            ),
-            "yamnet_class_map": _workspace_relative(
-                settings,
-                model_root / "yamnet/yamnet_class_map.csv",
-            ),
+        "cloud_asr": {
+            "provider": "openai_compatible",
+            "base_url": cloud_asr.base_url,
+            "model_id": cloud_asr.model,
+            "timeout_seconds": cloud_asr.timeout_seconds,
+            "max_attempts": cloud_asr.max_attempts,
+            "max_window_ms": cloud_asr.max_window_ms,
+            "overlap_ms": cloud_asr.overlap_ms,
+            "merge_gap_ms": cloud_asr.merge_gap_ms,
+            "max_upload_bytes": cloud_asr.max_upload_bytes,
+            "window_strategy_version": "2.0.0",
         },
         "qwen": {
             "base_url": _normalized_endpoint(settings.qwen_base_url),
@@ -414,6 +380,7 @@ def build_production_pipeline(
 ) -> ProductionPipeline:
     """组装工作区内安全媒体工具与延迟验证配置的 Qwen Adapter。"""
 
+    settings.require_cloud_asr_configuration()
     assert settings.runtime_root is not None
     ffmpeg = settings.ffmpeg_path or settings.runtime_root / "tools" / "ffmpeg"
     ffprobe = settings.ffprobe_path or settings.runtime_root / "tools" / "ffprobe"
@@ -486,13 +453,11 @@ def build_production_pipeline(
                 runtime_root=settings.runtime_root,
                 snapshot_store=SnapshotStore(AtomicArtifactStore(settings.runtime_root)),
                 artifact_store=AtomicArtifactStore(settings.runtime_root),
-                fingerprint_inputs=_speech_fingerprint_inputs(settings),
                 speech_runtime=_speech_runtime_config(settings, ffmpeg),
                 credentials=SpeechSubprocessCredentials(
-                    huggingface_token=settings.huggingface_token,
+                    openai_api_key=settings.require_cloud_asr_configuration().api_key,
                 ),
-                timeout_seconds=settings.speech_subprocess_timeout_seconds,
-                allow_speaker_fallback=settings.demo_degraded_mode,
+                asr_timeout_seconds=settings.speech_subprocess_timeout_seconds,
             ),
             ProductionVisualAnalyzer(
                 settings.runtime_root,
@@ -524,38 +489,44 @@ def _configured_oss_host(settings: Settings) -> str:
 
 
 def _speech_fingerprint_inputs(settings: Settings) -> SpeechFingerprintInputs:
-    assert settings.runtime_root is not None
-    report = build_production_model_identity_report(settings)
-    model_root = settings.runtime_root / "models"
+    configuration = settings.require_cloud_asr_configuration()
     return SpeechFingerprintInputs(
-        model_identities=tuple(
-            identity
-            for identity in report.models
-            if identity.component
-            in {"silero_vad", "faster_whisper", "whisperx", "pyannote", "yamnet"}
+        model_identities=(
+            _local_model_identity(
+                "silero_vad",
+                "silero-vad",
+                package="silero-vad",
+                device="cpu",
+            ),
+            ModelIdentity(
+                component="cloud_whisper",
+                provider="openai_compatible",
+                model_id=configuration.model,
+            ),
         ),
-        asr_compute_type=settings.whisper_compute_type,
-        yamnet_class_map_sha256=_optional_file_sha256(
-            model_root / "yamnet/yamnet_class_map.csv"
-        ),
-        yamnet_thresholds_sha256=_optional_file_sha256(
-            settings.workspace_root / "src/video_demo/audio/thresholds.json"
-        ),
+        cloud_asr_base_url=configuration.base_url,
+        max_window_ms=configuration.max_window_ms,
+        overlap_ms=configuration.overlap_ms,
+        merge_gap_ms=configuration.merge_gap_ms,
+        max_upload_bytes=configuration.max_upload_bytes,
     )
 
 
 def _speech_runtime_config(settings: Settings, ffmpeg: Path) -> SpeechRuntimeConfig:
+    configuration = settings.require_cloud_asr_configuration()
     inputs = _speech_fingerprint_inputs(settings)
     return SpeechRuntimeConfig(
-        inference_device=settings.inference_device,
-        whisper_compute_type=settings.whisper_compute_type,
+        base_url=configuration.base_url,
+        model=configuration.model,
+        timeout_seconds=configuration.timeout_seconds,
+        max_attempts=configuration.max_attempts,
+        max_window_ms=configuration.max_window_ms,
+        overlap_ms=configuration.overlap_ms,
+        merge_gap_ms=configuration.merge_gap_ms,
+        max_upload_bytes=configuration.max_upload_bytes,
         model_identities=inputs.model_identities,
-        yamnet_class_map_sha256=inputs.yamnet_class_map_sha256,
-        yamnet_thresholds_sha256=inputs.yamnet_thresholds_sha256,
         vad_threshold=inputs.vad_threshold,
         vad_merge_gap_ms=inputs.vad_merge_gap_ms,
-        lid_threshold=inputs.lid_threshold,
-        asr_beam_size=inputs.asr_beam_size,
         ffmpeg_relative_path=ffmpeg.relative_to(settings.workspace_root).as_posix(),
     )
 
@@ -651,6 +622,7 @@ class ProductionVisualComponentFactory:
 def build_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
     """用与 API 相同的数据库和运行目录组装可执行 Worker。"""
 
+    settings.require_cloud_asr_configuration()
     assert settings.runtime_root is not None
     settings.runtime_root.mkdir(parents=True, exist_ok=True)
     database = Database(f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}")

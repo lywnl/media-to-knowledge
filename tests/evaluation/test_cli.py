@@ -78,7 +78,6 @@ def test_live_dispatch_writes_outer_summary_instead_of_returning_baidu_report(
     checks = {
         "baidu": _gate_check("baidu_ocr_live", GateStatus.PASS),
         "qwen": _gate_check("qwen_live", GateStatus.FAIL),
-        "pyannote": _gate_check("pyannote_live", GateStatus.PASS),
         "models": _gate_check("five_language_models", GateStatus.PASS),
     }
 
@@ -91,9 +90,6 @@ def test_live_dispatch_writes_outer_summary_instead_of_returning_baidu_report(
 
         def run_workspace_qwen(self, _run_id: str) -> GateCheck:
             return checks["qwen"]
-
-        def run_workspace_pyannote(self, _run_id: str) -> GateCheck:
-            return checks["pyannote"]
 
         def run_workspace_local_model_stack(self, _run_id: str) -> GateCheck:
             return checks["models"]
@@ -114,7 +110,6 @@ def test_live_dispatch_writes_outer_summary_instead_of_returning_baidu_report(
     assert [item["check_id"] for item in summary["checks"]] == [
         "baidu_ocr_live",
         "qwen_live",
-        "pyannote_live",
         "five_language_models",
     ]
 

@@ -32,7 +32,6 @@ from video_demo.application.production_media import (
 from video_demo.application.production_visual import ProductionVisualAnalyzer
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
-from video_demo.audio.yamnet import NativeYamnetDetector
 from video_demo.config import Settings
 from video_demo.domain.evidence import SceneBoundary, SpeechSegment
 from video_demo.domain.manifest import Rational, VideoAssetManifest, VideoStream
@@ -54,16 +53,48 @@ from video_demo.media.probe import ProbeLimits
 from video_demo.persistence.database import Database
 from video_demo.persistence.models import JobStatus, RunStatusValue
 from video_demo.persistence.repositories import JobRepository, Scope, VideoRunRepository
-from video_demo.speech.alignment import WhisperXAligner
-from video_demo.speech.asr import FasterWhisperAdapter
-from video_demo.speech.diarization import PyannoteDiarizer
-from video_demo.speech.language import SegmentLanguageIdentifier
 from video_demo.speech.vad import SileroVadAdapter
 from video_demo.storage.object_store import LocalVideoObjectStore
 
 
+@pytest.mark.parametrize(
+    "builder",
+    (
+        lambda settings: build_worker(settings, worker_id="worker-missing-cloud-asr"),
+        lambda settings: __import__(
+            "video_demo.application.composition",
+            fromlist=["build_production_pipeline"],
+        ).build_production_pipeline(settings, object(), object()),
+        lambda settings: build_production_diagnostic_components(settings),
+    ),
+)
+def test_production_composition_rejects_missing_cloud_asr_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    builder: object,
+) -> None:
+    import video_demo.application.composition as composition
+
+    settings = Settings(workspace_root=tmp_path, _env_file=None)
+    assert settings.runtime_root is not None
+    monkeypatch.setattr(
+        composition.httpx,
+        "Client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("配置失败前不得创建 HTTP 客户端")
+        ),
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        builder(settings)  # type: ignore[operator]
+
+    assert raised.value.code == ErrorCode.INVALID_CONFIGURATION
+    assert not settings.runtime_root.exists()
+
+
 def test_production_worker_consumes_created_job_and_records_missing_ffprobe(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     settings = Settings(
         workspace_root=tmp_path,
@@ -87,8 +118,6 @@ def test_production_worker_consumes_created_job_and_records_missing_ffprobe(
         object_ref=uploaded.object_ref,
         idempotency_key="production-worker-0001",
         language_hints=("en",),
-        min_speakers=None,
-        max_speakers=None,
     )
 
     worker = build_worker(settings, worker_id="worker-production-test")
@@ -283,7 +312,7 @@ def test_production_pipeline_reuses_complete_orchestration_and_builds_retrieval_
 
     assert outcome.status == RunStatus.SUCCEEDED
     segment = outcome.result.segments[0]
-    assert segment.retrieval_text.startswith("标题：")
+    assert segment.retrieval_text.startswith("文档类型：VIDEO_SEGMENT")
     assert segment.retrieval_hash == hashlib.sha256(
         segment.retrieval_text.encode("utf-8"),
     ).hexdigest()
@@ -325,6 +354,7 @@ def test_production_pipeline_preserves_injectable_stage_clock() -> None:
 
 def test_worker_builds_real_production_media_adapters(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     from video_demo.application.composition import build_production_pipeline
 
@@ -352,6 +382,7 @@ def test_worker_builds_real_production_media_adapters(
 def test_production_pipeline_does_not_construct_in_process_speech_models(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -376,6 +407,7 @@ def test_production_pipeline_does_not_construct_in_process_speech_models(
 
 def test_strict_production_pipeline_rejects_configured_qwen_without_oss(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     from video_demo.application.composition import build_production_pipeline
 
@@ -399,6 +431,7 @@ def test_strict_production_pipeline_rejects_configured_qwen_without_oss(
 
 def test_production_pipeline_wraps_qwen_with_private_oss_publisher(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     from video_demo.application.composition import build_production_pipeline
 
@@ -432,6 +465,7 @@ def test_production_pipeline_wraps_qwen_with_private_oss_publisher(
 
 def test_demo_pipeline_fallback_wraps_published_qwen(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     from video_demo.application.composition import build_production_pipeline
 
@@ -466,6 +500,7 @@ def test_demo_pipeline_fallback_wraps_published_qwen(
 def test_production_pipeline_passes_nullable_qwen_configuration_and_dedicated_limits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -520,6 +555,7 @@ def test_production_pipeline_passes_nullable_qwen_configuration_and_dedicated_li
 def test_diagnostic_builder_uses_public_qwen_api_key_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -552,6 +588,7 @@ def test_diagnostic_builder_uses_public_qwen_api_key_provider(
 def test_worker_starts_without_qwen_configuration_and_fails_at_first_clip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -573,8 +610,6 @@ def test_worker_starts_without_qwen_configuration_and_fails_at_first_clip(
         object_ref=uploaded.object_ref,
         idempotency_key="missing-qwen-at-first-clip",
         language_hints=("en",),
-        min_speakers=None,
-        max_speakers=None,
     )
     clip_path = settings.runtime_root / "clip.mp4"
     clip_path.write_bytes(b"clip")
@@ -650,6 +685,7 @@ def test_worker_starts_without_qwen_configuration_and_fails_at_first_clip(
 
 def test_demo_mode_accepts_unrecognized_qwen_model_for_deterministic_fallback(
     tmp_path: Path,
+    cloud_asr_environment: None,
 ) -> None:
     from video_demo.application.composition import build_production_model_identity_report
 
@@ -666,19 +702,97 @@ def test_demo_mode_accepts_unrecognized_qwen_model_for_deterministic_fallback(
     assert qwen_models[0].model_id == "provider-video-model"
 
 
-def test_speech_fingerprint_inputs_bind_installed_package_versions(tmp_path: Path) -> None:
+def test_speech_fingerprint_inputs_bind_cloud_model_and_silero_version(
+    tmp_path: Path,
+    cloud_asr_environment: None,
+) -> None:
     from video_demo.application.composition import _speech_fingerprint_inputs
 
     inputs = _speech_fingerprint_inputs(Settings(workspace_root=tmp_path))
 
-    assert inputs.model_identities
-    assert all(identity.revision for identity in inputs.model_identities)
+    identities = {identity.component: identity for identity in inputs.model_identities}
+    assert identities["silero_vad"].revision
+    assert identities["cloud_whisper"].provider == "openai_compatible"
+    assert identities["cloud_whisper"].model_id == "openai/whisper"
+    assert inputs.cloud_asr_base_url == "https://ai-proxy.example.test/v1"
+    assert (inputs.max_window_ms, inputs.overlap_ms) == (600_000, 1_000)
+
+
+def test_speech_content_fingerprint_ignores_cloud_credentials_and_delivery_policy(
+    tmp_path: Path,
+) -> None:
+    from video_demo.application.composition import _speech_fingerprint_inputs
+    from video_demo.speech.snapshots import asr_fingerprint
+
+    common: dict[str, object] = {
+        "workspace_root": tmp_path,
+        "openai_base_url": "https://asr.example/v1",
+        "openai_model": "openai/whisper",
+        "_env_file": None,
+    }
+
+    def content_fingerprint(settings: Settings) -> str:
+        return asr_fingerprint(
+            audio_sha256="a" * 64,
+            duration_ms=60_000,
+            language_hints=("zh",),
+            hotwords=("Milvus",),
+            core_context="向量数据库课程",
+            inputs=_speech_fingerprint_inputs(settings),
+        )
+
+    fingerprints = {
+        content_fingerprint(
+            Settings(
+                **common,
+                openai_api_key="first-test-key",
+                openai_asr_timeout_seconds=300,
+                openai_asr_max_attempts=3,
+            )
+        ),
+        content_fingerprint(
+            Settings(
+                **common,
+                openai_api_key="second-test-key",
+                openai_asr_timeout_seconds=120,
+                openai_asr_max_attempts=5,
+            )
+        ),
+    }
+
+    assert len(fingerprints) == 1
+
+
+def test_production_model_identity_report_uses_only_current_cloud_speech_stack(
+    tmp_path: Path,
+    cloud_asr_environment: None,
+) -> None:
+    from video_demo.application.composition import build_production_model_identity_report
+
+    report = build_production_model_identity_report(Settings(workspace_root=tmp_path))
+    identities = {item.component: item for item in report.models}
+
+    assert report.schema_version == "2.0.0"
+    assert {"silero_vad", "cloud_whisper"}.issubset(identities)
+    assert {
+        "faster_whisper",
+        "whisperx",
+        "pyannote",
+        "yamnet",
+    }.isdisjoint(identities)
+    cloud = identities["cloud_whisper"]
+    assert cloud.provider == "openai_compatible"
+    assert cloud.model_id == "openai/whisper"
+    assert cloud.revision is None
+    assert cloud.device is None
 
 
 def test_production_speech_factory_reuses_lifecycle_models_across_tasks(
     tmp_path: Path,
 ) -> None:
     from video_demo.application.composition import _build_speech_component_factory
+    from video_demo.speech.runtime import ProductionSpeechModels
+    from video_demo.speech.vad import NativeSileroBackend
 
     settings = Settings(workspace_root=tmp_path)
     clients: list[object] = []
@@ -688,7 +802,15 @@ def test_production_speech_factory_reuses_lifecycle_models_across_tasks(
         clients.append(client)
         return client
 
-    factory = _build_speech_component_factory(settings, ffmpeg_factory)
+    models = ProductionSpeechModels(
+        vad=SileroVadAdapter(NativeSileroBackend()),
+        recognizer=object(),  # type: ignore[arg-type]
+    )
+    factory = _build_speech_component_factory(
+        settings,
+        ffmpeg_factory,
+        models=models,
+    )
     first = factory(  # type: ignore[arg-type]
         SimpleNamespace(source=SimpleNamespace(duration_ms=1_000)),
         lambda: False,
@@ -699,24 +821,9 @@ def test_production_speech_factory_reuses_lifecycle_models_across_tasks(
     )
 
     assert isinstance(first.vad, SileroVadAdapter)
-    assert isinstance(first.language_identifier, SegmentLanguageIdentifier)
-    assert isinstance(first.recognizer, FasterWhisperAdapter)
-    assert isinstance(first.aligner, WhisperXAligner)
-    assert isinstance(first.diarizer, PyannoteDiarizer)
-    assert isinstance(first.audio_events, NativeYamnetDetector)
     assert first.vad is second.vad
-    assert first.language_identifier is second.language_identifier
     assert first.recognizer is second.recognizer
-    assert first.aligner is second.aligner
-    assert first.diarizer is second.diarizer
-    assert first.audio_events is second.audio_events
     assert first.vad._backend is second.vad._backend  # type: ignore[attr-defined]
-    assert first.recognizer._backend is second.recognizer._backend  # type: ignore[attr-defined]
-    assert first.aligner._backend is second.aligner._backend  # type: ignore[attr-defined]
-    assert first.diarizer._backend is second.diarizer._backend  # type: ignore[attr-defined]
-    assert (  # type: ignore[attr-defined]
-        first.audio_events._backend_factory() is second.audio_events._backend_factory()
-    )
     assert first.slicer is not second.slicer
     assert len(clients) == 2
 
@@ -818,6 +925,7 @@ def test_production_pipeline_close_attempts_all_resources_when_later_close_raise
 def test_production_pipeline_build_closes_http_client_when_owner_construction_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -845,6 +953,7 @@ def test_production_pipeline_build_closes_http_client_when_owner_construction_fa
 def test_qwen_adapter_construction_failure_closes_visual_and_qwen_http_clients(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -878,6 +987,7 @@ def test_qwen_adapter_construction_failure_closes_visual_and_qwen_http_clients(
 def test_qwen_http_client_construction_failure_closes_visual_http_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -940,6 +1050,7 @@ def test_build_worker_closes_pipeline_when_downstream_construction_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -975,6 +1086,7 @@ def test_build_worker_closes_pipeline_when_downstream_construction_fails(
 def test_build_worker_transfers_pipeline_to_successful_worker_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -1002,6 +1114,7 @@ def test_build_worker_transfers_pipeline_to_successful_worker_owner(
 def test_production_pipeline_builds_lightweight_dependencies_without_diagnostics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -1032,6 +1145,7 @@ def test_production_pipeline_builds_lightweight_dependencies_without_diagnostics
 def test_diagnostic_builder_keeps_all_secrets_lazy_until_adapter_call(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -1042,7 +1156,6 @@ def test_diagnostic_builder_keeps_all_secrets_lazy_until_adapter_call(
         qwen_api_key="  qwen-secret  ",
         baidu_api_key="baidu-api-secret",
         baidu_secret_key="baidu-secret-secret",
-        huggingface_token="huggingface-secret",
     )
     assert settings.runtime_root is not None
     settings.runtime_root.mkdir(parents=True)
@@ -1080,20 +1193,6 @@ def test_diagnostic_builder_keeps_all_secrets_lazy_until_adapter_call(
         def reveal_credentials(self) -> tuple[str | None, str | None]:
             return self._credentials_provider()  # type: ignore[no-any-return,operator]
 
-    class PyannoteBackend:
-        def __init__(
-            self,
-            token_provider: object,
-            *,
-            model_root: Path,
-        ) -> None:
-            assert callable(token_provider)
-            self._token_provider = token_provider
-            self.model_root = model_root
-
-        def reveal_token(self) -> str | None:
-            return self._token_provider()  # type: ignore[no-any-return,operator]
-
     monkeypatch.setattr(SecretStr, "get_secret_value", reveal)
     monkeypatch.setattr(composition.httpx, "Client", Client)
     monkeypatch.setattr(
@@ -1102,10 +1201,6 @@ def test_diagnostic_builder_keeps_all_secrets_lazy_until_adapter_call(
         lambda *_args: lambda _cancel: object(),
     )
     monkeypatch.setattr(composition, "LazyBaiduOcrClient", LazyBaidu)
-    import video_demo.speech.runtime as speech_runtime
-
-    monkeypatch.setattr(speech_runtime, "NativePyannoteBackend", PyannoteBackend)
-
     diagnostics = build_production_diagnostic_components(settings)
     try:
         assert revealed == []
@@ -1122,17 +1217,13 @@ def test_diagnostic_builder_keeps_all_secrets_lazy_until_adapter_call(
             "baidu-api-secret",
             "baidu-secret-secret",
         ]
-        speech = diagnostics.speech_component_factory(
-            SimpleNamespace(source=SimpleNamespace(duration_ms=1_000)),  # type: ignore[arg-type]
-            lambda: False,
-        )
-        backend = speech.diarizer._backend  # type: ignore[attr-defined]
-        assert backend.reveal_token() == "huggingface-secret"
+        cloud_configuration = diagnostics.speech_models.recognizer._configuration  # type: ignore[attr-defined]
+        assert cloud_configuration.api_key.get_secret_value() == "test-openai-key"
         assert revealed == [
             "  qwen-secret  ",
             "baidu-api-secret",
             "baidu-secret-secret",
-            "huggingface-secret",
+            "test-openai-key",
         ]
     finally:
         diagnostics.close()
@@ -1141,6 +1232,7 @@ def test_diagnostic_builder_keeps_all_secrets_lazy_until_adapter_call(
 def test_diagnostic_components_close_resources_in_reverse_order_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -1168,23 +1260,20 @@ def test_diagnostic_components_close_resources_in_reverse_order_once(
     assert diagnostics.baidu_ocr_client is diagnostics.visual_component_factory.ocr_client
     assert diagnostics.speech_models.vad is not None
     assert diagnostics.speech_models.recognizer is not None
-    assert diagnostics.speech_models.aligner is not None
-    assert diagnostics.speech_models.diarizer is not None
-    assert diagnostics.speech_models.audio_events is not None
     diagnostics.close()
     diagnostics.close()
 
-    assert closes == [2, 1]
+    assert closes == [3, 2, 1]
 
 
 @pytest.mark.parametrize(
     ("failure", "expected_closes"),
     [
-        ("qwen_http", [1]),
-        ("qwen_adapter", [2, 1]),
-        ("speech_factory", [2, 1]),
-        ("identity_report", [2, 1]),
-        ("owner", [2, 1]),
+        ("qwen_http", [2, 1]),
+        ("qwen_adapter", [3, 2, 1]),
+        ("speech_factory", [3, 2, 1]),
+        ("identity_report", [3, 2, 1]),
+        ("owner", [3, 2, 1]),
     ],
 )
 def test_diagnostic_builder_closes_created_resources_in_reverse_on_failure(
@@ -1192,6 +1281,7 @@ def test_diagnostic_builder_closes_created_resources_in_reverse_on_failure(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
     expected_closes: list[int],
+    cloud_asr_environment: None,
 ) -> None:
     import video_demo.application.composition as composition
 
@@ -1203,7 +1293,7 @@ def test_diagnostic_builder_closes_created_resources_in_reverse_on_failure(
             nonlocal created
             created += 1
             self.identity = created
-            if failure == "qwen_http" and created == 2:
+            if failure == "qwen_http" and created == 3:
                 raise RuntimeError("qwen http construction failed")
 
         def close(self) -> None:

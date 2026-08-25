@@ -18,8 +18,6 @@ def _create_payload(object_ref: str) -> dict[str, object]:
         "object_ref": object_ref,
         "idempotency_key": "request-video-0001",
         "language_hints": ["zh", "en", "ja", "ko", "es"],
-        "min_speakers": None,
-        "max_speakers": None,
     }
 
 

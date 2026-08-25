@@ -8,7 +8,12 @@ import pytest
 
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.visual.keyframes import FrameCandidate, KeyframeSelector, OpenCvFrameExtractor
+from video_demo.visual.keyframes import (
+    FrameCandidate,
+    KeyframeSelector,
+    OpenCvFrameExtractor,
+    _sample_timestamps,
+)
 
 
 def _frame(
@@ -87,6 +92,11 @@ def test_selection_rejects_candidates_outside_window() -> None:
             TimeRange(start_ms=10_000, end_ms=20_000),
             (_frame(9_999),),
         )
+
+
+def test_default_sampling_uses_one_frame_for_short_window_and_two_for_long_window() -> None:
+    assert _sample_timestamps(TimeRange(start_ms=0, end_ms=8_000), None) == (4_000,)
+    assert _sample_timestamps(TimeRange(start_ms=0, end_ms=15_000), None) == (5_000, 10_000)
 
 
 def test_opencv_extractor_reuses_one_capture_seeks_and_atomically_encodes_jpeg(
@@ -490,7 +500,11 @@ def test_opencv_deduplicates_repeated_actual_timestamp_before_writing(
             return True, Encoded(payload)
 
     runtime = tmp_path / "runtime"
-    result = OpenCvFrameExtractor(runtime, module_loader=lambda: Cv2).extract(
+    result = OpenCvFrameExtractor(
+        runtime,
+        module_loader=lambda: Cv2,
+        samples_per_window=6,
+    ).extract(
         runtime / "runs/scope/run_001/media/proxy.mp4",
         Path("runs/scope/run_001"),
         (TimeRange(start_ms=0, end_ms=1_000),),

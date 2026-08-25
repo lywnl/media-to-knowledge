@@ -9,9 +9,6 @@ import pytest
 from video_demo.application.pipeline import PipelineRunConfig, ProbedAsset, RegisteredAsset
 from video_demo.application.production_media import ProductionMediaTranscoder
 from video_demo.domain.evidence import (
-    AlignedWord,
-    AudioEvent,
-    SpeakerTurn,
     SpeechSegment,
     SubtitleCue,
 )
@@ -27,9 +24,7 @@ from video_demo.media.transcode import (
 from video_demo.speech.isolated import IsolatedSpeechAnalyzer
 from video_demo.speech.snapshots import (
     AsrSnapshotPayload,
-    SpeechAnalysisSnapshotPayload,
     SpeechFingerprintInputs,
-    speech_fingerprint,
 )
 from video_demo.speech.subprocess_protocol import (
     SpeechRuntimeConfig,
@@ -95,14 +90,11 @@ def test_subtitle_eligibility_controls_audio_and_isolated_speech_route(
         assert media.audio_path is None
         assert process_calls == 0
         assert any(isinstance(item, SubtitleCue) for item in result.evidence)
-        assert not any(
-            isinstance(item, (SpeechSegment, AlignedWord, SpeakerTurn, AudioEvent))
-            for item in result.evidence
-        )
+        assert not any(isinstance(item, SpeechSegment) for item in result.evidence)
         assert not (runtime_root / "runs/scope/run_001/media/audio.wav").exists()
         assert not (runtime_root / "runs/scope/run_001/speech/ipc").exists()
     else:
-        assert transcoder.extract_audio_calls == [True]
+        assert transcoder.extract_audio_calls == [(True, 30_000)]
         assert media.audio_path is not None
         assert process_calls == 1
         assert "SUBTITLE_TRACK_REJECTED:2:INCOMPLETE" in result.warnings
@@ -193,7 +185,7 @@ def test_pgs_is_detected_but_never_parsed_as_text_before_asr(tmp_path: Path) -> 
         "hdmv_pgs_subtitle"
     ]
     assert transcoder.extract_subtitle_calls == []
-    assert transcoder.extract_audio_calls == [True]
+    assert transcoder.extract_audio_calls == [(True, 120_000)]
     assert media.subtitle is None
     assert media.audio_path is not None
 
@@ -248,7 +240,7 @@ def test_retry_after_crash_reuses_published_asr_snapshot(tmp_path: Path) -> None
 
     assert raised.value.code == ErrorCode.SPEECH_SUBPROCESS_CRASHED
     assert result.transcript_source == "ASR"
-    assert process_calls == 2
+    assert process_calls == 1
     assert recognizer_calls == 1
     assert tuple((runtime_root / "runs/scope/run_001/speech/ipc").iterdir()) == ()
 
@@ -341,7 +333,7 @@ class _RecordingTranscoder:
         self.runtime_root = runtime_root
         self.subtitle_payloads = subtitle_payloads
         self.extract_subtitle_calls: list[int] = []
-        self.extract_audio_calls: list[bool] = []
+        self.extract_audio_calls: list[tuple[bool, int]] = []
 
     def create_proxy(self, _source: Path, root: Path) -> ProxyVideoArtifact:
         relative = root / "media/proxy.mp4"
@@ -383,8 +375,9 @@ class _RecordingTranscoder:
         root: Path,
         *,
         has_audio: bool,
+        duration_ms: int,
     ) -> AudioArtifact:
-        self.extract_audio_calls.append(has_audio)
+        self.extract_audio_calls.append((has_audio, duration_ms))
         payload = b"wav"
         relative = root / "media/audio.wav"
         output = self.runtime_root / relative
@@ -402,21 +395,13 @@ class _RecordingTranscoder:
 
 def _isolated_analyzer(runtime_root: Path, factory: object) -> IsolatedSpeechAnalyzer:
     store = AtomicArtifactStore(runtime_root)
-    inputs = _fingerprint_inputs()
     return IsolatedSpeechAnalyzer(
         workspace_root=runtime_root.parent.parent,
         runtime_root=runtime_root,
         snapshot_store=SnapshotStore(store),
         artifact_store=store,
-        fingerprint_inputs=inputs,
-        speech_runtime=SpeechRuntimeConfig(
-            inference_device="cpu",
-            whisper_compute_type="int8",
-            model_identities=inputs.model_identities,
-            yamnet_class_map_sha256="b" * 64,
-            yamnet_thresholds_sha256="c" * 64,
-        ),
-        credentials=SpeechSubprocessCredentials(),
+        speech_runtime=_speech_runtime(),
+        credentials=SpeechSubprocessCredentials(openai_api_key="test-openai-key"),
         timeout_seconds=5,
         process_runner_factory=factory,  # type: ignore[arg-type]
     )
@@ -443,32 +428,20 @@ def _publish_successful_asr_response(
             request.asr_fingerprint,
             _asr_payload(),
         ).sha256
-    speech_key = speech_fingerprint(
-        processing_mode="ASR",
-        transcript_payload_sha256=asr_receipt_sha256,
-        media_warnings=request.media_warnings,
-        min_speakers=request.config.min_speakers,
-        max_speakers=request.config.max_speakers,
-        allow_speaker_fallback=request.allow_speaker_fallback,
-        inputs=request.runtime.fingerprint_inputs(),
-    )
-    speech_receipt = snapshots.publish(
+    asr_receipt = snapshots.load(
         Path(request.run_relative_root),
-        "speech",
-        speech_key,
-        SpeechAnalysisSnapshotPayload(
-            evidence=_asr_payload().segments,
-            warnings=request.media_warnings,
-            boundary_candidates=(),
-            transcript_source="ASR",
-        ),
+        "asr",
+        request.asr_fingerprint,
+        AsrSnapshotPayload,
     )
+    if asr_receipt is None:
+        raise AssertionError("测试辅助函数未发布 ASR 快照")
     response = {
         "schema_version": "1.0.0",
         "status": "SUCCEEDED",
         "request_id": request.request_id,
-        "speech_fingerprint": speech_key,
-        "payload_receipt": speech_receipt.model_dump(mode="json"),
+        "asr_fingerprint": request.asr_fingerprint,
+        "payload_receipt": asr_receipt[1].model_dump(mode="json"),
     }
     AtomicArtifactStore(runtime_root).write_json(
         response_path,
@@ -499,10 +472,20 @@ def _asr_payload() -> AsrSnapshotPayload:
     )
 
 
-def _fingerprint_inputs() -> SpeechFingerprintInputs:
-    return SpeechFingerprintInputs(
+def _speech_runtime() -> SpeechRuntimeConfig:
+    inputs = SpeechFingerprintInputs(
         model_identities=(),
-        asr_compute_type="int8",
-        yamnet_class_map_sha256="b" * 64,
-        yamnet_thresholds_sha256="c" * 64,
+        cloud_asr_base_url="https://ai-proxy.example/v1",
+        max_window_ms=600_000,
+        overlap_ms=1_000,
+    )
+    return SpeechRuntimeConfig(
+        base_url=inputs.cloud_asr_base_url,
+        model="openai/whisper",
+        timeout_seconds=300,
+        max_attempts=3,
+        max_window_ms=inputs.max_window_ms,
+        overlap_ms=inputs.overlap_ms,
+        model_identities=inputs.model_identities,
+        ffmpeg_relative_path="tools/ffmpeg",
     )

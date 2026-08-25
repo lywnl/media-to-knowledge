@@ -54,7 +54,6 @@ ArtifactRole = Literal[
 LiveCheckId = Literal[
     "baidu_ocr_live",
     "qwen_live",
-    "pyannote_live",
     "five_language_models",
 ]
 OfflineCheckId = Literal[
@@ -82,7 +81,6 @@ _LIVE_EXECUTED_CHECKS = frozenset(
     {
         "baidu_ocr_live",
         "qwen_live",
-        "pyannote_live",
         "five_language_models",
     }
 )
@@ -168,7 +166,6 @@ class PreflightReasonCode(StrEnum):
     REAL_MEDIA_CHAIN_UNAVAILABLE = "REAL_MEDIA_CHAIN_UNAVAILABLE"
     BAIDU_OCR_CREDENTIALS_UNAVAILABLE = "BAIDU_OCR_CREDENTIALS_UNAVAILABLE"
     QWEN_CREDENTIALS_UNAVAILABLE = "QWEN_CREDENTIALS_UNAVAILABLE"
-    PYANNOTE_MODEL_UNAVAILABLE = "PYANNOTE_MODEL_UNAVAILABLE"
     FIVE_LANGUAGE_MODELS_UNAVAILABLE = "FIVE_LANGUAGE_MODELS_UNAVAILABLE"
     M1_DURABILITY_INPUT_UNAVAILABLE = "M1_DURABILITY_INPUT_UNAVAILABLE"
 
@@ -184,7 +181,6 @@ _PREFLIGHT_REASON_CHECK: dict[PreflightReasonCode, str] = {
     PreflightReasonCode.REAL_MEDIA_CHAIN_UNAVAILABLE: "real_media_chain",
     PreflightReasonCode.BAIDU_OCR_CREDENTIALS_UNAVAILABLE: "baidu_ocr_live",
     PreflightReasonCode.QWEN_CREDENTIALS_UNAVAILABLE: "qwen_live",
-    PreflightReasonCode.PYANNOTE_MODEL_UNAVAILABLE: "pyannote_live",
     PreflightReasonCode.FIVE_LANGUAGE_MODELS_UNAVAILABLE: "five_language_models",
     PreflightReasonCode.M1_DURABILITY_INPUT_UNAVAILABLE: "m1_durability",
 }
@@ -419,10 +415,6 @@ class QwenLiveDetails(_LiveCheckDetails):
     type: Literal["QWEN_LIVE"]
 
 
-class PyannoteLiveDetails(_LiveCheckDetails):
-    type: Literal["PYANNOTE_LIVE"]
-
-
 class FiveLanguageModelsDetails(_LiveCheckDetails):
     type: Literal["FIVE_LANGUAGE_MODELS"]
 
@@ -563,7 +555,6 @@ MachineEvidenceDetails = Annotated[
     | LiveServiceDetails
     | BaiduLiveDetails
     | QwenLiveDetails
-    | PyannoteLiveDetails
     | FiveLanguageModelsDetails
     | RealMediaDetails
     | AuthorizedDatasetDetails
@@ -620,8 +611,6 @@ class PerformanceRawReport(FrozenModel):
     implementation_sha256: Sha256
     settings_fingerprint: Sha256
     worker_concurrency: Literal[1]
-    inference_device: Literal["cpu"]
-    whisper_compute_type: Literal["int8"]
     sample_report_sha256s: tuple[Sha256, Sha256]
     samples: tuple[PerformanceSampleDetails, PerformanceSampleDetails]
 
@@ -655,22 +644,10 @@ _LIVE_PREFLIGHT_CODES: dict[str, tuple[ErrorCode, ...]] = {
         ErrorCode.QWEN_MODEL_ID_UNAVAILABLE,
         ErrorCode.LIVE_AUTHORIZED_CLIP_UNAVAILABLE,
     ),
-    "pyannote_live": (
-        ErrorCode.PYANNOTE_TOKEN_UNAVAILABLE,
-        ErrorCode.PYANNOTE_TERMS_UNAVAILABLE,
-        ErrorCode.PYANNOTE_DEPENDENCY_UNAVAILABLE,
-        ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-        ErrorCode.LIVE_AUTHORIZED_AUDIO_UNAVAILABLE,
-    ),
     "five_language_models": (
         ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE,
         ErrorCode.SILERO_MODEL_UNAVAILABLE,
-        ErrorCode.FASTER_WHISPER_DEPENDENCY_UNAVAILABLE,
-        ErrorCode.FASTER_WHISPER_MODEL_UNAVAILABLE,
-        ErrorCode.WHISPERX_DEPENDENCY_UNAVAILABLE,
-        ErrorCode.WHISPERX_MODEL_UNAVAILABLE,
-        ErrorCode.YAMNET_DEPENDENCY_UNAVAILABLE,
-        ErrorCode.YAMNET_MODEL_UNAVAILABLE,
+        ErrorCode.INVALID_CONFIGURATION,
         ErrorCode.LIVE_FIVE_LANGUAGE_AUDIO_UNAVAILABLE,
     ),
 }
@@ -689,21 +666,11 @@ _DURABILITY_PREFLIGHT_CODES: tuple[ErrorCode, ...] = (
     ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE,
     ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE,
     ErrorCode.SILERO_MODEL_UNAVAILABLE,
-    ErrorCode.FASTER_WHISPER_DEPENDENCY_UNAVAILABLE,
-    ErrorCode.FASTER_WHISPER_MODEL_UNAVAILABLE,
-    ErrorCode.WHISPERX_DEPENDENCY_UNAVAILABLE,
-    ErrorCode.WHISPERX_MODEL_UNAVAILABLE,
-    ErrorCode.PYANNOTE_DEPENDENCY_UNAVAILABLE,
-    ErrorCode.PYANNOTE_TERMS_UNAVAILABLE,
-    ErrorCode.PYANNOTE_MODEL_UNAVAILABLE,
-    ErrorCode.YAMNET_DEPENDENCY_UNAVAILABLE,
-    ErrorCode.YAMNET_MODEL_UNAVAILABLE,
     ErrorCode.QWEN_ENDPOINT_UNAVAILABLE,
     ErrorCode.QWEN_API_KEY_UNAVAILABLE,
     ErrorCode.QWEN_MODEL_ID_UNAVAILABLE,
     ErrorCode.BAIDU_API_KEY_UNAVAILABLE,
     ErrorCode.BAIDU_SECRET_KEY_UNAVAILABLE,
-    ErrorCode.PYANNOTE_TOKEN_UNAVAILABLE,
 )
 _REAL_MEDIA_PHASES: tuple[str, ...] = (
     "generate",
@@ -733,31 +700,22 @@ LiveInputKind = Literal["SOURCE_MEDIA", "AUDIO", "KEYFRAME", "CLIP"]
 LiveComponent = Literal[
     "baidu_ocr",
     "qwen",
-    "pyannote",
     "silero_vad",
-    "faster_whisper",
-    "whisperx",
-    "yamnet",
+    "cloud_whisper",
 ]
 LiveFailureComponent = Literal[
     "baidu_ocr",
     "qwen",
-    "pyannote",
     "silero_vad",
-    "faster_whisper",
-    "whisperx",
-    "yamnet",
+    "cloud_whisper",
     "components_close",
 ]
 LiveOperation = Literal[
     "recognize",
     "capability_probe",
     "understand_segment",
-    "diarize",
     "vad",
     "transcribe",
-    "align",
-    "detect",
 ]
 LiveCapability = Literal["video_input", "strict_json_schema"]
 
@@ -824,36 +782,24 @@ class LiveSample(FrozenModel):
 _COMPONENT_OPERATION: dict[str, tuple[str, ...]] = {
     "baidu_ocr": ("recognize",),
     "qwen": ("capability_probe", "understand_segment"),
-    "pyannote": ("diarize",),
     "silero_vad": ("vad",),
-    "faster_whisper": ("transcribe",),
-    "whisperx": ("align",),
-    "yamnet": ("detect",),
+    "cloud_whisper": ("transcribe",),
 }
 _COMPONENT_INPUT_KIND: dict[str, str] = {
     "baidu_ocr": "KEYFRAME",
     "qwen": "CLIP",
-    "pyannote": "AUDIO",
     "silero_vad": "AUDIO",
-    "faster_whisper": "AUDIO",
-    "whisperx": "AUDIO",
-    "yamnet": "AUDIO",
+    "cloud_whisper": "AUDIO",
 }
 _COMPONENT_PROVIDER: dict[str, str] = {
     "baidu_ocr": "baidu_ocr",
     "qwen": "qwen",
-    "pyannote": "local",
     "silero_vad": "local",
-    "faster_whisper": "local",
-    "whisperx": "local",
-    "yamnet": "local",
+    "cloud_whisper": "openai_compatible",
 }
 _FIXED_MODEL_IDS: dict[str, str] = {
     "baidu_ocr": "accurate_basic",
-    "pyannote": "pyannote/speaker-diarization-community-1",
     "silero_vad": "silero-vad",
-    "faster_whisper": "large-v3",
-    "yamnet": "yamnet",
 }
 _QWEN_MODEL_ID_PATTERN = re.compile(
     r"qwen(?:2(?:\.5)?|3)-vl-(?:plus|max|flash)"
@@ -862,11 +808,6 @@ _QWEN_MODEL_ID_PATTERN = re.compile(
 _MODEL_REVISION_PATTERN = re.compile(
     r"(?:[0-9a-f]{7,64}|v?[0-9]+(?:\.[0-9]+){1,3})\Z",
 )
-_WHISPERX_MODEL_IDS = frozenset(
-    f"whisperx-align-{language}" for language in ("zh", "en", "ja", "ko", "es")
-)
-
-
 class ModelExecutionFact(FrozenModel):
     model_config = ConfigDict(revalidate_instances="always")
 
@@ -901,7 +842,7 @@ class ModelExecutionFact(FrozenModel):
         ):
             raise ValueError("远程服务执行事实只能表示成功的 2xx 阶段")
         self._validate_model_identity()
-        if self.component in {"faster_whisper", "whisperx"} and self.language is None:
+        if self.component == "cloud_whisper" and self.language is None:
             raise ValueError("五语模型执行事实必须声明语言")
         if self.component != "qwen" and self.capabilities:
             raise ValueError("仅 Qwen 能力探测可声明能力事实")
@@ -925,17 +866,13 @@ class ModelExecutionFact(FrozenModel):
             raise ValueError("模型 revision 必须是受限 ASCII 标识")
         if self.component in _FIXED_MODEL_IDS:
             valid_model = self.model.model_id == _FIXED_MODEL_IDS[self.component]
-        elif self.component == "whisperx":
-            valid_model = (
-                self.model.model_id in _WHISPERX_MODEL_IDS
-                and self.language is not None
-                and self.model.model_id == f"whisperx-align-{self.language}"
-            )
+        elif self.component == "cloud_whisper":
+            valid_model = bool(self.model.model_id.strip())
         else:
             valid_model = bool(_QWEN_MODEL_ID_PATTERN.fullmatch(self.model.model_id))
         if not valid_model:
             raise ValueError("模型 ID 与 live 组件不匹配")
-        if self.component in {"baidu_ocr", "qwen"}:
+        if self.component in {"baidu_ocr", "qwen", "cloud_whisper"}:
             if self.model.device is not None or self.model.revision is not None:
                 raise ValueError("远程服务模型身份不得声明本地设备或推测 revision")
         elif self.model.device not in {"cpu", "mps"}:
@@ -1176,39 +1113,6 @@ class QwenLiveRawReport(_LiveRawReport):
         return self
 
 
-class PyannoteLiveRawReport(_LiveRawReport):
-    check_id: Literal["pyannote_live"]
-    sample: LiveSample
-
-    @model_validator(mode="after")
-    def validate_pyannote_execution(self) -> PyannoteLiveRawReport:
-        self._validate_sample_inputs((self.sample,))
-        if self.status == GateStatus.FAIL:
-            if self.failure_component == "components_close":
-                if len(self.executions) != 1:
-                    raise ValueError("pyannote 组件关闭失败前执行事实不完整")
-            elif self.failure_component != "pyannote":
-                raise ValueError("pyannote 真实失败组件身份不匹配")
-        if any(
-            fact.component != "pyannote"
-            or fact.sample_id != self.sample.sample_id
-            or fact.language != self.sample.language
-            or fact.input_sha256 != self.sample.audio_sha256
-            for fact in self.executions
-        ):
-            raise ValueError("pyannote 执行事实与当前授权音频不匹配")
-        if self.status == GateStatus.PASS and (
-            len(self.executions) != 1
-            or (fact := self.executions[0]).component != "pyannote"
-            or fact.operation != "diarize"
-            or fact.sample_id != self.sample.sample_id
-            or fact.input_sha256 != self.sample.audio_sha256
-            or fact.model.model_id != "pyannote/speaker-diarization-community-1"
-        ):
-            raise ValueError("pyannote 真实执行事实不完整")
-        return self
-
-
 class FiveLanguageModelsRawReport(_LiveRawReport):
     check_id: Literal["five_language_models"]
     samples: tuple[LiveSample, ...] = Field(min_length=5, max_length=5)
@@ -1216,56 +1120,44 @@ class FiveLanguageModelsRawReport(_LiveRawReport):
     @model_validator(mode="after")
     def validate_model_coverage(self) -> FiveLanguageModelsRawReport:
         self._validate_sample_inputs(self.samples)
-        local_components = {
-            "silero_vad",
-            "faster_whisper",
-            "whisperx",
-            "yamnet",
-        }
+        speech_components = {"silero_vad", "cloud_whisper"}
         sample_by_id = {sample.sample_id: sample for sample in self.samples}
         if (
             len(sample_by_id) != 5
             or {sample.language for sample in self.samples} != {"zh", "en", "ja", "ko", "es"}
             or any(
                 fact.sample_id not in sample_by_id
-                or fact.component not in local_components
+                or fact.component not in speech_components
                 or fact.input_sha256 != sample_by_id[fact.sample_id].audio_sha256
                 or fact.language != sample_by_id[fact.sample_id].language
                 for fact in self.executions
             )
         ):
-            raise ValueError("本地模型执行事实未绑定完整五语授权音频")
-        component_languages = {
-            component: {
-                fact.language
-                for fact in self.executions
-                if fact.component == component
-            }
-            for component in ("faster_whisper", "whisperx")
+            raise ValueError("语音模型执行事实未绑定完整五语授权音频")
+        cloud_languages = {
+            fact.language
+            for fact in self.executions
+            if fact.component == "cloud_whisper"
         }
         complete_execution = (
-            len(self.executions) == 12
-            and component_languages["faster_whisper"]
-            == {"zh", "en", "ja", "ko", "es"}
-            and component_languages["whisperx"]
-            == {"zh", "en", "ja", "ko", "es"}
+            len(self.executions) == 6
+            and cloud_languages == {"zh", "en", "ja", "ko", "es"}
             and sum(fact.component == "silero_vad" for fact in self.executions) == 1
-            and sum(fact.component == "yamnet" for fact in self.executions) == 1
             and not any(
                 fact.language != sample_by_id[fact.sample_id].language
                 for fact in self.executions
-                if fact.component in {"faster_whisper", "whisperx"}
+                if fact.component == "cloud_whisper"
             )
         )
         if self.status == GateStatus.PASS:
             if not complete_execution:
-                raise ValueError("本地模型栈必须完整执行 Silero、五语 ASR/对齐与 YAMNet")
+                raise ValueError("语音模型栈必须完整执行 Silero 与五语云端 ASR")
         else:
             if self.failure_component == "components_close":
                 if not complete_execution:
-                    raise ValueError("本地模型栈组件关闭失败前执行事实不完整")
-            elif self.failure_component not in local_components:
-                raise ValueError("本地模型栈失败组件身份不匹配")
+                    raise ValueError("语音模型栈组件关闭失败前执行事实不完整")
+            elif self.failure_component not in speech_components:
+                raise ValueError("语音模型栈失败组件身份不匹配")
         return self
 
 
@@ -2526,7 +2418,6 @@ def _live_raw_type(check_id: str) -> type[_LiveRawReport]:
     raw_types: dict[str, type[_LiveRawReport]] = {
         "baidu_ocr_live": BaiduLiveRawReport,
         "qwen_live": QwenLiveRawReport,
-        "pyannote_live": PyannoteLiveRawReport,
         "five_language_models": FiveLanguageModelsRawReport,
     }
     try:
@@ -2862,7 +2753,6 @@ def _build_verified_gate_check(
         if check_id in {
             "baidu_ocr_live",
             "qwen_live",
-            "pyannote_live",
             "five_language_models",
         }:
             _verify_live_report_boundary(report_snapshot.path, artifacts)

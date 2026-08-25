@@ -49,9 +49,22 @@
         </form>
       </section>
 
-      <section id="status-panel" class="panel" aria-labelledby="status-title" hidden>
+      <section id="history-panel" class="panel history-panel" aria-labelledby="history-title">
         <div class="section-heading">
           <span class="step-number" aria-hidden="true">02</span>
+          <div>
+            <h2 id="history-title">历史解析</h2>
+            <p>查看当前知识库中已经上传过的视频及其解析文本。</p>
+          </div>
+          <button id="refresh-history" class="secondary-button" type="button">刷新</button>
+        </div>
+        <p id="history-status" class="history-status" role="status">正在读取历史记录</p>
+        <div id="history-list" class="history-list"></div>
+      </section>
+
+      <section id="status-panel" class="panel" aria-labelledby="status-title" hidden>
+        <div class="section-heading">
+          <span class="step-number" aria-hidden="true">03</span>
           <div>
             <h2 id="status-title">处理状态</h2>
             <p id="status-message" role="status">等待开始</p>
@@ -67,7 +80,7 @@
 
       <section id="result-panel" class="panel" aria-labelledby="result-title" hidden>
         <div class="section-heading">
-          <span class="step-number" aria-hidden="true">03</span>
+          <span class="step-number" aria-hidden="true">04</span>
           <div>
             <h2 id="result-title">处理结果</h2>
             <p>后端返回的摘要与分段理解内容。</p>

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import hashlib
-import math
+from typing import get_args
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
-from video_demo.domain.evidence import AlignedWord, SpeechSegment, SubtitleCue
+from video_demo.api.schemas import PublicEvidence
+from video_demo.domain.evidence import (
+    EvidenceItem,
+    SpeakerId,
+    SpeechSegment,
+    SubtitleCue,
+)
 from video_demo.domain.result import (
     SegmentUnderstanding,
     VideoSegment,
@@ -32,21 +38,31 @@ def test_models_reject_unknown_fields() -> None:
         TimeRange(start_ms=0, end_ms=1, seconds=0.001)
 
 
-@pytest.mark.parametrize("invalid_probability", [math.nan, math.inf, -0.01, 1.01])
-def test_aligned_word_rejects_non_finite_or_out_of_range_probability(
-    invalid_probability: float,
-) -> None:
-    with pytest.raises(ValidationError):
-        AlignedWord(
-            evidence_id="ev_word_001",
-            start_ms=0,
-            end_ms=100,
-            text="你好",
-            language="zh",
-            probability=invalid_probability,
-            speaker="SPEAKER_01",
-        )
+def test_retained_evidence_contract_excludes_retired_speech_enrichment_types() -> None:
+    retained = {
+        "ASR_SEGMENT",
+        "SUBTITLE_CUE",
+        "SCENE",
+        "KEYFRAME",
+        "OCR",
+    }
+    domain_types = get_args(EvidenceItem)
+    domain_discriminators = {
+        model.model_fields["evidence_type"].default for model in domain_types
+    }
+    public_schema = TypeAdapter(PublicEvidence).json_schema()
+    public_mapping = public_schema["discriminator"]["mapping"]
 
+    assert domain_discriminators == retained
+    assert set(public_mapping) == retained
+    assert "SPEAKER_UNKNOWN" in get_args(SpeakerId)
+    understanding = SegmentUnderstanding(
+        title="发言",
+        summary_zh="保留模型生成的通用说话人标签。",
+        speakers=("SPEAKER_01",),
+        evidence_refs=("ev_asr_001",),
+    )
+    assert understanding.speakers == ("SPEAKER_01",)
 
 def test_speech_segment_keeps_original_text_and_language() -> None:
     segment = SpeechSegment(

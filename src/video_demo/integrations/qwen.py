@@ -8,7 +8,7 @@ import math
 import socket
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Annotated, Literal, TypeVar, overload
 from urllib.parse import SplitResult, urlsplit
@@ -24,15 +24,16 @@ from pydantic import (
 
 from video_demo.domain.base import FrozenModel
 from video_demo.domain.evidence import (
-    AlignedWord,
-    AudioEvent,
     OcrEvidence,
     SceneBoundary,
-    SpeakerTurn,
     SpeechSegment,
     SubtitleCue,
 )
-from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
+from video_demo.domain.result import (
+    SegmentUnderstanding,
+    SummaryUnderstanding,
+    normalize_keyword_fields,
+)
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.prompts import (
@@ -45,7 +46,6 @@ from video_demo.integrations.prompts import (
     render_summary_segments,
     render_whole_video_evidence,
     select_spread_items,
-    whole_video_group_window_indexes,
 )
 from video_demo.integrations.video_port import (
     SegmentSummaryInput,
@@ -61,6 +61,7 @@ from video_demo.integrations.video_port import (
 from video_demo.storage.workspace import reject_symlink_components
 
 ResponseModel = TypeVar("ResponseModel", bound=FrozenModel)
+SemanticResult = TypeVar("SemanticResult", SegmentUnderstanding, SummaryUnderstanding)
 ApiKeyProvider = Callable[[], SecretStr | None]
 
 _DEFAULT_FULL_VIDEO_VISUAL_INSTRUCTION = """请对这段完整视频执行视觉理解，而不只是泛化总结。
@@ -275,11 +276,12 @@ class QwenVideoClient:
                 ],
             },
         ]
-        return self._call_and_validate(
+        result, receipt = self._call_and_validate(
             messages,
             SegmentUnderstanding,
             allowed_refs={item.evidence_id for item in request.evidence},
         )
+        return _normalize_semantic_keywords(result), receipt
 
     def understand_video(
         self,
@@ -306,6 +308,21 @@ class QwenVideoClient:
                 WholeVideoUnderstanding,
                 allowed_refs=None,
             )
+        result = result.model_copy(
+            update={
+                "windows": tuple(
+                    item.model_copy(
+                        update={
+                            "understanding": _normalize_semantic_keywords(
+                                item.understanding,
+                            ),
+                        },
+                    )
+                    for item in result.windows
+                ),
+                "summary": _normalize_semantic_keywords(result.summary),
+            },
+        )
         self._validate_whole_video_result(request, result)
         return result
 
@@ -354,25 +371,11 @@ class QwenVideoClient:
             compact = _CompactWholeVideoUnderstanding.model_validate(content)
             if len(compact.group_summaries) > len(request.windows):
                 raise ValueError("Qwen 返回语义组数量非法")
-            group_indexes = whole_video_group_window_indexes(
-                request,
-                len(compact.group_summaries),
-            )
-            group_by_window = {
-                window_index: group_summary
-                for group_summary, window_indexes in zip(
-                    compact.group_summaries,
-                    group_indexes,
-                    strict=True,
-                )
-                for window_index in window_indexes
-            }
             return WholeVideoUnderstanding(
                 windows=tuple(
                     WholeVideoWindowUnderstanding(
                         window_id=window.window_id,
-                        understanding=_map_group_summary_to_window(
-                            group_by_window[window_index],
+                        understanding=_map_window_to_local_understanding(
                             request,
                             window_index,
                         ),
@@ -381,7 +384,10 @@ class QwenVideoClient:
                 ),
                 summary=SummaryUnderstanding(
                     title=compact.title,
-                    summary_zh=compact.summary_zh,
+                    summary_zh=_merge_summary_units(
+                        compact.group_summaries,
+                        compact.summary_zh,
+                    ),
                     topics=compact.topics,
                     keywords=compact.keywords,
                 ),
@@ -557,7 +563,7 @@ class QwenVideoClient:
             SummaryUnderstanding,
             allowed_refs=None,
         )
-        return result
+        return _normalize_semantic_keywords(result)
 
     def _summarize_clip_video(
         self,
@@ -936,15 +942,8 @@ def _fallback_segment_understanding(
         for item in request.evidence
         if isinstance(item, SpeechSegment) and item.text.strip()
     )
-    aligned_items = tuple(
-        item
-        for item in request.evidence
-        if isinstance(item, AlignedWord) and item.text.strip()
-    )
-    spoken_items: tuple[SubtitleCue | SpeechSegment | AlignedWord, ...] = (
-        subtitle_items
-        if subtitle_items
-        else (speech_items if speech_items else aligned_items)
+    spoken_items: tuple[SubtitleCue | SpeechSegment, ...] = (
+        subtitle_items if subtitle_items else speech_items
     )
     spoken_values = tuple(
         _truncate_local_semantic_text(item.text, 160)
@@ -967,42 +966,47 @@ def _fallback_segment_understanding(
     )
     text_values = (*spoken_values, *ocr_values)
     title = text_values[0] if text_values else "视频片段"
-    speakers = tuple(
-        dict.fromkeys(
-            item.speaker
-            for item in request.evidence
-            if isinstance(item, (AlignedWord, SpeakerTurn))
-        )
-    )
     languages = tuple(
         dict.fromkeys(
             item.language
             for item in request.evidence
-            if isinstance(item, (SubtitleCue, SpeechSegment, AlignedWord, OcrEvidence))
+            if isinstance(item, (SubtitleCue, SpeechSegment, OcrEvidence))
         )
     )
     keywords = tuple(dict.fromkeys(text_values))
-    event_values = tuple(
-        dict.fromkeys(
-            item.normalized_event
-            for item in request.evidence
-            if isinstance(item, AudioEvent)
-        )
-    )
     scene_values = tuple(
         "画面场景"
         for item in request.evidence
         if isinstance(item, SceneBoundary)
     )
-    return SegmentUnderstanding(
-        title=title[:200],
-        summary_zh=title[:4000],
-        speakers=speakers,
-        languages=languages,
-        topics=tuple(dict.fromkeys((*event_values, *scene_values))),
-        keywords=keywords,
-        original_keywords=keywords,
-        evidence_refs=tuple(item.evidence_id for item in request.evidence),
+    visual_facts = tuple(dict.fromkeys(scene_values))
+    return _normalize_semantic_keywords(
+        SegmentUnderstanding(
+            title=title[:200],
+            summary_zh=title[:4000],
+            speakers=(),
+            languages=languages,
+            topics=tuple(dict.fromkeys(scene_values)),
+            keywords=keywords,
+            original_keywords=(),
+            visual_facts=visual_facts,
+            evidence_refs=tuple(item.evidence_id for item in request.evidence),
+        ),
+    )
+
+
+def _normalize_semantic_keywords(result: SemanticResult) -> SemanticResult:
+    """在模型结果进入融合前统一关键词格式并删除跨字段重复值。"""
+
+    keywords, original_keywords = normalize_keyword_fields(
+        result.keywords,
+        result.original_keywords,
+    )
+    return result.model_copy(
+        update={
+            "keywords": tuple(keywords),
+            "original_keywords": tuple(original_keywords),
+        },
     )
 
 
@@ -1011,8 +1015,7 @@ def _truncate_local_semantic_text(value: str, limit: int) -> str:
     return normalized if len(normalized) <= limit else normalized[: limit - 1] + "…"
 
 
-def _map_group_summary_to_window(
-    group_summary: str,
+def _map_window_to_local_understanding(
     request: WholeVideoUnderstandingRequest,
     window_index: int,
 ) -> SegmentUnderstanding:
@@ -1030,36 +1033,56 @@ def _map_group_summary_to_window(
             evidence=window.evidence,
         ),
     )
-    normalized_group = " ".join(group_summary.split())
-    summary_zh = f"{normalized_group}；本地证据：{local.summary_zh}"
     return SegmentUnderstanding(
         title=local.title,
-        summary_zh=summary_zh[:4000],
+        summary_zh=local.summary_zh,
         speakers=local.speakers,
         languages=local.languages,
-        topics=tuple(dict.fromkeys((normalized_group, *local.topics))),
+        topics=local.topics,
         entities=local.entities,
         actions=local.actions,
         keywords=local.keywords,
         original_keywords=local.original_keywords,
+        visual_facts=local.visual_facts,
         evidence_refs=tuple(item.evidence_id for item in window.evidence),
     )
+
+
+def _merge_summary_units(
+    summary_units: Sequence[str],
+    compact_summary: str | None = None,
+) -> str:
+    """按固定顺序合并视频级摘要，并删除完全重复的语义单元。"""
+
+    candidates = ((compact_summary,) if compact_summary is not None else ()) + tuple(
+        summary_units
+    )
+    ordered: list[str] = []
+    for value in candidates:
+        normalized = " ".join(value.split())
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
+    return _truncate_local_semantic_text("；".join(ordered), 4_000)
 
 
 def _fallback_summary_understanding(
     request: SummaryUnderstandingRequest,
 ) -> SummaryUnderstanding:
     first = request.segments[0].understanding
-    return SummaryUnderstanding(
-        title=first.title,
-        summary_zh="；".join(item.understanding.summary_zh for item in request.segments),
-        speakers=_ordered_values(request, "speakers"),
-        languages=_ordered_values(request, "languages"),
-        topics=_ordered_values(request, "topics"),
-        entities=_ordered_values(request, "entities"),
-        actions=_ordered_values(request, "actions"),
-        keywords=_ordered_values(request, "keywords"),
-        original_keywords=_ordered_values(request, "original_keywords"),
+    return _normalize_semantic_keywords(
+        SummaryUnderstanding(
+            title=first.title,
+            summary_zh=_merge_summary_units(
+                tuple(item.understanding.summary_zh for item in request.segments),
+            ),
+            speakers=_ordered_values(request, "speakers"),
+            languages=_ordered_values(request, "languages"),
+            topics=_ordered_values(request, "topics"),
+            entities=_ordered_values(request, "entities"),
+            actions=_ordered_values(request, "actions"),
+            keywords=_ordered_values(request, "keywords"),
+            original_keywords=_ordered_values(request, "original_keywords"),
+        ),
     )
 
 

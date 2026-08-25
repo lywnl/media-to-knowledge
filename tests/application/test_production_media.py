@@ -58,8 +58,6 @@ def test_production_registrar_materializes_scoped_input_and_carries_run_config(
         object_ref=uploaded.object_ref,
         idempotency_key="production-media-0001",
         language_hints=("zh", "en"),
-        min_speakers=1,
-        max_speakers=3,
     )
 
     registered = ProductionAssetRegistrar(database, store).register(
@@ -75,8 +73,6 @@ def test_production_registrar_materializes_scoped_input_and_carries_run_config(
     assert registered.source_mime == "video/mp4"
     assert registered.run_relative_root == expected_root
     assert registered.config.language_hints == ("zh", "en")
-    assert registered.config.min_speakers == 1
-    assert registered.config.max_speakers == 3
 
 
 def test_production_probe_uses_registered_metadata_and_preserves_manifest_warnings(
@@ -171,10 +167,12 @@ def test_production_transcoder_generates_scoped_proxy_and_explicit_no_audio_warn
             run_relative_root: Path,
             *,
             has_audio: bool,
+            duration_ms: int,
         ) -> AudioArtifact | NoAudioArtifact:
             assert path == source
             assert run_relative_root == Path("runs/scope/run_001")
             assert has_audio is False
+            assert duration_ms == 1_000
             return NoAudioArtifact(warning_code="NO_AUDIO_TRACK")
 
     prepared = ProductionMediaTranscoder(
@@ -235,10 +233,32 @@ def test_incomplete_text_subtitle_falls_back_to_audio(tmp_path: Path) -> None:
     ).transcode(probed)
 
     assert client.extract_subtitle_calls == [2]
-    assert client.extract_audio_calls == [True]
+    assert client.extract_audio_calls == [(True, 30_000)]
     assert prepared.subtitle is None
     assert prepared.audio_path is not None
     assert prepared.warnings == ("SUBTITLE_TRACK_REJECTED:2:INCOMPLETE",)
+
+
+def test_asr_audio_uses_video_timeline_instead_of_longer_container_duration(
+    tmp_path: Path,
+) -> None:
+    runtime_root, probed = _probed_media(
+        tmp_path,
+        has_audio=True,
+        subtitle_streams=(),
+        duration_ms=302_366,
+    )
+    probed = replace(probed, timeline_duration_ms=302_101)
+    client = _RecordingTranscoder(runtime_root)
+
+    ProductionMediaTranscoder(
+        runtime_root,
+        lambda _cancel: client,
+    ).transcode(probed)
+
+    assert probed.manifest.duration_ms == 302_366
+    assert probed.duration_ms == 302_101
+    assert client.extract_audio_calls == [(True, 302_101)]
 
 
 def test_rejected_first_subtitle_continues_to_second_complete_track(tmp_path: Path) -> None:
@@ -451,7 +471,9 @@ def _probed_media(
     registered = _registered(source)
     registered = replace(
         registered,
-        config=PipelineRunConfig(language_hints=language_hints),
+        config=PipelineRunConfig(
+            language_hints=language_hints,
+        ),
     )
     probed = ProductionAssetProbe(
         lambda: _StaticProbeClient(
@@ -477,7 +499,7 @@ class _RecordingTranscoder:
         self._subtitle_payloads = subtitle_payloads or {}
         self._subtitle_errors = subtitle_errors or {}
         self.extract_subtitle_calls: list[int] = []
-        self.extract_audio_calls: list[bool] = []
+        self.extract_audio_calls: list[tuple[bool, int]] = []
 
     def create_proxy(self, _path: Path, root: Path) -> ProxyVideoArtifact:
         relative = root / "media/proxy.mp4"
@@ -521,8 +543,9 @@ class _RecordingTranscoder:
         root: Path,
         *,
         has_audio: bool,
+        duration_ms: int,
     ) -> AudioArtifact | NoAudioArtifact:
-        self.extract_audio_calls.append(has_audio)
+        self.extract_audio_calls.append((has_audio, duration_ms))
         if not has_audio:
             return NoAudioArtifact(warning_code="NO_AUDIO_TRACK")
         payload = b"wav"

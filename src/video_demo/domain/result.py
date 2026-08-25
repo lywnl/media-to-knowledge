@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import unicodedata
 from collections.abc import Iterable
 from typing import Literal, Self
 
@@ -16,6 +17,44 @@ from video_demo.domain.base import (
 from video_demo.domain.evidence import SpeakerId, TimedEvidence
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
+
+RESULT_SCHEMA_VERSION: Literal["2.0.0"] = "2.0.0"
+SUPPORTED_RESULT_SCHEMA_VERSIONS = frozenset({"1.0.0", RESULT_SCHEMA_VERSION})
+
+
+def normalize_keyword_fields(
+    keywords: Iterable[str],
+    original_keywords: Iterable[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """规范化关键词，并从原语言关键词中移除跨字段重复项。"""
+
+    def normalize(value: str) -> str:
+        return " ".join(value.casefold().split())
+
+    def display(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", value).split()).strip()
+
+    normalized_keywords: list[str] = []
+    keyword_ids: set[str] = set()
+    for value in keywords:
+        normalized = display(value)
+        value_id = normalize(normalized)
+        if normalized and value_id not in keyword_ids:
+            normalized_keywords.append(normalized)
+            keyword_ids.add(value_id)
+    normalized_original_keywords: list[str] = []
+    original_ids: set[str] = set()
+    for value in original_keywords:
+        normalized = display(value)
+        value_id = normalize(normalized)
+        if (
+            normalized
+            and value_id not in keyword_ids
+            and value_id not in original_ids
+        ):
+            normalized_original_keywords.append(normalized)
+            original_ids.add(value_id)
+    return tuple(normalized_keywords), tuple(normalized_original_keywords)
 
 
 class SemanticFields(UniqueStringTuplesMixin, FrozenModel):
@@ -33,6 +72,7 @@ class SemanticFields(UniqueStringTuplesMixin, FrozenModel):
 class SegmentUnderstanding(SemanticFields):
     """Qwen 可返回的片段语义; 此契约故意不包含时间字段。"""
 
+    visual_facts: tuple[str, ...] = ()
     evidence_refs: tuple[StableId, ...] = Field(min_length=1)
 
 
@@ -46,6 +86,11 @@ class VideoSegment(TimeRange, SemanticFields):
     evidence_refs: tuple[StableId, ...] = Field(min_length=1)
     retrieval_text: str = Field(min_length=1)
     retrieval_hash: Sha256
+    video_title: str = ""
+    transcript_text: str = ""
+    ocr_text: tuple[str, ...] = ()
+    visual_facts: tuple[str, ...] = ()
+    transcript_source: Literal["SUBTITLE", "ASR", "NONE"] = "NONE"
 
     @model_validator(mode="after")
     def validate_retrieval_hash(self) -> Self:
@@ -72,7 +117,8 @@ class VideoSummary(SemanticFields):
 
 
 class VideoUnderstandingResult(FrozenModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    # 1.0.0 仍允许读取历史 bundle；新结果统一写入 2.0.0。
+    schema_version: Literal["1.0.0", "2.0.0"] = RESULT_SCHEMA_VERSION
     run_id: StableId
     asset_sha256: Sha256
     segments: tuple[VideoSegment, ...] = Field(min_length=1)
