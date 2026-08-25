@@ -124,31 +124,15 @@ class QwenVisionClient(ChapterVisionPort):
         on_provider_attempt: Callable[[], None] | None,
     ) -> tuple[ChapterVisionResponse, bytes, object]:
         run_root = self._validate_run_root(allowed_run_root)
-        frames = self._verified_frames(request, run_root)
-        encoded_frames = tuple((frame.frame_id, encoded) for frame, encoded in frames)
         response_schema = ChapterVisionResponse.model_json_schema()
-        payload = build_vision_payload(
-            prompt,
-            model_id=self._model_id,
+        raw = self._post_with_retry(
+            request,
+            run_root=run_root,
+            prompt=prompt,
             schema_name=schema_name,
             response_schema=response_schema,
-            ordered_encoded_frames=encoded_frames,
+            on_provider_attempt=on_provider_attempt,
         )
-        upper_bound = vision_payload_size_upper_bound(
-            prompt,
-            model_id=self._model_id,
-            schema_name=schema_name,
-            response_schema=response_schema,
-            ordered_frames=tuple((frame.frame_id, frame.size_bytes) for frame, _ in frames),
-        )
-        actual_size = len(vision_payload_json_bytes(payload))
-        if actual_size > upper_bound or actual_size > self._max_encoded_request_bytes:
-            raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "视觉模型请求体超过大小上限")
-        try:
-            raw = self._post_with_retry(payload, on_provider_attempt=on_provider_attempt)
-        finally:
-            frames.clear()
-            payload["messages"] = []
         return _parse_response(raw)
 
     def _validate_run_root(self, allowed_run_root: Path) -> Path:
@@ -192,13 +176,26 @@ class QwenVisionClient(ChapterVisionPort):
 
     def _post_with_retry(
         self,
-        payload: dict[str, object],
+        request: ChapterVisionRequest,
         *,
+        run_root: Path,
+        prompt: tuple[str, str, str],
+        schema_name: str,
+        response_schema: dict[str, object],
         on_provider_attempt: Callable[[], None] | None,
     ) -> bytes:
         last_error: VideoDemoError | None = None
         for attempt in range(1, self._max_attempts + 1):
+            frames: list[tuple[FrameCandidateArtifact, str]] = []
+            payload: dict[str, object] | None = None
             try:
+                frames = self._verified_frames(request, run_root)
+                payload = self._build_checked_payload(
+                    frames,
+                    prompt=prompt,
+                    schema_name=schema_name,
+                    response_schema=response_schema,
+                )
                 if on_provider_attempt is not None:
                     on_provider_attempt()
                 with self._http_client.stream(
@@ -225,9 +222,45 @@ class QwenVisionClient(ChapterVisionPort):
                 ):
                     raise
                 last_error = error
+            finally:
+                frames.clear()
+                if payload is not None:
+                    payload["messages"] = []
             if attempt < self._max_attempts:
                 self._sleeper(min(2 ** (attempt - 1), 4))
         raise last_error or RuntimeError("Qwen 重试状态非法")
+
+    def _build_checked_payload(
+        self,
+        frames: list[tuple[FrameCandidateArtifact, str]],
+        *,
+        prompt: tuple[str, str, str],
+        schema_name: str,
+        response_schema: dict[str, object],
+    ) -> dict[str, object]:
+        payload = build_vision_payload(
+            prompt,
+            model_id=self._model_id,
+            schema_name=schema_name,
+            response_schema=response_schema,
+            ordered_encoded_frames=tuple(
+                (frame.frame_id, encoded) for frame, encoded in frames
+            ),
+        )
+        upper_bound = vision_payload_size_upper_bound(
+            prompt,
+            model_id=self._model_id,
+            schema_name=schema_name,
+            response_schema=response_schema,
+            ordered_frames=tuple(
+                (frame.frame_id, frame.size_bytes) for frame, _encoded in frames
+            ),
+        )
+        actual_size = len(vision_payload_json_bytes(payload))
+        if actual_size > upper_bound or actual_size > self._max_encoded_request_bytes:
+            payload["messages"] = []
+            raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "视觉模型请求体超过大小上限")
+        return payload
 
 
 def _verified_directory(path: Path, message: str) -> Path:
@@ -249,7 +282,7 @@ def _bounded_response(response: httpx.Response, max_bytes: int) -> bytes:
 
 
 def _raise_response_status(response: httpx.Response) -> None:
-    if response.status_code < 400:
+    if 200 <= response.status_code < 300:
         return
     if response.status_code in {401, 403}:
         raise VideoDemoError(ErrorCode.QWEN_AUTHENTICATION_FAILED, "Qwen 视觉模型鉴权失败")
@@ -257,7 +290,7 @@ def _raise_response_status(response: httpx.Response) -> None:
         raise VideoDemoError(ErrorCode.DEPENDENCY_TEMPORARY_FAILURE, "Qwen 视觉模型暂时不可用")
     if response.status_code in {404, 415, 422}:
         raise VideoDemoError(ErrorCode.QWEN_CAPABILITY_UNAVAILABLE, "Qwen 端点不支持图片取证能力")
-    raise VideoDemoError(ErrorCode.QWEN_RESPONSE_INVALID, "Qwen 视觉模型请求被拒绝")
+    raise VideoDemoError(ErrorCode.QWEN_REQUEST_REJECTED, "Qwen 视觉模型请求被拒绝")
 
 
 def _parse_response(content: bytes) -> tuple[ChapterVisionResponse, bytes, object]:

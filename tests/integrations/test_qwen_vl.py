@@ -33,6 +33,8 @@ def _frame(root: Path, frame_id: str, timestamp_ms: int) -> FrameCandidateArtifa
     digest = hashlib.sha256(content).hexdigest()
     path = root / "visual" / "candidates" / f"{digest}.jpg"
     path.parent.mkdir(parents=True, exist_ok=True)
+    (root / "visual").chmod(0o700)
+    path.parent.chmod(0o700)
     path.write_bytes(content)
     path.chmod(0o600)
     return FrameCandidateArtifact(
@@ -205,6 +207,60 @@ def test_qwen_calls_attempt_callback_before_every_real_http_attempt(tmp_path: Pa
     assert attempts == [1, 1]
 
 
+def test_qwen_rereads_images_before_retry_and_does_not_count_blocked_attempt(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    request = _request(run_root)
+    attempts: list[int] = []
+    http_attempts = 0
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        nonlocal http_attempts
+        http_attempts += 1
+        if http_attempts == 1:
+            frame = request.frames[0]
+            path = run_root / frame.relative_path
+            path.unlink()
+            path.write_bytes(b"\xff\xd8\xffreplaced-after-500\xff\xd9")
+            path.chmod(0o600)
+            return httpx.Response(500, request=http_request)
+        return _provider_response(http_request, {"observations": []})
+
+    with pytest.raises(VideoDemoError) as raised:
+        _client(tmp_path, httpx.MockTransport(handler), max_attempts=2).analyze_chapter(
+            request,
+            allowed_run_root=run_root,
+            on_provider_attempt=lambda: attempts.append(1),
+        )
+
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+    assert http_attempts == 1
+    assert attempts == [1]
+
+
+@pytest.mark.parametrize("status_code", (302, 307, 400, 409))
+def test_qwen_request_rejection_is_not_response_content_invalid(
+    tmp_path: Path,
+    status_code: int,
+) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(status_code, request=request),
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        _client(tmp_path, transport).analyze_chapter(
+            _request(run_root),
+            allowed_run_root=run_root,
+        )
+
+    assert raised.value.code == ErrorCode.QWEN_REQUEST_REJECTED
+    assert not isinstance(raised.value, ModelResponseValidationError)
+
+
 def test_qwen_requires_per_call_run_root_inside_runtime_root(tmp_path: Path) -> None:
     run_root = tmp_path / "runs" / "scope_001" / "run_001"
     outside = tmp_path.parent / "outside-run"
@@ -310,14 +366,20 @@ def test_qwen_rejects_file_replaced_during_open(
     original_open = os.open
     swapped = False
 
-    def racing_open(name: os.PathLike[str] | str, flags: int, mode: int = 0o777) -> int:
+    def racing_open(
+        name: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
         nonlocal swapped
-        if Path(name) == path and not swapped:
+        if Path(name).name == path.name and dir_fd is not None and not swapped:
             swapped = True
             replacement = path.with_suffix(".replacement")
             replacement.write_bytes(b"\xff\xd8\xffreplacement\xff\xd9")
             os.replace(replacement, path)
-        return original_open(name, flags, mode)
+        return original_open(name, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", racing_open)
     client = _client(

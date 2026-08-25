@@ -316,6 +316,47 @@ def test_verified_candidate_reader_rejects_non_private_file(tmp_path: Path) -> N
     assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
 
 
+def test_verified_candidate_reader_never_follows_replaced_candidate_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_root = tmp_path / "runtime/runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    payload = _jpeg("stable-candidate-parent")
+    frame = _frame(run_root, payload)
+    candidate_root = run_root / "visual/candidates"
+    moved_root = run_root / "visual/candidates-before-swap"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / f"{frame.sha256}.jpg"
+    outside_file.write_bytes(payload)
+    outside_file.chmod(0o600)
+    real_open = candidate_artifacts.os.open
+    swapped = False
+
+    def replace_parent_before_leaf_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and os.fspath(path) == f"{frame.sha256}.jpg":
+            swapped = True
+            candidate_root.rename(moved_root)
+            candidate_root.symlink_to(outside, target_is_directory=True)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(candidate_artifacts.os, "open", replace_parent_before_leaf_open)
+
+    with pytest.raises(VideoDemoError) as raised:
+        read_verified_candidate_jpeg(run_root, frame, max_bytes=1024)
+
+    assert swapped
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+
+
 def test_session_rejects_symlink_run_lock_file(tmp_path: Path) -> None:
     runtime_root = tmp_path / "runtime"
     run_relative_root = Path("runs/scope/run_001")

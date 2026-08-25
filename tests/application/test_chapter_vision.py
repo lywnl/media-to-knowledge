@@ -158,7 +158,12 @@ def _response() -> ChapterVisionResponse:
     )
 
 
-def _service(tmp_path: Path, port: _VisionPort) -> ChapterVisionService:
+def _service(
+    tmp_path: Path,
+    port: _VisionPort,
+    *,
+    invocation_wait_timeout_seconds: float = 2,
+) -> ChapterVisionService:
     return ChapterVisionService(
         port,
         _identity(),
@@ -169,7 +174,7 @@ def _service(tmp_path: Path, port: _VisionPort) -> ChapterVisionService:
         max_encoded_request_bytes=64 * 1024,
         max_published_keyframe_bytes=4096,
         max_published_keyframe_files=10,
-        invocation_wait_timeout_seconds=2,
+        invocation_wait_timeout_seconds=invocation_wait_timeout_seconds,
         candidate_lock_timeout_seconds=2,
     )
 
@@ -271,6 +276,81 @@ def test_chapter_vision_degrades_only_temporary_failed_chapter(tmp_path: Path) -
     assert result.chapter_status == ((chapter.chapter_id, "DEGRADED"),)
     assert result.status == "PARTIAL_SUCCEEDED"
     assert result.warnings == (f"CHAPTER_VLM_DEGRADED:{chapter.chapter_id}",)
+    assert result.metrics["vlm_fallback_chapters"] == 1
+
+
+def test_oversized_candidate_with_target_covering_alternative_continues(
+    tmp_path: Path,
+) -> None:
+    run_root, chapter, frame_batch, speech, payload = _fixture(tmp_path)
+    first = frame_batch.frame_sets[0].candidates[0]
+    large_payload = b"\xff\xd8\xff" + b"x" * 1_100 + b"\xff\xd9"
+    large_digest = hashlib.sha256(large_payload).hexdigest()
+    large_path = run_root / f"visual/candidates/{large_digest}.jpg"
+    large_path.write_bytes(large_payload)
+    large_path.chmod(0o600)
+    oversized = first.model_copy(
+        update={
+            "frame_id": "frame_oversized",
+            "timestamp_ms": 1_400,
+            "sha256": large_digest,
+            "size_bytes": len(large_payload),
+            "relative_path": f"visual/candidates/{large_digest}.jpg",
+        },
+    )
+    batch = _replace_frame_batch(
+        frame_batch,
+        chapter=chapter,
+        candidates=(oversized, first),
+    )
+    port = _VisionPort(_response())
+
+    result = _service(tmp_path, port).analyze_all(
+        (chapter,),
+        batch,
+        (speech,),
+        DocumentGenerationConfig(),
+        cache=_cache(run_root),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert len(large_payload) > 1_024 > len(payload)
+    assert tuple(frame.frame_id for frame in port.requests[0].frames) == (first.frame_id,)
+    assert result.chapter_status == ((chapter.chapter_id, "SUCCEEDED"),)
+
+
+def test_only_target_covering_candidate_over_image_limit_degrades_by_budget(
+    tmp_path: Path,
+) -> None:
+    run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
+    original = frame_batch.frame_sets[0].candidates[0]
+    large_payload = b"\xff\xd8\xff" + b"y" * 1_100 + b"\xff\xd9"
+    large_digest = hashlib.sha256(large_payload).hexdigest()
+    large_path = run_root / f"visual/candidates/{large_digest}.jpg"
+    large_path.write_bytes(large_payload)
+    large_path.chmod(0o600)
+    oversized = original.model_copy(
+        update={
+            "sha256": large_digest,
+            "size_bytes": len(large_payload),
+            "relative_path": f"visual/candidates/{large_digest}.jpg",
+        },
+    )
+    batch = _replace_frame_batch(frame_batch, chapter=chapter, candidates=(oversized,))
+    port = _VisionPort(_response())
+
+    result = _service(tmp_path, port).analyze_all(
+        (chapter,),
+        batch,
+        (speech,),
+        DocumentGenerationConfig(),
+        cache=_cache(run_root),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert port.requests == []
+    assert result.chapter_status == ((chapter.chapter_id, "DEGRADED"),)
+    assert result.warnings == (f"CHAPTER_VLM_INPUT_BUDGET_DEGRADED:{chapter.chapter_id}",)
     assert result.metrics["vlm_fallback_chapters"] == 1
 
 
@@ -530,7 +610,26 @@ def test_reverse_time_frame_relation_is_rejected_as_local_invalid_response(
         ),
     )
 
-    result = _service(tmp_path, _VisionPort(response)).analyze_all(
+    class RelationshipRepairPort(_VisionPort):
+        def __init__(self) -> None:
+            super().__init__(response)
+            self.repair_requests: list[ChapterVisionRepairRequest] = []
+
+        def repair_chapter(
+            self,
+            request: ChapterVisionRepairRequest,
+            *,
+            allowed_run_root: Path,
+            on_provider_attempt: Callable[[], None] | None = None,
+        ) -> ChapterVisionResponse:
+            del allowed_run_root
+            self.repair_requests.append(request)
+            if on_provider_attempt is not None:
+                on_provider_attempt()
+            return _response()
+
+    port = RelationshipRepairPort()
+    result = _service(tmp_path, port).analyze_all(
         (chapter,),
         batch,
         (speech,),
@@ -539,17 +638,94 @@ def test_reverse_time_frame_relation_is_rejected_as_local_invalid_response(
         is_cancel_requested=lambda: False,
     )
 
-    assert result.chapter_status == ((chapter.chapter_id, "DEGRADED"),)
-    assert result.metrics["vlm_structure_repairs"] == 0
-    assert result.metrics["vlm_fallback_chapters"] == 1
+    assert result.chapter_status == ((chapter.chapter_id, "SUCCEEDED"),)
+    assert result.metrics["vlm_structure_repairs"] == 1
+    assert result.metrics["vlm_fallback_chapters"] == 0
+    assert len(port.repair_requests) == 1
+    assert port.repair_requests[0].request.frames == port.requests[0].frames
+    assert "frame_relations" in port.repair_requests[0].invalid_response.validation_errors[0]
+
+
+def test_local_type_error_from_port_is_not_masked_as_chapter_fallback(tmp_path: Path) -> None:
+    run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
+
+    class BrokenPort(_VisionPort):
+        def analyze_chapter(
+            self,
+            request: ChapterVisionRequest,
+            *,
+            allowed_run_root: Path,
+            on_provider_attempt: Callable[[], None] | None = None,
+        ) -> ChapterVisionResponse:
+            del request, allowed_run_root, on_provider_attempt
+            raise TypeError("模拟本地程序错误")
+
+    with pytest.raises(TypeError, match="模拟本地程序错误"):
+        _service(tmp_path, BrokenPort(_response())).analyze_all(
+            (chapter,),
+            frame_batch,
+            (speech,),
+            DocumentGenerationConfig(),
+            cache=_cache(run_root),
+            is_cancel_requested=lambda: False,
+        )
+
+
+class _SemanticRepairPort(_VisionPort):
+    def __init__(
+        self,
+        main_response: ChapterVisionResponse,
+        repair_response: ChapterVisionResponse,
+    ) -> None:
+        super().__init__(main_response)
+        self._repair_response = repair_response
+        self.repair_requests: list[ChapterVisionRepairRequest] = []
+
+    def repair_chapter(
+        self,
+        request: ChapterVisionRepairRequest,
+        *,
+        allowed_run_root: Path,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterVisionResponse:
+        del allowed_run_root
+        self.repair_requests.append(request)
+        if on_provider_attempt is not None:
+            on_provider_attempt()
+        return self._repair_response
 
 
 def test_duplicate_equivalent_observations_are_rejected_before_publication(tmp_path: Path) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
     duplicate = _response().observations[0]
     response = ChapterVisionResponse(observations=(duplicate, duplicate))
+    port = _SemanticRepairPort(response, _response())
 
-    result = _service(tmp_path, _VisionPort(response)).analyze_all(
+    result = _service(tmp_path, port).analyze_all(
+        (chapter,),
+        frame_batch,
+        (speech,),
+        DocumentGenerationConfig(),
+        cache=_cache(run_root),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert result.chapter_status == ((chapter.chapter_id, "SUCCEEDED"),)
+    assert result.metrics["vlm_structure_repairs"] == 1
+    assert result.metrics["vlm_provider_attempts"] == 2
+    assert len(port.repair_requests) == 1
+    assert port.repair_requests[0].request.frames == port.requests[0].frames
+
+
+def test_duplicate_equivalent_observations_degrade_when_repair_is_still_duplicate(
+    tmp_path: Path,
+) -> None:
+    run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
+    duplicate = _response().observations[0]
+    response = ChapterVisionResponse(observations=(duplicate, duplicate))
+    port = _SemanticRepairPort(response, response)
+
+    result = _service(tmp_path, port).analyze_all(
         (chapter,),
         frame_batch,
         (speech,),
@@ -560,6 +736,8 @@ def test_duplicate_equivalent_observations_are_rejected_before_publication(tmp_p
 
     assert result.observations == ()
     assert result.chapter_status == ((chapter.chapter_id, "DEGRADED"),)
+    assert result.metrics["vlm_structure_repairs"] == 1
+    assert result.metrics["vlm_fallback_chapters"] == 1
     assert not (run_root / "visual/keyframes").exists()
 
 
@@ -620,7 +798,7 @@ def test_publish_rolls_back_files_created_by_current_batch_on_later_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from video_demo.application import chapter_vision
+    from video_demo.visual import keyframe_artifacts
 
     run_root, chapter, frame_batch, speech, payload = _fixture(tmp_path)
     first = frame_batch.frame_sets[0].candidates[0]
@@ -646,17 +824,25 @@ def test_publish_rolls_back_files_created_by_current_batch_on_later_failure(
             ),
         ),
     )
-    real_write = chapter_vision._write_private_jpeg
+    real_write = keyframe_artifacts.KeyframeArtifactSession._write_private_jpeg
     writes = 0
 
-    def fail_second(path: Path, content: bytes) -> tuple[int, int, int]:
+    def fail_second(
+        session: keyframe_artifacts.KeyframeArtifactSession,
+        name: str,
+        content: bytes,
+    ) -> tuple[int, int, int]:
         nonlocal writes
         writes += 1
         if writes == 2:
             raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "模拟第二张复制失败")
-        return real_write(path, content)
+        return real_write(session, name, content)
 
-    monkeypatch.setattr(chapter_vision, "_write_private_jpeg", fail_second)
+    monkeypatch.setattr(
+        keyframe_artifacts.KeyframeArtifactSession,
+        "_write_private_jpeg",
+        fail_second,
+    )
 
     with pytest.raises(VideoDemoError):
         _service(tmp_path, _VisionPort(response)).analyze_all(
@@ -676,10 +862,12 @@ def test_private_jpeg_partial_write_failure_removes_owned_inode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from video_demo.application import chapter_vision
+    from video_demo.visual import keyframe_artifacts
 
-    destination = tmp_path / "partial.jpg"
-    real_write = chapter_vision.os.write
+    run_root, _chapter, frame_batch, _speech, _payload = _fixture(tmp_path)
+    frame = frame_batch.frame_sets[0].candidates[0]
+    (run_root / "visual").chmod(0o700)
+    real_write = keyframe_artifacts.os.write
     calls = 0
 
     def fail_after_first_byte(descriptor: int, payload: bytes | memoryview) -> int:
@@ -689,12 +877,16 @@ def test_private_jpeg_partial_write_failure_removes_owned_inode(
             return real_write(descriptor, bytes(payload[:1]))
         raise OSError("模拟写入中途失败")
 
-    monkeypatch.setattr(chapter_vision.os, "write", fail_after_first_byte)
+    monkeypatch.setattr(keyframe_artifacts.os, "write", fail_after_first_byte)
 
-    with pytest.raises(VideoDemoError):
-        chapter_vision._write_private_jpeg(destination, b"\xff\xd8\xffpartial\xff\xd9")
+    with keyframe_artifacts.KeyframeArtifactSession(
+        run_root,
+        max_files=10,
+        max_bytes=10_000,
+    ) as session, pytest.raises(VideoDemoError):
+        session.publish((frame,), session.snapshot())
 
-    assert not destination.exists()
+    assert tuple((run_root / "visual/keyframes").iterdir()) == ()
 
 
 class _ConcurrentVisionPort(_VisionPort):
@@ -848,3 +1040,72 @@ def test_cancellation_stops_submitting_and_waits_for_inflight_chapters(tmp_path:
     assert raised.value.code == ErrorCode.JOB_CANCELLED
     assert set(entered) == {"chapter_001", "chapter_002"}
     assert "chapter_003" not in entered
+
+
+def test_cancellation_returns_after_finite_wait_but_keeps_lease_until_port_finishes(
+    tmp_path: Path,
+) -> None:
+    from video_demo.visual.candidate_artifacts import CandidateDirectoryLease
+
+    run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+
+    class StuckPort(_VisionPort):
+        def analyze_chapter(
+            self,
+            request: ChapterVisionRequest,
+            *,
+            allowed_run_root: Path,
+            on_provider_attempt: Callable[[], None] | None = None,
+        ) -> ChapterVisionResponse:
+            del request, allowed_run_root, on_provider_attempt
+            started.set()
+            assert release.wait(timeout=3)
+            return ChapterVisionResponse(observations=())
+
+    service = _service(
+        tmp_path,
+        StuckPort(ChapterVisionResponse(observations=())),
+        invocation_wait_timeout_seconds=0.05,
+    )
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(
+            service.analyze_all,
+            (chapter,),
+            frame_batch,
+            (speech,),
+            DocumentGenerationConfig(),
+            cache=_cache(run_root),
+            is_cancel_requested=cancelled.is_set,
+        )
+        assert started.wait(timeout=1)
+        cancelled.set()
+        with pytest.raises(VideoDemoError) as raised:
+            future.result(timeout=0.5)
+        assert raised.value.code == ErrorCode.JOB_CANCELLED
+
+        held_lease = CandidateDirectoryLease.from_allowed_run_root(
+            runtime_root=tmp_path,
+            allowed_run_root=run_root,
+            mode="EXCLUSIVE",
+            wait_timeout_seconds=0,
+        )
+        with pytest.raises(VideoDemoError) as held:
+            held_lease.acquire()
+        assert held.value.code == ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
+
+        release.set()
+        lease = CandidateDirectoryLease.from_allowed_run_root(
+            runtime_root=tmp_path,
+            allowed_run_root=run_root,
+            mode="EXCLUSIVE",
+            wait_timeout_seconds=1,
+        )
+        with lease:
+            assert lease.is_acquired
+    finally:
+        release.set()
+        executor.shutdown(wait=True)

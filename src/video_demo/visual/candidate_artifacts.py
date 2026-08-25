@@ -465,19 +465,93 @@ def read_verified_candidate_jpeg(
     expected_relative = Path("visual/candidates") / f"{frame.sha256}.jpg"
     if Path(frame.relative_path) != expected_relative or frame.mime_type != "image/jpeg":
         raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "候选帧内容地址路径非法")
-    path = reject_symlink_components(
+    candidate_root = reject_symlink_components(
         run_root,
-        run_root / expected_relative,
+        run_root / "visual/candidates",
         message="候选帧必须位于当前 Run 且不能包含符号链接",
     )
-    return _read_verified_jpeg(
-        path,
+    return _read_verified_candidate_at(
+        run_root,
+        candidate_root,
+        f"{frame.sha256}.jpg",
         expected_digest=frame.sha256,
         expected_size=frame.size_bytes,
         max_bytes=max_bytes,
-        error_code=ErrorCode.ARTIFACT_SCHEMA_INVALID,
-        message="候选帧内容完整性校验失败",
     )
+
+
+def _read_verified_candidate_at(
+    run_root: Path,
+    candidate_root: Path,
+    name: str,
+    *,
+    expected_digest: str,
+    expected_size: int,
+    max_bytes: int,
+) -> bytes:
+    directory_descriptor = -1
+    file_descriptor = -1
+    try:
+        before_directory = os.lstat(candidate_root)
+        directory_descriptor = os.open(
+            candidate_root,
+            os.O_RDONLY | _directory_flags() | _no_follow_flag(),
+        )
+        opened_directory = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or stat.S_IMODE(opened_directory.st_mode) != 0o700
+            or _directory_identity(before_directory)
+            != _directory_identity(opened_directory)
+        ):
+            raise OSError
+        before_file = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        file_descriptor = os.open(
+            name,
+            os.O_RDONLY | _no_follow_flag(),
+            dir_fd=directory_descriptor,
+        )
+        opened_file = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(opened_file.st_mode)
+            or stat.S_IMODE(opened_file.st_mode) != 0o600
+            or opened_file.st_nlink != 1
+            or opened_file.st_size != expected_size
+            or _file_identity(before_file) != _file_identity(opened_file)
+        ):
+            raise OSError
+        payload = _read_bounded(file_descriptor, max_bytes)
+        after_file = os.fstat(file_descriptor)
+        current_file = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        current_directory = os.fstat(directory_descriptor)
+        reject_symlink_components(
+            run_root,
+            candidate_root,
+            message="候选帧必须位于当前 Run 且不能包含符号链接",
+        )
+        after_directory = os.lstat(candidate_root)
+        if (
+            _file_identity(opened_file) != _file_identity(after_file)
+            or _file_identity(after_file) != _file_identity(current_file)
+            or _directory_identity(opened_directory)
+            != _directory_identity(current_directory)
+            or _directory_identity(current_directory)
+            != _directory_identity(after_directory)
+            or not _is_jpeg(payload)
+            or hashlib.sha256(payload).hexdigest() != expected_digest
+        ):
+            raise OSError
+        return payload
+    except (OSError, VideoDemoError):
+        raise VideoDemoError(
+            ErrorCode.ARTIFACT_SCHEMA_INVALID,
+            "候选帧内容完整性校验失败",
+        ) from None
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
 
 
 def _open_lock_file(path: Path) -> int:
@@ -797,6 +871,10 @@ def _read_bounded(descriptor: int, max_bytes: int) -> bytes:
 
 def _file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+
+
+def _directory_identity(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
 
 
 def _fsync_directory(path: Path) -> None:

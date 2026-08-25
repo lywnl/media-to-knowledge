@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import math
-import os
-import stat
+import threading
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -49,6 +47,7 @@ from video_demo.integrations.document_port import (
     ChapterVisionResponse,
     InvalidModelResponse,
     ModelResponseValidationError,
+    invalid_model_response,
 )
 from video_demo.integrations.document_prompts import (
     prompt_for_vision,
@@ -56,11 +55,11 @@ from video_demo.integrations.document_prompts import (
     vision_payload_size_upper_bound,
 )
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
-from video_demo.storage.workspace import reject_symlink_components
 from video_demo.visual.candidate_artifacts import (
     CandidateDirectoryLease,
     read_verified_candidate_jpeg,
 )
+from video_demo.visual.keyframe_artifacts import KeyframeArtifactSession
 
 TranscriptEvidence: TypeAlias = SpeechSegment | SubtitleCue
 ChapterVisionStatus: TypeAlias = Literal[
@@ -95,6 +94,7 @@ _RELATION_VALUE = {
     "COMPLEMENTARY": 3,
     "CONFLICTING": 4,
 }
+_MAX_CANDIDATE_ARTIFACT_BYTES = 512 * 1024 * 1024
 
 
 class ChapterVisionBatch(FrozenModel):
@@ -183,6 +183,13 @@ class _MaterializedObservation:
     frames: tuple[FrameCandidateArtifact, ...]
 
 
+class _DeferredExecutorCleanup(Exception):
+    def __init__(self, error: BaseException, executor: ThreadPoolExecutor) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.executor = executor
+
+
 class ChapterVisionService:
     """把章节候选帧收敛为可追溯的视觉观察和已晋升关键帧。"""
 
@@ -249,17 +256,20 @@ class ChapterVisionService:
         transcripts = _validate_transcripts(chapters, transcript_evidence)
         if not any(frame_set.candidates for frame_set in frame_sets.values()):
             return _empty_batch(chapters, frame_status, frame_batch.status)
-        with CandidateDirectoryLease.from_allowed_run_root(
+        lease = CandidateDirectoryLease.from_allowed_run_root(
             runtime_root=self._runtime_root,
             allowed_run_root=frame_batch.allowed_run_root,
             mode="EXCLUSIVE",
             is_cancel_requested=is_cancel_requested,
             wait_timeout_seconds=self._candidate_lock_timeout_seconds,
-        ):
+        )
+        lease.acquire()
+        lease_transferred = False
+        try:
             _revalidate_candidate_closure(
                 frame_batch.allowed_run_root,
                 frame_sets.values(),
-                max_bytes=self._max_image_bytes,
+                max_bytes=_MAX_CANDIDATE_ARTIFACT_BYTES,
             )
             analyses = self._analyze_chapters(
                 chapters,
@@ -277,6 +287,13 @@ class ChapterVisionService:
                 frame_batch.allowed_run_root,
                 frame_tolerance_ms=frame_batch.frame_tolerance_ms,
             )
+        except _DeferredExecutorCleanup as deferred:
+            lease_transferred = True
+            _start_deferred_cleanup(deferred.executor, lease)
+            raise deferred.error.with_traceback(deferred.error.__traceback__) from None
+        finally:
+            if not lease_transferred:
+                lease.close()
 
     def _analyze_chapters(
         self,
@@ -377,10 +394,16 @@ class ChapterVisionService:
                         is_cancel_requested,
                     )
                     pending[next_future] = chapter.chapter_id
-        except BaseException:
+        except BaseException as error:
             for future in pending:
                 future.cancel()
-            wait(tuple(pending), timeout=self._invocation_wait_timeout_seconds)
+            _done, unfinished = wait(
+                tuple(pending),
+                timeout=self._invocation_wait_timeout_seconds,
+            )
+            if unfinished:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise _DeferredExecutorCleanup(error, executor) from error
             executor.shutdown(wait=True, cancel_futures=True)
             raise
         else:
@@ -483,8 +506,6 @@ class ChapterVisionService:
                 )
             except ModelResponseValidationError as error:
                 invalid = error.invalid_response
-            except (ValueError, TypeError):
-                return None
             except VideoDemoError as error:
                 if error.code in _FALLBACK_CODES:
                     return None
@@ -492,16 +513,17 @@ class ChapterVisionService:
             else:
                 try:
                     validate(response)
-                except (ValueError, TypeError):
-                    return None
-                successful_path: Literal["MAIN", "REPAIR"] = "MAIN"
-                return cache.put(
-                    self._identity,
-                    canonical_input,
-                    response,
-                    successful_path=successful_path,
-                    validate=validate,
-                ).response
+                except _VisionSemanticValidationError as error:
+                    invalid = _invalid_semantic_response(response, error)
+                else:
+                    successful_path: Literal["MAIN", "REPAIR"] = "MAIN"
+                    return cache.put(
+                        self._identity,
+                        canonical_input,
+                        response,
+                        successful_path=successful_path,
+                        validate=validate,
+                    ).response
 
             if invalid is not None:
                 counters.structure_repairs = 1
@@ -512,7 +534,7 @@ class ChapterVisionService:
                         on_provider_attempt=counters.provider_attempt,
                     )
                     validate(response)
-                except (ModelResponseValidationError, ValueError, TypeError):
+                except (ModelResponseValidationError, _VisionSemanticValidationError):
                     return None
                 except VideoDemoError as error:
                     if error.code in _FALLBACK_CODES:
@@ -581,63 +603,30 @@ class ChapterVisionService:
         frame_tolerance_ms: int,
     ) -> ChapterVisionBatch:
         observations = _collect_materialized_observations(analyses)
-        existing = _snapshot_keyframe_directory(
+        artifacts = KeyframeArtifactSession(
             allowed_run_root,
             max_files=self._max_published_keyframe_files,
             max_bytes=self._max_published_keyframe_bytes,
         )
-        retained, budget_chapters = _apply_published_budget(
-            observations,
-            existing,
-            max_files=self._max_published_keyframe_files,
-            max_bytes=self._max_published_keyframe_bytes,
-        )
-        frames = _unique_frames(retained)
-        keyframes = tuple(_keyframe_evidence(frame) for frame in frames)
-        keyframe_by_frame = {item.keyframe_id: item for item in keyframes}
-        evidence_observations = tuple(
-            _to_evidence(item, keyframe_by_frame, frame_tolerance_ms=frame_tolerance_ms)
-            for item in retained
-        )
-        used_keyframe_ids = {
-            ref for observation in evidence_observations for ref in observation.keyframe_refs
-        }
-        used_keyframes = tuple(
-            sorted(
-                (item for item in keyframes if item.evidence_id in used_keyframe_ids),
-                key=lambda item: (item.timestamp_ms, item.evidence_id),
-            ),
-        )
-        ordered_observations = tuple(
-            sorted(
-                evidence_observations,
-                key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),
-            ),
-        )
-        status_by_id = {analysis.chapter.chapter_id: analysis.status for analysis in analyses}
-        warnings = [analysis.warning for analysis in analyses if analysis.warning is not None]
-        for chapter_id in budget_chapters:
-            status_by_id[chapter_id] = "DEGRADED"
-            warnings.append(f"VISUAL_PUBLISHED_BUDGET_DEGRADED:{chapter_id}")
-        chapter_status = tuple(
-            (analysis.chapter.chapter_id, status_by_id[analysis.chapter.chapter_id])
-            for analysis in analyses
-        )
-        metrics = _merge_metrics(analyses, len(budget_chapters))
-        partial = frame_batch.status == "PARTIAL_SUCCEEDED" or any(
-            status == "DEGRADED" for _chapter_id, status in chapter_status
-        )
-        batch = ChapterVisionBatch(
-            observations=ordered_observations,
-            keyframe_evidence=used_keyframes,
-            evidence=(*used_keyframes, *ordered_observations),
-            chapter_status=chapter_status,
-            warnings=tuple(warnings),
-            status="PARTIAL_SUCCEEDED" if partial else "SUCCEEDED",
-            metrics=metrics,
-        )
-        _publish_keyframes(allowed_run_root, frames, existing)
-        return batch
+        with artifacts:
+            existing = artifacts.snapshot()
+            retained, budget_chapters = _apply_published_budget(
+                observations,
+                existing,
+                max_files=self._max_published_keyframe_files,
+                max_bytes=self._max_published_keyframe_bytes,
+            )
+            frames = _unique_frames(retained)
+            batch = _materialize_batch(
+                analyses,
+                frame_batch,
+                retained,
+                frames,
+                budget_chapters,
+                frame_tolerance_ms=frame_tolerance_ms,
+            )
+            artifacts.publish(frames, existing)
+            return batch
 
 
 def _validate_batch_alignment(
@@ -906,11 +895,15 @@ def _validate_response(
     observation_ids: set[str] = set()
     for observation in response.observations:
         if not set(observation.target_ids) <= target_ids:
-            raise ValueError("观察引用未知视觉目标")
+            raise _VisionSemanticValidationError("observations.target_ids:unknown_reference")
         if not set(observation.selected_frame_ids) <= frame_by_id.keys():
-            raise ValueError("观察引用未知候选帧")
+            raise _VisionSemanticValidationError(
+                "observations.selected_frame_ids:unknown_reference",
+            )
         if not set(observation.transcript_evidence_refs) <= transcript_ids:
-            raise ValueError("观察引用未知转写证据")
+            raise _VisionSemanticValidationError(
+                "observations.transcript_evidence_refs:unknown_reference",
+            )
         covered = set().union(
             *(set(frame_by_id[frame_id].target_ids) for frame_id in observation.selected_frame_ids),
         )
@@ -922,19 +915,23 @@ def _validate_response(
                 for frame_id in observation.selected_frame_ids
             )
         ):
-            raise ValueError("观察目标未被选中帧完整覆盖")
+            raise _VisionSemanticValidationError(
+                "observations.target_ids:frame_binding_mismatch",
+            )
         for relation in observation.frame_relations:
             if (
                 frame_by_id[relation.from_frame_id].timestamp_ms
                 >= frame_by_id[relation.to_frame_id].timestamp_ms
             ):
-                raise ValueError("观察帧关系必须按真实时间从早到晚")
+                raise _VisionSemanticValidationError(
+                    "observations.frame_relations:time_order_invalid",
+                )
         observation_id = stable_identifier(
             "visual_observation_draft",
             observation.model_dump(mode="json"),
         )
         if observation_id in observation_ids:
-            raise ValueError("视觉响应不得包含重复等价观察")
+            raise _VisionSemanticValidationError("observations:duplicate_equivalent")
         observation_ids.add(observation_id)
         selected.update(observation.selected_frame_ids)
     cap = min(
@@ -942,7 +939,25 @@ def _validate_response(
         3 if chapter.visual_mode in {"COMPARISON", "MULTI_STEP"} else 2,
     )
     if len(selected) > cap:
-        raise ValueError("视觉观察选择的唯一帧数超过章节预算")
+        raise _VisionSemanticValidationError("observations.selected_frame_ids:budget_exceeded")
+
+
+class _VisionSemanticValidationError(ValueError):
+    def __init__(self, summary: str) -> None:
+        super().__init__(summary)
+        self.summary = summary
+
+
+def _invalid_semantic_response(
+    response: ChapterVisionResponse,
+    error: _VisionSemanticValidationError,
+) -> InvalidModelResponse:
+    parsed = response.model_dump(mode="json")
+    return invalid_model_response(
+        response.model_dump_json().encode("utf-8"),
+        (error.summary,),
+        parsed_json=parsed,
+    )
 
 
 def _covers_targets(
@@ -1041,83 +1056,55 @@ def _unique_frames(
     return tuple(sorted(by_id.values(), key=lambda item: (item.timestamp_ms, item.frame_id)))
 
 
-def _snapshot_keyframe_directory(
-    run_root: Path,
-    *,
-    max_files: int,
-    max_bytes: int,
-) -> dict[str, int]:
-    root = run_root / "visual/keyframes"
-    try:
-        root_status = os.lstat(root)
-    except FileNotFoundError:
-        return {}
-    except OSError:
-        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "关键帧目录非法") from None
-    if (
-        stat.S_ISLNK(root_status.st_mode)
-        or not stat.S_ISDIR(root_status.st_mode)
-        or stat.S_IMODE(root_status.st_mode) != 0o700
-    ):
-        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "关键帧目录非法")
-    root = reject_symlink_components(run_root, root, message="关键帧目录不能包含符号链接")
-    existing: dict[str, int] = {}
-    total_bytes = 0
-    try:
-        with os.scandir(root) as entries:
-            for count, entry in enumerate(entries, start=1):
-                if count > max_files:
-                    raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "关键帧目录文件数超限")
-                path = Path(entry.path)
-                if entry.is_symlink() or path.suffix != ".jpg" or not _is_sha256(path.stem):
-                    raise OSError
-                payload = _read_private_jpeg(path, path.stem, max_bytes)
-                existing[path.stem] = len(payload)
-                total_bytes += len(payload)
-                if total_bytes > max_bytes:
-                    raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "既有关键帧超过字节预算")
-    except VideoDemoError:
-        raise
-    except OSError:
-        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "关键帧目录快照非法") from None
-    return existing
-
-
-def _publish_keyframes(
-    run_root: Path,
+def _materialize_batch(
+    analyses: tuple[_ChapterAnalysis, ...],
+    frame_batch: ChapterFrameSearchBatch,
+    retained: tuple[_MaterializedObservation, ...],
     frames: tuple[FrameCandidateArtifact, ...],
-    existing: Mapping[str, int],
-) -> None:
-    root = run_root / "visual/keyframes"
-    if frames:
-        _ensure_private_directory(run_root, root)
-    created: list[tuple[Path, tuple[int, int, int]]] = []
-    published_sha: set[str] = set(existing)
-    try:
-        for frame in frames:
-            destination = root / f"{frame.sha256}.jpg"
-            if frame.sha256 in existing:
-                if existing[frame.sha256] != frame.size_bytes:
-                    raise VideoDemoError(
-                        ErrorCode.ARTIFACT_SCHEMA_INVALID,
-                        "既有关键帧大小与候选元数据不一致",
-                    )
-                _read_private_jpeg(destination, frame.sha256, frame.size_bytes)
-                continue
-            if frame.sha256 in published_sha:
-                _read_private_jpeg(destination, frame.sha256, frame.size_bytes)
-                continue
-            payload = read_verified_candidate_jpeg(
-                run_root,
-                frame,
-                max_bytes=frame.size_bytes,
-            )
-            identity = _write_private_jpeg(destination, payload)
-            created.append((destination, identity))
-            published_sha.add(frame.sha256)
-    except BaseException:
-        _rollback_created_keyframes(created)
-        raise
+    budget_chapters: tuple[str, ...],
+    *,
+    frame_tolerance_ms: int,
+) -> ChapterVisionBatch:
+    keyframes = tuple(_keyframe_evidence(frame) for frame in frames)
+    keyframe_by_frame = {item.keyframe_id: item for item in keyframes}
+    evidence_observations = tuple(
+        _to_evidence(item, keyframe_by_frame, frame_tolerance_ms=frame_tolerance_ms)
+        for item in retained
+    )
+    used_ids = {ref for item in evidence_observations for ref in item.keyframe_refs}
+    used_keyframes = tuple(
+        sorted(
+            (item for item in keyframes if item.evidence_id in used_ids),
+            key=lambda item: (item.timestamp_ms, item.evidence_id),
+        ),
+    )
+    ordered_observations = tuple(
+        sorted(
+            evidence_observations,
+            key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),
+        ),
+    )
+    status_by_id = {analysis.chapter.chapter_id: analysis.status for analysis in analyses}
+    warnings = [analysis.warning for analysis in analyses if analysis.warning is not None]
+    for chapter_id in budget_chapters:
+        status_by_id[chapter_id] = "DEGRADED"
+        warnings.append(f"VISUAL_PUBLISHED_BUDGET_DEGRADED:{chapter_id}")
+    chapter_status = tuple(
+        (analysis.chapter.chapter_id, status_by_id[analysis.chapter.chapter_id])
+        for analysis in analyses
+    )
+    partial = frame_batch.status == "PARTIAL_SUCCEEDED" or any(
+        status == "DEGRADED" for _chapter_id, status in chapter_status
+    )
+    return ChapterVisionBatch(
+        observations=ordered_observations,
+        keyframe_evidence=used_keyframes,
+        evidence=(*used_keyframes, *ordered_observations),
+        chapter_status=chapter_status,
+        warnings=tuple(warnings),
+        status="PARTIAL_SUCCEEDED" if partial else "SUCCEEDED",
+        metrics=_merge_metrics(analyses, len(budget_chapters)),
+    )
 
 
 def _keyframe_evidence(frame: FrameCandidateArtifact) -> KeyframeEvidence:
@@ -1268,187 +1255,27 @@ def _zero_metrics() -> dict[str, int]:
     return {name: 0 for name in _METRIC_NAMES}
 
 
-def _ensure_private_directory(run_root: Path, path: Path) -> None:
-    reject_symlink_components(run_root, path, message="关键帧目录不能包含符号链接")
-    try:
-        status = os.lstat(path)
-    except FileNotFoundError:
-        try:
-            path.mkdir(mode=0o700)
-            _fsync_directory(path.parent)
-            status = os.lstat(path)
-        except (FileExistsError, OSError):
-            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "关键帧目录非法") from None
-    if (
-        stat.S_ISLNK(status.st_mode)
-        or not stat.S_ISDIR(status.st_mode)
-        or stat.S_IMODE(status.st_mode) != 0o700
-    ):
-        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "关键帧目录非法")
-    reject_symlink_components(run_root, path, message="关键帧目录不能包含符号链接")
-
-
-def _read_private_jpeg(path: Path, digest: str, max_bytes: int) -> bytes:
-    descriptor = -1
-    try:
-        before = os.lstat(path)
-        descriptor = os.open(path, os.O_RDONLY | _no_follow())
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or stat.S_IMODE(opened.st_mode) != 0o600
-            or opened.st_nlink != 1
-            or _identity(before) != _identity(opened)
-        ):
-            raise OSError
-        payload = _read_bounded(descriptor, max_bytes)
-        after = os.fstat(descriptor)
-        current = os.lstat(path)
-        if (
-            _identity(opened) != _identity(after)
-            or _identity(after) != _identity(current)
-            or not _is_jpeg(payload)
-            or hashlib.sha256(payload).hexdigest() != digest
-        ):
-            raise OSError
-        return payload
-    except OSError:
-        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "关键帧文件非法") from None
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _write_private_jpeg(path: Path, payload: bytes) -> tuple[int, int, int]:
-    descriptor = -1
-    identity: tuple[int, int, int] | None = None
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _no_follow(), 0o600)
-        os.fchmod(descriptor, 0o600)
-        created = os.fstat(descriptor)
-        if not stat.S_ISREG(created.st_mode) or created.st_nlink != 1:
-            raise OSError
-        identity = (created.st_dev, created.st_ino, created.st_size)
-        view = memoryview(payload)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError
-            view = view[written:]
-            current = os.fstat(descriptor)
-            identity = (current.st_dev, current.st_ino, current.st_size)
-        os.fsync(descriptor)
-        status = os.fstat(descriptor)
-        identity = (status.st_dev, status.st_ino, status.st_size)
-        if (
-            not stat.S_ISREG(status.st_mode)
-            or stat.S_IMODE(status.st_mode) != 0o600
-            or status.st_nlink != 1
-            or status.st_size != len(payload)
-        ):
-            raise OSError
-        os.close(descriptor)
-        descriptor = -1
-        current = os.lstat(path)
-        if (
-            stat.S_ISLNK(current.st_mode)
-            or not stat.S_ISREG(current.st_mode)
-            or (current.st_dev, current.st_ino, current.st_size) != identity
-            or current.st_nlink != 1
-            or stat.S_IMODE(current.st_mode) != 0o600
-        ):
-            raise OSError
-        _fsync_directory(path.parent)
-        verified = _read_private_jpeg(path, hashlib.sha256(payload).hexdigest(), len(payload))
-        if verified != payload:
-            raise OSError
-        return identity
-    except FileExistsError:
-        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "关键帧发布发生同名竞争") from None
-    except VideoDemoError:
-        if identity is not None:
-            _unlink_owned(path, identity)
-        raise
-    except OSError:
-        if identity is not None:
-            _unlink_owned(path, identity)
-        raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "关键帧安全复制失败") from None
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _unlink_owned(path: Path, identity: tuple[int, int, int]) -> None:
-    try:
-        status = os.lstat(path)
-        if (
-            stat.S_ISREG(status.st_mode)
-            and status.st_nlink == 1
-            and (status.st_dev, status.st_ino, status.st_size) == identity
-        ):
-            path.unlink()
-            _fsync_directory(path.parent)
-    except FileNotFoundError:
-        return
-
-
-def _rollback_created_keyframes(
-    created: list[tuple[Path, tuple[int, int, int]]],
+def _start_deferred_cleanup(
+    executor: ThreadPoolExecutor,
+    lease: CandidateDirectoryLease,
 ) -> None:
-    rollback_error: VideoDemoError | None = None
-    for path, identity in reversed(created):
+    def cleanup() -> None:
         try:
-            _unlink_owned(path, identity)
-        except (OSError, VideoDemoError) as error:
-            rollback_error = VideoDemoError(
-                ErrorCode.VISUAL_RESULT_INVALID,
-                "失败的关键帧批量发布无法安全回滚",
-            )
-            rollback_error.add_note(str(error))
-    if rollback_error is not None:
-        raise rollback_error
+            executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            lease.close()
 
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = -1
+    thread = threading.Thread(
+        target=cleanup,
+        name="chapter-vision-deferred-cleanup",
+        daemon=True,
+    )
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _no_follow())
-        os.fsync(descriptor)
-    except OSError:
-        raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "关键帧目录同步失败") from None
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _read_bounded(descriptor: int, max_bytes: int) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
-    while chunk := os.read(descriptor, min(1024 * 1024, max_bytes + 1 - total)):
-        total += len(chunk)
-        if total > max_bytes:
-            raise OSError
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
-def _identity(value: os.stat_result) -> tuple[int, int, int, int]:
-    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
-
-
-def _no_follow() -> int:
-    flag = getattr(os, "O_NOFOLLOW", None)
-    if flag is None:
-        raise VideoDemoError(ErrorCode.INVALID_CONFIGURATION, "当前平台不支持安全关键帧访问")
-    return int(flag)
-
-
-def _is_jpeg(payload: bytes) -> bool:
-    return payload.startswith(b"\xff\xd8\xff") and payload.endswith(b"\xff\xd9")
-
-
-def _is_sha256(value: str) -> bool:
-    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+        thread.start()
+    except BaseException:
+        executor.shutdown(wait=True, cancel_futures=True)
+        lease.close()
+        raise
 
 
 def _raise_if_cancelled(is_cancel_requested: Callable[[], bool]) -> None:
