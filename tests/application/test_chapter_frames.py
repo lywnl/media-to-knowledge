@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from video_demo.application.pipeline_contracts import (
     SceneIndex,
     scene_index_sha256,
 )
+from video_demo.domain.base import stable_identifier
 from video_demo.domain.document import DocumentGenerationConfig
 from video_demo.domain.document_plan import ChapterPlan, VisualSearchTarget
 from video_demo.domain.evidence import SceneBoundary, SpeechSegment
@@ -32,8 +34,17 @@ _JPEG = b"\xff\xd8\xffchapter-frame\xff\xd9"
 
 
 class _FakeExtractor:
-    def __init__(self, results: dict[int, tuple[str, bytes | None]]) -> None:
+    def __init__(
+        self,
+        results: dict[int, tuple[str, bytes | None]],
+        *,
+        result_for_sample: Callable[
+            [FrameSample], tuple[str, bytes | None, float, str]
+        ]
+        | None = None,
+    ) -> None:
         self._results = results
+        self._result_for_sample = result_for_sample
         self.calls: list[tuple[tuple[FrameSample, ...], int]] = []
 
     def extract_samples(
@@ -50,7 +61,15 @@ class _FakeExtractor:
         self.calls.append((samples, frame_tolerance_ms))
         output: list[ExactFrameSampleResult] = []
         for sample in samples:
-            status, payload = self._results.get(sample.timestamp_ms, ("DECODE_FAILED", None))
+            if self._result_for_sample is None:
+                status, payload = self._results.get(
+                    sample.timestamp_ms,
+                    ("DECODE_FAILED", None),
+                )
+                sharpness = float(sample.timestamp_ms)
+                perceptual_hash = "0123456789abcdef"
+            else:
+                status, payload, sharpness, perceptual_hash = self._result_for_sample(sample)
             candidate = None
             artifact_status = None
             if payload is not None:
@@ -77,9 +96,9 @@ class _FakeExtractor:
                 created = publication.created_by_call if publication is not None else True
                 candidate = FrameCandidate(
                     timestamp_ms=sample.timestamp_ms,
-                    sharpness=float(sample.timestamp_ms),
+                    sharpness=sharpness,
                     black_ratio=0.0,
-                    perceptual_hash="0123456789abcdef",
+                    perceptual_hash=perceptual_hash,
                     relative_path=relative_path,
                     created_by_call=created,
                 )
@@ -94,6 +113,37 @@ class _FakeExtractor:
                 ),
             )
         return tuple(output)
+
+
+def test_single_chapter_keeps_base_candidate_when_semantic_target_has_no_candidate(
+    tmp_path: Path,
+) -> None:
+    media, scene_index = _fixture(tmp_path)
+    chapter = _chapter(
+        semantic_targets=(_semantic_target("target_semantic", "asr_001"),),
+    )
+    extractor = _FakeExtractor(
+        {
+            2_000: ("QUALITY_REJECTED", None),
+            3_500: ("QUALITY_REJECTED", None),
+            5_000: ("SUCCEEDED", _JPEG),
+        },
+    )
+    extractor.runtime_root = tmp_path
+
+    batch = ChapterFrameSearcher(tmp_path, extractor).search(
+        media,
+        (chapter,),
+        {"asr_001": _speech()},
+        scene_index,
+        DocumentGenerationConfig(),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert batch.chapter_status == ((chapter.chapter_id, "SUCCEEDED"),)
+    assert tuple(candidate.target_ids for candidate in batch.frame_sets[0].candidates) == (
+        ("target_base",),
+    )
 
 
 def test_search_uses_scene_index_tolerance_and_merges_same_content_targets(
@@ -124,6 +174,75 @@ def test_search_uses_scene_index_tolerance_and_merges_same_content_targets(
         "target_semantic",
         "target_base",
     }
+
+
+def test_same_sha_preserves_each_target_window_when_selecting_window_best(
+    tmp_path: Path,
+) -> None:
+    media, original_scene_index = _fixture(tmp_path)
+    scenes = tuple(
+        SceneBoundary(
+            evidence_id=f"scene_{index:03d}",
+            start_ms=index * 2_500,
+            end_ms=(index + 1) * 2_500,
+            transition="candidate",
+            score=0.9,
+        )
+        for index in range(4)
+    )
+    scene_index = SceneIndex(
+        proxy_sha256=media.proxy_sha256,
+        duration_ms=original_scene_index.duration_ms,
+        frame_tolerance_ms=original_scene_index.frame_tolerance_ms,
+        scenes=scenes,
+        index_sha256=scene_index_sha256(
+            proxy_sha256=media.proxy_sha256,
+            duration_ms=original_scene_index.duration_ms,
+            frame_tolerance_ms=original_scene_index.frame_tolerance_ms,
+            scenes=scenes,
+        ),
+    )
+    chapter = ChapterPlan(
+        chapter_id="chapter_001",
+        start_ms=0,
+        end_ms=10_000,
+        segment_refs=("segment_001",),
+        title_hint="章节",
+        visual_mode="COMPARISON",
+        semantic_targets=(
+            _semantic_target("target_semantic_1", "asr_001"),
+            _semantic_target("target_semantic_2", "asr_002"),
+        ),
+        base_coverage_targets=(),
+    )
+
+    def result_for_sample(sample: FrameSample) -> tuple[str, bytes | None, float, str]:
+        if sample.timestamp_ms in {3_500, 6_500}:
+            return "SUCCEEDED", _JPEG, 1.0, "0000000000000000"
+        payload = b"\xff\xd8\xff" + sample.sample_id.encode("ascii") + b"\xff\xd9"
+        return "SUCCEEDED", payload, 10.0, "ffffffffffffffff"
+
+    extractor = _FakeExtractor({}, result_for_sample=result_for_sample)
+    extractor.runtime_root = tmp_path
+
+    batch = ChapterFrameSearcher(
+        tmp_path,
+        extractor,
+        max_hash_distance_for_duplicate=0,
+    ).search(
+        media,
+        (chapter,),
+        {"asr_001": _speech(), "asr_002": _speech_2()},
+        scene_index,
+        DocumentGenerationConfig(),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert len(batch.frame_sets[0].candidates) == 2
+    assert all(
+        candidate.sha256 != hashlib.sha256(_JPEG).hexdigest()
+        for candidate in batch.frame_sets[0].candidates
+    )
 
 
 def test_search_distinguishes_normal_no_candidate_from_decode_degradation(
@@ -267,6 +386,125 @@ def test_phash_deduplication_preserves_best_candidate_for_each_target(tmp_path: 
         for target_id in candidate.target_ids
     }
     assert retained_targets == {"target_semantic", "target_base"}
+
+
+def test_final_ranking_prefers_base_coverage_after_equal_semantic_hits_and_sharpness(
+    tmp_path: Path,
+) -> None:
+    media, scene_index = _fixture(tmp_path)
+    chapter = ChapterPlan(
+        chapter_id="chapter_001",
+        start_ms=0,
+        end_ms=10_000,
+        segment_refs=("segment_001",),
+        title_hint="章节",
+        visual_mode="COMPARISON",
+        semantic_targets=(
+            _semantic_target("target_semantic_1", "asr_001"),
+            _semantic_target("target_semantic_2", "asr_002"),
+        ),
+        base_coverage_targets=(
+            VisualSearchTarget(
+                target_id="target_base",
+                purpose="BASE_COVERAGE",
+                query_zh="代表画面",
+                sample_timestamps_ms=(6_500,),
+            ),
+        ),
+    )
+    semantic_only = b"\xff\xd8\xffsemantic-only\xff\xd9"
+    semantic_with_base = b"\xff\xd8\xffsemantic-with-base\xff\xd9"
+
+    def result_for_sample(sample: FrameSample) -> tuple[str, bytes | None, float, str]:
+        status, payload = {
+            3_500: ("SUCCEEDED", semantic_only),
+            6_500: ("SUCCEEDED", semantic_with_base),
+        }.get(sample.timestamp_ms, ("SUCCEEDED", semantic_only))
+        return status, payload, 1.0, "0123456789abcdef"
+
+    extractor = _FakeExtractor(
+        {
+            3_500: ("SUCCEEDED", semantic_only),
+            6_500: ("SUCCEEDED", semantic_with_base),
+        },
+        result_for_sample=result_for_sample,
+    )
+    extractor.runtime_root = tmp_path
+
+    batch = ChapterFrameSearcher(
+        tmp_path,
+        extractor,
+        max_hash_distance_for_duplicate=0,
+    ).search(
+        media,
+        (chapter,),
+        {"asr_001": _speech(), "asr_002": _speech_2()},
+        scene_index,
+        DocumentGenerationConfig(),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert "target_base" in batch.frame_sets[0].candidates[0].target_ids
+
+
+def test_final_ranking_uses_frame_id_after_timestamp_tie(tmp_path: Path) -> None:
+    media, scene_index = _fixture(tmp_path)
+    first_target = _semantic_target("target_semantic_1", "asr_001")
+    second_target = _semantic_target("target_semantic_2", "asr_002")
+    chapter = ChapterPlan(
+        chapter_id="chapter_001",
+        start_ms=0,
+        end_ms=10_000,
+        segment_refs=("segment_001",),
+        title_hint="章节",
+        visual_mode="COMPARISON",
+        semantic_targets=(first_target, second_target),
+        base_coverage_targets=(),
+    )
+    shared_timestamp_ms = 3_500
+    first_sample_id = stable_identifier(
+        "sample",
+        {
+            "chapter_id": chapter.chapter_id,
+            "target_id": first_target.target_id,
+            "timestamp_ms": shared_timestamp_ms,
+        },
+    )
+    payload_by_sample_id = {
+        first_sample_id: b"\xff\xd8\xffsort-0\xff\xd9",
+    }
+
+    def result_for_sample(sample: FrameSample) -> tuple[str, bytes | None, float, str]:
+        if sample.timestamp_ms != shared_timestamp_ms:
+            return "QUALITY_REJECTED", None, 1.0, "0123456789abcdef"
+        return (
+            "SUCCEEDED",
+            payload_by_sample_id.get(sample.sample_id, b"\xff\xd8\xffsort-8\xff\xd9"),
+            1.0,
+            "0123456789abcdef",
+        )
+
+    extractor = _FakeExtractor({}, result_for_sample=result_for_sample)
+    extractor.runtime_root = tmp_path
+
+    batch = ChapterFrameSearcher(
+        tmp_path,
+        extractor,
+        max_hash_distance_for_duplicate=0,
+    ).search(
+        media,
+        (chapter,),
+        {
+            "asr_001": _speech(),
+            "asr_002": _speech_at("asr_002", 3_000, 4_000),
+        },
+        scene_index,
+        DocumentGenerationConfig(),
+        is_cancel_requested=lambda: False,
+    )
+
+    frame_ids = tuple(candidate.frame_id for candidate in batch.frame_sets[0].candidates)
+    assert frame_ids == tuple(sorted(frame_ids))
 
 
 def test_search_rejects_scene_index_for_different_proxy(tmp_path: Path) -> None:
@@ -606,6 +844,76 @@ def test_search_rejects_success_candidate_outside_frame_tolerance(tmp_path: Path
     assert raised.value.code == ErrorCode.VISUAL_RESULT_INVALID
 
 
+@pytest.mark.parametrize(
+    ("status", "has_candidate", "artifact_status"),
+    (
+        ("DECODE_FAILED", False, "BUDGET_REJECTED"),
+        ("SUCCEEDED", True, None),
+    ),
+)
+def test_search_rejects_invalid_sample_result_state_combination(
+    tmp_path: Path,
+    status: str,
+    has_candidate: bool,
+    artifact_status: str | None,
+) -> None:
+    media, scene_index = _fixture(tmp_path)
+
+    class InvalidStateExtractor(_FakeExtractor):
+        def extract_samples(
+            self,
+            _proxy: Path,
+            _run_relative_root: Path,
+            samples: tuple[FrameSample, ...],
+            *,
+            is_cancel_requested: object,
+            frame_tolerance_ms: int,
+            artifact_session: CandidateArtifactSession | None = None,
+        ) -> tuple[ExactFrameSampleResult, ...]:
+            del is_cancel_requested, frame_tolerance_ms, artifact_session
+            results: list[ExactFrameSampleResult] = []
+            for index, sample in enumerate(samples):
+                candidate = (
+                    FrameCandidate(
+                        timestamp_ms=sample.timestamp_ms,
+                        sharpness=1.0,
+                        black_ratio=0.0,
+                        perceptual_hash="0123456789abcdef",
+                        relative_path=Path("unused.jpg"),
+                    )
+                    if has_candidate and index == 0
+                    else None
+                )
+                result = object.__new__(ExactFrameSampleResult)
+                object.__setattr__(result, "sample_id", sample.sample_id)
+                object.__setattr__(result, "requested_timestamp_ms", sample.timestamp_ms)
+                object.__setattr__(result, "status", status if index == 0 else "QUALITY_REJECTED")
+                object.__setattr__(result, "candidate", candidate)
+                object.__setattr__(
+                    result,
+                    "artifact_status",
+                    artifact_status if index == 0 else None,
+                )
+                results.append(result)
+            return tuple(results)
+
+    extractor = InvalidStateExtractor({})
+    extractor.runtime_root = tmp_path
+
+    with pytest.raises(VideoDemoError) as raised:
+        ChapterFrameSearcher(tmp_path, extractor).search(
+            media,
+            (_chapter(),),
+            {},
+            scene_index,
+            DocumentGenerationConfig(),
+            is_cancel_requested=lambda: False,
+        )
+
+    assert raised.value.code == ErrorCode.VISUAL_RESULT_INVALID
+    assert raised.value.message == "精确抽帧状态、候选和制品状态组合非法"
+
+
 @pytest.mark.parametrize("perceptual_hash", ("1", "0123456789ABCDEf", "g" * 16))
 def test_search_rejects_noncanonical_perceptual_hash(
     tmp_path: Path,
@@ -778,10 +1086,14 @@ def _speech() -> SpeechSegment:
 
 
 def _speech_2() -> SpeechSegment:
+    return _speech_at("asr_002", 6_000, 7_000)
+
+
+def _speech_at(evidence_id: str, start_ms: int, end_ms: int) -> SpeechSegment:
     return SpeechSegment(
-        evidence_id="asr_002",
-        start_ms=6_000,
-        end_ms=7_000,
+        evidence_id=evidence_id,
+        start_ms=start_ms,
+        end_ms=end_ms,
         text="展示第二个参数",
         language="zh",
         confidence=0.9,

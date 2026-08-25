@@ -59,6 +59,7 @@ _METRIC_NAMES = frozenset(
 _FAILED_SAMPLE_STATUSES = frozenset(
     {"SEEK_FAILED", "DECODE_FAILED", "INVALID_TIMESTAMP", "OUT_OF_TOLERANCE"},
 )
+_NO_ARTIFACT_SAMPLE_STATUSES = _FAILED_SAMPLE_STATUSES | {"QUALITY_REJECTED"}
 
 
 class ChapterFrameSearchBatch(FrozenModel):
@@ -119,17 +120,26 @@ class _SelectedSamplePoint:
 
 
 @dataclass(frozen=True, slots=True)
+class _CandidateTargetBinding:
+    target_id: str
+    window_start_ms: int
+    window_end_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class _InternalCandidate:
     chapter_id: str
     frame: FrameCandidate
     sha256: str
     size_bytes: int
     run_relative_path: str
-    target_ids: tuple[str, ...]
+    target_bindings: tuple[_CandidateTargetBinding, ...]
     scene_id: str
-    window_start_ms: int
-    window_end_ms: int
     created_by_call: bool
+
+    @property
+    def target_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(binding.target_id for binding in self.target_bindings))
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,6 +471,11 @@ class ChapterFrameSearcher:
         if any(requested[result.sample_id] != result.requested_timestamp_ms for result in results):
             raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "精确抽帧返回的请求时间不一致")
         for result in results:
+            if not _has_valid_result_state(result):
+                raise VideoDemoError(
+                    ErrorCode.VISUAL_RESULT_INVALID,
+                    "精确抽帧状态、候选和制品状态组合非法",
+                )
             if result.candidate is None:
                 continue
             candidate = result.candidate
@@ -506,10 +521,14 @@ class ChapterFrameSearcher:
                     sha256=digest,
                     size_bytes=len(payload),
                     run_relative_path=relative_path.as_posix(),
-                    target_ids=(binding.target_id,),
+                    target_bindings=(
+                        _CandidateTargetBinding(
+                            target_id=binding.target_id,
+                            window_start_ms=binding.window_start_ms,
+                            window_end_ms=binding.window_end_ms,
+                        ),
+                    ),
                     scene_id=_scene_at(scenes, candidate.timestamp_ms).evidence_id,
-                    window_start_ms=binding.window_start_ms,
-                    window_end_ms=binding.window_end_ms,
                     created_by_call=candidate.created_by_call,
                 ),
             )
@@ -557,7 +576,11 @@ class ChapterFrameSearcher:
             chapter_candidates = tuple(
                 item for item in candidates if item.chapter_id == chapter.chapter_id
             )
-            selected = self._select_chapter_candidates(chapter, chapter_candidates)
+            selected = self._select_chapter_candidates(
+                chapter,
+                chapter_candidates,
+                asset_sha256,
+            )
             chapter_results = tuple(
                 result
                 for result in results
@@ -575,7 +598,10 @@ class ChapterFrameSearcher:
             if rejected_target_ids - retained_target_ids:
                 budget_degraded.add(chapter.chapter_id)
                 selected = ()
-            if not required_semantic_ids.issubset(retained_target_ids):
+            if (
+                chapter.visual_mode in {"COMPARISON", "MULTI_STEP"}
+                and not required_semantic_ids.issubset(retained_target_ids)
+            ):
                 selected = ()
             selections.append(_ChapterSelection(chapter, selected, chapter_results))
         metrics: Counter[str] = Counter()
@@ -632,6 +658,7 @@ class ChapterFrameSearcher:
         self,
         chapter: ChapterPlan,
         candidates: tuple[_InternalCandidate, ...],
+        asset_sha256: str,
     ) -> tuple[_InternalCandidate, ...]:
         eligible = tuple(
             item for item in candidates if item.frame.black_ratio <= self._maximum_black_ratio
@@ -644,7 +671,10 @@ class ChapterFrameSearcher:
         )
         limit = 6 if chapter.visual_mode in {"COMPARISON", "MULTI_STEP"} else 4
         window_best = _best_candidate_per_window(unique)
-        ranked = sorted(window_best, key=lambda item: _candidate_rank(item, chapter))
+        ranked = sorted(
+            window_best,
+            key=lambda item: _candidate_rank(item, chapter, asset_sha256),
+        )
         protected = _protected_candidates(ranked, _target_order(chapter))
         selected = list(protected)
         selected.extend(item for item in ranked if item not in selected and len(selected) < limit)
@@ -653,7 +683,7 @@ class ChapterFrameSearcher:
         selected.sort(
             key=lambda item: (
                 0 if item in protected_set else 1,
-                *_candidate_rank(item, chapter),
+                *_candidate_rank(item, chapter, asset_sha256),
             ),
         )
         return tuple(selected)
@@ -675,16 +705,8 @@ class ChapterFrameSearcher:
 
     @staticmethod
     def _to_artifact(asset_sha256: str, item: _InternalCandidate) -> FrameCandidateArtifact:
-        frame_id = stable_identifier(
-            "keyframe",
-            {
-                "asset_sha256": asset_sha256,
-                "timestamp_ms": item.frame.timestamp_ms,
-                "sha256": item.sha256,
-            },
-        )
         return FrameCandidateArtifact(
-            frame_id=frame_id,
+            frame_id=_frame_identifier(asset_sha256, item),
             timestamp_ms=item.frame.timestamp_ms,
             sha256=item.sha256,
             size_bytes=item.size_bytes,
@@ -844,7 +866,6 @@ def _merge_same_sha(
         representative = min(
             group, key=lambda item: (item.frame.timestamp_ms, item.run_relative_path)
         )
-        targets = {target_id for item in group for target_id in item.target_ids}
         merged.append(
             _InternalCandidate(
                 chapter_id=representative.chapter_id,
@@ -852,10 +873,16 @@ def _merge_same_sha(
                 sha256=representative.sha256,
                 size_bytes=representative.size_bytes,
                 run_relative_path=representative.run_relative_path,
-                target_ids=tuple(target_id for target_id in target_order if target_id in targets),
+                target_bindings=tuple(
+                    dict.fromkeys(
+                        binding
+                        for target_id in target_order
+                        for item in group
+                        for binding in item.target_bindings
+                        if binding.target_id == target_id
+                    ),
+                ),
                 scene_id=representative.scene_id,
-                window_start_ms=min(item.window_start_ms for item in group),
-                window_end_ms=max(item.window_end_ms for item in group),
                 created_by_call=any(item.created_by_call for item in group),
             ),
         )
@@ -915,9 +942,9 @@ def _best_candidate_per_window(
 ) -> tuple[_InternalCandidate, ...]:
     grouped: dict[tuple[str, int, int], list[_InternalCandidate]] = {}
     for candidate in candidates:
-        for target_id in candidate.target_ids:
+        for binding in candidate.target_bindings:
             grouped.setdefault(
-                (target_id, candidate.window_start_ms, candidate.window_end_ms),
+                (binding.target_id, binding.window_start_ms, binding.window_end_ms),
                 [],
             ).append(candidate)
     selected: list[_InternalCandidate] = []
@@ -937,16 +964,43 @@ def _best_candidate_per_window(
 
 
 def _candidate_rank(
-    item: _InternalCandidate, chapter: ChapterPlan
-) -> tuple[int, float, float, int, str]:
+    item: _InternalCandidate,
+    chapter: ChapterPlan,
+    asset_sha256: str,
+) -> tuple[int, float, int, int, str]:
     semantic_ids = {target.target_id for target in chapter.semantic_targets}
+    base_ids = {target.target_id for target in chapter.base_coverage_targets}
     semantic_hits = len(semantic_ids.intersection(item.target_ids))
+    base_hits = len(base_ids.intersection(item.target_ids))
     return (
         -semantic_hits,
         -item.frame.sharpness,
-        item.frame.black_ratio,
+        -base_hits,
         item.frame.timestamp_ms,
-        item.sha256,
+        _frame_identifier(asset_sha256, item),
+    )
+
+
+def _frame_identifier(asset_sha256: str, item: _InternalCandidate) -> str:
+    return stable_identifier(
+        "keyframe",
+        {
+            "asset_sha256": asset_sha256,
+            "timestamp_ms": item.frame.timestamp_ms,
+            "sha256": item.sha256,
+        },
+    )
+
+
+def _has_valid_result_state(result: ExactFrameSampleResult) -> bool:
+    if result.status == "SUCCEEDED":
+        return (result.candidate is not None) == (result.artifact_status == "PUBLISHED") and (
+            result.candidate is None
+        ) == (result.artifact_status == "BUDGET_REJECTED")
+    return (
+        result.status in _NO_ARTIFACT_SAMPLE_STATUSES
+        and result.candidate is None
+        and result.artifact_status is None
     )
 
 
