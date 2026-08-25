@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import platform
 import threading
 import time
 from collections.abc import Callable
@@ -776,6 +778,43 @@ def test_published_budget_removes_complete_observation_and_degrades_only_its_cha
     assert not (run_root / "visual/keyframes").exists()
 
 
+def test_macos_publish_budget_counts_staging_and_formal_clone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from video_demo.visual import keyframe_artifacts
+
+    run_root, chapter, frame_batch, speech, payload = _fixture(tmp_path)
+    monkeypatch.setattr(keyframe_artifacts.platform, "system", lambda: "Darwin")
+    service = ChapterVisionService(
+        _VisionPort(_response()),
+        _identity(),
+        runtime_root=tmp_path,
+        concurrency=1,
+        max_image_bytes=1024,
+        max_request_image_bytes=4096,
+        max_encoded_request_bytes=64 * 1024,
+        max_published_keyframe_bytes=len(payload),
+        max_published_keyframe_files=1,
+        invocation_wait_timeout_seconds=2,
+        candidate_lock_timeout_seconds=2,
+    )
+
+    result = service.analyze_all(
+        (chapter,),
+        frame_batch,
+        (speech,),
+        DocumentGenerationConfig(),
+        cache=_cache(run_root),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert result.observations == result.keyframe_evidence == result.evidence == ()
+    assert result.chapter_status == ((chapter.chapter_id, "DEGRADED"),)
+    assert result.warnings == (f"VISUAL_PUBLISHED_BUDGET_DEGRADED:{chapter.chapter_id}",)
+    assert not (run_root / "visual/keyframes").exists()
+
+
 def test_keyframe_snapshot_rejects_dangling_directory_symlink(tmp_path: Path) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
     keyframes = run_root / "visual/keyframes"
@@ -794,7 +833,7 @@ def test_keyframe_snapshot_rejects_dangling_directory_symlink(tmp_path: Path) ->
     assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
 
 
-def test_publish_rolls_back_files_created_by_current_batch_on_later_failure(
+def test_publish_keeps_verified_file_from_current_batch_on_later_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -855,10 +894,21 @@ def test_publish_rolls_back_files_created_by_current_batch_on_later_failure(
         )
 
     assert payload != second_payload
-    assert tuple((run_root / "visual/keyframes").iterdir()) == ()
+    first_leaf = run_root / "visual/keyframes" / f"{first.sha256}.jpg"
+    assert first_leaf.read_bytes() == payload
+    expected = {first.sha256: len(payload)}
+    if platform.system() == "Darwin":
+        staging = next((run_root / "visual/.keyframe-staging").iterdir())
+        expected[f"pending:{staging.name}"] = len(payload)
+    with keyframe_artifacts.KeyframeArtifactSession(
+        run_root,
+        max_files=10,
+        max_bytes=10_000,
+    ) as session:
+        assert session.snapshot() == expected
 
 
-def test_private_jpeg_partial_write_failure_removes_owned_inode(
+def test_private_jpeg_partial_write_failure_only_leaves_budgeted_staging_residue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -867,26 +917,66 @@ def test_private_jpeg_partial_write_failure_removes_owned_inode(
     run_root, _chapter, frame_batch, _speech, _payload = _fixture(tmp_path)
     frame = frame_batch.frame_sets[0].candidates[0]
     (run_root / "visual").chmod(0o700)
+    real_open = keyframe_artifacts.os.open
     real_write = keyframe_artifacts.os.write
+    created_descriptor = -1
     calls = 0
+
+    def remember_exclusive_leaf(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal created_descriptor
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        temporary_flag = getattr(os, "O_TMPFILE", 0)
+        if (
+            flags & os.O_EXCL and os.fspath(path).endswith(".pending")
+        ) or (temporary_flag and flags & temporary_flag == temporary_flag):
+            created_descriptor = descriptor
+        return descriptor
 
     def fail_after_first_byte(descriptor: int, payload: bytes | memoryview) -> int:
         nonlocal calls
+        if descriptor != created_descriptor:
+            return real_write(descriptor, payload)
         calls += 1
         if calls == 1:
             return real_write(descriptor, bytes(payload[:1]))
         raise OSError("模拟写入中途失败")
 
+    monkeypatch.setattr(keyframe_artifacts.os, "open", remember_exclusive_leaf)
     monkeypatch.setattr(keyframe_artifacts.os, "write", fail_after_first_byte)
 
+    with (
+        keyframe_artifacts.KeyframeArtifactSession(
+            run_root,
+            max_files=10,
+            max_bytes=10_000,
+        ) as session,
+        pytest.raises(VideoDemoError) as raised,
+    ):
+        session._open_keyframe_directory(create=True)
+        session._open_staging_directory(create=True)
+        session._write_private_jpeg(f"{frame.sha256}.jpg", _payload)
+
+    assert calls == 2, str(raised.value)
+    assert raised.value.code == ErrorCode.VISUAL_RESULT_INVALID
+    assert tuple((run_root / "visual/keyframes").iterdir()) == ()
+    staging = tuple((run_root / "visual/.keyframe-staging").iterdir())
+    assert len(staging) == (1 if platform.system() == "Darwin" else 0)
+    if staging:
+        assert staging[0].read_bytes() == b"\xff"
     with keyframe_artifacts.KeyframeArtifactSession(
         run_root,
         max_files=10,
         max_bytes=10_000,
-    ) as session, pytest.raises(VideoDemoError):
-        session.publish((frame,), session.snapshot())
-
-    assert tuple((run_root / "visual/keyframes").iterdir()) == ()
+    ) as session:
+        existing = session.snapshot()
+    assert len(existing) == len(staging)
+    assert sum(existing.values()) == len(staging)
 
 
 class _ConcurrentVisionPort(_VisionPort):
@@ -1062,7 +1152,7 @@ def test_cancellation_returns_after_finite_wait_but_keeps_lease_until_port_finis
         ) -> ChapterVisionResponse:
             del request, allowed_run_root, on_provider_attempt
             started.set()
-            assert release.wait(timeout=3)
+            release.wait()
             return ChapterVisionResponse(observations=())
 
     service = _service(
@@ -1109,3 +1199,62 @@ def test_cancellation_returns_after_finite_wait_but_keeps_lease_until_port_finis
     finally:
         release.set()
         executor.shutdown(wait=True)
+
+
+def test_cleanup_handoff_start_failure_happens_before_port_and_returns_promptly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
+    port_started = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+    real_thread_start = threading.Thread.start
+
+    class StuckPort(_VisionPort):
+        def analyze_chapter(
+            self,
+            request: ChapterVisionRequest,
+            *,
+            allowed_run_root: Path,
+            on_provider_attempt: Callable[[], None] | None = None,
+        ) -> ChapterVisionResponse:
+            del request, allowed_run_root, on_provider_attempt
+            port_started.set()
+            assert release.wait(timeout=2)
+            return ChapterVisionResponse(observations=())
+
+    def fail_cleanup_handoff_start(thread: threading.Thread) -> None:
+        if thread.name == "chapter-vision-deferred-cleanup":
+            raise RuntimeError("模拟收尾交接线程启动失败")
+        real_thread_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_cleanup_handoff_start)
+    service = _service(
+        tmp_path,
+        StuckPort(ChapterVisionResponse(observations=())),
+        invocation_wait_timeout_seconds=0.05,
+    )
+    release_timer = threading.Timer(0.8, release.set)
+    release_timer.start()
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(
+            service.analyze_all,
+            (chapter,),
+            frame_batch,
+            (speech,),
+            DocumentGenerationConfig(),
+            cache=_cache(run_root),
+            is_cancel_requested=cancelled.is_set,
+        )
+        port_started.wait(timeout=0.1)
+        cancelled.set()
+        with pytest.raises(RuntimeError, match="收尾交接线程启动失败"):
+            future.result(timeout=0.5)
+    finally:
+        release.set()
+        release_timer.cancel()
+        executor.shutdown(wait=True)
+
+    assert not port_started.is_set()

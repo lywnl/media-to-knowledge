@@ -190,6 +190,52 @@ class _DeferredExecutorCleanup(Exception):
         self.executor = executor
 
 
+class _DeferredCleanupHandoff:
+    """在外部调用前启动，确保取消时只移交收尾资源。"""
+
+    def __init__(self) -> None:
+        self._ready = threading.Event()
+        self._dispatched = threading.Event()
+        self._resources: tuple[ThreadPoolExecutor, CandidateDirectoryLease] | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="chapter-vision-deferred-cleanup",
+            daemon=True,
+        )
+
+    def start(self, timeout_seconds: float) -> None:
+        self._thread.start()
+        if self._ready.wait(timeout=timeout_seconds):
+            return
+        self._dispatched.set()
+        raise VideoDemoError(
+            ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
+            "章节视觉收尾资源启动超时",
+        )
+
+    def defer(
+        self,
+        executor: ThreadPoolExecutor,
+        lease: CandidateDirectoryLease,
+    ) -> None:
+        self._resources = (executor, lease)
+        self._dispatched.set()
+
+    def close(self) -> None:
+        self._dispatched.set()
+
+    def _run(self) -> None:
+        self._ready.set()
+        self._dispatched.wait()
+        if self._resources is None:
+            return
+        executor, lease = self._resources
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            lease.close()
+
+
 class ChapterVisionService:
     """把章节候选帧收敛为可追溯的视觉观察和已晋升关键帧。"""
 
@@ -265,12 +311,14 @@ class ChapterVisionService:
         )
         lease.acquire()
         lease_transferred = False
+        cleanup_handoff = _DeferredCleanupHandoff()
         try:
             _revalidate_candidate_closure(
                 frame_batch.allowed_run_root,
                 frame_sets.values(),
                 max_bytes=_MAX_CANDIDATE_ARTIFACT_BYTES,
             )
+            cleanup_handoff.start(self._invocation_wait_timeout_seconds)
             analyses = self._analyze_chapters(
                 chapters,
                 frame_sets,
@@ -288,11 +336,12 @@ class ChapterVisionService:
                 frame_tolerance_ms=frame_batch.frame_tolerance_ms,
             )
         except _DeferredExecutorCleanup as deferred:
+            cleanup_handoff.defer(deferred.executor, lease)
             lease_transferred = True
-            _start_deferred_cleanup(deferred.executor, lease)
             raise deferred.error.with_traceback(deferred.error.__traceback__) from None
         finally:
             if not lease_transferred:
+                cleanup_handoff.close()
                 lease.close()
 
     def _analyze_chapters(
@@ -615,6 +664,7 @@ class ChapterVisionService:
                 existing,
                 max_files=self._max_published_keyframe_files,
                 max_bytes=self._max_published_keyframe_bytes,
+                new_artifact_multiplier=artifacts.new_artifact_budget_multiplier,
             )
             frames = _unique_frames(retained)
             batch = _materialize_batch(
@@ -1004,10 +1054,17 @@ def _apply_published_budget(
     *,
     max_files: int,
     max_bytes: int,
+    new_artifact_multiplier: int,
 ) -> tuple[tuple[_MaterializedObservation, ...], tuple[str, ...]]:
     retained = list(observations)
     removed_chapters: list[str] = []
-    while not _published_closure_fits(retained, existing, max_files=max_files, max_bytes=max_bytes):
+    while not _published_closure_fits(
+        retained,
+        existing,
+        max_files=max_files,
+        max_bytes=max_bytes,
+        new_artifact_multiplier=new_artifact_multiplier,
+    ):
         if not retained:
             raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "既有关键帧超过运行时预算")
         removed = min(retained, key=_observation_value)
@@ -1023,6 +1080,7 @@ def _published_closure_fits(
     *,
     max_files: int,
     max_bytes: int,
+    new_artifact_multiplier: int,
 ) -> bool:
     new = {
         frame.sha256: frame.size_bytes
@@ -1030,9 +1088,10 @@ def _published_closure_fits(
         for frame in observation.frames
         if frame.sha256 not in existing
     }
-    return len(existing) + len(new) <= max_files and sum(existing.values()) + sum(
-        new.values()
-    ) <= max_bytes
+    return (
+        len(existing) + len(new) * new_artifact_multiplier <= max_files
+        and sum(existing.values()) + sum(new.values()) * new_artifact_multiplier <= max_bytes
+    )
 
 
 def _observation_value(item: _MaterializedObservation) -> tuple[int, int, float, str]:
@@ -1253,29 +1312,6 @@ def _merge_metrics(
 
 def _zero_metrics() -> dict[str, int]:
     return {name: 0 for name in _METRIC_NAMES}
-
-
-def _start_deferred_cleanup(
-    executor: ThreadPoolExecutor,
-    lease: CandidateDirectoryLease,
-) -> None:
-    def cleanup() -> None:
-        try:
-            executor.shutdown(wait=True, cancel_futures=True)
-        finally:
-            lease.close()
-
-    thread = threading.Thread(
-        target=cleanup,
-        name="chapter-vision-deferred-cleanup",
-        daemon=True,
-    )
-    try:
-        thread.start()
-    except BaseException:
-        executor.shutdown(wait=True, cancel_futures=True)
-        lease.close()
-        raise
 
 
 def _raise_if_cancelled(is_cancel_requested: Callable[[], bool]) -> None:

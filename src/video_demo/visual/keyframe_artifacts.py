@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import os
+import platform
+import secrets
 import stat
 from collections.abc import Mapping
 from pathlib import Path
@@ -14,6 +18,7 @@ from video_demo.storage.workspace import reject_symlink_components
 from video_demo.visual.candidate_artifacts import read_verified_candidate_jpeg
 
 _READ_CHUNK_BYTES = 1024 * 1024
+_PENDING_SUFFIX = ".pending"
 
 
 class KeyframeArtifactSession:
@@ -28,12 +33,15 @@ class KeyframeArtifactSession:
         self._run_root = lexical_root.resolve(strict=True)
         self._visual_root = self._run_root / "visual"
         self._keyframe_path = self._visual_root / "keyframes"
+        self._staging_path = self._visual_root / ".keyframe-staging"
         self._max_files = max_files
         self._max_bytes = max_bytes
         self._visual_descriptor = -1
         self._visual_identity: tuple[int, int] | None = None
         self._keyframe_descriptor = -1
         self._keyframe_identity: tuple[int, int] | None = None
+        self._staging_descriptor = -1
+        self._staging_identity: tuple[int, int] | None = None
 
     def __enter__(self) -> Self:
         self._open_visual_directory()
@@ -49,6 +57,10 @@ class KeyframeArtifactSession:
         self.close()
 
     def close(self) -> None:
+        if self._staging_descriptor >= 0:
+            os.close(self._staging_descriptor)
+            self._staging_descriptor = -1
+            self._staging_identity = None
         if self._keyframe_descriptor >= 0:
             os.close(self._keyframe_descriptor)
             self._keyframe_descriptor = -1
@@ -58,31 +70,59 @@ class KeyframeArtifactSession:
             self._visual_descriptor = -1
             self._visual_identity = None
 
+    @property
+    def new_artifact_budget_multiplier(self) -> int:
+        """返回当前平台成功发布一个新关键帧占用的目录项和字节倍率。"""
+        return 2 if platform.system() == "Darwin" else 1
+
     def snapshot(self) -> dict[str, int]:
-        if not self._open_keyframe_directory(create=False):
-            return {}
-        self._require_bound_keyframe_directory("关键帧目录在快照前发生变化")
         existing: dict[str, int] = {}
         total_bytes = 0
+        count = 0
         try:
-            with os.scandir(self._keyframe_descriptor) as entries:
-                for count, entry in enumerate(entries, start=1):
-                    if count > self._max_files:
-                        raise VideoDemoError(
-                            ErrorCode.INPUT_BUDGET_EXCEEDED,
-                            "关键帧目录文件数超限",
+            if self._open_keyframe_directory(create=False):
+                self._require_bound_keyframe_directory("关键帧目录在快照前发生变化")
+                with os.scandir(self._keyframe_descriptor) as entries:
+                    for entry in entries:
+                        count += 1
+                        _require_file_budget(count, total_bytes, self._max_files, self._max_bytes)
+                        name = entry.name
+                        if not _is_keyframe_name(name):
+                            raise OSError
+                        payload = self._read_private_jpeg(name, name[:-4], self._max_bytes)
+                        existing[name[:-4]] = len(payload)
+                        total_bytes += len(payload)
+                        _require_file_budget(
+                            count,
+                            total_bytes,
+                            self._max_files,
+                            self._max_bytes,
                         )
-                    name = entry.name
-                    if not _is_keyframe_name(name):
-                        raise OSError
-                    payload = self._read_private_jpeg(name, name[:-4], self._max_bytes)
-                    existing[name[:-4]] = len(payload)
-                    total_bytes += len(payload)
-                    if total_bytes > self._max_bytes:
-                        raise VideoDemoError(
-                            ErrorCode.INPUT_BUDGET_EXCEEDED,
-                            "既有关键帧超过字节预算",
+                self._require_bound_keyframe_directory("关键帧目录在快照后发生变化")
+            if self._open_staging_directory(create=False):
+                self._require_bound_staging_directory("关键帧暂存目录在快照前发生变化")
+                with os.scandir(self._staging_descriptor) as entries:
+                    for entry in entries:
+                        count += 1
+                        _require_file_budget(
+                            count,
+                            total_bytes,
+                            self._max_files,
+                            self._max_bytes,
                         )
+                        name = entry.name
+                        if not _is_pending_name(name):
+                            raise OSError
+                        size = self._staging_file_size(name)
+                        total_bytes += size
+                        _require_file_budget(
+                            count,
+                            total_bytes,
+                            self._max_files,
+                            self._max_bytes,
+                        )
+                        existing[f"pending:{name}"] = size
+                self._require_bound_staging_directory("关键帧暂存目录在快照后发生变化")
         except VideoDemoError:
             raise
         except OSError:
@@ -90,7 +130,6 @@ class KeyframeArtifactSession:
                 ErrorCode.ARTIFACT_SCHEMA_INVALID,
                 "关键帧目录快照非法",
             ) from None
-        self._require_bound_keyframe_directory("关键帧目录在快照后发生变化")
         return existing
 
     def publish(
@@ -101,35 +140,30 @@ class KeyframeArtifactSession:
         if not frames:
             return
         self._open_keyframe_directory(create=True)
+        self._open_staging_directory(create=True)
         self._require_bound_keyframe_directory("关键帧目录在发布前发生变化")
-        created: list[tuple[str, tuple[int, int, int]]] = []
         published_sha = set(existing)
-        try:
-            for frame in frames:
-                name = f"{frame.sha256}.jpg"
-                if frame.sha256 in existing:
-                    if existing[frame.sha256] != frame.size_bytes:
-                        raise VideoDemoError(
-                            ErrorCode.ARTIFACT_SCHEMA_INVALID,
-                            "既有关键帧大小与候选元数据不一致",
-                        )
-                    self._read_private_jpeg(name, frame.sha256, frame.size_bytes)
-                    continue
-                if frame.sha256 in published_sha:
-                    self._read_private_jpeg(name, frame.sha256, frame.size_bytes)
-                    continue
-                payload = read_verified_candidate_jpeg(
-                    self._run_root,
-                    frame,
-                    max_bytes=frame.size_bytes,
-                )
-                identity = self._write_private_jpeg(name, payload)
-                created.append((name, identity))
-                published_sha.add(frame.sha256)
-            self._require_bound_keyframe_directory("关键帧目录在发布后发生变化")
-        except BaseException:
-            self._rollback_created(created)
-            raise
+        for frame in frames:
+            name = f"{frame.sha256}.jpg"
+            if frame.sha256 in existing:
+                if existing[frame.sha256] != frame.size_bytes:
+                    raise VideoDemoError(
+                        ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                        "既有关键帧大小与候选元数据不一致",
+                    )
+                self._read_private_jpeg(name, frame.sha256, frame.size_bytes)
+                continue
+            if frame.sha256 in published_sha:
+                self._read_private_jpeg(name, frame.sha256, frame.size_bytes)
+                continue
+            payload = read_verified_candidate_jpeg(
+                self._run_root,
+                frame,
+                max_bytes=frame.size_bytes,
+            )
+            self._write_private_jpeg(name, payload)
+            published_sha.add(frame.sha256)
+        self._require_bound_keyframe_directory("关键帧目录在发布后发生变化")
 
     def _open_visual_directory(self) -> None:
         if self._visual_descriptor >= 0:
@@ -173,6 +207,12 @@ class KeyframeArtifactSession:
                 return False
             try:
                 os.mkdir("keyframes", 0o700, dir_fd=self._visual_descriptor)
+                os.chmod(
+                    "keyframes",
+                    0o700,
+                    dir_fd=self._visual_descriptor,
+                    follow_symlinks=False,
+                )
                 os.fsync(self._visual_descriptor)
                 before = os.stat(
                     "keyframes",
@@ -245,6 +285,111 @@ class KeyframeArtifactSession:
         ):
             raise OSError
 
+    def _open_staging_directory(self, *, create: bool) -> bool:
+        if self._staging_descriptor >= 0:
+            self._require_bound_staging_directory("关键帧暂存目录发生变化")
+            return True
+        return self._open_private_child_directory(
+            ".keyframe-staging",
+            create=create,
+        )
+
+    def _open_private_child_directory(self, name: str, *, create: bool) -> bool:
+        assert self._visual_descriptor >= 0
+        try:
+            before = os.stat(name, dir_fd=self._visual_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            if not create:
+                return False
+            try:
+                os.mkdir(name, 0o700, dir_fd=self._visual_descriptor)
+                os.chmod(
+                    name,
+                    0o700,
+                    dir_fd=self._visual_descriptor,
+                    follow_symlinks=False,
+                )
+                os.fsync(self._visual_descriptor)
+                before = os.stat(name, dir_fd=self._visual_descriptor, follow_symlinks=False)
+            except (FileExistsError, OSError):
+                raise VideoDemoError(
+                    ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                    "关键帧暂存目录非法",
+                ) from None
+        except OSError:
+            raise VideoDemoError(
+                ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                "关键帧暂存目录非法",
+            ) from None
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _no_follow(),
+                dir_fd=self._visual_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            if (
+                not _is_private_directory(opened)
+                or _directory_identity(before) != _directory_identity(opened)
+            ):
+                raise OSError
+            self._staging_descriptor = descriptor
+            self._staging_identity = _directory_identity(opened)
+            self._require_bound_staging_directory("关键帧暂存目录在打开时发生变化")
+            return True
+        except (OSError, VideoDemoError):
+            if descriptor >= 0:
+                os.close(descriptor)
+            self._staging_descriptor = -1
+            self._staging_identity = None
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "关键帧暂存目录非法") from None
+
+    def _require_bound_staging_directory(self, message: str) -> None:
+        assert self._staging_descriptor >= 0
+        assert self._staging_identity is not None
+        try:
+            self._require_bound_visual_directory()
+            opened = os.fstat(self._staging_descriptor)
+            through_parent = os.stat(
+                ".keyframe-staging",
+                dir_fd=self._visual_descriptor,
+                follow_symlinks=False,
+            )
+            through_path = os.lstat(self._staging_path)
+            expected = self._staging_identity
+            if (
+                not _is_private_directory(opened)
+                or _directory_identity(opened) != expected
+                or _directory_identity(through_parent) != expected
+                or _directory_identity(through_path) != expected
+            ):
+                raise OSError
+        except OSError:
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, message) from None
+
+    def _staging_file_size(self, name: str) -> int:
+        descriptor = -1
+        try:
+            before = os.stat(name, dir_fd=self._staging_descriptor, follow_symlinks=False)
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | _no_follow(),
+                dir_fd=self._staging_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            current = os.stat(name, dir_fd=self._staging_descriptor, follow_symlinks=False)
+            if (
+                not _is_private_regular_file(opened)
+                or _file_identity(before) != _file_identity(opened)
+                or _file_identity(opened) != _file_identity(current)
+            ):
+                raise OSError
+            return opened.st_size
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
     def _read_private_jpeg(self, name: str, digest: str, max_bytes: int) -> bytes:
         descriptor = -1
         try:
@@ -283,33 +428,60 @@ class KeyframeArtifactSession:
 
     def _write_private_jpeg(self, name: str, payload: bytes) -> tuple[int, int, int]:
         assert self._keyframe_descriptor >= 0
+        assert self._staging_descriptor >= 0
         self._require_bound_keyframe_directory("关键帧目录在创建前发生变化")
+        self._require_bound_staging_directory("关键帧暂存目录在创建前发生变化")
+        temporary_name = f"{secrets.token_hex(16)}{_PENDING_SUFFIX}"
         descriptor = -1
         identity: tuple[int, int, int] | None = None
-        created_by_call = False
         try:
-            descriptor = os.open(
-                name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | _no_follow(),
-                0o600,
-                dir_fd=self._keyframe_descriptor,
+            descriptor = _open_publish_source(
+                self._staging_descriptor,
+                temporary_name,
             )
-            created_by_call = True
-            os.fchmod(descriptor, 0o600)
             created = os.fstat(descriptor)
-            if not _is_private_regular_file(created):
+            identity = _owned_identity(created)
+            os.fchmod(descriptor, 0o600)
+            secured = os.fstat(descriptor)
+            identity = _owned_identity(secured)
+            if not _is_private_publish_source(secured):
                 raise OSError
-            identity = (created.st_dev, created.st_ino, created.st_size)
             _write_all(descriptor, payload)
             os.fsync(descriptor)
             status = os.fstat(descriptor)
-            identity = (status.st_dev, status.st_ino, status.st_size)
-            if not _is_private_regular_file(status) or status.st_size != len(payload):
+            identity = _owned_identity(status)
+            if not _is_private_publish_source(status) or status.st_size != len(payload):
                 raise OSError
-            os.close(descriptor)
-            descriptor = -1
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            verified_staging = _read_bounded(descriptor, len(payload))
+            if (
+                verified_staging != payload
+                or not _is_jpeg(verified_staging)
+                or hashlib.sha256(verified_staging).hexdigest() != name[:-4]
+            ):
+                raise OSError
+            _publish_verified_fd(
+                descriptor,
+                self._keyframe_descriptor,
+                name,
+            )
+            os.fsync(self._staging_descriptor)
+            os.fsync(self._keyframe_descriptor)
             current = os.stat(name, dir_fd=self._keyframe_descriptor, follow_symlinks=False)
-            if _owned_identity(current) != identity or not _is_private_regular_file(current):
+            source_after = os.fstat(descriptor)
+            if (
+                _owned_identity(source_after) != identity
+                or not _is_private_publish_source(source_after)
+                or not _is_private_regular_file(current)
+                or (
+                    platform.system() == "Darwin"
+                    and _file_identity(source_after) == _file_identity(current)
+                )
+                or (
+                    platform.system() == "Linux"
+                    and _file_identity(source_after) != _file_identity(current)
+                )
+            ):
                 raise OSError
             self._require_bound_keyframe_directory("关键帧目录在创建后发生变化")
             os.fsync(self._keyframe_descriptor)
@@ -327,49 +499,12 @@ class KeyframeArtifactSession:
                 "关键帧发布发生同名竞争",
             ) from None
         except VideoDemoError:
-            if created_by_call:
-                self._unlink_owned_name(name, None)
             raise
         except OSError:
-            if created_by_call:
-                self._unlink_owned_name(name, None)
             raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "关键帧安全复制失败") from None
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
-
-    def _unlink_owned_name(
-        self,
-        name: str,
-        identity: tuple[int, int, int] | None,
-    ) -> None:
-        assert self._keyframe_descriptor >= 0
-        try:
-            current = os.stat(name, dir_fd=self._keyframe_descriptor, follow_symlinks=False)
-            if identity is not None and (
-                not _is_private_regular_file(current) or _owned_identity(current) != identity
-            ):
-                return
-            os.unlink(name, dir_fd=self._keyframe_descriptor)
-            os.fsync(self._keyframe_descriptor)
-        except FileNotFoundError:
-            return
-        except OSError:
-            raise VideoDemoError(
-                ErrorCode.VISUAL_RESULT_INVALID,
-                "失败的关键帧发布无法安全回滚",
-            ) from None
-
-    def _rollback_created(self, created: list[tuple[str, tuple[int, int, int]]]) -> None:
-        rollback_error: VideoDemoError | None = None
-        for name, identity in reversed(created):
-            try:
-                self._unlink_owned_name(name, identity)
-            except VideoDemoError as error:
-                rollback_error = error
-        if rollback_error is not None:
-            raise rollback_error
-
 
 def _read_bounded(descriptor: int, max_bytes: int) -> bytes:
     chunks: list[bytes] = []
@@ -391,6 +526,122 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         view = view[written:]
 
 
+def _open_publish_source(
+    staging_directory: int,
+    temporary_name: str,
+) -> int:
+    system = platform.system()
+    if system == "Darwin":
+        return os.open(
+            temporary_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | _no_follow(),
+            0o600,
+            dir_fd=staging_directory,
+        )
+    if system == "Linux":
+        temporary_flag = getattr(os, "O_TMPFILE", 0)
+        if temporary_flag == 0:
+            raise VideoDemoError(
+                ErrorCode.INVALID_CONFIGURATION,
+                "当前平台不支持匿名关键帧暂存文件",
+            )
+        try:
+            return os.open(
+                ".",
+                os.O_RDWR | temporary_flag,
+                0o600,
+                dir_fd=staging_directory,
+            )
+        except OSError as error:
+            if error.errno in {
+                errno.EINVAL,
+                errno.EISDIR,
+                errno.ENOENT,
+                errno.ENOSYS,
+                errno.ENOTSUP,
+                errno.EOPNOTSUPP,
+            }:
+                raise VideoDemoError(
+                    ErrorCode.INVALID_CONFIGURATION,
+                    "当前文件系统不支持匿名关键帧暂存文件",
+                ) from None
+            raise
+    raise VideoDemoError(
+        ErrorCode.INVALID_CONFIGURATION,
+        "当前平台不支持安全关键帧暂存",
+    )
+
+
+def _publish_verified_fd(
+    source_descriptor: int,
+    target_directory: int,
+    target_name: str,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    target = os.fsencode(target_name)
+    system = platform.system()
+    if system == "Darwin" and hasattr(libc, "fclonefileat"):
+        operation = libc.fclonefileat
+        operation.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+        ]
+        operation.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = operation(source_descriptor, target_directory, target, 0)
+        error_number = ctypes.get_errno() if result != 0 else 0
+    elif system == "Linux" and hasattr(libc, "linkat"):
+        operation = libc.linkat
+        operation.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        operation.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = operation(source_descriptor, b"", target_directory, target, 0x00001000)
+        error_number = ctypes.get_errno() if result != 0 else 0
+        if result != 0 and error_number in {errno.ENOENT, errno.EPERM}:
+            source = os.fsencode(f"/proc/self/fd/{source_descriptor}")
+            ctypes.set_errno(0)
+            result = operation(-100, source, target_directory, target, 0x00000400)
+            error_number = ctypes.get_errno() if result != 0 else 0
+    else:
+        raise VideoDemoError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "当前平台不支持原子排他关键帧发布",
+        )
+    if result == 0:
+        return
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number), target_name)
+    if error_number in {
+        errno.EINVAL,
+        errno.ENOENT,
+        errno.ENOSYS,
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+        errno.EXDEV,
+    }:
+        raise VideoDemoError(
+            ErrorCode.INVALID_CONFIGURATION,
+            "当前文件系统不支持原子排他关键帧发布",
+        )
+    raise OSError(error_number, os.strerror(error_number), target_name)
+
+
+def _require_file_budget(count: int, total_bytes: int, max_files: int, max_bytes: int) -> None:
+    if count > max_files or total_bytes > max_bytes:
+        raise VideoDemoError(
+            ErrorCode.INPUT_BUDGET_EXCEEDED,
+            "关键帧与暂存制品超过运行时预算",
+        )
+
+
 def _is_private_directory(value: os.stat_result) -> bool:
     return stat.S_ISDIR(value.st_mode) and stat.S_IMODE(value.st_mode) == 0o700
 
@@ -400,6 +651,14 @@ def _is_private_regular_file(value: os.stat_result) -> bool:
         stat.S_ISREG(value.st_mode)
         and stat.S_IMODE(value.st_mode) == 0o600
         and value.st_nlink == 1
+    )
+
+
+def _is_private_publish_source(value: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(value.st_mode)
+        and stat.S_IMODE(value.st_mode) == 0o600
+        and value.st_nlink in {0, 1}
     )
 
 
@@ -417,6 +676,13 @@ def _owned_identity(value: os.stat_result) -> tuple[int, int, int]:
 
 def _is_keyframe_name(value: str) -> bool:
     return len(value) == 68 and value.endswith(".jpg") and _is_sha256(value[:-4])
+
+
+def _is_pending_name(value: str) -> bool:
+    token = value.removesuffix(_PENDING_SUFFIX)
+    return value.endswith(_PENDING_SUFFIX) and len(token) == 32 and all(
+        character in "0123456789abcdef" for character in token
+    )
 
 
 def _is_sha256(value: str) -> bool:
