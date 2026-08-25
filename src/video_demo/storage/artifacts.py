@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from video_demo.domain.base import FrozenModel, Sha256
 from video_demo.errors import ErrorCode, VideoDemoError
@@ -23,6 +25,22 @@ class ArtifactReceipt(FrozenModel):
     schema_version: str = Field(min_length=1, max_length=32)
     sha256: Sha256
     upstream_sha256: Sha256
+
+
+class ArtifactBytesReceipt(FrozenModel):
+    """可用于校验任意非空字节制品的最小回执。"""
+
+    relative_path: str = Field(min_length=1, max_length=1024)
+    sha256: Sha256
+    size_bytes: int = Field(gt=0)
+
+    @field_validator("relative_path")
+    @classmethod
+    def validate_relative_path(cls, value: str) -> str:
+        try:
+            return _validated_bytes_relative_path(Path(value)).as_posix()
+        except VideoDemoError:
+            raise ValueError("字节制品回执路径必须是安全相对路径") from None
 
 
 def canonical_artifact_envelope_bytes(
@@ -110,6 +128,162 @@ class AtomicArtifactStore:
             upstream_sha256=upstream_sha256,
         )
 
+    def write_bytes(
+        self,
+        relative_path: Path,
+        content: bytes,
+        *,
+        max_bytes: int,
+        file_mode: int = 0o600,
+        exclusive: bool = False,
+    ) -> ArtifactBytesReceipt:
+        """以私有权限原子发布非空字节，并返回内容摘要回执。"""
+
+        _require_positive_byte_limit(max_bytes)
+        if not 0 <= file_mode <= 0o777:
+            raise ValueError("文件权限模式非法")
+        if not content:
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "字节制品不能为空")
+        if len(content) > max_bytes:
+            raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "字节制品超过写入上限")
+
+        validated_path = _validated_bytes_relative_path(relative_path)
+        parent_descriptor = _open_private_directory_tree(
+            self.runtime_root,
+            validated_path.parent,
+            create=True,
+        )
+        temporary_name = f".{validated_path.name}.{uuid.uuid4().hex}.part"
+        descriptor: int | None = None
+        try:
+            _reject_symlink_leaf(parent_descriptor, validated_path.name)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _require_no_follow()
+            descriptor = os.open(temporary_name, flags, file_mode, dir_fd=parent_descriptor)
+            os.fchmod(descriptor, file_mode)
+            with os.fdopen(descriptor, "wb", closefd=False) as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.close(descriptor)
+            descriptor = None
+
+            if exclusive:
+                os.link(
+                    temporary_name,
+                    validated_path.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            else:
+                os.replace(
+                    temporary_name,
+                    validated_path.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
+            os.fsync(parent_descriptor)
+        except BaseException:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            raise
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_descriptor)
+
+        return ArtifactBytesReceipt(
+            relative_path=validated_path.as_posix(),
+            sha256=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
+        )
+
+    def read_verified_bytes(
+        self,
+        receipt: ArtifactBytesReceipt,
+        *,
+        max_bytes: int,
+    ) -> bytes:
+        """有界读取普通文件，并校验路径、身份、大小和内容摘要。"""
+
+        _require_positive_byte_limit(max_bytes)
+        validated_path = _validated_bytes_relative_path(Path(receipt.relative_path))
+        parent_descriptor = _open_private_directory_tree(
+            self.runtime_root,
+            validated_path.parent,
+            create=False,
+        )
+        try:
+            before = os.lstat(
+                validated_path.name,
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            os.close(parent_descriptor)
+            raise VideoDemoError(ErrorCode.ARTIFACT_NOT_FOUND, "字节制品不存在") from None
+        except OSError as error:
+            os.close(parent_descriptor)
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "字节制品文件非法") from error
+        if stat.S_ISLNK(before.st_mode):
+            os.close(parent_descriptor)
+            raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "字节制品路径包含符号链接")
+        if not stat.S_ISREG(before.st_mode):
+            os.close(parent_descriptor)
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "字节制品文件非法")
+
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                validated_path.name,
+                os.O_RDONLY | _require_no_follow(),
+                dir_fd=parent_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            _require_same_bytes_file(before, opened)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                remaining = max_bytes + 1 - total
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise VideoDemoError(
+                        ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                        "字节制品超过读取上限",
+                    )
+            after = os.fstat(descriptor)
+            _require_same_bytes_file(opened, after)
+            try:
+                current = os.lstat(
+                    validated_path.name,
+                    dir_fd=parent_descriptor,
+                )
+            except OSError as error:
+                raise VideoDemoError(
+                    ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                    "字节制品读取期间发生变化",
+                ) from error
+            _require_same_bytes_file(after, current)
+        except FileNotFoundError:
+            raise VideoDemoError(ErrorCode.ARTIFACT_NOT_FOUND, "字节制品不存在") from None
+        except OSError as error:
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "字节制品文件非法") from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_descriptor)
+
+        encoded = b"".join(chunks)
+        if len(encoded) != receipt.size_bytes:
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "字节制品大小与回执不一致")
+        if hashlib.sha256(encoded).hexdigest() != receipt.sha256:
+            raise VideoDemoError(ErrorCode.ARTIFACT_DIGEST_MISMATCH, "字节制品摘要不匹配")
+        return encoded
+
     def read_verified_json(self, receipt: ArtifactReceipt) -> dict[str, Any] | list[Any]:
         return self.read_verified_json_limited(receipt)
 
@@ -168,3 +342,123 @@ class AtomicArtifactStore:
             return False
         artifact.unlink()
         return True
+
+
+def _require_positive_byte_limit(max_bytes: int) -> None:
+    if max_bytes <= 0:
+        raise ValueError("字节制品大小上限必须大于 0")
+
+
+def _require_no_follow() -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(no_follow, int):
+        raise VideoDemoError(ErrorCode.INVALID_CONFIGURATION, "当前平台不支持安全制品读写")
+    return no_follow
+
+
+def _validated_bytes_relative_path(relative_path: Path) -> Path:
+    if (
+        "\x00" in str(relative_path)
+        or relative_path.is_absolute()
+        or relative_path == Path()
+        or ".." in relative_path.parts
+    ):
+        raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "字节制品路径非法")
+    return relative_path
+
+
+def _open_private_directory_tree(
+    runtime_root: Path,
+    relative_directory: Path,
+    *,
+    create: bool,
+) -> int:
+    runtime_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = _open_verified_directory(runtime_root)
+    next_descriptor: int | None = None
+    try:
+        os.fchmod(descriptor, 0o700)
+        for component in relative_directory.parts:
+            if create:
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | _require_directory_flag() | _require_no_follow(),
+                dir_fd=descriptor,
+            )
+            if not stat.S_ISDIR(os.fstat(next_descriptor).st_mode):
+                os.close(next_descriptor)
+                raise OSError
+            os.fchmod(next_descriptor, 0o700)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            next_descriptor = None
+        return descriptor
+    except FileNotFoundError:
+        if next_descriptor is not None:
+            os.close(next_descriptor)
+        os.close(descriptor)
+        raise VideoDemoError(ErrorCode.ARTIFACT_NOT_FOUND, "字节制品目录不存在") from None
+    except VideoDemoError:
+        if next_descriptor is not None:
+            os.close(next_descriptor)
+        os.close(descriptor)
+        raise
+    except OSError as error:
+        if next_descriptor is not None:
+            os.close(next_descriptor)
+        os.close(descriptor)
+        raise VideoDemoError(
+            ErrorCode.WORKSPACE_PATH_ESCAPE,
+            "字节制品路径不能包含符号链接",
+        ) from error
+
+
+def _open_verified_directory(directory: Path) -> int:
+    descriptor: int | None = None
+    try:
+        before = os.lstat(directory)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            raise OSError
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY | _require_directory_flag() | _require_no_follow(),
+        )
+        _require_same_bytes_file(before, os.fstat(descriptor))
+        return descriptor
+    except VideoDemoError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "字节制品目录非法") from error
+
+
+def _require_directory_flag() -> int:
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if not isinstance(directory_flag, int):
+        raise VideoDemoError(ErrorCode.INVALID_CONFIGURATION, "当前平台不支持安全制品目录")
+    return directory_flag
+
+
+def _reject_symlink_leaf(parent_descriptor: int, name: str) -> None:
+    try:
+        current = os.lstat(name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "字节制品目标非法") from error
+    if stat.S_ISLNK(current.st_mode):
+        raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "字节制品路径包含符号链接")
+
+
+def _require_same_bytes_file(before: os.stat_result, after: os.stat_result) -> None:
+    if _bytes_file_identity(before) != _bytes_file_identity(after):
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "字节制品读取期间发生变化")
+
+
+def _bytes_file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
