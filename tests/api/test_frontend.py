@@ -4,7 +4,10 @@ import re
 from pathlib import Path
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
 
 from video_demo.api.app import create_app
 from video_demo.config import Settings
@@ -49,6 +52,32 @@ def test_create_app_runs_migration_before_database_construction(
     with pytest.raises(VideoDemoError, match="停止于迁移"):
         app_module.create_app(Settings(workspace_root=tmp_path))
     assert events == ["迁移"]
+
+
+def test_create_app_upgrades_real_unversioned_0001_database(
+    tmp_path: Path,
+    cloud_asr_environment: None,
+) -> None:
+    settings = Settings(workspace_root=tmp_path)
+    assert settings.runtime_root is not None
+    settings.runtime_root.mkdir(parents=True)
+    database_url = f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}"
+    config = Config()
+    config.attributes["configure_logging"] = False
+    config.set_main_option("script_location", str(tmp_path / "migrations"))
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "0001_video_demo")
+    with create_engine(database_url).begin() as connection:
+        connection.execute(text("DROP TABLE alembic_version"))
+
+    app = create_app(settings)
+
+    with create_engine(database_url).connect() as connection:
+        assert (
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+            == "0002_document_artifact"
+        )
+    assert app.state.container.database is not None
 
 
 def test_frontend_page_exposes_local_video_file_workflow(client: TestClient) -> None:

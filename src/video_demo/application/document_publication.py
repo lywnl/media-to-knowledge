@@ -33,7 +33,12 @@ from video_demo.persistence.models import (
     VideoUnderstandingRunModel,
 )
 from video_demo.persistence.repositories import JobRepository, Scope, VideoRunRepository
-from video_demo.storage.artifacts import ArtifactBytesReceipt, ArtifactReceipt, AtomicArtifactStore
+from video_demo.storage.artifacts import (
+    ArtifactBytesReceipt,
+    ArtifactReceipt,
+    AtomicArtifactStore,
+    canonical_artifact_envelope_bytes,
+)
 
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 _MAX_BUNDLE_BYTES = 64 * 1024 * 1024
@@ -191,6 +196,7 @@ class DocumentPublicationService:
             run = VideoRunRepository(session).get(scope, run_id)
             if run is None:
                 raise VideoDemoError(ErrorCode.VIDEO_RUN_NOT_FOUND, "视频理解运行不存在")
+            asset_sha = self._asset_sha(session, scope, run.asset_id)
         candidates: list[ArtifactBytesReceipt] = []
         for name in self._store.list_regular_artifacts(root, max_entries=max_entries):
             relative_path = root / name
@@ -207,7 +213,7 @@ class DocumentPublicationService:
             if match.group(4) == "md":
                 expected_digest = match.group(2)
             else:
-                expected_digest = _bundle_payload_digest(encoded)
+                expected_digest = _validate_orphan_bundle(encoded, run_id, asset_sha)
                 if expected_digest != match.group(3):
                     _invalid("孤儿 bundle 文件名与 payload 摘要不一致")
             if match.group(4) == "md" and receipt.sha256 != expected_digest:
@@ -395,10 +401,30 @@ def _canonical_payload(payload: DocumentArtifactPayload) -> bytes:
     ).encode("utf-8")
 
 
-def _bundle_payload_digest(encoded: bytes) -> str:
+def _validate_orphan_bundle(encoded: bytes, run_id: str, asset_sha: str) -> str:
     try:
         envelope = json.loads(encoded)
+        if not isinstance(envelope, dict) or set(envelope) != {
+            "schema_version",
+            "upstream_sha256",
+            "payload",
+        }:
+            _invalid("孤儿 bundle envelope 非法")
+        if envelope["schema_version"] != "3.0.0" or envelope["upstream_sha256"] != asset_sha:
+            _invalid("孤儿 bundle envelope 版本或上游摘要非法")
         payload = envelope["payload"]
+        if not isinstance(payload, dict):
+            _invalid("孤儿 bundle payload 非法")
+        artifact = DocumentArtifactPayload.model_validate(payload)
+        validate_evidence_references(artifact.result, artifact.evidence)
+        if (
+            artifact.result.run_id != run_id
+            or artifact.result.asset_sha256 != asset_sha
+            or not _transcript_source_matches(artifact)
+        ):
+            _invalid("孤儿 bundle 不属于目标 Run 或 Asset")
+        if encoded != canonical_artifact_envelope_bytes(payload, "3.0.0", asset_sha):
+            _invalid("孤儿 bundle 不是规范 envelope")
         canonical = json.dumps(
             payload,
             ensure_ascii=False,
@@ -406,7 +432,14 @@ def _bundle_payload_digest(encoded: bytes) -> str:
             separators=(",", ":"),
             allow_nan=False,
         ).encode("utf-8")
-    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        ValidationError,
+    ) as error:
         raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "孤儿 bundle 非法") from error
     return hashlib.sha256(canonical).hexdigest()
 

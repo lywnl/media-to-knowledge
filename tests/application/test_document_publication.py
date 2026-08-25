@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -30,7 +31,7 @@ from video_demo.persistence.models import (
     VideoUnderstandingRunModel,
 )
 from video_demo.persistence.repositories import JobRepository, Scope, VideoRunRepository
-from video_demo.storage.artifacts import AtomicArtifactStore
+from video_demo.storage.artifacts import ArtifactBytesReceipt, ArtifactReceipt, AtomicArtifactStore
 
 
 def _digest(value: str) -> str:
@@ -180,6 +181,31 @@ def test_document_repository_round_trips_3_result(
         assert repository.get(scope, "run_001", "a" * 64) == _result()
 
 
+@pytest.mark.parametrize(
+    ("remaining", "expected"),
+    (
+        ("NONE", ErrorCode.VIDEO_RESULT_NOT_READY),
+        ("SUMMARY", ErrorCode.ARTIFACT_SCHEMA_INVALID),
+        ("SEGMENT", ErrorCode.ARTIFACT_SCHEMA_INVALID),
+    ),
+)
+def test_document_repository_distinguishes_empty_and_partial_rows(
+    publication: tuple[DocumentPublicationService, Database, Scope, ResultWriteFence, Path],
+    remaining: str,
+    expected: ErrorCode,
+) -> None:
+    _, database, scope, _, _ = publication
+    with database.session() as session:
+        DocumentResultRepository(session).replace(scope, _result())
+        if remaining in {"NONE", "SUMMARY"}:
+            session.query(VideoSegmentModel).delete()
+        if remaining in {"NONE", "SEGMENT"}:
+            session.query(VideoSummaryModel).delete()
+    with database.session() as session, pytest.raises(VideoDemoError) as raised:
+        DocumentResultRepository(session).get(scope, "run_001", "a" * 64)
+    assert raised.value.code == expected
+
+
 def test_document_repository_validates_before_deleting_existing_rows(
     publication: tuple[DocumentPublicationService, Database, Scope, ResultWriteFence, Path],
 ) -> None:
@@ -273,13 +299,26 @@ def test_two_real_publishers_compete_and_exactly_one_wins_transaction(
 ) -> None:
     service, database, scope, fence, runtime_root = publication
     barrier = threading.Barrier(2)
-    original = DocumentPublicationService._require_active_fence
+    original = DocumentPublicationService._commit
+    written: list[tuple[str, str]] = []
+    written_lock = threading.Lock()
 
-    def synchronize(self: DocumentPublicationService, candidate: ResultWriteFence) -> None:
-        original(self, candidate)
+    def synchronize(
+        self: DocumentPublicationService,
+        candidate_scope: Scope,
+        result: VideoUnderstandingResult,
+        candidate: ResultWriteFence,
+        status: str,
+        warnings: tuple[str, ...],
+        document: ArtifactBytesReceipt,
+        bundle: ArtifactReceipt,
+    ) -> None:
+        with written_lock:
+            written.append((bundle.relative_path, document.relative_path))
         barrier.wait(timeout=5)
+        original(self, candidate_scope, result, candidate, status, warnings, document, bundle)
 
-    monkeypatch.setattr(DocumentPublicationService, "_require_active_fence", synchronize)
+    monkeypatch.setattr(DocumentPublicationService, "_commit", synchronize)
 
     def attempt() -> ErrorCode | None:
         try:
@@ -294,12 +333,19 @@ def test_two_real_publishers_compete_and_exactly_one_wins_transaction(
     assert sorted(str(item) for item in outcomes) == sorted(
         (str(None), str(ErrorCode.JOB_LEASE_LOST))
     )
+    assert len(written) == 2
     assert service.get_document(scope, "run_001").startswith(b"# ")
     assert len(tuple((runtime_root / "runs").rglob("*.json"))) == 1
     assert len(tuple((runtime_root / "runs").rglob("*.md"))) == 1
     with database.session() as session:
+        run = session.query(VideoUnderstandingRunModel).one()
+        winning = (run.artifact_manifest_relative_path, run.document_relative_path)
         assert session.query(VideoSummaryModel).count() == 1
         assert session.query(VideoSegmentModel).count() == 1
+    assert winning in written
+    losing = next(pair for pair in written if pair != winning)
+    assert all((runtime_root / path).is_file() for path in winning if path is not None)
+    assert all(not (runtime_root / path).exists() for path in losing)
 
 
 def test_current_run_orphan_recovery_is_explicit_bounded_and_preserves_current_closure(
@@ -357,6 +403,60 @@ def test_current_run_orphan_recovery_fails_closed_on_unknown_or_excess_entries(
             max_entries=2,
         )
     assert bounded_error.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+
+
+@pytest.mark.parametrize("tamper", ["envelope", "schema", "upstream", "run", "asset", "evidence"])
+def test_current_run_orphan_recovery_rejects_invalid_or_cross_target_bundle(
+    publication: tuple[DocumentPublicationService, Database, Scope, ResultWriteFence, Path],
+    tamper: str,
+) -> None:
+    service, database, scope, fence, runtime_root = publication
+    _publish(service, scope, fence)
+    with database.session() as session:
+        run = session.query(VideoUnderstandingRunModel).one()
+        assert run.artifact_manifest_relative_path
+        bundle = runtime_root / run.artifact_manifest_relative_path
+    envelope = json.loads(bundle.read_bytes())
+    payload = envelope["payload"]
+    if tamper == "envelope":
+        envelope["unknown"] = True
+    elif tamper == "schema":
+        envelope["schema_version"] = "2.0.0"
+    elif tamper == "upstream":
+        envelope["upstream_sha256"] = "b" * 64
+    elif tamper == "run":
+        payload["result"]["run_id"] = "run_other"
+    elif tamper == "asset":
+        payload["result"]["asset_sha256"] = "b" * 64
+    else:
+        payload["result"]["chapters"][0]["evidence_refs"] = ["missing_evidence"]
+    payload_digest = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    orphan = bundle.with_name(f"bundle-{payload_digest}-{'b' * 32}.json")
+    orphan.write_bytes(
+        json.dumps(
+            envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        service.recover_current_run_orphans(
+            scope,
+            "run_001",
+            publishers_stopped=True,
+            max_entries=3,
+        )
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+    assert orphan.is_file()
 
 
 def test_published_attempt_accepts_worker_outer_idempotent_completion(

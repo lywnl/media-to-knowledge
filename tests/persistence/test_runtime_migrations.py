@@ -124,6 +124,47 @@ def test_runtime_migration_accepts_legacy_create_schema_equivalent_database(
     _assert_upgraded(database_url, "run-from-create-schema")
 
 
+def test_runtime_migration_rejects_unversioned_head_without_stamping(
+    workspace_runtime: tuple[Path, Path],
+) -> None:
+    workspace_root, runtime_root = workspace_runtime
+    database_url = f"sqlite+pysqlite:///{runtime_root / 'unversioned-head.db'}"
+    Database(database_url).create_schema()
+
+    with pytest.raises(VideoDemoError) as raised:
+        upgrade_runtime_database(workspace_root, runtime_root, database_url)
+
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+    assert "alembic_version" not in inspect(create_engine(database_url)).get_table_names()
+
+
+@pytest.mark.parametrize("object_type", ["VIEW", "TRIGGER"])
+def test_runtime_migration_rejects_unknown_view_or_trigger_without_stamping(
+    workspace_runtime: tuple[Path, Path],
+    object_type: str,
+) -> None:
+    workspace_root, runtime_root = workspace_runtime
+    database_url = f"sqlite+pysqlite:///{runtime_root / f'unknown-{object_type.lower()}.db'}"
+    command.upgrade(_alembic_config(workspace_root, database_url), "0001_video_demo")
+    with create_engine(database_url).begin() as connection:
+        connection.execute(text("DROP TABLE alembic_version"))
+        if object_type == "VIEW":
+            connection.execute(text("CREATE VIEW unknown_view AS SELECT id FROM video_object"))
+        else:
+            connection.execute(
+                text(
+                    "CREATE TRIGGER unknown_trigger AFTER INSERT ON video_object "
+                    "BEGIN UPDATE video_object SET status = NEW.status WHERE id = NEW.id; END"
+                )
+            )
+
+    with pytest.raises(VideoDemoError) as raised:
+        upgrade_runtime_database(workspace_root, runtime_root, database_url)
+
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+    assert "alembic_version" not in inspect(create_engine(database_url)).get_table_names()
+
+
 def test_runtime_migration_rejects_nonempty_unknown_schema(
     workspace_runtime: tuple[Path, Path],
 ) -> None:

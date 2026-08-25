@@ -7,7 +7,10 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from alembic import command
+from alembic.config import Config
 from pydantic import SecretStr
+from sqlalchemy import create_engine, text
 
 from video_demo.application.composition import (
     ProductionDiagnosticComponents,
@@ -57,6 +60,25 @@ from video_demo.speech.vad import SileroVadAdapter
 from video_demo.storage.object_store import LocalVideoObjectStore
 
 
+def _create_migrated_database(settings: Settings, revision: str = "head") -> None:
+    assert settings.runtime_root is not None
+    settings.runtime_root.mkdir(parents=True, exist_ok=True)
+    database_url = f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}"
+    config = Config()
+    config.attributes["configure_logging"] = False
+    config.set_main_option("script_location", str(settings.workspace_root / "migrations"))
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, revision)
+
+
+def _create_unversioned_0001(settings: Settings) -> None:
+    _create_migrated_database(settings, "0001_video_demo")
+    assert settings.runtime_root is not None
+    database_url = f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}"
+    with create_engine(database_url).begin() as connection:
+        connection.execute(text("DROP TABLE alembic_version"))
+
+
 @pytest.mark.parametrize(
     "builder",
     (
@@ -102,9 +124,8 @@ def test_production_worker_consumes_created_job_and_records_missing_ffprobe(
         ffmpeg_path=tmp_path / "missing-ffmpeg",
     )
     assert settings.runtime_root is not None
-    settings.runtime_root.mkdir(parents=True)
+    _create_migrated_database(settings)
     database = Database(f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}")
-    database.create_schema()
     object_store = LocalVideoObjectStore(settings.runtime_root, max_video_bytes=1024)
     scope = Scope("tenant-a", "app-a", "kb-a")
     uploaded = UploadService(database, object_store).upload(
@@ -122,6 +143,11 @@ def test_production_worker_consumes_created_job_and_records_missing_ffprobe(
 
     worker = build_worker(settings, worker_id="worker-production-test")
     try:
+        with database.engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0002_document_artifact"
+            )
         assert worker.run_once() is True
         with database.session() as session:
             job = JobRepository(session).get(scope, run.job_id)
@@ -606,9 +632,8 @@ def test_worker_starts_without_qwen_configuration_and_fails_at_first_clip(
 
     settings = Settings(workspace_root=tmp_path)
     assert settings.runtime_root is not None
-    settings.runtime_root.mkdir(parents=True)
+    _create_migrated_database(settings)
     database = Database(f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}")
-    database.create_schema()
     object_store = LocalVideoObjectStore(settings.runtime_root, max_video_bytes=1024)
     scope = Scope("tenant-a", "app-a", "kb-a")
     uploaded = UploadService(database, object_store).upload(
@@ -1151,6 +1176,36 @@ def test_build_worker_runs_migration_before_database_construction(
             worker_id="worker-order",
         )
     assert events == ["迁移"]
+
+
+def test_build_worker_upgrades_real_unversioned_0001_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cloud_asr_environment: None,
+) -> None:
+    import video_demo.application.composition as composition
+
+    settings = Settings(workspace_root=tmp_path)
+    _create_unversioned_0001(settings)
+
+    class Pipeline:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(composition, "build_production_pipeline", lambda *_args: Pipeline())
+    monkeypatch.setattr(composition, "PipelineJobHandler", lambda *_args: lambda _job: None)
+
+    worker = composition.build_worker(settings, worker_id="worker-real-migration")
+    try:
+        assert settings.runtime_root is not None
+        database_url = f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}"
+        with create_engine(database_url).connect() as connection:
+            assert (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                == "0002_document_artifact"
+            )
+    finally:
+        worker.close()
 
 
 def test_production_pipeline_builds_lightweight_dependencies_without_diagnostics(

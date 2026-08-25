@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
 
 from video_demo.config import Settings
-from video_demo.persistence.database import Database
 
 
 def pytest_configure() -> None:
@@ -43,7 +43,7 @@ def pytest_configure() -> None:
 
 
 @pytest.fixture
-def cloud_asr_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def cloud_asr_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """只供显式启动生产组合根的测试注入非真实凭据。"""
 
     monkeypatch.setenv("OPENAI_BASE_URL", "https://ai-proxy.example.test/v1")
@@ -52,15 +52,10 @@ def cloud_asr_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_ASR_TIMEOUT_SECONDS", "300")
     monkeypatch.setenv("OPENAI_ASR_MAX_ATTEMPTS", "3")
 
-    # 既有组合根测试使用隔离 tmp_path 作为数据工作区且不携带迁移脚本；它们继续聚焦原行为。
-    def create_test_schema(_workspace: Path, _runtime: Path, database_url: str) -> None:
-        Database(database_url).create_schema()
-
-    monkeypatch.setattr("video_demo.api.app.upgrade_runtime_database", create_test_schema)
-    monkeypatch.setattr(
-        "video_demo.application.composition.upgrade_runtime_database",
-        create_test_schema,
-    )
+    source = Path(__file__).resolve().parents[1] / "migrations"
+    destination = tmp_path / "migrations"
+    if not destination.exists():
+        shutil.copytree(source, destination)
 
 
 @pytest.fixture(autouse=True)

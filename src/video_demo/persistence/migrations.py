@@ -192,6 +192,7 @@ def upgrade_runtime_database(workspace_root: Path, runtime_root: Path, database_
 
 
 def _upgrade_locked(engine: Engine, config: Config) -> None:
+    _require_no_unknown_schema_objects(engine)
     tables = _user_tables(engine)
     if not tables:
         command.upgrade(config, "head")
@@ -199,13 +200,10 @@ def _upgrade_locked(engine: Engine, config: Config) -> None:
         _require_single_revision(engine)
         command.upgrade(config, "head")
     else:
-        if _schema_matches(engine, _HEAD_COLUMNS):
-            # 兼容 Task 9 合入后仍显式调用 create_schema() 的测试/工具，严格匹配 head 才 stamp。
-            command.stamp(config, _HEAD_REVISION)
-        else:
-            _require_legacy_schema(engine)
-            command.stamp(config, _LEGACY_REVISION)
-            command.upgrade(config, "head")
+        _require_legacy_schema(engine)
+        command.stamp(config, _LEGACY_REVISION)
+        command.upgrade(config, "head")
+    _require_no_unknown_schema_objects(engine)
     if _require_single_revision(engine) != _HEAD_REVISION:
         raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "数据库未升级到唯一 head")
     if not _schema_matches(engine, _HEAD_COLUMNS):
@@ -283,6 +281,18 @@ def _migration_lock(runtime: Path) -> Iterator[None]:
 
 def _user_tables(engine: Engine) -> set[str]:
     return {name for name in inspect(engine).get_table_names() if not name.startswith("sqlite_")}
+
+
+def _require_no_unknown_schema_objects(engine: Engine) -> None:
+    with engine.connect() as connection:
+        objects = connection.execute(
+            text(
+                "SELECT type, name FROM sqlite_master "
+                "WHERE type IN ('view', 'trigger') AND name NOT LIKE 'sqlite_%'"
+            )
+        ).all()
+    if objects:
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "数据库包含未知视图或触发器")
 
 
 def _require_single_revision(engine: Engine) -> str:
