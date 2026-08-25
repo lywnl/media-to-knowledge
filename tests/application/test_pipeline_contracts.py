@@ -9,7 +9,7 @@ import pytest
 
 import video_demo.application.pipeline as pipeline_module
 import video_demo.application.pipeline_contracts as contracts
-from video_demo.domain.document_artifact import MAX_METRIC_VALUE
+from video_demo.domain.document_artifact import MAX_METRIC_VALUE, MODEL_METRIC_NAMES
 from video_demo.domain.evidence import (
     KeyframeEvidence,
     SceneBoundary,
@@ -336,10 +336,52 @@ def test_model_metric_merge_rejects_unknown_name_and_overflow() -> None:
 def test_model_metric_merge_sums_known_stage_subsets() -> None:
     merge = contracts.merge_model_metrics
 
-    assert merge(
+    merged = merge(
         {"vlm_logical_analyses": 1},
         {"vlm_logical_analyses": 2, "vlm_cache_hits": 1},
-    ) == {"vlm_logical_analyses": 3, "vlm_cache_hits": 1}
+    )
+
+    assert set(merged) == MODEL_METRIC_NAMES
+    assert merged["vlm_logical_analyses"] == 3
+    assert merged["vlm_cache_hits"] == 1
+    assert all(
+        value == 0
+        for name, value in merged.items()
+        if name not in {"vlm_logical_analyses", "vlm_cache_hits"}
+    )
+
+
+@pytest.mark.parametrize("invalid", [True, 0, -1, 1.5])
+def test_result_evidence_budget_rejects_non_positive_strict_integer(
+    invalid: object,
+) -> None:
+    with pytest.raises(ValueError, match="正整数"):
+        contracts.require_result_evidence_budget((), invalid)  # type: ignore[arg-type]
+
+
+def test_result_evidence_budget_checks_actual_complete_closure() -> None:
+    evidence = (
+        _speech("asr_001", 0, 1_000),
+        _keyframe("keyframe_001", 500),
+    )
+
+    contracts.require_result_evidence_budget(evidence, len(evidence))
+    with pytest.raises(VideoDemoError) as raised:
+        contracts.require_result_evidence_budget(evidence, len(evidence) - 1)
+
+    assert raised.value.code == ErrorCode.INPUT_BUDGET_EXCEEDED
+
+
+def test_result_evidence_budget_rejects_non_unique_closure() -> None:
+    evidence = (
+        _speech("same_id", 0, 1_000),
+        _keyframe("same_id", 500),
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        contracts.require_result_evidence_budget(evidence, len(evidence))
+
+    assert raised.value.code == ErrorCode.DUPLICATE_EVIDENCE_ID
 
 
 def test_run_status_merge_propagates_partial_success() -> None:

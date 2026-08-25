@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
@@ -16,6 +16,7 @@ from video_demo.domain.document import DocumentGenerationConfig, TranscriptSourc
 from video_demo.domain.document_artifact import (
     MAX_METRIC_VALUE,
     MODEL_METRIC_NAMES,
+    RESULT_STAGE_NAMES,
 )
 from video_demo.domain.evidence import (
     DocumentEvidenceItem,
@@ -30,9 +31,80 @@ from video_demo.domain.manifest import VideoAssetManifest
 from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.probe import ProbeLimits, SupportedMime
+from video_demo.persistence.repositories import Scope
 
 if TYPE_CHECKING:
+    from video_demo.application.chapter_frames import ChapterFrameSearchBatch
+    from video_demo.application.chapter_vision import ChapterVisionBatch
+    from video_demo.application.document_rendering import RenderedDocument
+    from video_demo.domain.document import VideoUnderstandingResult
     from video_demo.media.subtitles import ParsedSubtitle
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentPipelineContext:
+    """私有 3.0 文档流水线一次运行所需的全部显式输入。"""
+
+    run_id: str
+    scope: Scope
+    title_hint: str
+    document_config: DocumentGenerationConfig
+    is_cancel_requested: Callable[[], bool] = lambda: False
+    on_stage_start: Callable[[str], None] = lambda _stage: None
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.title_hint) <= 200 or self.title_hint != self.title_hint.strip():
+            raise ValueError("title_hint 必须是已规范化的非空标题")
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentPipelineOutcome:
+    """尚未发布的 3.0 结果及发布后清理所需的内部闭包。"""
+
+    status: Literal["SUCCEEDED", "PARTIAL_SUCCEEDED"]
+    result: VideoUnderstandingResult
+    evidence: tuple[DocumentEvidenceItem, ...]
+    document: RenderedDocument
+    warnings: tuple[str, ...]
+    stage_metrics: Mapping[str, int]
+    model_metrics: Mapping[str, StrictInt]
+    stage_cache_hits: tuple[str, ...]
+    transcript_source: TranscriptSource
+    frame_batch: ChapterFrameSearchBatch
+    visual_batch: ChapterVisionBatch
+
+    def __post_init__(self) -> None:
+        from video_demo.application.document_rendering import render_markdown
+
+        expected_document = render_markdown(self.result, self.evidence)
+        if self.document != expected_document:
+            raise ValueError("document 必须由同一 result/evidence 确定性渲染生成")
+        _validate_complete_metric_map(
+            self.stage_metrics,
+            RESULT_STAGE_NAMES,
+            "阶段",
+        )
+        _validate_complete_metric_map(
+            self.model_metrics,
+            MODEL_METRIC_NAMES,
+            "模型",
+        )
+        object.__setattr__(self, "stage_metrics", MappingProxyType(dict(self.stage_metrics)))
+        object.__setattr__(self, "model_metrics", MappingProxyType(dict(self.model_metrics)))
+
+
+def _validate_complete_metric_map(
+    metrics: Mapping[str, int],
+    expected_names: frozenset[str],
+    display_name: str,
+) -> None:
+    if set(metrics) != expected_names:
+        raise ValueError(f"{display_name}指标必须恰好覆盖白名单")
+    if any(
+        type(value) is not int or not 0 <= value <= MAX_METRIC_VALUE
+        for value in metrics.values()
+    ):
+        raise ValueError(f"{display_name}指标必须是非负严格整数")
 
 
 class PipelineRunConfig(FrozenModel):
@@ -267,6 +339,27 @@ def stable_merge_document_evidence(
     return (*ordered_transcript, *ordered_visual)
 
 
+def require_result_evidence_budget(
+    evidence: tuple[DocumentEvidenceItem, ...],
+    max_result_evidence_items: int,
+) -> None:
+    """在写作前校验完整且 ID 唯一的最终证据闭包预算。"""
+
+    if type(max_result_evidence_items) is not int or max_result_evidence_items < 1:
+        raise ValueError("max_result_evidence_items 必须是正整数")
+    evidence_ids = tuple(item.evidence_id for item in evidence)
+    if len(evidence_ids) != len(set(evidence_ids)):
+        raise VideoDemoError(
+            ErrorCode.DUPLICATE_EVIDENCE_ID,
+            "最终文档证据标识不得重复",
+        )
+    if len(evidence) > max_result_evidence_items:
+        raise VideoDemoError(
+            ErrorCode.INPUT_BUDGET_EXCEEDED,
+            "最终文档证据数量超过部署预算",
+        )
+
+
 def _visual_evidence_sort_key(
     item: KeyframeEvidence | VisualObservationEvidence,
 ) -> tuple[int, int, int, str]:
@@ -276,7 +369,7 @@ def _visual_evidence_sort_key(
 
 
 def merge_model_metrics(*metrics: Mapping[str, StrictInt]) -> dict[str, StrictInt]:
-    merged: dict[str, StrictInt] = {}
+    merged: dict[str, StrictInt] = dict.fromkeys(MODEL_METRIC_NAMES, 0)
     for stage_metrics in metrics:
         unknown_names = set(stage_metrics) - MODEL_METRIC_NAMES
         if unknown_names:
