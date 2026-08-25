@@ -129,6 +129,28 @@ def test_ipc_request_file_is_private_and_removed_after_success(tmp_path: Path) -
     assert not list(tmp_path.glob("runs/*/*/speech/ipc/*.json"))
 
 
+def test_asr_subprocess_receives_duration_aware_timeout(tmp_path: Path) -> None:
+    timeouts: list[int] = []
+
+    class Runner:
+        def run(self, args: list[str], **kwargs: object) -> ProcessResult:
+            timeouts.append(int(kwargs["timeout_seconds"]))
+            request_path = tmp_path / Path(args[args.index("--request") + 1])
+            request = SpeechSubprocessRequest.model_validate(
+                json.loads(request_path.read_text(encoding="utf-8"))["payload"]
+            )
+            _publish_success(tmp_path, args, request)
+            return ProcessResult(0, b"", b"")
+
+    _analyzer(
+        tmp_path,
+        lambda _cancel: Runner(),
+        timeout_seconds=600,
+    ).analyze(_media(tmp_path, duration_ms=7_200_000))
+
+    assert timeouts == [11_100]
+
+
 def test_snapshot_hit_does_not_start_subprocess(tmp_path: Path) -> None:
     analyzer = _analyzer(
         tmp_path,
@@ -328,7 +350,12 @@ def _runtime() -> SpeechRuntimeConfig:
     )
 
 
-def _analyzer(tmp_path: Path, factory: Any) -> IsolatedSpeechAnalyzer:
+def _analyzer(
+    tmp_path: Path,
+    factory: Any,
+    *,
+    timeout_seconds: int = 5,
+) -> IsolatedSpeechAnalyzer:
     store = AtomicArtifactStore(tmp_path)
     return IsolatedSpeechAnalyzer(
         workspace_root=tmp_path,
@@ -337,7 +364,7 @@ def _analyzer(tmp_path: Path, factory: Any) -> IsolatedSpeechAnalyzer:
         artifact_store=store,
         speech_runtime=_runtime(),
         credentials=SpeechSubprocessCredentials(openai_api_key="test-openai-key"),
-        timeout_seconds=5,
+        timeout_seconds=timeout_seconds,
         process_runner_factory=factory,
     )
 
@@ -406,7 +433,7 @@ def _asr_key(media: PreparedMedia) -> str:
     )
 
 
-def _media(tmp_path: Path) -> PreparedMedia:
+def _media(tmp_path: Path, *, duration_ms: int = 1_000) -> PreparedMedia:
     run_root = Path("runs/scope/run_001")
     source = tmp_path / run_root / "input/source.mp4"
     audio = tmp_path / run_root / "media/audio.wav"
@@ -430,7 +457,7 @@ def _media(tmp_path: Path) -> PreparedMedia:
         source_sha256=registered.source_sha256,
         source_size_bytes=6,
         source_mime="video/mp4",
-        duration_ms=1_000,
+        duration_ms=duration_ms,
         video_stream=VideoStream(
             index=0,
             codec_name="h264",
@@ -450,7 +477,11 @@ def _media(tmp_path: Path) -> PreparedMedia:
         ffprobe_version="test",
     )
     return PreparedMedia(
-        source=ProbedAsset(registered, manifest, ProbeLimits()),
+        source=ProbedAsset(
+            registered,
+            manifest,
+            ProbeLimits(max_duration_ms=max(1_800_000, duration_ms)),
+        ),
         proxy_path=proxy,
         proxy_sha256=hashlib.sha256(b"proxy").hexdigest(),
         proxy_size_bytes=5,

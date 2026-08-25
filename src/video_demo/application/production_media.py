@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -31,6 +33,7 @@ from video_demo.media.transcode import (
     NoAudioArtifact,
     ProxyVideoArtifact,
     SubtitleArtifact,
+    TranscodeLimits,
 )
 from video_demo.persistence.database import Database
 from video_demo.persistence.repositories import VideoObjectRepository, VideoRunRepository
@@ -56,7 +59,13 @@ class ProbeClient(Protocol):
 
 
 class TranscodeClient(Protocol):
-    def create_proxy(self, source: Path, run_relative_root: Path) -> ProxyVideoArtifact: ...
+    def create_proxy(
+        self,
+        source: Path,
+        run_relative_root: Path,
+        *,
+        duration_ms: int | None = None,
+    ) -> ProxyVideoArtifact: ...
 
     def extract_audio(
         self,
@@ -72,7 +81,130 @@ class TranscodeClient(Protocol):
         source: Path,
         run_relative_root: Path,
         stream: SubtitleStream,
+        *,
+        duration_ms: int | None = None,
     ) -> SubtitleArtifact: ...
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentCapacityProfile:
+    """输入已物化后，知识文档流水线在当前卷上的最坏容量画像。"""
+
+    proxy_output_bytes: int
+    proxy_temporary_bytes: int
+    pcm_audio_bytes: int
+    max_asr_slice_bytes: int
+    candidate_frame_bytes: int
+    published_keyframe_bytes: int
+    model_cache_bytes: int
+    result_bundle_bytes: int
+    document_bytes: int
+    reserve_bytes: int
+    required_free_bytes: int
+
+    def __post_init__(self) -> None:
+        components = (
+            self.proxy_output_bytes,
+            self.proxy_temporary_bytes,
+            self.pcm_audio_bytes,
+            self.max_asr_slice_bytes,
+            self.candidate_frame_bytes,
+            self.published_keyframe_bytes,
+            self.model_cache_bytes,
+            self.result_bundle_bytes,
+            self.document_bytes,
+            self.reserve_bytes,
+        )
+        if any(type(value) is not int or value < 0 for value in components):
+            raise ValueError("容量画像的组成项必须是非负整数")
+        if type(self.required_free_bytes) is not int or self.required_free_bytes != sum(
+            components
+        ):
+            raise ValueError("容量画像总量必须等于各组成项之和")
+
+
+def build_document_capacity_profile(
+    *,
+    duration_ms: int,
+    proxy_estimated_bytes_per_second: int,
+    max_proxy_bytes: int,
+    max_asr_window_ms: int,
+    candidate_frame_bytes: int,
+    published_keyframe_bytes: int,
+    model_cache_bytes: int,
+    result_bundle_bytes: int,
+    document_bytes: int,
+    reserve_bytes: int,
+) -> DocumentCapacityProfile:
+    """计算 Probe 后容量；已经落盘的 source 不在此重复计入。"""
+
+    positive_values = {
+        "duration_ms": duration_ms,
+        "proxy_estimated_bytes_per_second": proxy_estimated_bytes_per_second,
+        "max_proxy_bytes": max_proxy_bytes,
+        "max_asr_window_ms": max_asr_window_ms,
+    }
+    if any(type(value) is not int or value < 1 for value in positive_values.values()):
+        raise ValueError("容量画像的时长、代理速率和上限必须是正整数")
+    byte_budgets = {
+        "candidate_frame_bytes": candidate_frame_bytes,
+        "published_keyframe_bytes": published_keyframe_bytes,
+        "model_cache_bytes": model_cache_bytes,
+        "result_bundle_bytes": result_bundle_bytes,
+        "document_bytes": document_bytes,
+        "reserve_bytes": reserve_bytes,
+    }
+    if any(type(value) is not int or value < 0 for value in byte_budgets.values()):
+        raise ValueError("容量画像的字节预算必须是非负整数")
+
+    duration_seconds = (duration_ms + 999) // 1_000
+    proxy_output_bytes = min(
+        duration_seconds * proxy_estimated_bytes_per_second,
+        max_proxy_bytes,
+    )
+    pcm_audio_bytes = duration_seconds * 32_000
+    max_asr_slice_bytes = ((max_asr_window_ms + 999) // 1_000) * 32_000
+    parts = (
+        proxy_output_bytes,
+        proxy_output_bytes,
+        pcm_audio_bytes,
+        max_asr_slice_bytes,
+        *byte_budgets.values(),
+    )
+    return DocumentCapacityProfile(
+        proxy_output_bytes=proxy_output_bytes,
+        proxy_temporary_bytes=proxy_output_bytes,
+        pcm_audio_bytes=pcm_audio_bytes,
+        max_asr_slice_bytes=max_asr_slice_bytes,
+        candidate_frame_bytes=candidate_frame_bytes,
+        published_keyframe_bytes=published_keyframe_bytes,
+        model_cache_bytes=model_cache_bytes,
+        result_bundle_bytes=result_bundle_bytes,
+        document_bytes=document_bytes,
+        reserve_bytes=reserve_bytes,
+        required_free_bytes=sum(parts),
+    )
+
+
+def require_document_capacity(
+    path: Path,
+    profile: DocumentCapacityProfile,
+    *,
+    available_bytes: Callable[[Path], int] | None = None,
+) -> None:
+    """在 Probe 后、转码前对当前目标卷执行容量门禁。"""
+
+    candidate = path.expanduser().resolve(strict=False)
+    free_bytes = (
+        shutil.disk_usage(candidate).free
+        if available_bytes is None
+        else available_bytes(candidate)
+    )
+    if free_bytes < profile.required_free_bytes:
+        raise VideoDemoError(
+            ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT,
+            "可用磁盘空间不足",
+        )
 
 
 class ProductionAssetRegistrar:
@@ -176,7 +308,11 @@ class ProductionMediaTranscoder:
     ) -> PreparedMedia:
         client = self._client_factory(is_cancel_requested)
         asset = probed.asset
-        proxy = client.create_proxy(asset.source_path, asset.run_relative_root)
+        proxy = client.create_proxy(
+            asset.source_path,
+            asset.run_relative_root,
+            duration_ms=probed.duration_ms,
+        )
         proxy_path = verified_mp4_file(
             self._runtime_root,
             asset.run_relative_root,
@@ -237,6 +373,7 @@ class ProductionMediaTranscoder:
                     asset.source_path,
                     asset.run_relative_root,
                     stream,
+                    duration_ms=probed.duration_ms,
                 )
                 parsed = parse_webvtt(
                     self._runtime_root,
@@ -293,12 +430,23 @@ def build_ffmpeg_factory(
     settings_workspace_root: Path,
     runtime_root: Path,
     executable: Path,
+    *,
+    max_output_bytes: int = 4 * 1024 * 1024 * 1024,
+    required_free_bytes: int = 512 * 1024 * 1024,
+    timeout_seconds: int = 1_800,
+    visual_proxy_max_edge: int = 1_280,
 ) -> Callable[[Callable[[], bool]], TranscodeClient]:
     return lambda is_cancel_requested: FFmpegTranscoder.from_path(
         executable,
         runtime_root,
         workspace_root=settings_workspace_root,
         is_cancel_requested=is_cancel_requested,
+        limits=TranscodeLimits(
+            max_output_bytes=max_output_bytes,
+            required_free_bytes=required_free_bytes,
+            timeout_seconds=timeout_seconds,
+        ),
+        proxy_max_edge=visual_proxy_max_edge,
     )
 
 

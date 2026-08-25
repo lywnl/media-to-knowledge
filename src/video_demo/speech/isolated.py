@@ -22,6 +22,10 @@ from video_demo.application.production_speech import (
 )
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.process import SafeProcessRunner
+from video_demo.media.transcode import (
+    MAX_DURATION_AWARE_TIMEOUT_SECONDS,
+    duration_aware_timeout_seconds,
+)
 from video_demo.speech.snapshots import AsrSnapshotPayload, asr_fingerprint
 from video_demo.speech.subprocess_protocol import (
     ALLOWED_SPEECH_SUBPROCESS_FAILURE_CODES,
@@ -133,6 +137,13 @@ class IsolatedSpeechAnalyzer:
         self._asr_timeout_seconds = (
             timeout_seconds if timeout_seconds is not None else asr_timeout_seconds
         )
+        if (
+            type(self._asr_timeout_seconds) is not int
+            or not 1
+            <= self._asr_timeout_seconds
+            <= MAX_DURATION_AWARE_TIMEOUT_SECONDS
+        ):
+            raise ValueError("ASR 子进程基础超时必须位于 1~14400 秒")
         self._process_runner_factory = process_runner_factory or (
             lambda cancel: SafeProcessRunner(
                 max_output_bytes=64 * 1024,
@@ -268,7 +279,10 @@ class IsolatedSpeechAnalyzer:
             try:
                 result = runner.run(
                     command,
-                    timeout_seconds=self._asr_timeout_seconds,
+                    timeout_seconds=duration_aware_timeout_seconds(
+                        self._asr_timeout_seconds,
+                        request.duration_ms,
+                    ),
                     output_paths=(self._runtime_root / response_relative,),
                     env=self._subprocess_environment(),
                 )

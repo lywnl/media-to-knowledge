@@ -129,6 +129,29 @@ def test_parse_rejects_when_container_or_video_stream_exceeds_duration_limit(
     assert raised.value.code == ErrorCode.VIDEO_DURATION_LIMIT_EXCEEDED
 
 
+def test_parse_accepts_two_hour_manifest_only_with_explicit_limit() -> None:
+    payload = _payload("valid_mp4.json")
+    payload["format"]["duration"] = "7200.000"
+    payload["streams"][0]["duration"] = "7200.000"
+
+    result = parse_ffprobe_payload(
+        payload,
+        object_ref="obj_001",
+        source_sha256="a" * 64,
+        source_size_bytes=1024,
+        source_mime="video/mp4",
+        ffprobe_version="ffprobe version 7.1",
+        limits=ProbeLimits(max_duration_ms=7_200_000),
+    )
+
+    assert result.manifest.duration_ms == 7_200_000
+
+
+def test_probe_limit_rejects_duration_above_domain_hard_limit() -> None:
+    with pytest.raises(ValueError, match="视频时长上限"):
+        ProbeLimits(max_duration_ms=7_200_001)
+
+
 def test_parse_preserves_text_and_bitmap_subtitle_metadata() -> None:
     result = parse_ffprobe_payload(
         _payload("embedded_text_subtitles.json"),

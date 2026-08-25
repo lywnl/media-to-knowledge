@@ -130,9 +130,10 @@ class Settings(BaseSettings):
     ffprobe_path: Path | None = None
 
     worker_concurrency: int = Field(default=1, ge=1, le=4)
-    process_timeout_seconds: int = Field(default=600, ge=1, le=86_400)
-    speech_subprocess_timeout_seconds: int = Field(default=3_600, ge=1, le=7_200)
+    process_timeout_seconds: int = Field(default=600, ge=1, le=14_400)
+    speech_subprocess_timeout_seconds: int = Field(default=3_600, ge=1, le=14_400)
     max_video_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
+    max_video_duration_ms: int = Field(default=1_800_000, ge=1, le=7_200_000)
     # 仅供本地演示显式开启；默认保持严格外部依赖失败语义。
     demo_degraded_mode: bool = False
 

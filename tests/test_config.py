@@ -355,10 +355,32 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(settings.qwen_max_video_duration_ms, 30_000)
             self.assertEqual(settings.qwen_timeout_seconds, 300.0)
             self.assertEqual(settings.speech_subprocess_timeout_seconds, 3_600)
+            self.assertEqual(settings.max_video_duration_ms, 1_800_000)
             self.assertEqual(settings.oss_prefix, "video-demo/qwen-clips")
             self.assertEqual(settings.oss_signed_url_ttl_seconds, 3_600)
             self.assertFalse(settings.has_complete_oss_configuration())
             self.assertFalse(settings.demo_degraded_mode)
+
+    def test_video_duration_and_subprocess_timeout_hard_limits_are_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            settings = Settings(
+                workspace_root=workspace,
+                max_video_duration_ms=7_200_000,
+                process_timeout_seconds=14_400,
+                speech_subprocess_timeout_seconds=14_400,
+                _env_file=None,
+            )
+
+            self.assertEqual(settings.max_video_duration_ms, 7_200_000)
+            for values in (
+                {"max_video_duration_ms": 7_200_001},
+                {"process_timeout_seconds": 14_401},
+                {"speech_subprocess_timeout_seconds": 14_401},
+            ):
+                with self.subTest(values=values), self.assertRaises(ValidationError):
+                    Settings(workspace_root=workspace, _env_file=None, **values)  # type: ignore[arg-type]
 
     def test_complete_oss_configuration_is_available_without_serializing_secrets(
         self,

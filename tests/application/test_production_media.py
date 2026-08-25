@@ -9,9 +9,13 @@ import pytest
 
 from video_demo.application.pipeline import PipelineContext, RegisteredAsset
 from video_demo.application.production_media import (
+    DocumentCapacityProfile,
     ProductionAssetProbe,
     ProductionAssetRegistrar,
     ProductionMediaTranscoder,
+    build_document_capacity_profile,
+    build_ffmpeg_factory,
+    require_document_capacity,
 )
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
@@ -146,9 +150,16 @@ def test_production_transcoder_generates_scoped_proxy_and_explicit_no_audio_warn
     ).probe(registered)
 
     class Transcoder:
-        def create_proxy(self, path: Path, run_relative_root: Path) -> ProxyVideoArtifact:
+        def create_proxy(
+            self,
+            path: Path,
+            run_relative_root: Path,
+            *,
+            duration_ms: int | None = None,
+        ) -> ProxyVideoArtifact:
             assert path == source
             assert run_relative_root == Path("runs/scope/run_001")
+            assert duration_ms == 1_000
             relative_path = run_relative_root / "media/proxy.mp4"
             destination = runtime_root / relative_path
             destination.parent.mkdir(parents=True)
@@ -261,6 +272,139 @@ def test_asr_audio_uses_video_timeline_instead_of_longer_container_duration(
     assert client.extract_audio_calls == [(True, 302_101)]
 
 
+@pytest.mark.parametrize("duration_ms", [1_800_000, 7_200_000])
+def test_document_capacity_profile_uses_duration_and_bounded_proxy_estimate(
+    duration_ms: int,
+) -> None:
+    profile = build_document_capacity_profile(
+        duration_ms=duration_ms,
+        proxy_estimated_bytes_per_second=2 * 1024 * 1024,
+        max_proxy_bytes=4 * 1024 * 1024 * 1024,
+        max_asr_window_ms=600_000,
+        candidate_frame_bytes=512 * 1024 * 1024,
+        published_keyframe_bytes=256 * 1024 * 1024,
+        model_cache_bytes=256 * 1024 * 1024,
+        result_bundle_bytes=64 * 1024 * 1024,
+        document_bytes=16 * 1024 * 1024,
+        reserve_bytes=512 * 1024 * 1024,
+    )
+
+    duration_seconds = (duration_ms + 999) // 1_000
+    expected_proxy = min(
+        duration_seconds * 2 * 1024 * 1024,
+        4 * 1024 * 1024 * 1024,
+    )
+    expected_total = sum(
+        (
+            expected_proxy,
+            expected_proxy,
+            duration_seconds * 32_000,
+            600 * 32_000,
+            512 * 1024 * 1024,
+            256 * 1024 * 1024,
+            256 * 1024 * 1024,
+            64 * 1024 * 1024,
+            16 * 1024 * 1024,
+            512 * 1024 * 1024,
+        ),
+    )
+
+    assert profile.proxy_output_bytes == expected_proxy
+    assert profile.proxy_temporary_bytes == expected_proxy
+    assert profile.max_asr_slice_bytes == 19_200_000
+    assert profile.required_free_bytes == expected_total
+
+
+def test_short_video_capacity_does_not_reserve_four_gib_proxy() -> None:
+    profile = build_document_capacity_profile(
+        duration_ms=10_000,
+        proxy_estimated_bytes_per_second=100,
+        max_proxy_bytes=4 * 1024 * 1024 * 1024,
+        max_asr_window_ms=600_001,
+        candidate_frame_bytes=10,
+        published_keyframe_bytes=20,
+        model_cache_bytes=30,
+        result_bundle_bytes=40,
+        document_bytes=50,
+        reserve_bytes=60,
+    )
+
+    assert profile == DocumentCapacityProfile(
+        proxy_output_bytes=1_000,
+        proxy_temporary_bytes=1_000,
+        pcm_audio_bytes=320_000,
+        max_asr_slice_bytes=19_232_000,
+        candidate_frame_bytes=10,
+        published_keyframe_bytes=20,
+        model_cache_bytes=30,
+        result_bundle_bytes=40,
+        document_bytes=50,
+        reserve_bytes=60,
+        required_free_bytes=19_554_210,
+    )
+
+
+def test_document_capacity_check_rejects_insufficient_space(tmp_path: Path) -> None:
+    profile = build_document_capacity_profile(
+        duration_ms=1_000,
+        proxy_estimated_bytes_per_second=1,
+        max_proxy_bytes=1,
+        max_asr_window_ms=1_000,
+        candidate_frame_bytes=1,
+        published_keyframe_bytes=1,
+        model_cache_bytes=1,
+        result_bundle_bytes=1,
+        document_bytes=1,
+        reserve_bytes=1,
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        require_document_capacity(
+            tmp_path,
+            profile,
+            available_bytes=lambda _path: profile.required_free_bytes - 1,
+        )
+
+    assert raised.value.code == ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT
+
+
+def test_ffmpeg_factory_forwards_low_level_media_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def fake_from_path(*args: object, **kwargs: object) -> object:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(
+        "video_demo.application.production_media.FFmpegTranscoder.from_path",
+        fake_from_path,
+    )
+    factory = build_ffmpeg_factory(
+        tmp_path,
+        tmp_path / "runtime",
+        tmp_path / "tools/ffmpeg",
+        max_output_bytes=123,
+        required_free_bytes=456,
+        timeout_seconds=789,
+        visual_proxy_max_edge=1920,
+    )
+
+    assert factory(lambda: False) is sentinel
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["proxy_max_edge"] == 1920
+    limits = kwargs["limits"]
+    assert hasattr(limits, "max_output_bytes")
+    assert limits.max_output_bytes == 123
+    assert limits.required_free_bytes == 456
+    assert limits.timeout_seconds == 789
+
+
 def test_rejected_first_subtitle_continues_to_second_complete_track(tmp_path: Path) -> None:
     runtime_root, probed = _probed_media(
         tmp_path,
@@ -369,7 +513,14 @@ def test_production_transcoder_rejects_invalid_proxy_before_prepared_media(
     payload = b"" if mutation == "empty" else (b"not-mp4" if mutation == "fake_mp4" else _MP4)
 
     class Transcoder:
-        def create_proxy(self, _path: Path, root: Path) -> ProxyVideoArtifact:
+        def create_proxy(
+            self,
+            _path: Path,
+            root: Path,
+            *,
+            duration_ms: int | None = None,
+        ) -> ProxyVideoArtifact:
+            assert duration_ms == 1_000
             relative = root / "media/proxy.mp4"
             output = runtime_root / relative
             output.parent.mkdir(parents=True)
@@ -500,8 +651,16 @@ class _RecordingTranscoder:
         self._subtitle_errors = subtitle_errors or {}
         self.extract_subtitle_calls: list[int] = []
         self.extract_audio_calls: list[tuple[bool, int]] = []
+        self.create_proxy_durations: list[int | None] = []
 
-    def create_proxy(self, _path: Path, root: Path) -> ProxyVideoArtifact:
+    def create_proxy(
+        self,
+        _path: Path,
+        root: Path,
+        *,
+        duration_ms: int | None = None,
+    ) -> ProxyVideoArtifact:
+        self.create_proxy_durations.append(duration_ms)
         relative = root / "media/proxy.mp4"
         output = self._runtime_root / relative
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -519,7 +678,10 @@ class _RecordingTranscoder:
         _path: Path,
         root: Path,
         stream: SubtitleStream,
+        *,
+        duration_ms: int | None = None,
     ) -> SubtitleArtifact:
+        assert duration_ms is not None
         self.extract_subtitle_calls.append(stream.index)
         if stream.index in self._subtitle_errors:
             raise VideoDemoError(self._subtitle_errors[stream.index], "稳定测试错误")
