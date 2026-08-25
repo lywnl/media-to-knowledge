@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from itertools import pairwise
 from pathlib import Path
+from threading import Event
 from typing import cast
 
 import pytest
@@ -97,6 +99,7 @@ def _planner(
     max_input_bytes: int = 1_048_576,
     max_chapters: int = 240,
     max_planning_batches: int = 64,
+    invocation_wait_timeout_seconds: float = 2,
 ) -> ChapterPlanner:
     return ChapterPlanner(
         cast(DocumentTextPort, port),
@@ -105,7 +108,7 @@ def _planner(
         max_input_bytes=max_input_bytes,
         max_chapters=max_chapters,
         max_planning_batches=max_planning_batches,
-        invocation_wait_timeout_seconds=2,
+        invocation_wait_timeout_seconds=invocation_wait_timeout_seconds,
     )
 
 
@@ -470,6 +473,64 @@ def test_chapter_planner_splits_oversized_input_on_segment_boundaries(
     assert batch.metrics["chapter_planner_logical_calls"] == 4
 
 
+def test_chapter_planner_applies_utf8_byte_budget_independently_of_char_budget(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(2, text="汉" * 200)
+    config = DocumentGenerationConfig()
+
+    def request_for(
+        request_segments: tuple[BaseSegment, ...],
+        request_transcript: tuple[SpeechSegment, ...],
+    ) -> ChapterPlanningRequest:
+        return ChapterPlanningRequest(
+            title_hint="测试视频",
+            duration_ms=segments[-1].end_ms,
+            segments=request_segments,
+            transcript_evidence=request_transcript,
+            document_config=config,
+            prompt_version="chapter-planner-v1",
+        )
+
+    combined_data = prompt_for_planning(request_for(segments, transcript))[2]
+    single_byte_limit = max(
+        len(
+            prompt_for_planning(request_for((segment,), (evidence,)))[2].encode(
+                "utf-8",
+            ),
+        )
+        for segment, evidence in zip(segments, transcript, strict=True)
+    )
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        return ChapterPlanningResponse(
+            chapter_drafts=(
+                ChapterDraft(
+                    segment_refs=tuple(item.segment_id for item in request.segments),
+                    title_hint="按字节分批",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                ),
+            ),
+        )
+
+    port = _PlanningTextPort(response, response)
+    batch = _plan(
+        _planner(
+            port,
+            max_input_chars=len(combined_data),
+            max_input_bytes=single_byte_limit,
+        ),
+        tmp_path,
+        segments,
+        transcript,
+        scenes,
+    )
+
+    assert len(port.main_requests) == 2
+    assert batch.metrics["chapter_planner_logical_calls"] == 2
+
+
 def test_chapter_planner_rejects_excessive_batches_before_provider_calls(
     tmp_path: Path,
 ) -> None:
@@ -514,6 +575,65 @@ def test_chapter_planner_rejects_excessive_batches_before_provider_calls(
         _plan(planner, tmp_path, segments, transcript, scenes)
 
     assert raised.value.code == ErrorCode.INPUT_BUDGET_EXCEEDED
+    assert not port.main_requests
+
+
+def test_chapter_planner_propagates_invocation_lock_timeout_without_fallback(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture()
+    config = DocumentGenerationConfig()
+    request = ChapterPlanningRequest(
+        title_hint="测试视频",
+        duration_ms=segments[-1].end_ms,
+        segments=segments,
+        transcript_evidence=transcript,
+        document_config=config,
+        prompt_version="chapter-planner-v1",
+    )
+    identity = _planning_identity()
+    holder = DocumentModelCache(
+        tmp_path,
+        max_entry_bytes=1_048_576,
+        max_run_bytes=4_194_304,
+    )
+    entered = Event()
+    release = Event()
+
+    def hold_invocation_lock() -> None:
+        with holder.invocation_lock(
+            identity,
+            request,
+            wait_timeout_seconds=2,
+            is_cancel_requested=lambda: False,
+            poll_interval_seconds=0.005,
+        ):
+            entered.set()
+            release.wait(timeout=2)
+
+    port = _PlanningTextPort(
+        lambda _request: AssertionError("等待锁超时不得调用模型"),
+        lambda _request: AssertionError("等待锁超时不得调用修复模型"),
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(hold_invocation_lock)
+            assert entered.wait(timeout=1)
+            with pytest.raises(VideoDemoError) as raised:
+                _plan(
+                    _planner(port, invocation_wait_timeout_seconds=0.02),
+                    tmp_path,
+                    segments,
+                    transcript,
+                    scenes,
+                    config,
+                )
+            release.set()
+            future.result(timeout=1)
+    finally:
+        release.set()
+
+    assert raised.value.code == ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
     assert not port.main_requests
 
 
@@ -650,6 +770,49 @@ def test_chapter_planner_does_not_invent_comparison_when_merging_short_chapters(
     assert len(batch.plans[0].semantic_targets) == 2
 
 
+def test_chapter_planner_repairs_chapter_longer_than_five_minutes(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(6)
+
+    def oversized(_request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        return ChapterPlanningResponse(
+            chapter_drafts=(
+                ChapterDraft(
+                    segment_refs=tuple(item.segment_id for item in segments),
+                    title_hint="超长章节",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                ),
+            ),
+        )
+
+    def repaired(_request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        return ChapterPlanningResponse(
+            chapter_drafts=(
+                ChapterDraft(
+                    segment_refs=tuple(item.segment_id for item in segments[:3]),
+                    title_hint="前半部分",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                ),
+                ChapterDraft(
+                    segment_refs=tuple(item.segment_id for item in segments[3:]),
+                    title_hint="后半部分",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                ),
+            ),
+        )
+
+    port = _PlanningTextPort(oversized, repaired)
+    batch = _plan(_planner(port), tmp_path, segments, transcript, scenes)
+
+    assert batch.status == "SUCCEEDED"
+    assert [plan.duration_ms for plan in batch.plans] == [180_000, 180_000]
+    assert batch.metrics["chapter_planner_structure_repairs"] == 1
+
+
 def test_chapter_planner_repairs_semantic_anchor_span_over_thirty_seconds(
     tmp_path: Path,
 ) -> None:
@@ -683,6 +846,43 @@ def test_chapter_planner_repairs_semantic_anchor_span_over_thirty_seconds(
     assert batch.status == "PARTIAL_SUCCEEDED"
     assert batch.metrics["chapter_planner_structure_repairs"] == 1
     assert batch.plans[0].semantic_targets == ()
+
+
+def test_chapter_planner_repairs_overlapping_complex_anchor_groups(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(2, interval_ms=15_000)
+
+    def response(second_anchor: str) -> ChapterPlanningResponse:
+        return ChapterPlanningResponse(
+            chapter_drafts=(
+                ChapterDraft(
+                    segment_refs=("segment_000", "segment_001"),
+                    title_hint="画面对比",
+                    visual_mode="COMPARISON",
+                    semantic_targets=(
+                        VisualTargetDraft(
+                            query_zh="对比前状态",
+                            anchor_evidence_refs=("asr_000",),
+                        ),
+                        VisualTargetDraft(
+                            query_zh="对比后状态",
+                            anchor_evidence_refs=(second_anchor,),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    port = _PlanningTextPort(
+        lambda _request: response("asr_000"),
+        lambda _request: response("asr_001"),
+    )
+    batch = _plan(_planner(port), tmp_path, segments, transcript, scenes)
+
+    assert batch.status == "SUCCEEDED"
+    assert batch.plans[0].visual_mode == "COMPARISON"
+    assert batch.metrics["chapter_planner_structure_repairs"] == 1
 
 
 @pytest.mark.parametrize(
