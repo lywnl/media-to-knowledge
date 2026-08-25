@@ -135,6 +135,10 @@ def test_plan_request_uses_main_schema_prompt_and_temperature_zero() -> None:
         "chapter_planning_v1"
     )
     assert "chapter-planner-v1" in payloads[0]["messages"][0]["content"]  # type: ignore[index]
+    assert "完整分区" in payloads[0]["messages"][0]["content"]  # type: ignore[index]
+    assert "1~3" in payloads[0]["messages"][0]["content"]  # type: ignore[index]
+    assert "30 秒" in payloads[0]["messages"][0]["content"]  # type: ignore[index]
+    assert "fine 60~120 秒" in payloads[0]["messages"][0]["content"]  # type: ignore[index]
     assert "text-secret" not in json.dumps(payloads)
 
 
@@ -377,6 +381,7 @@ def test_all_six_operations_use_distinct_schema_and_prompt_versions() -> None:
 
 def test_text_client_retries_temporary_failure_but_not_capability_error() -> None:
     attempts = 0
+    reported_attempts = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal attempts
@@ -385,10 +390,16 @@ def test_text_client_retries_temporary_failure_but_not_capability_error() -> Non
             return httpx.Response(503, request=request)
         return _provider_response(request, _planning_body())
 
+    def report_attempt() -> None:
+        nonlocal reported_attempts
+        reported_attempts += 1
+
     _client(httpx.MockTransport(handler), max_attempts=2).plan_chapters(
         _planning_request(),
+        on_provider_attempt=report_attempt,
     )
     assert attempts == 2
+    assert reported_attempts == 2
 
     attempts = 0
 

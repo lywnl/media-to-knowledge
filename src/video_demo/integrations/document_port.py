@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, Protocol, Self
 
@@ -251,22 +252,46 @@ class GlobalWritingRepairRequest(FrozenModel):
 
 
 class DocumentTextPort(Protocol):
-    def plan_chapters(self, request: ChapterPlanningRequest) -> ChapterPlanningResponse: ...
+    def plan_chapters(
+        self,
+        request: ChapterPlanningRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterPlanningResponse: ...
 
-    def repair_chapter_plan(self, request: ChapterPlanRepairRequest) -> ChapterPlanningResponse: ...
+    def repair_chapter_plan(
+        self,
+        request: ChapterPlanRepairRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterPlanningResponse: ...
 
-    def write_chapter(self, request: ChapterWritingRequest) -> ChapterWritingResponse: ...
+    def write_chapter(
+        self,
+        request: ChapterWritingRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterWritingResponse: ...
 
     def repair_chapter_writing(
         self,
         request: ChapterWritingRepairRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
     ) -> ChapterWritingResponse: ...
 
-    def organize_document(self, request: GlobalWritingRequest) -> GlobalWritingResponse: ...
+    def organize_document(
+        self,
+        request: GlobalWritingRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> GlobalWritingResponse: ...
 
     def repair_global_writing(
         self,
         request: GlobalWritingRepairRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
     ) -> GlobalWritingResponse: ...
 
 

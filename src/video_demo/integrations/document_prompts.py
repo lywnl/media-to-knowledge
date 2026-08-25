@@ -18,7 +18,14 @@ from video_demo.integrations.document_port import (
 def prompt_for_planning(request: ChapterPlanningRequest) -> tuple[str, str, str]:
     return _prompt(
         request.prompt_version,
-        "你只能根据输入的基础片段和转写证据规划连续章节；不得生成时间、章节 ID 或未知引用。",
+        (
+            "你只能根据输入的基础片段和转写证据规划连续章节。所有 segment_refs "
+            "必须按输入顺序完整分区且恰好使用一次；每个语义目标必须绑定当前章节的 "
+            "1~3 个按时间排序的转写 evidence_id，首个锚点起点到末个锚点终点不得超过 "
+            "30 秒。章节粒度优先目标为 fine 60~120 秒、standard 60~180 秒、"
+            "coarse 120~300 秒；证据不可拆分时允许偏离目标范围，但任何章节不得超过 "
+            "300 秒。不得生成时间、章节 ID 或未知引用。"
+        ),
         request.model_dump(mode="json"),
     )
 

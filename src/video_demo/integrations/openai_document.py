@@ -67,7 +67,12 @@ class OpenAIDocumentClient(DocumentTextPort):
         self._max_response_bytes = max_response_bytes
         self._sleeper = sleeper
 
-    def plan_chapters(self, request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+    def plan_chapters(
+        self,
+        request: ChapterPlanningRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterPlanningResponse:
         return self._call(
             prompt_for_planning(request),
             response_type=ChapterPlanningResponse,
@@ -79,9 +84,15 @@ class OpenAIDocumentClient(DocumentTextPort):
                     item.evidence_id for item in request.transcript_evidence
                 },
             ),
+            on_provider_attempt=on_provider_attempt,
         )
 
-    def repair_chapter_plan(self, request: ChapterPlanRepairRequest) -> ChapterPlanningResponse:
+    def repair_chapter_plan(
+        self,
+        request: ChapterPlanRepairRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterPlanningResponse:
         return self._call(
             prompt_for_plan_repair(request),
             response_type=ChapterPlanningResponse,
@@ -91,9 +102,15 @@ class OpenAIDocumentClient(DocumentTextPort):
                 allowed_segment_ids=set(request.allowed_segment_ids),
                 allowed_transcript_ids=set(request.allowed_transcript_ids),
             ),
+            on_provider_attempt=on_provider_attempt,
         )
 
-    def write_chapter(self, request: ChapterWritingRequest) -> ChapterWritingResponse:
+    def write_chapter(
+        self,
+        request: ChapterWritingRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterWritingResponse:
         return self._call(
             prompt_for_writing(request),
             response_type=ChapterWritingResponse,
@@ -105,11 +122,14 @@ class OpenAIDocumentClient(DocumentTextPort):
                     item.evidence_id for item in request.visual_observations
                 },
             ),
+            on_provider_attempt=on_provider_attempt,
         )
 
     def repair_chapter_writing(
         self,
         request: ChapterWritingRepairRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
     ) -> ChapterWritingResponse:
         return self._call(
             prompt_for_writing_repair(request),
@@ -122,9 +142,15 @@ class OpenAIDocumentClient(DocumentTextPort):
                     item.evidence_id for item in request.request.visual_observations
                 },
             ),
+            on_provider_attempt=on_provider_attempt,
         )
 
-    def organize_document(self, request: GlobalWritingRequest) -> GlobalWritingResponse:
+    def organize_document(
+        self,
+        request: GlobalWritingRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> GlobalWritingResponse:
         return self._call(
             prompt_for_global_editing(request),
             response_type=GlobalWritingResponse,
@@ -133,9 +159,15 @@ class OpenAIDocumentClient(DocumentTextPort):
                 response,
                 allowed_chapter_ids=set(allowed_global_chapter_ids(request)),
             ),
+            on_provider_attempt=on_provider_attempt,
         )
 
-    def repair_global_writing(self, request: GlobalWritingRepairRequest) -> GlobalWritingResponse:
+    def repair_global_writing(
+        self,
+        request: GlobalWritingRepairRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> GlobalWritingResponse:
         return self._call(
             prompt_for_global_repair(request),
             response_type=GlobalWritingResponse,
@@ -144,6 +176,7 @@ class OpenAIDocumentClient(DocumentTextPort):
                 response,
                 allowed_chapter_ids=set(request.allowed_chapter_ids),
             ),
+            on_provider_attempt=on_provider_attempt,
         )
 
     def _call(
@@ -153,6 +186,7 @@ class OpenAIDocumentClient(DocumentTextPort):
         response_type: type[ResponseModel],
         schema_name: str,
         validate_response: Callable[[ResponseModel], None],
+        on_provider_attempt: Callable[[], None] | None,
     ) -> ResponseModel:
         version, instruction, data = prompt
         _validate_input_budget(data, self._max_input_chars, self._max_input_bytes)
@@ -164,17 +198,24 @@ class OpenAIDocumentClient(DocumentTextPort):
             response_type=response_type,
             schema_name=schema_name,
         )
-        raw = self._post_with_retry(payload)
+        raw = self._post_with_retry(payload, on_provider_attempt=on_provider_attempt)
         return _parse_and_validate_response(
             raw,
             response_type,
             validate_response=validate_response,
         )
 
-    def _post_with_retry(self, payload: dict[str, object]) -> bytes:
+    def _post_with_retry(
+        self,
+        payload: dict[str, object],
+        *,
+        on_provider_attempt: Callable[[], None] | None,
+    ) -> bytes:
         last_error: VideoDemoError | None = None
         for attempt in range(1, self._max_attempts + 1):
             try:
+                if on_provider_attempt is not None:
+                    on_provider_attempt()
                 with self._http_client.stream(
                     "POST",
                     self._endpoint,
