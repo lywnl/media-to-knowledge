@@ -16,8 +16,14 @@ from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.document_port import (
     ChapterVisionRepairRequest,
     ChapterVisionRequest,
+    ChapterVisionResponse,
     InvalidModelResponse,
     ModelResponseValidationError,
+)
+from video_demo.integrations.document_prompts import (
+    prompt_for_vision,
+    prompt_for_vision_repair,
+    vision_payload_size_upper_bound,
 )
 from video_demo.integrations.qwen_vl import QwenVisionClient
 
@@ -28,6 +34,7 @@ def _frame(root: Path, frame_id: str, timestamp_ms: int) -> FrameCandidateArtifa
     path = root / "visual" / "candidates" / f"{digest}.jpg"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
+    path.chmod(0o600)
     return FrameCandidateArtifact(
         frame_id=frame_id,
         timestamp_ms=timestamp_ms,
@@ -75,6 +82,7 @@ def _client(
     handler: httpx.MockTransport,
     *,
     max_response_bytes: int = 2 * 1024 * 1024,
+    max_attempts: int = 1,
 ) -> QwenVisionClient:
     return QwenVisionClient(
         httpx.Client(transport=handler),
@@ -82,8 +90,9 @@ def _client(
         api_key="vision-secret",
         model_id="qwen3-vl-flash",
         runtime_root=runtime_root,
-        max_attempts=1,
+        max_attempts=max_attempts,
         max_response_bytes=max_response_bytes,
+        sleeper=lambda _seconds: None,
     )
 
 
@@ -146,6 +155,54 @@ def test_qwen_sends_sorted_jpeg_frames_in_one_request_without_local_metadata(
     assert "candidates" not in untrusted
     assert "https://" not in untrusted
     assert payloads[0]["response_format"]["json_schema"]["name"] == "chapter_vlm_v1"  # type: ignore[index]
+
+
+def test_qwen_request_bytes_do_not_exceed_shared_payload_upper_bound(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    request = _request(run_root)
+    actual_sizes: list[int] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        actual_sizes.append(len(http_request.content))
+        return _provider_response(http_request, {"observations": []})
+
+    _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+        request,
+        allowed_run_root=run_root,
+    )
+
+    ordered = sorted(request.frames, key=lambda item: (item.timestamp_ms, item.frame_id))
+    upper_bound = vision_payload_size_upper_bound(
+        prompt_for_vision(request),
+        model_id="qwen3-vl-flash",
+        schema_name="chapter_vlm_v1",
+        response_schema=ChapterVisionResponse.model_json_schema(),
+        ordered_frames=tuple((frame.frame_id, frame.size_bytes) for frame in ordered),
+    )
+    assert actual_sizes[0] <= upper_bound
+    assert upper_bound - actual_sizes[0] < 16
+
+
+def test_qwen_calls_attempt_callback_before_every_real_http_attempt(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    attempts: list[int] = []
+    responses = iter((500, 200))
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        status = next(responses)
+        if status == 500:
+            return httpx.Response(status, request=http_request)
+        return _provider_response(http_request, {"observations": []})
+
+    _client(tmp_path, httpx.MockTransport(handler), max_attempts=2).analyze_chapter(
+        _request(run_root),
+        allowed_run_root=run_root,
+        on_provider_attempt=lambda: attempts.append(1),
+    )
+
+    assert attempts == [1, 1]
 
 
 def test_qwen_requires_per_call_run_root_inside_runtime_root(tmp_path: Path) -> None:
@@ -227,7 +284,7 @@ def test_qwen_rejects_symlink_and_non_jpg_extension(tmp_path: Path) -> None:
             request.model_copy(update={"frames": (linked, request.frames[1])}),
             allowed_run_root=run_root,
         )
-    assert raised.value.code == ErrorCode.WORKSPACE_PATH_ESCAPE
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
 
     renamed = real.with_suffix(".jpeg")
     real.rename(renamed)
@@ -239,7 +296,7 @@ def test_qwen_rejects_symlink_and_non_jpg_extension(tmp_path: Path) -> None:
             request.model_copy(update={"frames": (wrong_extension, request.frames[1])}),
             allowed_run_root=run_root,
         )
-    assert raised.value.code == ErrorCode.VISUAL_MEDIA_INVALID
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
 
 
 def test_qwen_rejects_file_replaced_during_open(
@@ -270,7 +327,7 @@ def test_qwen_rejects_file_replaced_during_open(
 
     with pytest.raises(VideoDemoError) as raised:
         client.analyze_chapter(request, allowed_run_root=run_root)
-    assert raised.value.code == ErrorCode.VISUAL_MEDIA_INVALID
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
 
 
 def test_unknown_frame_returns_repairable_validation_error(tmp_path: Path) -> None:
@@ -288,6 +345,33 @@ def test_unknown_frame_returns_repairable_validation_error(tmp_path: Path) -> No
     assert raised.value.code == ErrorCode.QWEN_RESPONSE_INVALID
     assert raised.value.invalid_response.validation_errors == (
         "observations.selected_frame_ids:unknown_reference",
+    )
+
+
+def test_qwen_requires_every_claimed_target_to_have_a_selected_frame(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    request = _request(run_root)
+    second_target = VisualSearchTarget(
+        target_id="target_002",
+        purpose="SEMANTIC",
+        query_zh="另一处画面",
+        anchor_evidence_refs=("asr_001",),
+    )
+    body = _valid_observation()
+    body["observations"][0]["target_ids"] = ["target_001", "target_002"]  # type: ignore[index]
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        return _provider_response(http_request, body)
+
+    with pytest.raises(ModelResponseValidationError) as raised:
+        _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+            request.model_copy(update={"targets": (*request.targets, second_target)}),
+            allowed_run_root=run_root,
+        )
+
+    assert raised.value.invalid_response.validation_errors == (
+        "observations.target_ids:frame_binding_mismatch",
     )
 
 
@@ -328,6 +412,19 @@ def test_qwen_repair_resends_same_images_with_repair_prompt_and_schema(tmp_path:
     assert labels.index("FRAME_ID=frame_a") < labels.index("FRAME_ID=frame_b")
     assert sum(item.get("type") == "image_url" for item in content) == 2  # type: ignore[union-attr]
     assert "d" * 64 in labels[0]
+
+    ordered = sorted(original.frames, key=lambda item: (item.timestamp_ms, item.frame_id))
+    upper_bound = vision_payload_size_upper_bound(
+        prompt_for_vision_repair(repair),
+        model_id="qwen3-vl-flash",
+        schema_name="chapter_vlm_repair_v1",
+        response_schema=ChapterVisionResponse.model_json_schema(),
+        ordered_frames=tuple((frame.frame_id, frame.size_bytes) for frame in ordered),
+    )
+    actual_size = len(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(),
+    )
+    assert actual_size <= upper_bound
 
 
 def test_qwen_repair_rejects_changed_or_reordered_frame_whitelist(tmp_path: Path) -> None:

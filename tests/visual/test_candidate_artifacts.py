@@ -10,11 +10,13 @@ from threading import Event, Thread
 
 import pytest
 
+from video_demo.domain.document_plan import FrameCandidateArtifact
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.visual import candidate_artifacts
 from video_demo.visual.candidate_artifacts import (
     CandidateArtifactSession,
     CandidateDirectoryLease,
+    read_verified_candidate_jpeg,
 )
 
 
@@ -28,6 +30,23 @@ def _write_existing_candidate(candidate_root: Path, payload: bytes) -> Path:
     destination.write_bytes(payload)
     destination.chmod(0o600)
     return destination
+
+
+def _frame(run_root: Path, payload: bytes) -> FrameCandidateArtifact:
+    digest = hashlib.sha256(payload).hexdigest()
+    path = run_root / "visual/candidates" / f"{digest}.jpg"
+    path.parent.mkdir(parents=True, mode=0o700)
+    path.write_bytes(payload)
+    path.chmod(0o600)
+    return FrameCandidateArtifact(
+        frame_id="frame_001",
+        timestamp_ms=1_000,
+        sha256=digest,
+        size_bytes=len(payload),
+        relative_path=f"visual/candidates/{digest}.jpg",
+        perceptual_hash="0123456789abcdef",
+        target_ids=("target_001",),
+    )
 
 
 def _session(
@@ -218,7 +237,7 @@ def test_exclusive_lease_blocks_another_process_until_released(tmp_path: Path) -
     process.start()
     child_connection.close()
 
-    assert parent_connection.recv() == ErrorCode.VISUAL_RESULT_INVALID.value
+    assert parent_connection.recv() == ErrorCode.DEPENDENCY_TEMPORARY_FAILURE.value
     process.join(timeout=3.0)
     assert process.exitcode == 0
     parent_connection.close()
@@ -237,6 +256,64 @@ def test_zero_timeout_lease_attempts_once_and_succeeds_when_run_is_free(tmp_path
 
     assert lease.is_acquired
     lease.close()
+
+
+def test_lease_accepts_prevalidated_absolute_run_root(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    run_root = runtime_root / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+
+    lease = CandidateDirectoryLease.from_allowed_run_root(
+        runtime_root=runtime_root,
+        allowed_run_root=run_root,
+        mode="EXCLUSIVE",
+        wait_timeout_seconds=0.0,
+    ).acquire()
+
+    assert lease.visual_root == run_root / "visual"
+    assert lease.candidate_root == run_root / "visual/candidates"
+    lease.close()
+
+
+def test_lease_rejects_absolute_directory_that_is_not_an_exact_run_root(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    invalid_root = runtime_root / "runs/scope_001"
+    invalid_root.mkdir(parents=True)
+
+    with pytest.raises(VideoDemoError) as raised:
+        CandidateDirectoryLease.from_allowed_run_root(
+            runtime_root=runtime_root,
+            allowed_run_root=invalid_root,
+            mode="EXCLUSIVE",
+        )
+
+    assert raised.value.code == ErrorCode.WORKSPACE_PATH_ESCAPE
+
+
+def test_verified_candidate_reader_checks_private_content_addressed_jpeg(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runtime/runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    payload = _jpeg("verified-reader")
+    frame = _frame(run_root, payload)
+
+    assert read_verified_candidate_jpeg(run_root, frame, max_bytes=1024) == payload
+
+
+def test_verified_candidate_reader_rejects_non_private_file(tmp_path: Path) -> None:
+    run_root = tmp_path / "runtime/runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    payload = _jpeg("public-reader")
+    frame = _frame(run_root, payload)
+    (run_root / frame.relative_path).chmod(0o644)
+
+    with pytest.raises(VideoDemoError) as raised:
+        read_verified_candidate_jpeg(run_root, frame, max_bytes=1024)
+
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
 
 
 def test_session_rejects_symlink_run_lock_file(tmp_path: Path) -> None:

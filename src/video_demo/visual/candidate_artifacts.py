@@ -14,10 +14,12 @@ from pathlib import Path
 from types import TracebackType
 from typing import Literal, Self
 
+from video_demo.domain.document_plan import FrameCandidateArtifact
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.storage.workspace import (
     reject_symlink_components,
     safe_runtime_path,
+    validate_path_component,
 )
 
 CandidateReservation = Literal["NEW", "REUSED", "REJECTED"]
@@ -83,6 +85,25 @@ class CandidateDirectoryLease:
         self._process_lock_entry: _ProcessLockEntry | None = None
         self._process_lock_acquired = False
         self._lock_descriptor = -1
+
+    @classmethod
+    def from_allowed_run_root(
+        cls,
+        *,
+        runtime_root: Path,
+        allowed_run_root: Path,
+        mode: CandidateLeaseMode,
+        is_cancel_requested: Callable[[], bool] | None = None,
+        wait_timeout_seconds: float = 300.0,
+    ) -> Self:
+        run_relative_root = _validated_run_relative_root(runtime_root, allowed_run_root)
+        return cls(
+            runtime_root=runtime_root,
+            run_relative_root=run_relative_root,
+            mode=mode,
+            is_cancel_requested=is_cancel_requested,
+            wait_timeout_seconds=wait_timeout_seconds,
+        )
 
     @property
     def visual_root(self) -> Path:
@@ -157,7 +178,7 @@ class CandidateDirectoryLease:
             if remaining <= 0:
                 self._release_process_lock(acquired=False)
                 raise VideoDemoError(
-                    ErrorCode.VISUAL_RESULT_INVALID,
+                    ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
                     "候选帧 Run 锁等待超时",
                 )
             if entry.lock.acquire(timeout=min(_LOCK_POLL_SECONDS, remaining)):
@@ -426,6 +447,39 @@ class CandidateArtifactSession:
             inode=status.st_ino,
         )
 
+
+def read_verified_candidate_jpeg(
+    allowed_run_root: Path,
+    frame: FrameCandidateArtifact,
+    *,
+    max_bytes: int,
+) -> bytes:
+    """受限读取当前 Run 下与内容地址一致的私有候选 JPEG。"""
+
+    if max_bytes < 1:
+        raise ValueError("候选帧读取上限必须大于 0")
+    run_root = allowed_run_root.expanduser()
+    if not run_root.is_absolute() or not run_root.is_dir():
+        raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "当前 Run 根非法")
+    run_root = run_root.resolve(strict=True)
+    expected_relative = Path("visual/candidates") / f"{frame.sha256}.jpg"
+    if Path(frame.relative_path) != expected_relative or frame.mime_type != "image/jpeg":
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "候选帧内容地址路径非法")
+    path = reject_symlink_components(
+        run_root,
+        run_root / expected_relative,
+        message="候选帧必须位于当前 Run 且不能包含符号链接",
+    )
+    return _read_verified_jpeg(
+        path,
+        expected_digest=frame.sha256,
+        expected_size=frame.size_bytes,
+        max_bytes=max_bytes,
+        error_code=ErrorCode.ARTIFACT_SCHEMA_INVALID,
+        message="候选帧内容完整性校验失败",
+    )
+
+
 def _open_lock_file(path: Path) -> int:
     descriptor = -1
     try:
@@ -471,7 +525,7 @@ def _acquire_file_lock(
         except BlockingIOError:
             if time.monotonic() >= deadline:
                 raise VideoDemoError(
-                    ErrorCode.VISUAL_RESULT_INVALID,
+                    ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
                     "候选帧 Run 锁等待超时",
                 ) from None
             time.sleep(_LOCK_POLL_SECONDS)
@@ -613,6 +667,25 @@ def _verify_existing_jpeg(
     expected_size: int,
     max_bytes: int,
 ) -> None:
+    _read_verified_jpeg(
+        path,
+        expected_digest=expected_digest,
+        expected_size=expected_size,
+        max_bytes=max_bytes,
+        error_code=ErrorCode.VISUAL_RESULT_INVALID,
+        message="既有候选帧与内容地址不一致",
+    )
+
+
+def _read_verified_jpeg(
+    path: Path,
+    *,
+    expected_digest: str,
+    expected_size: int,
+    max_bytes: int,
+    error_code: ErrorCode,
+    message: str,
+) -> bytes:
     descriptor = -1
     try:
         before_open = os.lstat(path)
@@ -636,11 +709,9 @@ def _verify_existing_jpeg(
             or hashlib.sha256(payload).hexdigest() != expected_digest
         ):
             raise OSError
+        return payload
     except OSError:
-        raise VideoDemoError(
-            ErrorCode.VISUAL_RESULT_INVALID,
-            "既有候选帧与内容地址不一致",
-        ) from None
+        raise VideoDemoError(error_code, message) from None
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -742,3 +813,24 @@ def _is_sha256(value: str) -> bool:
 
 def _is_jpeg(payload: bytes) -> bool:
     return payload.startswith(b"\xff\xd8\xff") and payload.endswith(b"\xff\xd9")
+
+
+def _validated_run_relative_root(runtime_root: Path, allowed_run_root: Path) -> Path:
+    runtime = runtime_root.expanduser().resolve(strict=False)
+    lexical = allowed_run_root.expanduser()
+    if not lexical.is_absolute():
+        raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "当前 Run 根必须是绝对路径")
+    run_root = reject_symlink_components(
+        runtime,
+        lexical,
+        message="当前 Run 根必须位于运行目录且不能包含符号链接",
+    )
+    try:
+        relative = run_root.relative_to(runtime)
+    except ValueError:
+        raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "当前 Run 根非法") from None
+    if len(relative.parts) != 3 or relative.parts[0] != "runs" or not run_root.is_dir():
+        raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "当前 Run 根非法")
+    validate_path_component(relative.parts[1], "scope_key")
+    validate_path_component(relative.parts[2], "run_id")
+    return relative

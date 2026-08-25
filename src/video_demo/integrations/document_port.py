@@ -301,6 +301,7 @@ class ChapterVisionPort(Protocol):
         request: ChapterVisionRequest,
         *,
         allowed_run_root: Path,
+        on_provider_attempt: Callable[[], None] | None = None,
     ) -> ChapterVisionResponse: ...
 
     def repair_chapter(
@@ -308,6 +309,7 @@ class ChapterVisionPort(Protocol):
         request: ChapterVisionRepairRequest,
         *,
         allowed_run_root: Path,
+        on_provider_attempt: Callable[[], None] | None = None,
     ) -> ChapterVisionResponse: ...
 
 

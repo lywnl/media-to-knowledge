@@ -177,6 +177,7 @@ class Settings(BaseSettings):
         allow_inf_nan=False,
     )
     max_published_keyframe_bytes_per_run: int = Field(default=256 * 1024 * 1024, ge=1)
+    max_published_keyframe_files_per_run: int = Field(default=20_000, ge=1)
     max_result_bundle_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
     max_document_bytes: int = Field(default=16 * 1024 * 1024, ge=1)
     model_cache_max_entry_bytes: int = Field(default=4 * 1024 * 1024, ge=1)

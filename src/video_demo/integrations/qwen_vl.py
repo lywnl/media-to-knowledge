@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
-import os
-import stat
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -24,17 +21,20 @@ from video_demo.integrations.document_port import (
     invalid_model_response,
 )
 from video_demo.integrations.document_prompts import (
+    build_vision_payload,
     prompt_for_vision,
     prompt_for_vision_repair,
+    vision_payload_json_bytes,
+    vision_payload_size_upper_bound,
 )
 from video_demo.storage.workspace import reject_symlink_components, validate_path_component
+from video_demo.visual.candidate_artifacts import read_verified_candidate_jpeg
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 _MAX_FRAMES = 6
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024
 _MAX_RAW_REQUEST_BYTES = 24 * 1024 * 1024
 _MAX_ENCODED_REQUEST_BYTES = 36 * 1024 * 1024
-_READ_CHUNK_BYTES = 1024 * 1024
 
 
 class QwenVisionClient(ChapterVisionPort):
@@ -74,12 +74,14 @@ class QwenVisionClient(ChapterVisionPort):
         request: ChapterVisionRequest,
         *,
         allowed_run_root: Path,
+        on_provider_attempt: Callable[[], None] | None = None,
     ) -> ChapterVisionResponse:
         result, raw_message, parsed = self._call_with_images(
             request,
             allowed_run_root=allowed_run_root,
             prompt=prompt_for_vision(request),
             schema_name="chapter_vlm_v1",
+            on_provider_attempt=on_provider_attempt,
         )
         return _validate_or_raise(
             result,
@@ -93,12 +95,14 @@ class QwenVisionClient(ChapterVisionPort):
         request: ChapterVisionRepairRequest,
         *,
         allowed_run_root: Path,
+        on_provider_attempt: Callable[[], None] | None = None,
     ) -> ChapterVisionResponse:
         result, raw_message, parsed = self._call_with_images(
             request.request,
             allowed_run_root=allowed_run_root,
             prompt=prompt_for_vision_repair(request),
             schema_name="chapter_vlm_repair_v1",
+            on_provider_attempt=on_provider_attempt,
         )
         return _validate_or_raise(
             result,
@@ -117,22 +121,33 @@ class QwenVisionClient(ChapterVisionPort):
         allowed_run_root: Path,
         prompt: tuple[str, str, str],
         schema_name: str,
+        on_provider_attempt: Callable[[], None] | None,
     ) -> tuple[ChapterVisionResponse, bytes, object]:
         run_root = self._validate_run_root(allowed_run_root)
         frames = self._verified_frames(request, run_root)
-        version, instruction, data = prompt
-        content = _vision_content(data, frames)
-        payload = self._payload(
-            version,
-            instruction,
-            content,
+        encoded_frames = tuple((frame.frame_id, encoded) for frame, encoded in frames)
+        response_schema = ChapterVisionResponse.model_json_schema()
+        payload = build_vision_payload(
+            prompt,
+            model_id=self._model_id,
             schema_name=schema_name,
+            response_schema=response_schema,
+            ordered_encoded_frames=encoded_frames,
         )
+        upper_bound = vision_payload_size_upper_bound(
+            prompt,
+            model_id=self._model_id,
+            schema_name=schema_name,
+            response_schema=response_schema,
+            ordered_frames=tuple((frame.frame_id, frame.size_bytes) for frame, _ in frames),
+        )
+        actual_size = len(vision_payload_json_bytes(payload))
+        if actual_size > upper_bound or actual_size > self._max_encoded_request_bytes:
+            raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "视觉模型请求体超过大小上限")
         try:
-            raw = self._post_with_retry(payload)
+            raw = self._post_with_retry(payload, on_provider_attempt=on_provider_attempt)
         finally:
             frames.clear()
-            content.clear()
             payload["messages"] = []
         return _parse_response(raw)
 
@@ -164,10 +179,10 @@ class QwenVisionClient(ChapterVisionPort):
         verified: list[tuple[FrameCandidateArtifact, str]] = []
         total_bytes = 0
         for frame in ordered:
-            content = _verified_jpeg(
+            content = read_verified_candidate_jpeg(
                 run_root,
                 frame,
-                max_image_bytes=self._max_image_bytes,
+                max_bytes=self._max_image_bytes,
             )
             total_bytes += len(content)
             if total_bytes > self._max_request_image_bytes:
@@ -175,44 +190,17 @@ class QwenVisionClient(ChapterVisionPort):
             verified.append((frame, base64.b64encode(content).decode("ascii")))
         return verified
 
-    def _payload(
+    def _post_with_retry(
         self,
-        version: str,
-        instruction: str,
-        content: list[dict[str, object]],
+        payload: dict[str, object],
         *,
-        schema_name: str,
-    ) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "model": self._model_id,
-            "temperature": 0,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "strict": True,
-                    "schema": ChapterVisionResponse.model_json_schema(),
-                },
-            },
-            "messages": [
-                {
-                    "role": "system",
-                    "content": f"PROMPT_VERSION={version}\n{instruction}",
-                },
-                {"role": "user", "content": content},
-            ],
-        }
-        encoded_payload_size = len(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-        )
-        if encoded_payload_size > self._max_encoded_request_bytes:
-            raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "视觉模型请求体超过大小上限")
-        return payload
-
-    def _post_with_retry(self, payload: dict[str, object]) -> bytes:
+        on_provider_attempt: Callable[[], None] | None,
+    ) -> bytes:
         last_error: VideoDemoError | None = None
         for attempt in range(1, self._max_attempts + 1):
             try:
+                if on_provider_attempt is not None:
+                    on_provider_attempt()
                 with self._http_client.stream(
                     "POST",
                     self._endpoint,
@@ -247,102 +235,6 @@ def _verified_directory(path: Path, message: str) -> Path:
     if not lexical.is_absolute() or lexical.is_symlink() or not lexical.is_dir():
         raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, message)
     return lexical.resolve(strict=True)
-
-
-def _verified_jpeg(
-    run_root: Path,
-    frame: FrameCandidateArtifact,
-    *,
-    max_image_bytes: int,
-) -> bytes:
-    if frame.mime_type != "image/jpeg":
-        raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "视觉图片只允许 JPEG")
-    relative = Path(frame.relative_path)
-    if relative.is_absolute() or relative.suffix != ".jpg":
-        raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "视觉图片必须使用 .jpg 相对路径")
-    path = reject_symlink_components(
-        run_root,
-        run_root / relative,
-        message="视觉图片必须位于当前 Run 且不能包含符号链接",
-    )
-    try:
-        before = os.lstat(path)
-    except OSError as error:
-        raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "视觉图片无法读取") from error
-    if stat.S_ISLNK(before.st_mode):
-        raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "视觉图片不能是符号链接")
-    if not stat.S_ISREG(before.st_mode):
-        raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "视觉图片不是普通文件")
-    if before.st_size != frame.size_bytes or before.st_size > max_image_bytes:
-        raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "视觉图片大小校验失败")
-    descriptor = _open_no_follow(path)
-    try:
-        opened = os.fstat(descriptor)
-        _require_same_file(before, opened)
-        content = _read_descriptor(descriptor, max_image_bytes)
-        after = os.fstat(descriptor)
-        _require_same_file(opened, after)
-    finally:
-        os.close(descriptor)
-    if len(content) != frame.size_bytes:
-        raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "视觉图片大小校验失败")
-    if not _has_jpeg_magic(content):
-        raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "视觉图片媒体类型校验失败")
-    if hashlib.sha256(content).hexdigest() != frame.sha256:
-        raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "视觉图片摘要校验失败")
-    return content
-
-
-def _open_no_follow(path: Path) -> int:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None:
-        raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "当前平台不支持安全图片打开")
-    try:
-        return os.open(path, os.O_RDONLY | no_follow)
-    except OSError as error:
-        raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "视觉图片安全打开失败") from error
-
-
-def _read_descriptor(descriptor: int, max_bytes: int) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
-    while chunk := os.read(descriptor, min(_READ_CHUNK_BYTES, max_bytes + 1 - total)):
-        total += len(chunk)
-        if total > max_bytes:
-            raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "视觉图片超过大小上限")
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
-def _require_same_file(before: os.stat_result, after: os.stat_result) -> None:
-    if _file_identity(before) != _file_identity(after):
-        raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "视觉图片读取期间发生变化")
-
-
-def _file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
-    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
-
-
-def _has_jpeg_magic(content: bytes) -> bool:
-    return content.startswith(b"\xff\xd8\xff") and content.endswith(b"\xff\xd9")
-
-
-def _vision_content(
-    data: str,
-    frames: list[tuple[FrameCandidateArtifact, str]],
-) -> list[dict[str, object]]:
-    content: list[dict[str, object]] = [
-        {"type": "text", "text": "UNTRUSTED_VISION_CONTEXT_JSON\n" + data},
-    ]
-    for frame, encoded in frames:
-        content.append({"type": "text", "text": f"FRAME_ID={frame.frame_id}"})
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
-            },
-        )
-    return content
 
 
 def _bounded_response(response: httpx.Response, max_bytes: int) -> bytes:
@@ -455,9 +347,15 @@ def _validate_observation_references(
             transcript_ids,
             "observations.transcript_evidence_refs",
         )
-        if any(
-            not frame_targets[frame_id].intersection(observation.target_ids)
-            for frame_id in observation.selected_frame_ids
+        selected_targets = set().union(
+            *(frame_targets[frame_id] for frame_id in observation.selected_frame_ids),
+        )
+        if (
+            any(
+                not frame_targets[frame_id].intersection(observation.target_ids)
+                for frame_id in observation.selected_frame_ids
+            )
+            or not set(observation.target_ids).issubset(selected_targets)
         ):
             raise _ReferenceValidationError("observations.target_ids:frame_binding_mismatch")
 

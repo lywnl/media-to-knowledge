@@ -21,8 +21,10 @@ class SettingsTest(unittest.TestCase):
 
             self.assertEqual(settings.max_candidate_frame_files_per_run, 20_000)
             self.assertEqual(settings.candidate_directory_lock_timeout_seconds, 300.0)
+            self.assertEqual(settings.max_published_keyframe_files_per_run, 20_000)
             for field, value in (
                 ("max_candidate_frame_files_per_run", 0),
+                ("max_published_keyframe_files_per_run", 0),
                 ("candidate_directory_lock_timeout_seconds", 0),
                 ("candidate_directory_lock_timeout_seconds", float("inf")),
             ):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from video_demo.integrations.document_port import (
@@ -13,6 +14,9 @@ from video_demo.integrations.document_port import (
     GlobalWritingRepairRequest,
     GlobalWritingRequest,
 )
+
+VisionPrompt = tuple[str, str, str]
+VisionPayload = dict[str, object]
 
 
 def prompt_for_planning(request: ChapterPlanningRequest) -> tuple[str, str, str]:
@@ -54,6 +58,71 @@ def prompt_for_vision_repair(request: ChapterVisionRepairRequest) -> tuple[str, 
         "只修复结构和引用；图片顺序和原始取证问题不得改变，不得添加新事实。",
         context,
     )
+
+
+def build_vision_payload(
+    prompt: VisionPrompt,
+    *,
+    model_id: str,
+    schema_name: str,
+    response_schema: dict[str, object],
+    ordered_encoded_frames: tuple[tuple[str, str], ...],
+) -> VisionPayload:
+    version, instruction, data = prompt
+    return {
+        "model": model_id,
+        "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": True,
+                "schema": response_schema,
+            },
+        },
+        "messages": [
+            {
+                "role": "system",
+                "content": f"PROMPT_VERSION={version}\n{instruction}",
+            },
+            {
+                "role": "user",
+                "content": _vision_content(data, ordered_encoded_frames),
+            },
+        ],
+    }
+
+
+def vision_payload_size_upper_bound(
+    prompt: VisionPrompt,
+    *,
+    model_id: str,
+    schema_name: str,
+    response_schema: dict[str, object],
+    ordered_frames: tuple[tuple[str, int], ...],
+) -> int:
+    if any(size_bytes < 1 for _frame_id, size_bytes in ordered_frames):
+        raise ValueError("视觉图片大小必须大于 0")
+    payload_without_base64 = build_vision_payload(
+        prompt,
+        model_id=model_id,
+        schema_name=schema_name,
+        response_schema=response_schema,
+        ordered_encoded_frames=tuple((frame_id, "") for frame_id, _size in ordered_frames),
+    )
+    encoded_image_bytes = sum(
+        4 * math.ceil(size_bytes / 3)
+        for _frame_id, size_bytes in ordered_frames
+    )
+    return len(vision_payload_json_bytes(payload_without_base64)) + encoded_image_bytes
+
+
+def vision_payload_json_bytes(payload: VisionPayload) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def prompt_for_writing(request: ChapterWritingRequest) -> tuple[str, str, str]:
@@ -100,6 +169,24 @@ def _vision_context(request: ChapterVisionRequest) -> dict[str, object]:
     context = request.model_dump(mode="json", exclude={"frames"})
     context["frames"] = frame_descriptors
     return context
+
+
+def _vision_content(
+    data: str,
+    ordered_encoded_frames: tuple[tuple[str, str], ...],
+) -> list[dict[str, object]]:
+    content: list[dict[str, object]] = [
+        {"type": "text", "text": "UNTRUSTED_VISION_CONTEXT_JSON\n" + data},
+    ]
+    for frame_id, encoded in ordered_encoded_frames:
+        content.append({"type": "text", "text": f"FRAME_ID={frame_id}"})
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+            },
+        )
+    return content
 
 
 def _prompt(version: str, instruction: str, value: Any) -> tuple[str, str, str]:
