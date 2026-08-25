@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
 from video_demo.config import Settings
+from video_demo.persistence.database import Database
 
 
 def pytest_configure() -> None:
@@ -49,6 +51,16 @@ def cloud_asr_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_MODEL", "openai/whisper")
     monkeypatch.setenv("OPENAI_ASR_TIMEOUT_SECONDS", "300")
     monkeypatch.setenv("OPENAI_ASR_MAX_ATTEMPTS", "3")
+
+    # 既有组合根测试使用隔离 tmp_path 作为数据工作区且不携带迁移脚本；它们继续聚焦原行为。
+    def create_test_schema(_workspace: Path, _runtime: Path, database_url: str) -> None:
+        Database(database_url).create_schema()
+
+    monkeypatch.setattr("video_demo.api.app.upgrade_runtime_database", create_test_schema)
+    monkeypatch.setattr(
+        "video_demo.application.composition.upgrade_runtime_database",
+        create_test_schema,
+    )
 
 
 @pytest.fixture(autouse=True)

@@ -78,9 +78,12 @@ class AtomicArtifactStore:
         upstream_sha256: str,
         file_mode: int | None = None,
         exclusive: bool = False,
+        max_bytes: int | None = None,
     ) -> ArtifactReceipt:
         if file_mode is not None and not 0 <= file_mode <= 0o777:
             raise ValueError("文件权限模式非法")
+        if max_bytes is not None and max_bytes <= 0:
+            raise ValueError("阶段产物写入上限必须大于 0")
         destination = safe_runtime_path(self.runtime_root, relative_path)
         if file_mode is not None:
             destination = reject_symlink_components(
@@ -93,6 +96,8 @@ class AtomicArtifactStore:
             schema_version,
             upstream_sha256,
         )
+        if max_bytes is not None and len(encoded) > max_bytes:
+            raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "阶段产物超过写入上限")
         digest = hashlib.sha256(encoded).hexdigest()
         temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -287,6 +292,118 @@ class AtomicArtifactStore:
     def read_verified_json(self, receipt: ArtifactReceipt) -> dict[str, Any] | list[Any]:
         return self.read_verified_json_limited(receipt)
 
+    def list_regular_artifacts(
+        self,
+        relative_directory: Path,
+        *,
+        max_entries: int,
+    ) -> tuple[str, ...]:
+        """有界列出安全目录中的普通文件；遇未知类型失败关闭。"""
+
+        if max_entries <= 0:
+            raise ValueError("制品目录条目上限必须大于 0")
+        validated = _validated_bytes_relative_path(relative_directory)
+        directory = _open_private_directory_tree(self.runtime_root, validated, create=False)
+        names: list[str] = []
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if len(names) >= max_entries:
+                        raise VideoDemoError(
+                            ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                            "制品目录条目超过恢复上限",
+                        )
+                    if not entry.is_file(follow_symlinks=False):
+                        raise VideoDemoError(
+                            ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                            "制品目录包含非普通文件",
+                        )
+                    names.append(entry.name)
+        except OSError as error:
+            raise VideoDemoError(
+                ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                "制品目录无法安全枚举",
+            ) from error
+        finally:
+            os.close(directory)
+        return tuple(sorted(names))
+
+    def inspect_artifact_bytes(
+        self,
+        relative_path: Path,
+        *,
+        max_bytes: int,
+    ) -> tuple[bytes, ArtifactBytesReceipt]:
+        """有界读取当前普通文件，并返回供二次身份/摘要复验的回执。"""
+
+        _require_positive_byte_limit(max_bytes)
+        encoded = self._read_limited_artifact_bytes(relative_path.as_posix(), max_bytes)
+        return encoded, ArtifactBytesReceipt(
+            relative_path=relative_path.as_posix(),
+            sha256=hashlib.sha256(encoded).hexdigest(),
+            size_bytes=len(encoded),
+        )
+
+    def discard_bytes(self, receipt: ArtifactBytesReceipt) -> bool:
+        """仅在普通文件身份和摘要均未变化时按目录描述符删除。"""
+
+        validated = _validated_bytes_relative_path(Path(receipt.relative_path))
+        try:
+            parent = _open_private_directory_tree(
+                self.runtime_root,
+                validated.parent,
+                create=False,
+            )
+        except VideoDemoError:
+            return False
+        descriptor: int | None = None
+        try:
+            before = os.lstat(validated.name, dir_fd=parent)
+            if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+                return False
+            descriptor = os.open(
+                validated.name,
+                os.O_RDONLY | _require_no_follow(),
+                dir_fd=parent,
+            )
+            opened = os.fstat(descriptor)
+            _require_same_bytes_file(before, opened)
+            digest = hashlib.sha256()
+            size = 0
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+                if size > receipt.size_bytes:
+                    return False
+            current = os.lstat(validated.name, dir_fd=parent)
+            _require_same_bytes_file(opened, current)
+            if size != receipt.size_bytes or digest.hexdigest() != receipt.sha256:
+                return False
+            os.unlink(validated.name, dir_fd=parent)
+            os.fsync(parent)
+            return True
+        except (OSError, VideoDemoError):
+            return False
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent)
+
+    def discard_artifact(self, receipt: ArtifactReceipt, *, max_bytes: int) -> bool:
+        """以 JSON 制品的已知摘要和有界大小复用安全字节删除。"""
+
+        _require_positive_byte_limit(max_bytes)
+        try:
+            encoded = self._read_limited_artifact_bytes(receipt.relative_path, max_bytes)
+        except VideoDemoError:
+            return False
+        bytes_receipt = ArtifactBytesReceipt(
+            relative_path=receipt.relative_path,
+            sha256=receipt.sha256,
+            size_bytes=len(encoded),
+        )
+        return self.discard_bytes(bytes_receipt)
+
     def read_verified_json_limited(
         self,
         receipt: ArtifactReceipt,
@@ -295,19 +412,13 @@ class AtomicArtifactStore:
     ) -> dict[str, Any] | list[Any]:
         if max_bytes is not None and max_bytes < 1:
             raise ValueError("阶段产物读取上限必须大于 0")
-        artifact = safe_runtime_path(self.runtime_root, Path(receipt.relative_path))
-        if artifact.is_symlink() or not artifact.is_file():
-            raise VideoDemoError(ErrorCode.ARTIFACT_NOT_FOUND, "阶段产物不存在")
-        if max_bytes is None:
-            encoded = artifact.read_bytes()
+        if max_bytes is not None:
+            encoded = self._read_limited_artifact_bytes(receipt.relative_path, max_bytes)
         else:
-            with artifact.open("rb") as stream:
-                encoded = stream.read(max_bytes + 1)
-            if len(encoded) > max_bytes:
-                raise VideoDemoError(
-                    ErrorCode.ARTIFACT_SCHEMA_INVALID,
-                    "阶段产物超过读取上限",
-                )
+            artifact = safe_runtime_path(self.runtime_root, Path(receipt.relative_path))
+            if artifact.is_symlink() or not artifact.is_file():
+                raise VideoDemoError(ErrorCode.ARTIFACT_NOT_FOUND, "阶段产物不存在")
+            encoded = artifact.read_bytes()
         if hashlib.sha256(encoded).hexdigest() != receipt.sha256:
             raise VideoDemoError(ErrorCode.ARTIFACT_DIGEST_MISMATCH, "阶段产物摘要不匹配")
         try:
@@ -327,6 +438,39 @@ class AtomicArtifactStore:
         if not isinstance(payload, (dict, list)):
             raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "阶段产物 payload 类型非法")
         return payload
+
+    def _read_limited_artifact_bytes(self, relative_path: str, max_bytes: int) -> bytes:
+        validated = _validated_bytes_relative_path(Path(relative_path))
+        parent = _open_private_directory_tree(self.runtime_root, validated.parent, create=False)
+        descriptor: int | None = None
+        try:
+            before = os.lstat(validated.name, dir_fd=parent)
+            if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+                raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "阶段产物文件非法")
+            descriptor = os.open(validated.name, os.O_RDONLY | _require_no_follow(), dir_fd=parent)
+            opened = os.fstat(descriptor)
+            _require_same_bytes_file(before, opened)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, min(1024 * 1024, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "阶段产物超过读取上限")
+            current = os.lstat(validated.name, dir_fd=parent)
+            _require_same_bytes_file(opened, current)
+            return b"".join(chunks)
+        except FileNotFoundError:
+            raise VideoDemoError(ErrorCode.ARTIFACT_NOT_FOUND, "阶段产物不存在") from None
+        except OSError as error:
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "阶段产物文件非法") from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent)
 
     def discard(self, receipt: ArtifactReceipt) -> bool:
         """仅删除摘要仍与本次写入一致的未发布产物。"""

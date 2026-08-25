@@ -17,6 +17,7 @@ from video_demo.application.uploads import UploadService
 from video_demo.config import Settings
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
+from video_demo.persistence.migrations import upgrade_runtime_database
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.object_store import LocalVideoObjectStore
 
@@ -58,10 +59,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     actual_settings.require_cloud_asr_configuration()
     assert actual_settings.runtime_root is not None
     actual_settings.runtime_root.mkdir(parents=True, exist_ok=True)
-    database = Database(
-        f"sqlite+pysqlite:///{actual_settings.runtime_root / 'video-demo.db'}",
+    database_url = f"sqlite+pysqlite:///{actual_settings.runtime_root / 'video-demo.db'}"
+    upgrade_runtime_database(
+        actual_settings.workspace_root,
+        actual_settings.runtime_root,
+        database_url,
     )
-    database.create_schema()
+    database = Database(database_url)
     object_store = LocalVideoObjectStore(
         actual_settings.runtime_root,
         max_video_bytes=actual_settings.max_video_bytes,

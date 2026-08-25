@@ -75,6 +75,10 @@ API 和 Worker 必须同时运行；API 只创建持久任务，Worker 才负责
 .venv/bin/video-demo-worker
 ```
 
+启动时 API 与 Worker 会使用 `.database-migration.lock` 串行升级运行时 SQLite。该机制仅支持
+macOS/Linux 的本地文件系统；运行目录和数据库不得放在 NFS 等网络文件系统上，也不要依赖
+网络文件锁提供等价安全性。
+
 两个进程启动后，浏览器访问 `http://127.0.0.1:8000/`，选择一个本地视频并点击
 “开始处理”。页面会自动完成上传、创建任务、查询处理状态和展示结果，内部固定使用
 `tenant-demo / app-demo / kb-demo` 作为本地演示作用域；现有 API 的调用方式不变。

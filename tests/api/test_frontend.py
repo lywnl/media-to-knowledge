@@ -23,6 +23,34 @@ def test_api_rejects_missing_cloud_asr_configuration_before_writing_runtime(
     assert raised.value.code == ErrorCode.INVALID_CONFIGURATION
     assert not settings.runtime_root.exists()
 
+
+def test_create_app_runs_migration_before_database_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import video_demo.api.app as app_module
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://ai-proxy.example.test/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "openai/whisper")
+    events: list[str] = []
+
+    def migrate(*_args: object) -> None:
+        events.append("迁移")
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "停止于迁移")
+
+    class ForbiddenDatabase:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            events.append("数据库")
+
+    monkeypatch.setattr(app_module, "upgrade_runtime_database", migrate)
+    monkeypatch.setattr(app_module, "Database", ForbiddenDatabase)
+
+    with pytest.raises(VideoDemoError, match="停止于迁移"):
+        app_module.create_app(Settings(workspace_root=tmp_path))
+    assert events == ["迁移"]
+
+
 def test_frontend_page_exposes_local_video_file_workflow(client: TestClient) -> None:
     response = client.get("/")
 

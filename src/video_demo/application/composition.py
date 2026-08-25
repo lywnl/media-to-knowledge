@@ -51,6 +51,7 @@ from video_demo.integrations.oss import (
 from video_demo.integrations.qwen import DemoFallbackVideoUnderstanding, QwenVideoClient
 from video_demo.integrations.video_port import WholeVideoUnderstandingPort
 from video_demo.persistence.database import Database
+from video_demo.persistence.migrations import upgrade_runtime_database
 from video_demo.speech.isolated import IsolatedSpeechAnalyzer
 from video_demo.speech.runtime import ProductionSpeechModels
 from video_demo.speech.runtime import (
@@ -628,8 +629,9 @@ def build_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
     settings.require_cloud_asr_configuration()
     assert settings.runtime_root is not None
     settings.runtime_root.mkdir(parents=True, exist_ok=True)
-    database = Database(f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}")
-    database.create_schema()
+    database_url = f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}"
+    upgrade_runtime_database(settings.workspace_root, settings.runtime_root, database_url)
+    database = Database(database_url)
     object_store = LocalVideoObjectStore(
         settings.runtime_root,
         max_video_bytes=settings.max_video_bytes,

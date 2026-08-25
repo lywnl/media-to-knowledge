@@ -1123,6 +1123,36 @@ def test_build_worker_transfers_pipeline_to_successful_worker_owner(
     assert closes == ["close"]
 
 
+def test_build_worker_runs_migration_before_database_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import video_demo.application.composition as composition
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://ai-proxy.example.test/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "openai/whisper")
+    events: list[str] = []
+
+    def migrate(*_args: object) -> None:
+        events.append("迁移")
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "停止于迁移")
+
+    class ForbiddenDatabase:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            events.append("数据库")
+
+    monkeypatch.setattr(composition, "upgrade_runtime_database", migrate)
+    monkeypatch.setattr(composition, "Database", ForbiddenDatabase)
+
+    with pytest.raises(VideoDemoError, match="停止于迁移"):
+        composition.build_worker(
+            Settings(workspace_root=tmp_path),
+            worker_id="worker-order",
+        )
+    assert events == ["迁移"]
+
+
 def test_production_pipeline_builds_lightweight_dependencies_without_diagnostics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

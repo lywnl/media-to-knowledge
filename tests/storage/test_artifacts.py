@@ -257,3 +257,123 @@ def test_bytes_artifact_rejects_file_replaced_between_lstat_and_open(
         store.read_verified_bytes(receipt, max_bytes=100)
 
     assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+
+
+def test_limited_json_rejects_symlink_leaf_and_limit_plus_one(tmp_path: Path) -> None:
+    store = AtomicArtifactStore(tmp_path / "runtime")
+    receipt = store.write_json(
+        Path("runs/run_001/result.json"),
+        {"value": "正文"},
+        schema_version="3.0.0",
+        upstream_sha256="a" * 64,
+        file_mode=0o600,
+    )
+    with pytest.raises(VideoDemoError) as oversized:
+        store.read_verified_json_limited(receipt, max_bytes=1)
+    assert oversized.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+
+    artifact = store.runtime_root / receipt.relative_path
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(artifact.read_bytes())
+    artifact.unlink()
+    artifact.symlink_to(outside)
+    with pytest.raises(VideoDemoError) as symlink:
+        store.read_verified_json_limited(receipt, max_bytes=1024)
+    assert symlink.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+
+
+def test_json_write_rejects_non_positive_limit(tmp_path: Path) -> None:
+    store = AtomicArtifactStore(tmp_path)
+
+    with pytest.raises(ValueError, match="写入上限"):
+        store.write_json(
+            Path("result.json"),
+            {},
+            schema_version="3.0.0",
+            upstream_sha256="a" * 64,
+            max_bytes=0,
+        )
+
+
+def test_limited_json_rejects_file_replaced_between_lstat_and_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = AtomicArtifactStore(tmp_path / "runtime")
+    receipt = store.write_json(
+        Path("result.json"),
+        {"value": "original"},
+        schema_version="3.0.0",
+        upstream_sha256="a" * 64,
+        file_mode=0o600,
+    )
+    artifact = store.runtime_root / receipt.relative_path
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(b"replacement")
+    original_open = os.open
+    replaced = False
+
+    def racing_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal replaced
+        if Path(path) == Path(artifact.name) and not replaced:
+            replacement.replace(artifact)
+            replaced = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(artifacts_module.os, "open", racing_open)
+
+    with pytest.raises(VideoDemoError) as raised:
+        store.read_verified_json_limited(receipt, max_bytes=1024)
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+
+
+def test_discard_bytes_deletes_only_unchanged_regular_artifact(tmp_path: Path) -> None:
+    store = AtomicArtifactStore(tmp_path / "runtime")
+    receipt = store.write_bytes(Path("result.md"), b"document", max_bytes=100)
+    artifact = store.runtime_root / receipt.relative_path
+
+    assert store.discard_bytes(receipt.model_copy(update={"sha256": "b" * 64})) is False
+    assert artifact.exists()
+    assert store.discard_bytes(receipt.model_copy(update={"size_bytes": 1})) is False
+    assert artifact.exists()
+    assert store.discard_bytes(receipt) is True
+    assert not artifact.exists()
+
+
+def test_discard_bytes_rejects_symlink_without_deleting_target(tmp_path: Path) -> None:
+    store = AtomicArtifactStore(tmp_path / "runtime")
+    receipt = store.write_bytes(Path("result.md"), b"document", max_bytes=100)
+    artifact = store.runtime_root / receipt.relative_path
+    outside = tmp_path / "outside.md"
+    artifact.replace(outside)
+    artifact.symlink_to(outside)
+
+    assert store.discard_bytes(receipt) is False
+    assert outside.read_bytes() == b"document"
+
+
+def test_discard_artifact_rejects_replaced_or_symlink_json(tmp_path: Path) -> None:
+    store = AtomicArtifactStore(tmp_path / "runtime")
+    receipt = store.write_json(
+        Path("result.json"),
+        {"value": "original"},
+        schema_version="3.0.0",
+        upstream_sha256="a" * 64,
+        file_mode=0o600,
+    )
+    artifact = store.runtime_root / receipt.relative_path
+    artifact.write_bytes(b"replacement")
+    assert store.discard_artifact(receipt, max_bytes=1024) is False
+    assert artifact.read_bytes() == b"replacement"
+
+    outside = tmp_path / "outside.json"
+    artifact.replace(outside)
+    artifact.symlink_to(outside)
+    assert store.discard_artifact(receipt, max_bytes=1024) is False
+    assert outside.read_bytes() == b"replacement"
