@@ -23,6 +23,7 @@ from video_demo.errors import ErrorCode, VideoDemoError
 RESULT_SCHEMA_VERSION: Literal["3.0.0"] = "3.0.0"
 TranscriptSource: TypeAlias = Literal["SUBTITLE", "ASR", "NONE"]
 _TITLE_MAX_LENGTH = 200
+_VISUAL_CAPTION_MAX_LENGTH = 2_000
 _TITLE_WHITESPACE_PATTERN = re.compile(r"\s+")
 _DOCUMENT_KEYFRAME_PATH_PATTERN = re.compile(r"^visual/keyframes/([0-9a-f]{64})\.jpg$")
 
@@ -190,7 +191,9 @@ class SemanticChapter(TimeRange):
     result_type: Literal["SEMANTIC_CHAPTER"] = "SEMANTIC_CHAPTER"
     chapter_id: StableId
     title: str = Field(min_length=1, max_length=200)
+    title_evidence_refs: tuple[StableId, ...] = Field(max_length=32)
     summary_zh: str = Field(max_length=4_000)
+    summary_evidence_refs: tuple[StableId, ...] = Field(max_length=32)
     body_blocks: tuple[ChapterBodyBlock, ...] = Field(max_length=128)
     claims: tuple[GroundedClaim, ...] = Field(max_length=128)
     content_status: Literal["GROUNDED", "NO_SEMANTIC_EVIDENCE"] = "GROUNDED"
@@ -207,18 +210,65 @@ class SemanticChapter(TimeRange):
         _validate_retrieval_hash(self.retrieval_text, self.retrieval_hash)
         if len(self.evidence_refs) != len(set(self.evidence_refs)):
             raise ValueError("章节 evidence_refs 不得重复")
+        if len(self.title_evidence_refs) != len(set(self.title_evidence_refs)):
+            raise ValueError("章节 title_evidence_refs 不得重复")
+        if len(self.summary_evidence_refs) != len(set(self.summary_evidence_refs)):
+            raise ValueError("章节 summary_evidence_refs 不得重复")
+        if not set((*self.title_evidence_refs, *self.summary_evidence_refs)).issubset(
+            self.evidence_refs,
+        ):
+            raise ValueError("章节标题和摘要引用必须属于章节证据闭包")
         if len(self.selected_keyframe_refs) != len(set(self.selected_keyframe_refs)):
             raise ValueError("章节 selected_keyframe_refs 不得重复")
         if self.content_status == "NO_SEMANTIC_EVIDENCE":
             if self.transcript_source != "NONE":
                 raise ValueError("NO_SEMANTIC_EVIDENCE 章节必须没有转写来源")
-            if self.body_blocks or self.claims or self.evidence_refs or self.selected_keyframe_refs:
+            if (
+                self.body_blocks
+                or self.claims
+                or self.evidence_refs
+                or self.title_evidence_refs
+                or self.summary_evidence_refs
+                or self.selected_keyframe_refs
+            ):
                 raise ValueError("NO_SEMANTIC_EVIDENCE 章节不得包含事实或证据")
             if self.retrieval_text:
                 raise ValueError("NO_SEMANTIC_EVIDENCE 章节检索文本必须为空")
-        elif not self.evidence_refs:
-            raise ValueError("GROUNDED 章节至少需要一个证据引用")
+        else:
+            if not self.evidence_refs:
+                raise ValueError("GROUNDED 章节至少需要一个证据引用")
+            if not self.title_evidence_refs or not self.summary_evidence_refs:
+                raise ValueError("GROUNDED 章节的标题和摘要至少需要一个证据引用")
         return self
+
+
+def visual_caption_for_policy(
+    observation: VisualObservationEvidence,
+    config: DocumentGenerationConfig,
+) -> str:
+    """把视觉观察投影为最终文档唯一可接受的确定性文案。"""
+
+    if observation.relation_to_transcript != "CONFLICTING":
+        return observation.caption
+    uncertainty = "；".join(observation.uncertainties)
+    if config.uncertainty_policy == "conservative":
+        marker = " (画面与转写存在冲突，未采纳为确定事实："
+    else:
+        marker = " (音画信息存在冲突："
+    suffix = ")"
+    fixed_length = len(marker) + len(suffix)
+    content_budget = _VISUAL_CAPTION_MAX_LENGTH - fixed_length
+    total_content_length = len(observation.caption) + len(uncertainty)
+    if total_content_length <= content_budget:
+        caption = observation.caption
+    else:
+        caption_budget = max(
+            1,
+            content_budget * len(observation.caption) // total_content_length,
+        )
+        caption = observation.caption[:caption_budget]
+    uncertainty_budget = content_budget - len(caption)
+    return f"{caption}{marker}{uncertainty[:uncertainty_budget]}{suffix}"
 
 
 class PromptVersions(FrozenModel):
@@ -305,10 +355,33 @@ def validate_evidence_references(
         evidence_by_id[item.evidence_id] = item
 
     chapters_by_id = {chapter.chapter_id: chapter for chapter in result.chapters}
+    referenced_keyframes: set[str] = set()
     for evidence_item in evidence_by_id.values():
         if isinstance(evidence_item, KeyframeEvidence):
             _validate_document_keyframe(evidence_item)
+        elif isinstance(evidence_item, VisualObservationEvidence):
+            referenced_keyframes.update(evidence_item.keyframe_refs)
+    orphan_keyframes = {
+        evidence_id
+        for evidence_id, evidence_item in evidence_by_id.items()
+        if isinstance(evidence_item, KeyframeEvidence)
+        and evidence_id not in referenced_keyframes
+    }
     for chapter in result.chapters:
+        _validate_attributed_evidence_refs(
+            chapter,
+            chapter.title_evidence_refs,
+            evidence_by_id,
+            result.generation.document_config,
+            allow_typed_visual=False,
+        )
+        _validate_attributed_evidence_refs(
+            chapter,
+            chapter.summary_evidence_refs,
+            evidence_by_id,
+            result.generation.document_config,
+            allow_typed_visual=False,
+        )
         for evidence_ref in chapter.evidence_refs:
             _require_chapter_evidence(chapter, evidence_ref, evidence_by_id)
         for keyframe_ref in chapter.selected_keyframe_refs:
@@ -330,24 +403,25 @@ def validate_evidence_references(
                     "章节引用的关键帧超出自身时间范围",
                 )
         for block in chapter.body_blocks:
-            for evidence_ref in block.evidence_refs:
-                referenced = _require_chapter_evidence(chapter, evidence_ref, evidence_by_id)
-                if isinstance(block, VisualBlock) and not isinstance(
-                    referenced,
-                    VisualObservationEvidence,
-                ):
-                    raise VideoDemoError(
-                        ErrorCode.EVIDENCE_TYPE_MISMATCH,
-                        "VISUAL block 只能引用视觉观察证据",
-                    )
-            if (
-                isinstance(block, VisualBlock)
-                and block.visual_observation_ref not in block.evidence_refs
-            ):
+            if not block.evidence_refs:
                 raise VideoDemoError(
                     ErrorCode.UNKNOWN_EVIDENCE_REFERENCE,
-                    "VISUAL block 的观察引用必须属于 evidence_refs",
+                    "章节正文块至少需要一个证据引用",
                 )
+            if isinstance(block, VisualBlock) and block.evidence_refs != (
+                block.visual_observation_ref,
+            ):
+                raise VideoDemoError(
+                    ErrorCode.EVIDENCE_RELATION_INVALID,
+                    "VISUAL block 只能绑定其视觉观察",
+                )
+            _validate_attributed_evidence_refs(
+                chapter,
+                block.evidence_refs,
+                evidence_by_id,
+                result.generation.document_config,
+                allow_typed_visual=isinstance(block, VisualBlock),
+            )
             if isinstance(block, VisualBlock):
                 observation = evidence_by_id.get(block.visual_observation_ref)
                 if not isinstance(observation, VisualObservationEvidence):
@@ -375,9 +449,42 @@ def validate_evidence_references(
                         ErrorCode.UNKNOWN_EVIDENCE_REFERENCE,
                         "空内容视觉观察不得选择子内容",
                     )
+                if (
+                    observation.relation_to_transcript == "CONFLICTING"
+                    and block.caption
+                    != visual_caption_for_policy(
+                        observation,
+                        result.generation.document_config,
+                    )
+                ):
+                    raise VideoDemoError(
+                        ErrorCode.EVIDENCE_RELATION_INVALID,
+                        "冲突视觉文案必须是视觉观察的确定性策略投影",
+                    )
         for claim in chapter.claims:
-            for evidence_ref in claim.evidence_refs:
-                _require_chapter_evidence(chapter, evidence_ref, evidence_by_id)
+            _validate_attributed_evidence_refs(
+                chapter,
+                claim.evidence_refs,
+                evidence_by_id,
+                result.generation.document_config,
+                allow_typed_visual=False,
+            )
+        rebuilt_keyframes = _selected_keyframes_from_body(
+            chapter,
+            evidence_by_id,
+        )
+        if rebuilt_keyframes != chapter.selected_keyframe_refs:
+            raise VideoDemoError(
+                ErrorCode.EVIDENCE_RELATION_INVALID,
+                "章节展示关键帧必须严格来自正文所选视觉子内容",
+                {"chapter_id": chapter.chapter_id},
+            )
+        if any(ref not in chapter.evidence_refs for ref in rebuilt_keyframes):
+            raise VideoDemoError(
+                ErrorCode.UNKNOWN_EVIDENCE_REFERENCE,
+                "章节展示关键帧必须属于章节证据闭包",
+                {"chapter_id": chapter.chapter_id},
+            )
 
     for evidence_item in evidence_by_id.values():
         if not isinstance(evidence_item, VisualObservationEvidence):
@@ -450,6 +557,11 @@ def validate_evidence_references(
                     ErrorCode.EVIDENCE_OUTSIDE_CHAPTER,
                     "视觉观察的转写证据不属于所在章节",
                 )
+    if orphan_keyframes:
+        raise VideoDemoError(
+            ErrorCode.UNKNOWN_EVIDENCE_REFERENCE,
+            "最终证据不得包含未被视觉观察引用的孤立关键帧",
+        )
 
 
 def _require_chapter_evidence(
@@ -471,6 +583,129 @@ def _require_chapter_evidence(
             {"chapter_id": chapter.chapter_id, "evidence_id": evidence_ref},
         )
     return referenced
+
+
+def _validate_attributed_evidence_refs(
+    chapter: SemanticChapter,
+    evidence_refs: tuple[str, ...],
+    evidence_by_id: dict[str, TimedEvidence],
+    config: DocumentGenerationConfig,
+    *,
+    allow_typed_visual: bool,
+) -> None:
+    for evidence_ref in evidence_refs:
+        if evidence_ref not in chapter.evidence_refs:
+            raise VideoDemoError(
+                ErrorCode.UNKNOWN_EVIDENCE_REFERENCE,
+                "标题、摘要、正文和 Claim 的引用必须属于章节证据闭包",
+                {"chapter_id": chapter.chapter_id, "evidence_id": evidence_ref},
+            )
+        referenced = _require_chapter_evidence(chapter, evidence_ref, evidence_by_id)
+        if isinstance(referenced, KeyframeEvidence):
+            raise VideoDemoError(
+                ErrorCode.EVIDENCE_TYPE_MISMATCH,
+                "标题、摘要、正文和 Claim 不能直接引用关键帧证据",
+            )
+        if not isinstance(referenced, VisualObservationEvidence):
+            continue
+        relation = referenced.relation_to_transcript
+        if relation == "DUPLICATE":
+            raise VideoDemoError(
+                ErrorCode.EVIDENCE_RELATION_INVALID,
+                "DUPLICATE 视觉观察不得重复进入最终正文",
+            )
+        if relation == "CONFLICTING" and not allow_typed_visual:
+            raise VideoDemoError(
+                ErrorCode.EVIDENCE_RELATION_INVALID,
+                "CONFLICTING 视觉观察只能通过类型化视觉块表达",
+            )
+        if (
+            config.uncertainty_policy == "conservative"
+            and referenced.certainty < 0.7
+            and relation != "CONFLICTING"
+        ):
+            raise VideoDemoError(
+                ErrorCode.EVIDENCE_RELATION_INVALID,
+                "保守策略下低置信视觉观察只能进入信息边界",
+            )
+
+
+def _selected_keyframes_from_body(
+    chapter: SemanticChapter,
+    evidence_by_id: dict[str, TimedEvidence],
+) -> tuple[str, ...]:
+    selected: list[str] = []
+    for block in chapter.body_blocks:
+        if not isinstance(block, VisualBlock):
+            continue
+        observation = evidence_by_id.get(block.visual_observation_ref)
+        if not isinstance(observation, VisualObservationEvidence):
+            raise VideoDemoError(
+                ErrorCode.EVIDENCE_TYPE_MISMATCH,
+                "VISUAL block 必须绑定视觉观察",
+            )
+        source_by_content = {
+            item.visual_content_id: item.source_keyframe_refs
+            for item in observation.content_blocks
+        }
+        source_by_content.update(
+            {
+                item.visual_fact_id: item.source_keyframe_refs
+                for item in observation.visual_facts
+            },
+        )
+        sources = tuple(
+            ref
+            for content_ref in block.visual_content_refs
+            for ref in source_by_content[content_ref]
+        ) or observation.keyframe_refs
+        sources = tuple(dict.fromkeys(sources))
+        if not _selected_frames_are_related(observation, sources):
+            raise VideoDemoError(
+                ErrorCode.EVIDENCE_RELATION_INVALID,
+                "多图视觉正文缺少所选帧之间的对应关系",
+                {"evidence_id": observation.evidence_id},
+            )
+        for ref in sources:
+            if ref not in selected:
+                selected.append(ref)
+    return tuple(selected)
+
+
+def _selected_frames_are_related(
+    observation: VisualObservationEvidence,
+    sources: tuple[str, ...],
+) -> bool:
+    selected = set(sources)
+    if len(selected) <= 1:
+        return True
+    relation_edges = {
+        frozenset((relation.from_keyframe_ref, relation.to_keyframe_ref))
+        for relation in observation.frame_relations
+        if (
+            relation.from_keyframe_ref in selected
+            and relation.to_keyframe_ref in selected
+        )
+    }
+    if len(selected) == 2:
+        return frozenset(selected) in relation_edges
+    adjacency: dict[str, set[str]] = {source: set() for source in selected}
+    for relation in observation.frame_relations:
+        if (
+            relation.from_keyframe_ref in selected
+            and relation.to_keyframe_ref in selected
+        ):
+            adjacency[relation.from_keyframe_ref].add(relation.to_keyframe_ref)
+            adjacency[relation.to_keyframe_ref].add(relation.from_keyframe_ref)
+    visited: set[str] = set()
+    stack = [sources[0]]
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        stack.extend(adjacency[current] - visited)
+    return visited == selected
 
 
 def _keyframe_timestamp(

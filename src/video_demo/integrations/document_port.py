@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, Protocol, Self
@@ -35,7 +36,12 @@ from video_demo.errors import ErrorCode, VideoDemoError
 
 TranscriptEvidence = SpeechSegment | SubtitleCue
 _SUSPICIOUS_VALUE = re.compile(
-    r"(?i)(?:https?://|data:|bearer\s+|(?:[A-Za-z0-9+/]{80,}={0,2}))",
+    r"(?i)(?:"
+    r"https?://|data:|bearer\s+|"
+    r"(?:sk-(?:proj-)?|gh[pousr]_|github_pat_|xox[baprs]-|AKIA|AIza|hf_|glpat-|npm_|pypi-)"
+    r"[A-Za-z0-9_-]{16,}|"
+    r"(?:[A-Za-z0-9+/]{20,}={1,2})|(?:[A-Za-z0-9+/]{80,})"
+    r")",
 )
 _SENSITIVE_KEY = re.compile(r"(?i)(?:authorization|api[_-]?key|token|password|secret)")
 
@@ -67,6 +73,20 @@ class InvalidModelResponse(FrozenModel):
             raise ValueError("validation_errors 不得重复")
         if any(not item or len(item) > 500 for item in value):
             raise ValueError("validation_errors 每条必须为 1~500 个字符")
+        if any(_contains_control_character(item) for item in value):
+            raise ValueError("validation_errors 不得包含控制字符")
+        if any(_SUSPICIOUS_VALUE.search(item) for item in value):
+            raise ValueError("validation_errors 不得包含疑似敏感信息")
+        return value
+
+    @field_validator("safe_json_excerpt")
+    @classmethod
+    def validate_safe_json_excerpt(cls, value: str | None) -> str | None:
+        if value is not None:
+            if _contains_control_character(value):
+                raise ValueError("safe_json_excerpt 不得包含控制字符")
+            if _SUSPICIOUS_VALUE.search(value):
+                raise ValueError("safe_json_excerpt 不得包含疑似敏感信息")
         return value
 
 
@@ -169,9 +189,17 @@ class ChapterWritingRequest(FrozenModel):
 
 class ChapterWritingResponse(FrozenModel):
     title: str = Field(min_length=1, max_length=200)
+    title_evidence_refs: tuple[StableId, ...] = Field(min_length=1, max_length=32)
     summary_zh: str = Field(max_length=500)
+    summary_evidence_refs: tuple[StableId, ...] = Field(min_length=1, max_length=32)
     body_blocks: tuple[ChapterBodyBlock, ...] = Field(max_length=128)
     claims: tuple[GroundedClaim, ...] = Field(max_length=128)
+
+    @model_validator(mode="after")
+    def reject_duplicate_header_refs(self) -> Self:
+        _reject_duplicate_ids(self.title_evidence_refs, "title_evidence_refs")
+        _reject_duplicate_ids(self.summary_evidence_refs, "summary_evidence_refs")
+        return self
 
 
 class ChapterWritingRepairRequest(FrozenModel):
@@ -360,10 +388,15 @@ def _is_safe_json_value(value: object, *, key: str | None = None) -> bool:
     if key is not None and _SENSITIVE_KEY.search(key):
         return False
     if isinstance(value, str):
-        return _SUSPICIOUS_VALUE.search(value) is None
+        return (
+            _SUSPICIOUS_VALUE.search(value) is None
+            and not _contains_control_character(value)
+        )
     if isinstance(value, dict):
         return all(
             isinstance(item_key, str)
+            and _SUSPICIOUS_VALUE.search(item_key) is None
+            and not _contains_control_character(item_key)
             and _is_safe_json_value(item_value, key=item_key)
             for item_key, item_value in value.items()
         )
@@ -373,8 +406,16 @@ def _is_safe_json_value(value: object, *, key: str | None = None) -> bool:
 
 
 def _normalize_validation_error(value: str) -> str:
-    normalized = " ".join(value.split())
+    without_controls = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in value
+    )
+    normalized = " ".join(without_controls.split())
     return (normalized or "response:invalid")[:500]
+
+
+def _contains_control_character(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
 
 
 def _require_exact_ids(actual: tuple[str, ...], expected: tuple[str, ...], field: str) -> None:

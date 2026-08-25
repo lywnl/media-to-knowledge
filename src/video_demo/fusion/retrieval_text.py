@@ -37,19 +37,28 @@ def render_document_chapter_retrieval_text(
     if chapter.content_status == "NO_SEMANTIC_EVIDENCE":
         return ""
     observation_by_id = {item.evidence_id: item for item in visual_observations}
+    selected_visual_blocks = tuple(
+        block for block in chapter.body_blocks if isinstance(block, VisualBlock)
+    )
+    selected_observations = tuple(
+        observation_by_id[block.visual_observation_ref]
+        for block in selected_visual_blocks
+        if block.visual_observation_ref in observation_by_id
+    )
     body = _join_plain_text(_body_block_text(block) for block in chapter.body_blocks)
     visual_captions = _join_plain_text(
-        item.caption
-        for item in visual_observations
-        if item.evidence_id in chapter.evidence_refs
-        and item.relation_to_transcript != "DUPLICATE"
+        dict.fromkeys(
+            normalize_retrieval_value(block.caption)
+            for block in selected_visual_blocks
+        ),
     )
     uncertainties = _join(
         tuple(
-            uncertainty
-            for item in visual_observations
-            if item.evidence_id in chapter.evidence_refs
-            for uncertainty in item.uncertainties
+            dict.fromkeys(
+                uncertainty
+                for item in selected_observations
+                for uncertainty in item.uncertainties
+            ),
         ),
     )
     lines = [
@@ -98,7 +107,7 @@ def _body_block_text(block: object) -> str:
     if isinstance(block, FormulaBlock):
         return " ".join(value for value in (block.latex, block.explanation) if value)
     if isinstance(block, VisualBlock):
-        return block.caption
+        return ""
     raise TypeError(f"不支持的章节正文块：{type(block).__name__}")
 
 

@@ -20,6 +20,7 @@ SpeakerId = Literal[
     "SPEAKER_09",
     "SPEAKER_10",
 ]
+VisualUncertainty = Annotated[str, Field(min_length=1)]
 
 
 class TimedEvidence(TimeRange):
@@ -209,7 +210,7 @@ class VisualObservationEvidence(TimedEvidence):
     ]
     certainty: Probability
     quality_flags: tuple[str, ...] = Field(default=(), max_length=16)
-    uncertainties: tuple[str, ...] = Field(default=(), max_length=16)
+    uncertainties: tuple[VisualUncertainty, ...] = Field(default=(), max_length=16)
 
     @model_validator(mode="after")
     def validate_local_references(self) -> Self:
@@ -352,7 +353,7 @@ class ChapterVisualObservation(FrozenModel):
     ]
     certainty: Probability
     quality_flags: tuple[str, ...] = Field(default=(), max_length=16)
-    uncertainties: tuple[str, ...] = Field(default=(), max_length=16)
+    uncertainties: tuple[VisualUncertainty, ...] = Field(default=(), max_length=16)
 
     @model_validator(mode="after")
     def validate_local_references(self) -> Self:

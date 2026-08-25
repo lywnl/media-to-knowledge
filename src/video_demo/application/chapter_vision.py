@@ -273,6 +273,16 @@ class ChapterVisionService:
             or candidate_lock_timeout_seconds <= 0
         ):
             raise ValueError("章节视觉锁超时必须为有限正数")
+        if identity.logical_operation != "chapter_vision":
+            raise ValueError("章节视觉缓存身份与逻辑操作不一致")
+        if identity.main_prompt_version != "chapter-vlm-v1":
+            raise ValueError("章节视觉缓存身份与 Prompt 版本不一致")
+        if identity.repair_prompt_version != "chapter-vlm-repair-v1":
+            raise ValueError("章节视觉缓存身份与修复 Prompt 版本不一致")
+        if identity.main_response_schema_name != "chapter_vlm_v2":
+            raise ValueError("章节视觉缓存身份与主响应 Schema 不一致")
+        if identity.repair_response_schema_name != "chapter_vlm_repair_v2":
+            raise ValueError("章节视觉缓存身份与修复响应 Schema 不一致")
         self._vision_port = vision_port
         self._identity = identity
         self._runtime_root = runtime_root.expanduser().resolve(strict=False)
@@ -925,11 +935,11 @@ def _repair_request(
 
 
 def _worst_invalid_response() -> InvalidModelResponse:
-    errors = tuple(f"{index:02d}:" + "x" * 497 for index in range(32))
+    errors = tuple(f"{index:02d}:" + "." * 497 for index in range(32))
     return InvalidModelResponse(
         content_sha256="f" * 64,
         validation_errors=errors,
-        safe_json_excerpt="x" * 8_000,
+        safe_json_excerpt="." * 8_000,
     )
 
 

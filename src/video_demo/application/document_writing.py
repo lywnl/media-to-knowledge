@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from itertools import pairwise
+from threading import Event, Lock
 from typing import Literal, cast
 
 from pydantic import StrictInt, field_validator
@@ -32,6 +33,7 @@ from video_demo.domain.document import (
     VisualBlock,
     section_id_for,
     validate_evidence_references,
+    visual_caption_for_policy,
 )
 from video_demo.domain.document_artifact import MAX_METRIC_VALUE
 from video_demo.domain.document_plan import ChapterPlan
@@ -145,6 +147,44 @@ class _Counters:
         }
 
 
+class _CacheCommitGate:
+    """让取消与不可撤销的缓存提交形成单一线性化边界。"""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._commit_finished = Event()
+        self._state: Literal["PRE_COMMIT", "COMMITTING", "FINISHED", "CANCELLED"] = (
+            "PRE_COMMIT"
+        )
+
+    def begin_commit(self, is_cancel_requested: Callable[[], bool]) -> None:
+        with self._lock:
+            if self._state == "CANCELLED" or is_cancel_requested():
+                self._state = "CANCELLED"
+                raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
+            if self._state != "PRE_COMMIT":
+                raise RuntimeError("缓存提交门状态非法")
+            self._state = "COMMITTING"
+
+    def finish_commit(self) -> None:
+        with self._lock:
+            if self._state != "COMMITTING":
+                raise RuntimeError("缓存提交门状态非法")
+            self._state = "FINISHED"
+            self._commit_finished.set()
+
+    def cancel(self) -> Event | None:
+        """取消先到则阻止提交；提交先到则返回必须等待的完成事件。"""
+
+        with self._lock:
+            if self._state == "PRE_COMMIT":
+                self._state = "CANCELLED"
+                return None
+            if self._state == "COMMITTING":
+                return self._commit_finished
+            return None
+
+
 @dataclass(frozen=True, slots=True)
 class _ChapterOutcome:
     chapter: SemanticChapter
@@ -185,16 +225,28 @@ class DocumentWriter:
             raise ValueError("模型调用锁等待时间必须大于 0")
         if chapter_identity.main_prompt_version != prompt_versions.chapter_writer:
             raise ValueError("章节写作缓存身份与 Prompt 版本不一致")
+        if chapter_identity.logical_operation != "chapter_writing":
+            raise ValueError("章节写作缓存身份与逻辑操作不一致")
         if chapter_identity.repair_prompt_version != prompt_versions.chapter_writer_repair:
             raise ValueError("章节写作缓存身份与修复 Prompt 版本不一致")
         if chapter_identity.model_id != text_model_id:
             raise ValueError("章节写作缓存身份与文本模型不一致")
+        if chapter_identity.main_response_schema_name != "chapter_writing_v2":
+            raise ValueError("章节写作缓存身份与响应 Schema 不一致")
+        if chapter_identity.repair_response_schema_name != "chapter_writing_repair_v2":
+            raise ValueError("章节写作缓存身份与修复 Schema 不一致")
         if global_identity.main_prompt_version != prompt_versions.global_editor:
             raise ValueError("全局编辑缓存身份与 Prompt 版本不一致")
+        if global_identity.logical_operation != "global_editing":
+            raise ValueError("全局编辑缓存身份与逻辑操作不一致")
         if global_identity.repair_prompt_version != prompt_versions.global_editor_repair:
             raise ValueError("全局编辑缓存身份与修复 Prompt 版本不一致")
         if global_identity.model_id != text_model_id:
             raise ValueError("全局编辑缓存身份与文本模型不一致")
+        if global_identity.main_response_schema_name != "global_writing_v1":
+            raise ValueError("全局编辑缓存身份与主响应 Schema 不一致")
+        if global_identity.repair_response_schema_name != "global_writing_repair_v1":
+            raise ValueError("全局编辑缓存身份与修复响应 Schema 不一致")
         self._text_port = text_port
         self._text_model_id = text_model_id
         self._vlm_model_id = vlm_model_id
@@ -218,6 +270,7 @@ class DocumentWriter:
         is_cancel_requested: Callable[[], bool],
     ) -> WrittenDocument:
         _validate_inputs(context, plans, transcript_evidence, visual_evidence, keyframe_evidence)
+        _raise_if_cancelled(is_cancel_requested)
         counters = _Counters()
         packages = tuple(
             (
@@ -241,6 +294,7 @@ class DocumentWriter:
             counters,
             is_cancel_requested,
         )
+        _raise_if_cancelled(is_cancel_requested)
         chapters = tuple(item.chapter for item in outcomes)
         chapter_degraded = tuple(item.chapter.chapter_id for item in outcomes if item.degraded)
         global_response, global_degraded = self._write_global(
@@ -250,6 +304,7 @@ class DocumentWriter:
             counters,
             is_cancel_requested,
         )
+        _raise_if_cancelled(is_cancel_requested)
         result = _materialize_result(
             context,
             chapters,
@@ -267,6 +322,7 @@ class DocumentWriter:
         )
         if global_degraded:
             warnings += ("GLOBAL_WRITING_DEGRADED",)
+        _raise_if_cancelled(is_cancel_requested)
         return WrittenDocument(
             result=result,
             warnings=warnings,
@@ -318,38 +374,65 @@ class DocumentWriter:
         if not pending_indexes:
             return cast(tuple[_ChapterOutcome, ...], tuple(outcomes))
         executor = ThreadPoolExecutor(max_workers=self._concurrency)
-        in_flight: dict[Future[_ChapterOutcome], int] = {}
+        in_flight: dict[Future[_ChapterOutcome], tuple[int, _CacheCommitGate]] = {}
         next_position = 0
         try:
             while next_position < len(pending_indexes) or in_flight:
                 if is_cancel_requested():
+                    _cancel_before_or_wait_for_commits(
+                        gate for _, gate in in_flight.values()
+                    )
                     raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
                 while next_position < len(pending_indexes) and len(in_flight) < self._concurrency:
                     index = pending_indexes[next_position]
                     request = packages[index][1]
                     assert request is not None
+                    commit_gate = _CacheCommitGate()
                     future = executor.submit(
                         self._write_one,
                         request,
                         keyframes,
                         cache,
                         is_cancel_requested,
+                        commit_gate,
                     )
-                    in_flight[future] = index
+                    in_flight[future] = (index, commit_gate)
                     next_position += 1
-                completed, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+                completed, _ = wait(
+                    tuple(in_flight),
+                    timeout=0.05,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not completed:
+                    continue
                 for future in completed:
-                    index = in_flight.pop(future)
+                    index, _ = in_flight.pop(future)
                     outcome = future.result()
                     outcomes[index] = outcome
                     counters.chapter_attempts += outcome.provider_attempts
                     counters.chapter_repairs += outcome.structure_repairs
                     counters.chapter_cache_hits += outcome.cache_hits
                     counters.chapter_fallbacks += int(outcome.degraded)
-        finally:
+        except BaseException as error:
+            _cancel_before_or_wait_for_commits(
+                gate for _, gate in in_flight.values()
+            )
             for future in in_flight:
                 future.cancel()
-            executor.shutdown(wait=True, cancel_futures=True)
+            if isinstance(error, VideoDemoError) and error.code == ErrorCode.JOB_CANCELLED:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            _done, unfinished = wait(
+                tuple(in_flight),
+                timeout=self._wait_timeout_seconds,
+            )
+            if unfinished:
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
         return cast(tuple[_ChapterOutcome, ...], tuple(outcomes))
 
     def _write_one(
@@ -358,6 +441,7 @@ class DocumentWriter:
         keyframes: tuple[KeyframeEvidence, ...],
         cache: DocumentModelCache,
         is_cancel_requested: Callable[[], bool],
+        commit_gate: _CacheCommitGate,
     ) -> _ChapterOutcome:
         local = _Counters()
         response = self._chapter_logical_call(
@@ -365,9 +449,18 @@ class DocumentWriter:
             cache,
             local,
             is_cancel_requested,
+            commit_gate,
         )
         degraded = response is None
         if response is None:
+            if not _fallback_header_evidence_refs(request):
+                return _ChapterOutcome(
+                    _empty_chapter(request.chapter),
+                    True,
+                    local.chapter_attempts,
+                    local.chapter_repairs,
+                    local.chapter_cache_hits,
+                )
             response = _fallback_chapter_response(request)
         response = _normalize_response_blocks(response, request)
         chapter = _materialize_chapter(request, response, keyframes)
@@ -385,6 +478,7 @@ class DocumentWriter:
         cache: DocumentModelCache,
         counters: _Counters,
         is_cancel_requested: Callable[[], bool],
+        commit_gate: _CacheCommitGate,
     ) -> ChapterWritingResponse | None:
         def validate(response: ChapterWritingResponse) -> None:
             _validate_chapter_response(response, request)
@@ -407,15 +501,21 @@ class DocumentWriter:
             try:
                 response = self._text_port.write_chapter(
                     request,
-                    on_provider_attempt=counters.chapter_attempt,
+                    on_provider_attempt=_cancellable_attempt_callback(
+                        counters.chapter_attempt,
+                        is_cancel_requested,
+                    ),
                 )
             except ModelResponseValidationError as error:
+                _raise_if_cancelled(is_cancel_requested)
                 invalid = error.invalid_response
             except VideoDemoError as error:
+                _raise_if_cancelled(is_cancel_requested)
                 if _is_fallback_error(error):
                     return None
                 raise
             else:
+                _raise_if_cancelled(is_cancel_requested)
                 try:
                     validate(response)
                 except (ValueError, TypeError) as error:
@@ -423,6 +523,7 @@ class DocumentWriter:
             if invalid is None:
                 path: Literal["MAIN", "REPAIR"] = "MAIN"
             else:
+                _raise_if_cancelled(is_cancel_requested)
                 counters.chapter_repairs += 1
                 try:
                     response = self._text_port.repair_chapter_writing(
@@ -432,26 +533,36 @@ class DocumentWriter:
                             allowed_evidence_ids=allowed_writing_evidence_ids(request),
                             prompt_version=self._prompt_versions.chapter_writer_repair,
                         ),
-                        on_provider_attempt=counters.chapter_attempt,
+                        on_provider_attempt=_cancellable_attempt_callback(
+                            counters.chapter_attempt,
+                            is_cancel_requested,
+                        ),
                     )
                 except ModelResponseValidationError:
+                    _raise_if_cancelled(is_cancel_requested)
                     return None
                 except VideoDemoError as error:
+                    _raise_if_cancelled(is_cancel_requested)
                     if _is_fallback_error(error):
                         return None
                     raise
+                _raise_if_cancelled(is_cancel_requested)
                 try:
                     validate(response)
                 except (ValueError, TypeError):
                     return None
                 path = "REPAIR"
-            return cache.put(
-                self._chapter_identity,
-                request,
-                response,
-                successful_path=path,
-                validate=validate,
-            ).response
+            commit_gate.begin_commit(is_cancel_requested)
+            try:
+                return cache.put(
+                    self._chapter_identity,
+                    request,
+                    response,
+                    successful_path=path,
+                    validate=validate,
+                ).response
+            finally:
+                commit_gate.finish_commit()
 
     def _write_global(
         self,
@@ -471,11 +582,53 @@ class DocumentWriter:
             self._max_input_bytes,
         )
         counters.global_logical += 1
+
+        commit_gate = _CacheCommitGate()
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            self._global_logical_call,
+            request,
+            chapters,
+            cache,
+            counters,
+            is_cancel_requested,
+            commit_gate,
+        )
+        try:
+            while True:
+                if is_cancel_requested():
+                    _cancel_before_or_wait_for_commits((commit_gate,))
+                    raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
+                completed, _ = wait(
+                    (future,),
+                    timeout=0.05,
+                    return_when=FIRST_COMPLETED,
+                )
+                if completed:
+                    result = future.result()
+                    executor.shutdown(wait=True)
+                    return result
+        except BaseException:
+            future.cancel()
+            executor.shutdown(wait=future.done(), cancel_futures=True)
+            raise
+
+    def _global_logical_call(
+        self,
+        request: GlobalWritingRequest,
+        chapters: tuple[SemanticChapter, ...],
+        cache: DocumentModelCache,
+        counters: _Counters,
+        is_cancel_requested: Callable[[], bool],
+        commit_gate: _CacheCommitGate,
+    ) -> tuple[GlobalWritingResponse, bool]:
         def validate(response: GlobalWritingResponse) -> None:
             _validate_global_response(response, request, chapters)
 
+        _raise_if_cancelled(is_cancel_requested)
         cached = cache.get(self._global_identity, request, GlobalWritingResponse, validate)
         if cached is not None:
+            _raise_if_cancelled(is_cancel_requested)
             counters.global_cache_hits += 1
             return cached.response, False
         with cache.invocation_lock(
@@ -486,22 +639,30 @@ class DocumentWriter:
         ):
             cached = cache.get(self._global_identity, request, GlobalWritingResponse, validate)
             if cached is not None:
+                _raise_if_cancelled(is_cancel_requested)
                 counters.global_cache_hits += 1
                 return cached.response, False
+            _raise_if_cancelled(is_cancel_requested)
             invalid: InvalidModelResponse | None = None
             try:
                 response = self._text_port.organize_document(
                     request,
-                    on_provider_attempt=counters.global_attempt,
+                    on_provider_attempt=_cancellable_attempt_callback(
+                        counters.global_attempt,
+                        is_cancel_requested,
+                    ),
                 )
             except ModelResponseValidationError as error:
+                _raise_if_cancelled(is_cancel_requested)
                 invalid = error.invalid_response
             except VideoDemoError as error:
+                _raise_if_cancelled(is_cancel_requested)
                 if _is_fallback_error(error):
                     counters.global_fallbacks += 1
                     return _fallback_global_response(chapters), True
                 raise
             else:
+                _raise_if_cancelled(is_cancel_requested)
                 try:
                     validate(response)
                 except (ValueError, TypeError) as error:
@@ -510,6 +671,7 @@ class DocumentWriter:
                 path: Literal["MAIN", "REPAIR"] = "MAIN"
             else:
                 counters.global_repairs += 1
+                _raise_if_cancelled(is_cancel_requested)
                 try:
                     response = self._text_port.repair_global_writing(
                         GlobalWritingRepairRequest(
@@ -518,29 +680,39 @@ class DocumentWriter:
                             allowed_chapter_ids=allowed_global_chapter_ids(request),
                             prompt_version=self._prompt_versions.global_editor_repair,
                         ),
-                        on_provider_attempt=counters.global_attempt,
+                        on_provider_attempt=_cancellable_attempt_callback(
+                            counters.global_attempt,
+                            is_cancel_requested,
+                        ),
                     )
                 except ModelResponseValidationError:
+                    _raise_if_cancelled(is_cancel_requested)
                     counters.global_fallbacks += 1
                     return _fallback_global_response(chapters), True
                 except VideoDemoError as error:
+                    _raise_if_cancelled(is_cancel_requested)
                     if _is_fallback_error(error):
                         counters.global_fallbacks += 1
                         return _fallback_global_response(chapters), True
                     raise
+                _raise_if_cancelled(is_cancel_requested)
                 try:
                     validate(response)
                 except (ValueError, TypeError):
                     counters.global_fallbacks += 1
                     return _fallback_global_response(chapters), True
                 path = "REPAIR"
-            response = cache.put(
-                self._global_identity,
-                request,
-                response,
-                successful_path=path,
-                validate=validate,
-            ).response
+            commit_gate.begin_commit(is_cancel_requested)
+            try:
+                response = cache.put(
+                    self._global_identity,
+                    request,
+                    response,
+                    successful_path=path,
+                    validate=validate,
+                ).response
+            finally:
+                commit_gate.finish_commit()
             return response, False
 
 
@@ -642,7 +814,9 @@ def _chapter_request(
         )
         if _chapter_request_fits(request, max_chars, max_bytes):
             return request
-        if chapter_observations:
+        if chapter_observations and (
+            chapter_transcript or len(chapter_observations) > 1
+        ):
             chapter_observations = chapter_observations[:-1]
         elif len(chapter_transcript) > 1:
             chapter_transcript = chapter_transcript[:-1]
@@ -651,14 +825,20 @@ def _chapter_request(
 
 
 def _chapter_request_fits(request: ChapterWritingRequest, max_chars: int, max_bytes: int) -> bool:
-    repair = ChapterWritingRepairRequest(
-        request=request,
-        invalid_response=_worst_invalid_response(),
-        allowed_evidence_ids=allowed_writing_evidence_ids(request),
-        prompt_version="chapter-writer-repair-v1",
+    repairs = tuple(
+        ChapterWritingRepairRequest(
+            request=request,
+            invalid_response=invalid,
+            allowed_evidence_ids=allowed_writing_evidence_ids(request),
+            prompt_version="chapter-writer-repair-v1",
+        )
+        for invalid in _worst_invalid_responses()
     )
     return _prompts_fit(
-        (prompt_for_writing(request)[2], prompt_for_writing_repair(repair)[2]),
+        (
+            prompt_for_writing(request)[2],
+            *(prompt_for_writing_repair(repair)[2] for repair in repairs),
+        ),
         max_chars,
         max_bytes,
     )
@@ -679,23 +859,47 @@ def _global_request(
     )
     if _global_request_fits(request, max_chars, max_bytes):
         return request
-    original_lengths = [len(group.digest_zh) for group in groups]
-    for numerator in range(99, 0, -1):
-        resized: list[GlobalChapterGroup] = []
-        for group, original_length in zip(groups, original_lengths, strict=True):
-            if not group.grounded_chapter_refs:
-                resized.append(group)
-                continue
-            length = max(1, original_length * numerator // 100)
-            resized.append(group.model_copy(update={"digest_zh": group.digest_zh[:length]}))
-        request = GlobalWritingRequest(
-            context=context,
-            groups=tuple(resized),
-            prompt_version=prompt_version,
+    minimum = _resized_global_request(context, groups, prompt_version, scale=0)
+    if not _global_request_fits(minimum, max_chars, max_bytes):
+        raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "全局编辑最小输入超过预算")
+    lower = 0
+    upper = 1_000_000
+    best = minimum
+    while lower <= upper:
+        scale = (lower + upper) // 2
+        candidate = _resized_global_request(context, groups, prompt_version, scale=scale)
+        if _global_request_fits(candidate, max_chars, max_bytes):
+            best = candidate
+            lower = scale + 1
+        else:
+            upper = scale - 1
+    return best
+
+
+def _resized_global_request(
+    context: DocumentWritingContext,
+    groups: list[GlobalChapterGroup],
+    prompt_version: Literal["global-editor-v1"],
+    *,
+    scale: int,
+) -> GlobalWritingRequest:
+    resized = tuple(
+        group
+        if not group.grounded_chapter_refs
+        else group.model_copy(
+            update={
+                "digest_zh": group.digest_zh[
+                    : max(1, len(group.digest_zh) * scale // 1_000_000)
+                ],
+            },
         )
-        if _global_request_fits(request, max_chars, max_bytes):
-            return request
-    raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "全局编辑最小输入超过预算")
+        for group in groups
+    )
+    return GlobalWritingRequest(
+        context=context,
+        groups=resized,
+        prompt_version=prompt_version,
+    )
 
 
 def _global_groups(chapters: tuple[SemanticChapter, ...]) -> tuple[GlobalChapterGroup, ...]:
@@ -705,10 +909,13 @@ def _global_groups(chapters: tuple[SemanticChapter, ...]) -> tuple[GlobalChapter
         grounded = tuple(
             chapter for chapter in batch if chapter.content_status == "GROUNDED"
         )
-        digest = "\n".join(
-            f"{chapter.title}|{chapter.summary_zh}|{chapter.retrieval_text}"
-            for chapter in grounded
-        )[:_MAX_GLOBAL_DIGEST_CHARS]
+        digest = _fit_digest_parts(
+            tuple(
+                f"{chapter.title}|{chapter.summary_zh}|{chapter.retrieval_text}"
+                for chapter in grounded
+            ),
+            _MAX_GLOBAL_DIGEST_CHARS,
+        )
         groups.append(
             GlobalChapterGroup(
                 start_ms=batch[0].start_ms,
@@ -721,15 +928,48 @@ def _global_groups(chapters: tuple[SemanticChapter, ...]) -> tuple[GlobalChapter
     return tuple(groups)
 
 
+def _fit_digest_parts(parts: tuple[str, ...], maximum: int) -> str:
+    """公平裁剪章节投影，避免长首章吞掉同组后续章节。"""
+
+    joined = "\n".join(parts)
+    if len(joined) <= maximum:
+        return joined
+    content_budget = maximum - max(0, len(parts) - 1)
+    allocations = [0] * len(parts)
+    remaining = content_budget
+    active = list(range(len(parts)))
+    while remaining > 0 and active:
+        share = max(1, remaining // len(active))
+        next_active: list[int] = []
+        for index in active:
+            available = len(parts[index]) - allocations[index]
+            granted = min(available, share, remaining)
+            allocations[index] += granted
+            remaining -= granted
+            if allocations[index] < len(parts[index]):
+                next_active.append(index)
+        active = next_active
+    return "\n".join(
+        part[:allocation]
+        for part, allocation in zip(parts, allocations, strict=True)
+    )
+
+
 def _global_request_fits(request: GlobalWritingRequest, max_chars: int, max_bytes: int) -> bool:
-    repair = GlobalWritingRepairRequest(
-        request=request,
-        invalid_response=_worst_invalid_response(),
-        allowed_chapter_ids=allowed_global_chapter_ids(request),
-        prompt_version="global-editor-repair-v1",
+    repairs = tuple(
+        GlobalWritingRepairRequest(
+            request=request,
+            invalid_response=invalid,
+            allowed_chapter_ids=allowed_global_chapter_ids(request),
+            prompt_version="global-editor-repair-v1",
+        )
+        for invalid in _worst_invalid_responses()
     )
     return _prompts_fit(
-        (prompt_for_global_editing(request)[2], prompt_for_global_repair(repair)[2]),
+        (
+            prompt_for_global_editing(request)[2],
+            *(prompt_for_global_repair(repair)[2] for repair in repairs),
+        ),
         max_chars,
         max_bytes,
     )
@@ -742,11 +982,17 @@ def _prompts_fit(prompts: Iterable[str], max_chars: int, max_bytes: int) -> bool
     )
 
 
-def _worst_invalid_response() -> InvalidModelResponse:
+def _worst_invalid_responses() -> tuple[InvalidModelResponse, InvalidModelResponse]:
+    return (_worst_invalid_response("\\"), _worst_invalid_response("\U00010000"))
+
+
+def _worst_invalid_response(character: str = "\\") -> InvalidModelResponse:
     return InvalidModelResponse(
         content_sha256="f" * 64,
-        validation_errors=tuple(f"field_{index:02d}:" + "x" * 488 for index in range(32)),
-        safe_json_excerpt="x" * 8_000,
+        validation_errors=tuple(
+            f"{index:02d}:" + character * 497 for index in range(32)
+        ),
+        safe_json_excerpt=character * 8_000,
     )
 
 
@@ -756,6 +1002,20 @@ def _validate_chapter_response(
 ) -> None:
     allowed = set(allowed_writing_evidence_ids(request))
     observations = {item.evidence_id: item for item in request.visual_observations}
+    _validate_attributed_text_refs(
+        response.title_evidence_refs,
+        "章节标题",
+        allowed,
+        observations,
+        request,
+    )
+    _validate_attributed_text_refs(
+        response.summary_evidence_refs,
+        "章节摘要",
+        allowed,
+        observations,
+        request,
+    )
     for block in response.body_blocks:
         if not block.evidence_refs:
             raise ValueError("正文块至少需要一个本章证据引用")
@@ -776,6 +1036,20 @@ def _validate_chapter_response(
                 or not set(block.visual_content_refs).issubset(allowed_content_ids)
             ):
                 raise ValueError("VISUAL block 引用了未知或跨观察子内容")
+            _validate_visual_reference_policy(
+                observation,
+                request,
+                is_visual_block=True,
+            )
+        else:
+            for ref in block.evidence_refs:
+                referenced_observation = observations.get(ref)
+                if referenced_observation is not None:
+                    _validate_visual_reference_policy(
+                        referenced_observation,
+                        request,
+                        is_visual_block=False,
+                    )
         if (
             isinstance(block, QuoteBlock)
             and not request.context.document_config.include_verbatim_quotes
@@ -784,12 +1058,22 @@ def _validate_chapter_response(
     for claim in response.claims:
         if not set(claim.evidence_refs).issubset(allowed):
             raise ValueError("Claim 引用了证据包之外的 ID")
+        for ref in claim.evidence_refs:
+            referenced_observation = observations.get(ref)
+            if referenced_observation is not None:
+                _validate_visual_reference_policy(
+                    referenced_observation,
+                    request,
+                    is_visual_block=False,
+                )
     detail = request.context.document_config.detail_level
     if len(response.summary_zh) > _DETAIL_SUMMARY_LIMITS[detail]:
         raise ValueError("章节摘要超过配置字符预算")
     if _response_body_characters(response) > _DETAIL_BODY_LIMITS[detail]:
         raise ValueError("章节正文超过配置字符预算")
     normalized = _normalize_response_blocks(response, request)
+    if _response_body_characters(normalized) > _DETAIL_BODY_LIMITS[detail]:
+        raise ValueError("章节归一化正文超过配置字符预算")
     source_refs = _selected_keyframes(
         normalized.body_blocks,
         request.visual_observations,
@@ -802,6 +1086,46 @@ def _validate_chapter_response(
     )
     if len(source_refs) > maximum:
         raise ValueError("正文使用的关键帧超过章节图片预算")
+
+
+def _validate_attributed_text_refs(
+    evidence_refs: tuple[str, ...],
+    field: str,
+    allowed: set[str],
+    observations: dict[str, VisualObservationEvidence],
+    request: ChapterWritingRequest,
+) -> None:
+    if not set(evidence_refs).issubset(allowed):
+        raise ValueError(f"{field}引用了证据包之外的 ID")
+    for ref in evidence_refs:
+        observation = observations.get(ref)
+        if observation is not None:
+            _validate_visual_reference_policy(
+                observation,
+                request,
+                is_visual_block=False,
+            )
+
+
+def _validate_visual_reference_policy(
+    observation: VisualObservationEvidence,
+    request: ChapterWritingRequest,
+    *,
+    is_visual_block: bool,
+) -> None:
+    relation = observation.relation_to_transcript
+    if relation == "DUPLICATE":
+        if is_visual_block:
+            return
+        raise ValueError("DUPLICATE 视觉观察不得由普通正文或 Claim 重复表达")
+    if relation == "CONFLICTING" and not is_visual_block:
+        raise ValueError("CONFLICTING 视觉观察只能通过类型化视觉块表达")
+    if (
+        request.context.document_config.uncertainty_policy == "conservative"
+        and observation.certainty < 0.7
+        and relation != "CONFLICTING"
+    ):
+        raise ValueError("保守策略下低置信视觉观察只能进入信息边界")
 
 
 def _response_body_characters(response: ChapterWritingResponse) -> int:
@@ -844,10 +1168,10 @@ def _normalize_response_blocks(
             if observation.relation_to_transcript == "DUPLICATE":
                 continue
             if observation.relation_to_transcript == "CONFLICTING":
-                if request.context.document_config.uncertainty_policy == "conservative":
-                    caption = _conservative_conflict_caption(observation)
-                else:
-                    caption = _conflict_aware_caption(observation)
+                caption = visual_caption_for_policy(
+                    observation,
+                    request.context.document_config,
+                )
                 blocks.append(
                     block.model_copy(update={"caption": caption}),
                 )
@@ -897,6 +1221,8 @@ def _materialize_chapter(
     evidence_refs = tuple(
         dict.fromkeys(
             (
+                *response.title_evidence_refs,
+                *response.summary_evidence_refs,
                 *(item.evidence_id for item in request.transcript_evidence),
                 *(item.evidence_id for item in request.visual_observations),
                 *selected,
@@ -908,7 +1234,9 @@ def _materialize_chapter(
         start_ms=request.chapter.start_ms,
         end_ms=request.chapter.end_ms,
         title=response.title,
+        title_evidence_refs=response.title_evidence_refs,
         summary_zh=response.summary_zh,
+        summary_evidence_refs=response.summary_evidence_refs,
         body_blocks=response.body_blocks,
         claims=response.claims,
         evidence_refs=evidence_refs,
@@ -957,8 +1285,9 @@ def _selected_keyframes(
             for content_ref in block.visual_content_refs
             for ref in content_by_id[content_ref]
         ) or observation.keyframe_refs
-        if len(set(sources)) > 1 and not observation.frame_relations:
-            raise ValueError("多图视觉正文必须包含对应帧关系")
+        sources = tuple(dict.fromkeys(sources))
+        if not _frames_have_relation_path(observation, sources):
+            raise ValueError("多图视觉正文缺少所选帧之间的对应关系")
         for ref in sources:
             if validate_keyframe_membership and ref not in allowed_keyframes:
                 raise VideoDemoError(ErrorCode.UNKNOWN_EVIDENCE_REFERENCE, "展示图未晋升")
@@ -967,13 +1296,51 @@ def _selected_keyframes(
     return tuple(selected)
 
 
+def _frames_have_relation_path(
+    observation: VisualObservationEvidence,
+    sources: tuple[str, ...],
+) -> bool:
+    selected = set(sources)
+    if len(selected) <= 1:
+        return True
+    relation_edges = {
+        frozenset((relation.from_keyframe_ref, relation.to_keyframe_ref))
+        for relation in observation.frame_relations
+        if (
+            relation.from_keyframe_ref in selected
+            and relation.to_keyframe_ref in selected
+        )
+    }
+    if len(selected) == 2:
+        return frozenset(selected) in relation_edges
+    adjacency: dict[str, set[str]] = {source: set() for source in selected}
+    for relation in observation.frame_relations:
+        if (
+            relation.from_keyframe_ref in selected
+            and relation.to_keyframe_ref in selected
+        ):
+            adjacency[relation.from_keyframe_ref].add(relation.to_keyframe_ref)
+            adjacency[relation.to_keyframe_ref].add(relation.from_keyframe_ref)
+    visited: set[str] = set()
+    stack = [sources[0]]
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        stack.extend(adjacency[current] - visited)
+    return visited == selected
+
+
 def _empty_chapter(plan: ChapterPlan) -> SemanticChapter:
     return SemanticChapter(
         chapter_id=plan.chapter_id,
         start_ms=plan.start_ms,
         end_ms=plan.end_ms,
         title=_PLACEHOLDER,
+        title_evidence_refs=(),
         summary_zh=_PLACEHOLDER,
+        summary_evidence_refs=(),
         body_blocks=(),
         claims=(),
         content_status="NO_SEMANTIC_EVIDENCE",
@@ -987,88 +1354,120 @@ def _empty_chapter(plan: ChapterPlan) -> SemanticChapter:
 
 def _fallback_chapter_response(request: ChapterWritingRequest) -> ChapterWritingResponse:
     blocks: list[ChapterBodyBlock] = []
-    if request.transcript_evidence:
-        blocks.append(
-            ParagraphBlock(
-                text=" ".join(item.text for item in request.transcript_evidence)[
-                    : _DETAIL_BODY_LIMITS[request.context.document_config.detail_level]
-                ],
-                evidence_refs=tuple(item.evidence_id for item in request.transcript_evidence),
-            ),
-        )
+    body_limit = _DETAIL_BODY_LIMITS[request.context.document_config.detail_level]
+    for start in range(0, len(request.transcript_evidence), 32):
+        batch = request.transcript_evidence[start : start + 32]
+        remaining = body_limit - sum(_block_character_count(block) for block in blocks)
+        if remaining < 1:
+            break
+        text = " ".join(item.text for item in batch)[:remaining]
+        if text:
+            blocks.append(
+                ParagraphBlock(
+                    text=text,
+                    evidence_refs=tuple(item.evidence_id for item in batch),
+                ),
+            )
+    maximum = min(
+        request.context.document_config.max_visuals_per_chapter,
+        3 if request.chapter.visual_mode in {"COMPARISON", "MULTI_STEP"} else 2,
+    )
+    used_sources: set[str] = set()
     for observation in request.visual_observations:
         if observation.relation_to_transcript == "DUPLICATE":
             continue
-        current_sources = _observation_source_refs(observation)
-        maximum = min(
-            request.context.document_config.max_visuals_per_chapter,
-            3 if request.chapter.visual_mode in {"COMPARISON", "MULTI_STEP"} else 2,
-        )
-        used_sources = {
-            ref
-            for block in blocks
-            if isinstance(block, VisualBlock)
-            for ref in _observation_source_refs(
-                next(
-                    item
-                    for item in request.visual_observations
-                    if item.evidence_id == block.visual_observation_ref
-                ),
-            )
-        }
-        if len(used_sources | set(current_sources)) > maximum:
+        if (
+            request.context.document_config.uncertainty_policy == "conservative"
+            and observation.certainty < 0.7
+            and observation.relation_to_transcript != "CONFLICTING"
+        ):
             continue
+        selection = _fallback_visual_selection(
+            observation,
+            used_sources=used_sources,
+            maximum=maximum,
+        )
+        if selection is None:
+            continue
+        content_refs, current_sources = selection
         visual = VisualBlock(
             visual_observation_ref=observation.evidence_id,
-            visual_content_refs=tuple(
-                (
-                    *(item.visual_content_id for item in observation.content_blocks),
-                    *(item.visual_fact_id for item in observation.visual_facts),
-                ),
-            ),
+            visual_content_refs=content_refs,
             caption=(
-                _conservative_conflict_caption(observation)
-                if observation.relation_to_transcript == "CONFLICTING"
-                and request.context.document_config.uncertainty_policy == "conservative"
-                else _conflict_aware_caption(observation)
+                visual_caption_for_policy(
+                    observation,
+                    request.context.document_config,
+                )
             ),
             evidence_refs=(observation.evidence_id,),
         )
-        remaining = _DETAIL_BODY_LIMITS[
-            request.context.document_config.detail_level
-        ] - sum(_block_character_count(block) for block in blocks)
-        if remaining < 1:
+        remaining = body_limit - sum(_block_character_count(block) for block in blocks)
+        if len(visual.caption) > remaining:
             continue
-        blocks.append(visual.model_copy(update={"caption": visual.caption[:remaining]}))
+        blocks.append(visual)
+        used_sources.update(current_sources)
     return ChapterWritingResponse(
         title=request.chapter.title_hint,
+        title_evidence_refs=_fallback_header_evidence_refs(request),
         summary_zh=(
             blocks[0].text
             if blocks and isinstance(blocks[0], ParagraphBlock)
             else request.chapter.title_hint
         )[: _DETAIL_SUMMARY_LIMITS[request.context.document_config.detail_level]],
+        summary_evidence_refs=_fallback_header_evidence_refs(request),
         body_blocks=tuple(blocks),
         claims=(),
     )
 
 
-def _conflict_aware_caption(observation: VisualObservationEvidence) -> str:
-    if observation.relation_to_transcript != "CONFLICTING":
-        return observation.caption
-    uncertainty = "；".join(observation.uncertainties)
-    return f"{observation.caption} (音画信息存在冲突：{uncertainty})"
+def _fallback_header_evidence_refs(request: ChapterWritingRequest) -> tuple[str, ...]:
+    if request.transcript_evidence:
+        return (request.transcript_evidence[0].evidence_id,)
+    for observation in request.visual_observations:
+        if observation.relation_to_transcript in {"DUPLICATE", "CONFLICTING"}:
+            continue
+        if (
+            request.context.document_config.uncertainty_policy == "conservative"
+            and observation.certainty < 0.7
+        ):
+            continue
+        return (observation.evidence_id,)
+    return ()
 
 
-def _conservative_conflict_caption(observation: VisualObservationEvidence) -> str:
-    uncertainty = "；".join(observation.uncertainties)
-    return f"画面信息与转写存在冲突，未采纳为确定事实：{uncertainty}"
-
-
-def _observation_source_refs(observation: VisualObservationEvidence) -> tuple[str, ...]:
-    sources = tuple(
-        ref for content in observation.content_blocks for ref in content.source_keyframe_refs
-    ) + tuple(ref for fact in observation.visual_facts for ref in fact.source_keyframe_refs)
-    return tuple(dict.fromkeys(sources or observation.keyframe_refs))
+def _fallback_visual_selection(
+    observation: VisualObservationEvidence,
+    *,
+    used_sources: set[str],
+    maximum: int,
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    candidates = tuple(
+        (
+            item.visual_content_id,
+            tuple(dict.fromkeys(item.source_keyframe_refs)),
+        )
+        for item in observation.content_blocks
+    ) + tuple(
+        (
+            item.visual_fact_id,
+            tuple(dict.fromkeys(item.source_keyframe_refs)),
+        )
+        for item in observation.visual_facts
+    )
+    if not candidates:
+        sources = tuple(dict.fromkeys(observation.keyframe_refs))
+        if (
+            len(used_sources | set(sources)) <= maximum
+            and _frames_have_relation_path(observation, sources)
+        ):
+            return (), sources
+        return None
+    for content_id, sources in candidates:
+        if len(used_sources | set(sources)) > maximum:
+            continue
+        if _frames_have_relation_path(observation, sources):
+            return (content_id,), sources
+    return None
 
 
 def _validate_global_response(
@@ -1185,3 +1584,31 @@ def _is_fallback_error(error: BaseException) -> bool:
         ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
         ErrorCode.TEXT_LLM_RESPONSE_INVALID,
     }
+
+
+def _raise_if_cancelled(is_cancel_requested: Callable[[], bool]) -> None:
+    if is_cancel_requested():
+        raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
+
+
+def _cancellable_attempt_callback(
+    count_attempt: Callable[[], None],
+    is_cancel_requested: Callable[[], bool],
+) -> Callable[[], None]:
+    def before_provider_attempt() -> None:
+        _raise_if_cancelled(is_cancel_requested)
+        count_attempt()
+
+    return before_provider_attempt
+
+
+def _cancel_before_or_wait_for_commits(gates: Iterable[_CacheCommitGate]) -> None:
+    """先阻止尚未开始的提交，再等待已经跨过提交边界的提交完成。"""
+
+    commit_events = tuple(
+        event
+        for gate in gates
+        if (event := gate.cancel()) is not None
+    )
+    for event in commit_events:
+        event.wait()

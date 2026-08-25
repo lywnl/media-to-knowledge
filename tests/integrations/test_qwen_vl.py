@@ -156,7 +156,7 @@ def test_qwen_sends_sorted_jpeg_frames_in_one_request_without_local_metadata(
     assert "sha256" not in untrusted
     assert "candidates" not in untrusted
     assert "https://" not in untrusted
-    assert payloads[0]["response_format"]["json_schema"]["name"] == "chapter_vlm_v1"  # type: ignore[index]
+    assert payloads[0]["response_format"]["json_schema"]["name"] == "chapter_vlm_v2"  # type: ignore[index]
 
 
 def test_qwen_request_bytes_do_not_exceed_shared_payload_upper_bound(tmp_path: Path) -> None:
@@ -178,7 +178,7 @@ def test_qwen_request_bytes_do_not_exceed_shared_payload_upper_bound(tmp_path: P
     upper_bound = vision_payload_size_upper_bound(
         prompt_for_vision(request),
         model_id="qwen3-vl-flash",
-        schema_name="chapter_vlm_v1",
+        schema_name="chapter_vlm_v2",
         response_schema=ChapterVisionResponse.model_json_schema(),
         ordered_frames=tuple((frame.frame_id, frame.size_bytes) for frame in ordered),
     )
@@ -466,7 +466,7 @@ def test_qwen_repair_resends_same_images_with_repair_prompt_and_schema(tmp_path:
 
     payload = payloads[0]
     assert payload["response_format"]["json_schema"]["name"] == (  # type: ignore[index]
-        "chapter_vlm_repair_v1"
+        "chapter_vlm_repair_v2"
     )
     assert "chapter-vlm-repair-v1" in payload["messages"][0]["content"]  # type: ignore[index]
     content = payload["messages"][1]["content"]  # type: ignore[index]
@@ -479,7 +479,7 @@ def test_qwen_repair_resends_same_images_with_repair_prompt_and_schema(tmp_path:
     upper_bound = vision_payload_size_upper_bound(
         prompt_for_vision_repair(repair),
         model_id="qwen3-vl-flash",
-        schema_name="chapter_vlm_repair_v1",
+        schema_name="chapter_vlm_repair_v2",
         response_schema=ChapterVisionResponse.model_json_schema(),
         ordered_frames=tuple((frame.frame_id, frame.size_bytes) for frame in ordered),
     )

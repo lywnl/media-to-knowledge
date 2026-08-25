@@ -196,20 +196,41 @@ def _information_boundaries(
     evidence_by_id: dict[str, DocumentEvidenceItem],
 ) -> tuple[str, ...]:
     boundaries: list[str] = []
+    config = result.generation.document_config
+    observations_by_chapter: dict[str, list[VisualObservationEvidence]] = {}
+    for item in evidence_by_id.values():
+        if isinstance(item, VisualObservationEvidence):
+            observations_by_chapter.setdefault(item.chapter_id, []).append(item)
     for chapter in result.chapters:
+        rendered_observation_refs = {
+            block.visual_observation_ref
+            for block in chapter.body_blocks
+            if isinstance(block, VisualBlock)
+        }
         if chapter.content_status == "NO_SEMANTIC_EVIDENCE":
             boundaries.append(
                 f"{_format_time(chapter.start_ms)} - {_format_time(chapter.end_ms)} "
                 "未提取到可验证语义内容",
             )
-        for evidence_ref in chapter.evidence_refs:
-            item = evidence_by_id[evidence_ref]
-            if not isinstance(item, VisualObservationEvidence):
-                continue
+        for item in observations_by_chapter.get(chapter.chapter_id, ()):
             if item.relation_to_transcript == "CONFLICTING":
+                visual_detail = (
+                    ""
+                    if item.evidence_id in rendered_observation_refs
+                    else f"，视觉观察：{item.caption}"
+                )
                 boundaries.append(
                     f"{_format_time(item.start_ms)} - {_format_time(item.end_ms)} "
-                    "画面与转写存在冲突",
+                    f"画面与转写存在冲突{visual_detail}",
+                )
+            if (
+                config.uncertainty_policy == "conservative"
+                and item.certainty < 0.7
+                and item.relation_to_transcript != "CONFLICTING"
+            ):
+                boundaries.append(
+                    f"{_format_time(item.start_ms)} - {_format_time(item.end_ms)} "
+                    f"低置信视觉观察，未纳入正文：{item.caption}",
                 )
             boundaries.extend(
                 f"{_format_time(item.start_ms)} - {_format_time(item.end_ms)} "

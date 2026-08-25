@@ -115,7 +115,7 @@ class OpenAIDocumentClient(DocumentTextPort):
         return self._call(
             prompt_for_writing(request),
             response_type=ChapterWritingResponse,
-            schema_name="chapter_writing_v1",
+            schema_name="chapter_writing_v2",
             validate_response=lambda response: _validate_writing_response(
                 response,
                 allowed_evidence_ids=set(allowed_writing_evidence_ids(request)),
@@ -133,7 +133,7 @@ class OpenAIDocumentClient(DocumentTextPort):
         return self._call(
             prompt_for_writing_repair(request),
             response_type=ChapterWritingResponse,
-            schema_name="chapter_writing_repair_v1",
+            schema_name="chapter_writing_repair_v2",
             validate_response=lambda response: _validate_writing_response(
                 response,
                 allowed_evidence_ids=set(request.allowed_evidence_ids),
@@ -398,6 +398,16 @@ def _validate_writing_response(
 ) -> None:
     allowed_visual_observation_ids = {item.evidence_id for item in visual_observations}
     observation_by_id = {item.evidence_id: item for item in visual_observations}
+    _require_known_ids(
+        response.title_evidence_refs,
+        allowed_evidence_ids,
+        "title_evidence_refs",
+    )
+    _require_known_ids(
+        response.summary_evidence_refs,
+        allowed_evidence_ids,
+        "summary_evidence_refs",
+    )
     for block in response.body_blocks:
         _require_known_ids(block.evidence_refs, allowed_evidence_ids, "body_blocks.evidence_refs")
         if isinstance(block, VisualBlock):

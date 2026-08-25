@@ -22,6 +22,7 @@ from video_demo.integrations.document_port import (
     GlobalWritingRequest,
     InvalidModelResponse,
     ModelResponseValidationError,
+    invalid_model_response,
 )
 from video_demo.integrations.openai_document import OpenAIDocumentClient
 
@@ -289,13 +290,92 @@ def test_non_json_message_hashes_message_content_instead_of_provider_envelope() 
     assert raised.value.invalid_response.safe_json_excerpt is None
 
 
+def test_invalid_model_response_normalizes_control_characters_before_repair_context() -> None:
+    invalid = invalid_model_response(
+        b"raw",
+        ("field:\x00bad\nvalue",),
+        parsed_json={"text": "line\nvalue"},
+    )
+
+    assert invalid.validation_errors == ("field: bad value",)
+    assert invalid.safe_json_excerpt is None
+
+    surrogate = invalid_model_response(
+        b"raw",
+        ("field:invalid",),
+        parsed_json={"text": "\ud800"},
+    )
+    assert surrogate.safe_json_excerpt is None
+
+    emoji_joiner = invalid_model_response(
+        b"raw",
+        ("field:invalid",),
+        parsed_json={"text": "程序员\u200d💻"},
+    )
+    assert emoji_joiner.safe_json_excerpt is None
+
+    unsafe_key = invalid_model_response(
+        b"raw",
+        ("field:invalid",),
+        parsed_json={"字段\u200d名": "value"},
+    )
+    assert unsafe_key.safe_json_excerpt is None
+
+    suspicious_key = invalid_model_response(
+        b"raw",
+        ("field:invalid",),
+        parsed_json={"https://example.invalid": "value"},
+    )
+    assert suspicious_key.safe_json_excerpt is None
+
+
+@pytest.mark.parametrize(
+    "suspicious_value",
+    (
+        "sk-proj-abcdefghijklmnopqrstuvwxyz123456",
+        "ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+        "YWJjZGVmZ2hpamtsbW5vcA==",
+        "A" * 80,
+    ),
+)
+def test_invalid_model_response_excludes_common_tokens_and_short_base64(
+    suspicious_value: str,
+) -> None:
+    invalid = invalid_model_response(
+        b"raw",
+        ("field:invalid",),
+        parsed_json={"text": suspicious_value},
+    )
+
+    assert invalid.safe_json_excerpt is None
+
+
+@pytest.mark.parametrize("field", ["validation_errors", "safe_json_excerpt"])
+def test_invalid_model_response_model_rejects_directly_injected_sensitive_context(
+    field: str,
+) -> None:
+    values: dict[str, object] = {
+        "content_sha256": "f" * 64,
+        "validation_errors": ("response:invalid",),
+        "safe_json_excerpt": None,
+    }
+    values[field] = (
+        ("sk-proj-abcdefghijklmnopqrstuvwxyz123456",)
+        if field == "validation_errors"
+        else '{"text":"https://example.invalid/secret"}'
+    )
+
+    with pytest.raises(ValidationError, match="疑似敏感信息"):
+        InvalidModelResponse.model_validate(values)
+
+
 def test_all_six_operations_use_distinct_schema_and_prompt_versions() -> None:
     payloads: list[dict[str, object]] = []
     response_by_schema = {
         "chapter_planning_v1": _planning_body(),
         "chapter_planning_repair_v1": _planning_body(),
-        "chapter_writing_v1": _writing_body(),
-        "chapter_writing_repair_v1": _writing_body(),
+        "chapter_writing_v2": _writing_body(),
+        "chapter_writing_repair_v2": _writing_body(),
         "global_writing_v1": _global_body(),
         "global_writing_repair_v1": _global_body(),
     }
@@ -456,7 +536,9 @@ def _planning_body() -> dict[str, object]:
 def _writing_body() -> dict[str, object]:
     return {
         "title": "章节",
+        "title_evidence_refs": ["asr_001"],
         "summary_zh": "摘要",
+        "summary_evidence_refs": ["asr_001"],
         "body_blocks": [],
         "claims": [],
     }

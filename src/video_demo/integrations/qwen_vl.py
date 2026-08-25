@@ -80,7 +80,7 @@ class QwenVisionClient(ChapterVisionPort):
             request,
             allowed_run_root=allowed_run_root,
             prompt=prompt_for_vision(request),
-            schema_name="chapter_vlm_v1",
+            schema_name="chapter_vlm_v2",
             on_provider_attempt=on_provider_attempt,
         )
         return _validate_or_raise(
@@ -101,7 +101,7 @@ class QwenVisionClient(ChapterVisionPort):
             request.request,
             allowed_run_root=allowed_run_root,
             prompt=prompt_for_vision_repair(request),
-            schema_name="chapter_vlm_repair_v1",
+            schema_name="chapter_vlm_repair_v2",
             on_provider_attempt=on_provider_attempt,
         )
         return _validate_or_raise(

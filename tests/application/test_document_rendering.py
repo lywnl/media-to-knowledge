@@ -23,6 +23,7 @@ from video_demo.domain.document import (
     VideoUnderstandingResult,
     VisualBlock,
     section_id_for,
+    visual_caption_for_policy,
 )
 from video_demo.domain.evidence import (
     DocumentEvidenceItem,
@@ -109,7 +110,9 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
         start_ms=0,
         end_ms=10_000,
         title="安装 #1 <script>",
+        title_evidence_refs=(speech.evidence_id,),
         summary_zh="本章说明安装与参数。",
+        summary_evidence_refs=(speech.evidence_id,),
         body_blocks=(
             ParagraphBlock(
                 text="<script>alert(1)</script>\n# 不能成为标题 | 保留竖线",
@@ -141,7 +144,7 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
             VisualBlock(
                 visual_observation_ref=observation.evidence_id,
                 visual_content_refs=("visual_content_001",),
-                caption="<img src=x>画面参数",
+                caption=visual_caption_for_policy(observation, DocumentGenerationConfig()),
                 evidence_refs=(observation.evidence_id,),
             ),
         ),
@@ -231,7 +234,7 @@ def test_render_markdown_escapes_untrusted_text_and_renders_every_block_type() -
     assert r"| 参数\|名 | &lt;script&gt;值&lt;/script&gt; |" in markdown
     assert r"5\|推荐 / 第二行" in markdown
     assert "$$\nx = y + 1\n$$" in markdown
-    assert "画面参数" in markdown
+    assert "音画信息存在冲突" in markdown
 
 
 def test_render_markdown_uses_keyframe_placeholder_without_leaking_storage_path() -> None:
@@ -246,6 +249,8 @@ def test_render_markdown_uses_keyframe_placeholder_without_leaking_storage_path(
 
 def test_render_markdown_summarizes_visual_information_boundaries() -> None:
     result, evidence = _document_fixture()
+    observation = evidence[2]
+    assert isinstance(observation, VisualObservationEvidence)
 
     markdown = render_markdown(result, evidence).content.decode("utf-8")
     boundary = markdown.split("## 信息边界\n", maxsplit=1)[1]
@@ -253,6 +258,100 @@ def test_render_markdown_summarizes_visual_information_boundaries() -> None:
     assert "屏幕参数与口述参数可能不一致" in boundary
     assert "右下角轻微模糊" in boundary
     assert "画面与转写存在冲突" in boundary
+    assert markdown.count(observation.caption) == 1
+
+
+def test_conservative_policy_moves_low_confidence_visual_caption_to_boundary() -> None:
+    result, evidence = _document_fixture()
+    observation = evidence[2]
+    assert isinstance(observation, VisualObservationEvidence)
+    observation = observation.model_copy(
+        update={
+            "relation_to_transcript": "COMPLEMENTARY",
+            "certainty": 0.6,
+        },
+    )
+    chapter = result.chapters[0].model_copy(
+        update={
+            "body_blocks": tuple(
+                block
+                for block in result.chapters[0].body_blocks
+                if not isinstance(block, VisualBlock)
+            ),
+            "selected_keyframe_refs": (),
+        },
+    )
+    result = result.model_copy(
+        update={
+            "chapters": (chapter,),
+            "generation": result.generation.model_copy(
+                update={
+                    "document_config": DocumentGenerationConfig(
+                        uncertainty_policy="conservative",
+                    ),
+                },
+            ),
+        },
+    )
+
+    markdown = render_markdown(
+        result,
+        (evidence[0], evidence[1], observation),
+    ).content.decode("utf-8")
+    before_boundary, boundary = markdown.split("## 信息边界\n", maxsplit=1)
+
+    assert observation.caption not in before_boundary
+    assert f"低置信视觉观察，未纳入正文：{observation.caption}" in boundary
+
+
+@pytest.mark.parametrize("relation", ["CONFLICTING", "COMPLEMENTARY"])
+def test_information_boundary_includes_observation_omitted_from_chapter_evidence(
+    relation: str,
+) -> None:
+    result, evidence = _document_fixture()
+    observation = evidence[2]
+    assert isinstance(observation, VisualObservationEvidence)
+    observation = observation.model_copy(
+        update={
+            "relation_to_transcript": relation,
+            "certainty": 0.6,
+        },
+    )
+    chapter = result.chapters[0].model_copy(
+        update={
+            "body_blocks": tuple(
+                block
+                for block in result.chapters[0].body_blocks
+                if not isinstance(block, VisualBlock)
+            ),
+            "evidence_refs": (evidence[0].evidence_id,),
+            "selected_keyframe_refs": (),
+        },
+    )
+    result = result.model_copy(
+        update={
+            "chapters": (chapter,),
+            "generation": result.generation.model_copy(
+                update={
+                    "document_config": DocumentGenerationConfig(
+                        uncertainty_policy="conservative",
+                    ),
+                },
+            ),
+        },
+    )
+
+    markdown = render_markdown(
+        result,
+        (evidence[0], evidence[1], observation),
+    ).content.decode("utf-8")
+    boundary = markdown.split("## 信息边界\n", maxsplit=1)[1]
+
+    if relation == "CONFLICTING":
+        assert "画面与转写存在冲突" in boundary
+        assert observation.caption in boundary
+    else:
+        assert f"低置信视觉观察，未纳入正文：{observation.caption}" in boundary
 
 
 def test_render_markdown_revalidates_selected_keyframe_evidence() -> None:
@@ -283,7 +382,9 @@ def test_no_semantic_evidence_placeholder_only_appears_in_information_boundary()
         start_ms=0,
         end_ms=10_000,
         title=placeholder,
+        title_evidence_refs=(),
         summary_zh=placeholder,
+        summary_evidence_refs=(),
         body_blocks=(),
         claims=(),
         content_status="NO_SEMANTIC_EVIDENCE",

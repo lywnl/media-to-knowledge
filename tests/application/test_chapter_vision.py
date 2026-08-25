@@ -78,9 +78,9 @@ def _identity() -> ModelInvocationIdentity:
         provider_config_fingerprint="a" * 64,
         model_id="qwen3-vl-flash",
         generation_config=(("temperature", "0"),),
-        main_response_schema_name="chapter_vlm_v1",
+        main_response_schema_name="chapter_vlm_v2",
         main_prompt_version="chapter-vlm-v1",
-        repair_response_schema_name="chapter_vlm_repair_v1",
+        repair_response_schema_name="chapter_vlm_repair_v2",
         repair_prompt_version="chapter-vlm-repair-v1",
     )
 
@@ -181,6 +181,36 @@ def _service(
         invocation_wait_timeout_seconds=invocation_wait_timeout_seconds,
         candidate_lock_timeout_seconds=2,
     )
+
+
+@pytest.mark.parametrize(
+    ("identity_field", "invalid_schema"),
+    (
+        ("main_response_schema_name", "chapter_vlm_v1"),
+        ("repair_response_schema_name", "chapter_vlm_repair_v1"),
+    ),
+)
+def test_chapter_vision_rejects_stale_cache_schema_identity(
+    tmp_path: Path,
+    identity_field: str,
+    invalid_schema: str,
+) -> None:
+    identity = _identity().model_copy(update={identity_field: invalid_schema})
+
+    with pytest.raises(ValueError, match=r"章节视觉缓存身份与.*Schema 不一致"):
+        ChapterVisionService(
+            _VisionPort(_response()),
+            identity,
+            runtime_root=tmp_path,
+            concurrency=2,
+            max_image_bytes=1024,
+            max_request_image_bytes=4096,
+            max_encoded_request_bytes=64 * 1024,
+            max_published_keyframe_bytes=4096,
+            max_published_keyframe_files=10,
+            invocation_wait_timeout_seconds=2,
+            candidate_lock_timeout_seconds=2,
+        )
 
 
 def _replace_frame_batch(

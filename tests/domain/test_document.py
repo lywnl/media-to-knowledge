@@ -90,7 +90,9 @@ def _chapter(
             start_ms=start_ms,
             end_ms=end_ms,
             title=f"章节 {chapter_id}",
+            title_evidence_refs=("asr_001",),
             summary_zh="这是章节摘要。",
+            summary_evidence_refs=("asr_001",),
             body_blocks=(ParagraphBlock(text=text, evidence_refs=("asr_001",)),),
             claims=(GroundedClaim(text="可验证结论", evidence_refs=("asr_001",), certainty=0.9),),
             content_status="GROUNDED",
@@ -105,7 +107,9 @@ def _chapter(
         start_ms=start_ms,
         end_ms=end_ms,
         title="本时段未提取到可验证语义内容",
+        title_evidence_refs=(),
         summary_zh="本时段未提取到可验证语义内容",
+        summary_evidence_refs=(),
         body_blocks=(),
         claims=(),
         content_status="NO_SEMANTIC_EVIDENCE",
@@ -166,6 +170,15 @@ def test_document_rejects_non_contiguous_or_overlapping_chapters() -> None:
 def test_document_rejects_chapter_longer_than_five_minutes() -> None:
     with pytest.raises(ValidationError, match="5 分钟"):
         _result((_chapter("ch_001", 0, 300_001),))
+
+
+@pytest.mark.parametrize("field", ["title_evidence_refs", "summary_evidence_refs"])
+def test_grounded_chapter_requires_header_evidence_references(field: str) -> None:
+    payload = _chapter("ch_001", 0, 1_000).model_dump(exclude={"duration_ms"})
+    payload[field] = ()
+
+    with pytest.raises(ValidationError, match="标题和摘要至少需要一个证据引用"):
+        SemanticChapter.model_validate(payload)
 
 
 def test_document_rejects_non_3_schema() -> None:
@@ -268,7 +281,9 @@ def test_chapter_retrieval_text_is_limited_to_thirty_two_thousand_characters() -
             start_ms=0,
             end_ms=1_000,
             title="章节",
+            title_evidence_refs=("asr_001",),
             summary_zh="摘要",
+            summary_evidence_refs=("asr_001",),
             body_blocks=(ParagraphBlock(text="正文", evidence_refs=("asr_001",)),),
             claims=(GroundedClaim(text="结论", evidence_refs=("asr_001",), certainty=0.9),),
             content_status="GROUNDED",
