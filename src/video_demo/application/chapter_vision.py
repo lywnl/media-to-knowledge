@@ -1208,8 +1208,9 @@ def _to_evidence(
         "transcript_evidence_refs": draft.transcript_evidence_refs,
         "draft": draft.model_dump(mode="json"),
     }
+    observation_id = stable_identifier("visual_observation", payload)
     return VisualObservationEvidence(
-        evidence_id=stable_identifier("visual_observation", payload),
+        evidence_id=observation_id,
         chapter_id=item.chapter.chapter_id,
         start_ms=start_ms,
         end_ms=end_ms,
@@ -1219,10 +1220,13 @@ def _to_evidence(
         visual_type=draft.visual_type,
         caption=draft.caption,
         content_blocks=tuple(
-            _content_block(block, frame_to_evidence)
-            for block in draft.content_blocks
+            _content_block(block, frame_to_evidence, observation_id, ordinal)
+            for ordinal, block in enumerate(draft.content_blocks)
         ),
-        visual_facts=tuple(_visual_fact(fact, frame_to_evidence) for fact in draft.visual_facts),
+        visual_facts=tuple(
+            _visual_fact(fact, frame_to_evidence, observation_id, ordinal)
+            for ordinal, fact in enumerate(draft.visual_facts)
+        ),
         frame_relations=tuple(
             _frame_relation(relation, frame_to_evidence) for relation in draft.frame_relations
         ),
@@ -1233,30 +1237,51 @@ def _to_evidence(
     )
 
 
-def _content_block(block: object, refs: Mapping[str, str]):  # type: ignore[no-untyped-def]
+def _content_block(  # type: ignore[no-untyped-def]
+    block: object,
+    refs: Mapping[str, str],
+    observation_id: str,
+    ordinal: int,
+):
     source = tuple(refs[frame_id] for frame_id in block.source_frame_ids)  # type: ignore[attr-defined]
+    content_id = stable_identifier(
+        "visual_content",
+        {
+            "visual_observation_id": observation_id,
+            "content_type": block.content_type,  # type: ignore[attr-defined]
+            "ordinal": ordinal,
+        },
+    )
     if isinstance(block, VisualTextContentDraft):
-        return VisualTextContent(source_keyframe_refs=source, text=block.text)
+        return VisualTextContent(
+            visual_content_id=content_id,
+            source_keyframe_refs=source,
+            text=block.text,
+        )
     if isinstance(block, VisualCodeContentDraft):
         return VisualCodeContent(
+            visual_content_id=content_id,
             source_keyframe_refs=source,
             language=block.language,
             code=block.code,
         )
     if isinstance(block, VisualTableContentDraft):
         return VisualTableContent(
+            visual_content_id=content_id,
             source_keyframe_refs=source,
             columns=block.columns,
             rows=block.rows,
         )
     if isinstance(block, VisualFormulaContentDraft):
         return VisualFormulaContent(
+            visual_content_id=content_id,
             source_keyframe_refs=source,
             latex=block.latex,
             explanation=block.explanation,
         )
     if isinstance(block, VisualDiagramContentDraft):
         return VisualDiagramContent(
+            visual_content_id=content_id,
             source_keyframe_refs=source,
             description=block.description,
             labels=block.labels,
@@ -1264,6 +1289,7 @@ def _content_block(block: object, refs: Mapping[str, str]):  # type: ignore[no-u
         )
     if isinstance(block, VisualStateContentDraft):
         return VisualStateContent(
+            visual_content_id=content_id,
             source_keyframe_refs=source,
             state_type=block.state_type,
             description=block.description,
@@ -1272,8 +1298,20 @@ def _content_block(block: object, refs: Mapping[str, str]):  # type: ignore[no-u
     raise TypeError("未知视觉内容草稿")
 
 
-def _visual_fact(fact: VisualFactDraft, refs: Mapping[str, str]) -> GroundedVisualFact:
+def _visual_fact(
+    fact: VisualFactDraft,
+    refs: Mapping[str, str],
+    observation_id: str,
+    ordinal: int,
+) -> GroundedVisualFact:
     return GroundedVisualFact(
+        visual_fact_id=stable_identifier(
+            "visual_fact",
+            {
+                "visual_observation_id": observation_id,
+                "ordinal": ordinal,
+            },
+        ),
         text=fact.text,
         source_keyframe_refs=tuple(refs[frame_id] for frame_id in fact.source_frame_ids),
     )

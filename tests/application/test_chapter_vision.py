@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import threading
@@ -23,6 +24,7 @@ from video_demo.domain.document_plan import (
 from video_demo.domain.evidence import (
     ChapterVisualObservation,
     SpeechSegment,
+    VisualFactDraft,
     VisualFrameRelationDraft,
     VisualTextContentDraft,
 )
@@ -235,6 +237,79 @@ def test_chapter_vision_maps_response_and_publishes_selected_keyframe(tmp_path: 
         "vlm_fallback_chapters": 0,
         "visual_published_budget_degraded_chapters": 0,
     }
+
+
+def test_chapter_vision_generates_stable_unique_content_and_fact_ids(
+    tmp_path: Path,
+) -> None:
+    run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
+    base = _response().observations[0]
+    response = ChapterVisionResponse(
+        observations=(
+            base.model_copy(
+                update={
+                    "content_blocks": (
+                        VisualTextContentDraft(
+                            source_frame_ids=("frame_001",),
+                            text="vlm_concurrency = 2",
+                        ),
+                        VisualTextContentDraft(
+                            source_frame_ids=("frame_001",),
+                            text="worker_concurrency = 2",
+                        ),
+                    ),
+                    "visual_facts": (
+                        VisualFactDraft(
+                            text="界面显示两个并发配置",
+                            source_frame_ids=("frame_001",),
+                        ),
+                    ),
+                },
+            ),
+        ),
+    )
+    port = _VisionPort(response)
+    service = _service(tmp_path, port)
+    cache = _cache(run_root)
+    arguments = (
+        (chapter,),
+        frame_batch,
+        (speech,),
+        DocumentGenerationConfig(),
+    )
+
+    first = service.analyze_all(
+        *arguments,
+        cache=cache,
+        is_cancel_requested=lambda: False,
+    )
+    second = service.analyze_all(
+        *arguments,
+        cache=cache,
+        is_cancel_requested=lambda: False,
+    )
+
+    first_observation = first.observations[0]
+    second_observation = second.observations[0]
+    first_ids = (
+        *(item.visual_content_id for item in first_observation.content_blocks),
+        *(item.visual_fact_id for item in first_observation.visual_facts),
+    )
+    second_ids = (
+        *(item.visual_content_id for item in second_observation.content_blocks),
+        *(item.visual_fact_id for item in second_observation.visual_facts),
+    )
+    assert len(first_ids) == len(set(first_ids)) == 3
+    assert second_ids == first_ids
+    assert len(port.requests) == 1
+    assert second.metrics["vlm_cache_hits"] == 1
+
+
+def test_chapter_vision_draft_schema_does_not_expose_final_content_ids() -> None:
+    schema_json = json.dumps(ChapterVisionResponse.model_json_schema(), ensure_ascii=False)
+
+    assert "visual_content_id" not in schema_json
+    assert "visual_fact_id" not in schema_json
 
 
 def test_chapter_vision_cache_hit_still_revalidates_candidate_file(tmp_path: Path) -> None:

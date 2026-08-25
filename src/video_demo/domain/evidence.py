@@ -94,12 +94,14 @@ class OcrEvidence(TimedEvidence):
 
 class VisualTextContent(FrozenModel):
     content_type: Literal["TEXT"] = "TEXT"
+    visual_content_id: StableId
     source_keyframe_refs: tuple[StableId, ...] = Field(min_length=1, max_length=3)
     text: str = Field(min_length=1, max_length=16_000)
 
 
 class VisualCodeContent(FrozenModel):
     content_type: Literal["CODE"] = "CODE"
+    visual_content_id: StableId
     source_keyframe_refs: tuple[StableId, ...] = Field(min_length=1, max_length=3)
     language: str | None = Field(default=None, max_length=32)
     code: str = Field(min_length=1, max_length=32_000)
@@ -107,6 +109,7 @@ class VisualCodeContent(FrozenModel):
 
 class VisualTableContent(FrozenModel):
     content_type: Literal["TABLE"] = "TABLE"
+    visual_content_id: StableId
     source_keyframe_refs: tuple[StableId, ...] = Field(min_length=1, max_length=3)
     columns: tuple[str, ...] = Field(min_length=1, max_length=32)
     rows: tuple[tuple[str, ...], ...] = Field(max_length=256)
@@ -120,6 +123,7 @@ class VisualTableContent(FrozenModel):
 
 class VisualFormulaContent(FrozenModel):
     content_type: Literal["FORMULA"] = "FORMULA"
+    visual_content_id: StableId
     source_keyframe_refs: tuple[StableId, ...] = Field(min_length=1, max_length=3)
     latex: str = Field(min_length=1, max_length=8_000)
     explanation: str | None = Field(default=None, max_length=4_000)
@@ -127,6 +131,7 @@ class VisualFormulaContent(FrozenModel):
 
 class VisualDiagramContent(FrozenModel):
     content_type: Literal["DIAGRAM"] = "DIAGRAM"
+    visual_content_id: StableId
     source_keyframe_refs: tuple[StableId, ...] = Field(min_length=1, max_length=3)
     description: str = Field(min_length=1, max_length=8_000)
     labels: tuple[str, ...] = Field(max_length=64)
@@ -135,6 +140,7 @@ class VisualDiagramContent(FrozenModel):
 
 class VisualStateContent(FrozenModel):
     content_type: Literal["STATE"] = "STATE"
+    visual_content_id: StableId
     source_keyframe_refs: tuple[StableId, ...] = Field(min_length=1, max_length=3)
     state_type: Literal["UI_CONTROL", "TERMINAL", "GENERAL"]
     description: str = Field(min_length=1, max_length=8_000)
@@ -153,6 +159,7 @@ VisualContentBlock: TypeAlias = Annotated[
 
 
 class GroundedVisualFact(FrozenModel):
+    visual_fact_id: StableId
     text: str = Field(min_length=1, max_length=2_000)
     source_keyframe_refs: tuple[StableId, ...] = Field(min_length=1, max_length=3)
 
@@ -210,6 +217,12 @@ class VisualObservationEvidence(TimedEvidence):
         _reject_duplicate_ids(self.keyframe_refs, "keyframe_refs")
         _reject_duplicate_ids(self.transcript_evidence_refs, "transcript_evidence_refs")
         keyframes = set(self.keyframe_refs)
+        content_ids = tuple(block.visual_content_id for block in self.content_blocks)
+        fact_ids = tuple(fact.visual_fact_id for fact in self.visual_facts)
+        _reject_duplicate_ids(content_ids, "visual_content_id")
+        _reject_duplicate_ids(fact_ids, "visual_fact_id")
+        if set(content_ids) & set(fact_ids):
+            raise ValueError("视觉内容与事实 ID 不得重复")
         for block in self.content_blocks:
             if not set(block.source_keyframe_refs).issubset(keyframes):
                 raise ValueError("source_keyframe_refs 必须属于当前观察的 keyframe_refs")

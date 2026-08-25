@@ -93,6 +93,7 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
         caption="画面给出了更精确的参数。",
         content_blocks=(
             VisualTextContent(
+                visual_content_id="visual_content_001",
                 source_keyframe_refs=(keyframe.evidence_id,),
                 text="beam_size=5",
             ),
@@ -139,6 +140,7 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
             ),
             VisualBlock(
                 visual_observation_ref=observation.evidence_id,
+                visual_content_refs=("visual_content_001",),
                 caption="<img src=x>画面参数",
                 evidence_refs=(observation.evidence_id,),
             ),

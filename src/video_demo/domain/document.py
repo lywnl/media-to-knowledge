@@ -162,8 +162,16 @@ class FormulaBlock(FrozenModel):
 class VisualBlock(FrozenModel):
     block_type: Literal["VISUAL"] = "VISUAL"
     visual_observation_ref: StableId
+    visual_content_refs: tuple[StableId, ...] = Field(max_length=48)
     caption: str = Field(min_length=1, max_length=2_000)
     evidence_refs: tuple[StableId, ...] = Field(min_length=1, max_length=32)
+
+    @field_validator("visual_content_refs")
+    @classmethod
+    def reject_duplicate_content_refs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("visual_content_refs 不得重复")
+        return value
 
 
 ChapterBodyBlock: TypeAlias = Annotated[
@@ -340,6 +348,33 @@ def validate_evidence_references(
                     ErrorCode.UNKNOWN_EVIDENCE_REFERENCE,
                     "VISUAL block 的观察引用必须属于 evidence_refs",
                 )
+            if isinstance(block, VisualBlock):
+                observation = evidence_by_id.get(block.visual_observation_ref)
+                if not isinstance(observation, VisualObservationEvidence):
+                    raise VideoDemoError(
+                        ErrorCode.EVIDENCE_TYPE_MISMATCH,
+                        "VISUAL block 必须绑定视觉观察",
+                    )
+                allowed_content_ids = {
+                    *(item.visual_content_id for item in observation.content_blocks),
+                    *(item.visual_fact_id for item in observation.visual_facts),
+                }
+                if allowed_content_ids:
+                    if not block.visual_content_refs:
+                        raise VideoDemoError(
+                            ErrorCode.UNKNOWN_EVIDENCE_REFERENCE,
+                            "有内容的视觉观察至少选择一个子内容",
+                        )
+                    if not set(block.visual_content_refs).issubset(allowed_content_ids):
+                        raise VideoDemoError(
+                            ErrorCode.UNKNOWN_EVIDENCE_REFERENCE,
+                            "VISUAL block 引用了未知或跨观察子内容",
+                        )
+                elif block.visual_content_refs:
+                    raise VideoDemoError(
+                        ErrorCode.UNKNOWN_EVIDENCE_REFERENCE,
+                        "空内容视觉观察不得选择子内容",
+                    )
         for claim in chapter.claims:
             for evidence_ref in claim.evidence_refs:
                 _require_chapter_evidence(chapter, evidence_ref, evidence_by_id)

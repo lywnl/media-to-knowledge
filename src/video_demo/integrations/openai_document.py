@@ -9,6 +9,7 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from video_demo.domain.document import VisualBlock
+from video_demo.domain.evidence import VisualObservationEvidence
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.document_port import (
     ChapterPlanningRequest,
@@ -118,9 +119,7 @@ class OpenAIDocumentClient(DocumentTextPort):
             validate_response=lambda response: _validate_writing_response(
                 response,
                 allowed_evidence_ids=set(allowed_writing_evidence_ids(request)),
-                allowed_visual_observation_ids={
-                    item.evidence_id for item in request.visual_observations
-                },
+                visual_observations=request.visual_observations,
             ),
             on_provider_attempt=on_provider_attempt,
         )
@@ -138,9 +137,7 @@ class OpenAIDocumentClient(DocumentTextPort):
             validate_response=lambda response: _validate_writing_response(
                 response,
                 allowed_evidence_ids=set(request.allowed_evidence_ids),
-                allowed_visual_observation_ids={
-                    item.evidence_id for item in request.request.visual_observations
-                },
+                visual_observations=request.request.visual_observations,
             ),
             on_provider_attempt=on_provider_attempt,
         )
@@ -397,8 +394,10 @@ def _validate_writing_response(
     response: ChapterWritingResponse,
     *,
     allowed_evidence_ids: set[str],
-    allowed_visual_observation_ids: set[str],
+    visual_observations: tuple[VisualObservationEvidence, ...],
 ) -> None:
+    allowed_visual_observation_ids = {item.evidence_id for item in visual_observations}
+    observation_by_id = {item.evidence_id: item for item in visual_observations}
     for block in response.body_blocks:
         _require_known_ids(block.evidence_refs, allowed_evidence_ids, "body_blocks.evidence_refs")
         if isinstance(block, VisualBlock):
@@ -407,6 +406,18 @@ def _validate_writing_response(
                 allowed_visual_observation_ids,
                 "body_blocks.visual_observation_ref",
             )
+            observation = observation_by_id[block.visual_observation_ref]
+            allowed_content_ids = {
+                *(item.visual_content_id for item in observation.content_blocks),
+                *(item.visual_fact_id for item in observation.visual_facts),
+            }
+            if (
+                bool(allowed_content_ids) != bool(block.visual_content_refs)
+                or not set(block.visual_content_refs).issubset(allowed_content_ids)
+            ):
+                raise _ReferenceValidationError(
+                    "body_blocks.visual_content_refs:unknown_reference",
+                )
             _require_known_ids(
                 (block.visual_observation_ref,),
                 set(block.evidence_refs),

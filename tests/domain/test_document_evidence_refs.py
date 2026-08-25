@@ -15,6 +15,7 @@ from video_demo.domain.document import (
     SemanticSection,
     VideoDocumentSummary,
     VideoUnderstandingResult,
+    VisualBlock,
     section_id_for,
     validate_evidence_references,
 )
@@ -131,6 +132,7 @@ def _observation() -> VisualObservationEvidence:
         caption="画面显示一个数字。",
         content_blocks=(
             VisualTextContent(
+                visual_content_id="visual_content_001",
                 source_keyframe_refs=("keyframe_frame_001",),
                 text="42",
             ),
@@ -143,7 +145,11 @@ def _observation() -> VisualObservationEvidence:
 def test_visual_observation_rejects_unknown_local_frame_reference() -> None:
     payload = _observation().model_dump(exclude={"duration_ms"})
     payload["content_blocks"] = (
-        VisualTextContent(source_keyframe_refs=("frame_unknown",), text="42"),
+        VisualTextContent(
+            visual_content_id="visual_content_001",
+            source_keyframe_refs=("frame_unknown",),
+            text="42",
+        ),
     )
     with pytest.raises(ValidationError, match="source_keyframe_refs"):
         VisualObservationEvidence.model_validate(payload)
@@ -172,6 +178,28 @@ def test_cross_object_validation_requires_frame_and_transcript_membership() -> N
 def test_cross_object_validation_accepts_visual_observation_and_body_refs() -> None:
     result = _result()
     validate_evidence_references(result, (_speech(), _keyframe(), _observation()))
+
+
+def test_visual_block_rejects_unknown_or_cross_observation_content_id() -> None:
+    observation = _observation()
+    chapter = _chapter().model_copy(
+        update={
+            "body_blocks": (
+                VisualBlock(
+                    visual_observation_ref=observation.evidence_id,
+                    visual_content_refs=("visual_content_other",),
+                    caption="非法子内容",
+                    evidence_refs=(observation.evidence_id,),
+                ),
+            ),
+            "evidence_refs": (observation.evidence_id,),
+        },
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        validate_evidence_references(_result(chapter), (_keyframe(), observation, _speech()))
+
+    assert raised.value.code == ErrorCode.UNKNOWN_EVIDENCE_REFERENCE
 
 
 def test_cross_object_validation_requires_selected_keyframes_in_chapter_evidence() -> None:

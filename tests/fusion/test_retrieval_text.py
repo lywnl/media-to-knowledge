@@ -2,9 +2,21 @@ from __future__ import annotations
 
 import hashlib
 
+from video_demo.domain.document import (
+    GroundedClaim,
+    ParagraphBlock,
+    SemanticChapter,
+    VideoDocumentSummary,
+    VisualBlock,
+)
+from video_demo.domain.evidence import VisualObservationEvidence
 from video_demo.domain.result import SegmentUnderstanding
 from video_demo.fusion.merge import BoundaryPoint, WindowUnderstanding, merge_segment_understandings
-from video_demo.fusion.retrieval_text import render_segment_retrieval_text
+from video_demo.fusion.retrieval_text import (
+    render_document_chapter_retrieval_text,
+    render_document_summary_retrieval_text,
+    render_segment_retrieval_text,
+)
 
 
 def test_duplicate_keyword_fields_are_rendered_only_once() -> None:
@@ -143,3 +155,80 @@ def test_same_semantics_produce_identical_segment_serialization() -> None:
     right = merge_segment_understandings((window,), boundaries=tuple(reversed(boundaries)))[0]
 
     assert left.model_dump_json() == right.model_dump_json()
+
+
+def test_document_chapter_retrieval_projection_excludes_internal_fields() -> None:
+    observation = VisualObservationEvidence(
+        evidence_id="visual_001",
+        chapter_id="chapter_001",
+        start_ms=100,
+        end_ms=200,
+        target_ids=("target_001",),
+        keyframe_refs=("keyframe_001",),
+        transcript_evidence_refs=(),
+        visual_type="TEXT",
+        caption="界面显示参数 42。",
+        relation_to_transcript="INDEPENDENT",
+        certainty=0.8,
+        uncertainties=("小字号可能识别有误",),
+    )
+    chapter = SemanticChapter.model_construct(
+        chapter_id="chapter_001",
+        start_ms=0,
+        end_ms=1_000,
+        title="参数设置",
+        summary_zh="介绍参数配置。",
+        body_blocks=(
+            ParagraphBlock(text="打开设置页面。", evidence_refs=("asr_001",)),
+            VisualBlock(
+                visual_observation_ref="visual_001",
+                visual_content_refs=(),
+                caption="参数为 42。",
+                evidence_refs=("visual_001",),
+            ),
+        ),
+        claims=(GroundedClaim(text="参数可以调整。", evidence_refs=("asr_001",), certainty=0.9),),
+        content_status="GROUNDED",
+        evidence_refs=("asr_001", "visual_001"),
+        selected_keyframe_refs=("keyframe_001",),
+        transcript_source="ASR",
+        retrieval_text="",
+        retrieval_hash="0" * 64,
+    )
+
+    rendered = render_document_chapter_retrieval_text(chapter, (observation,))
+
+    assert rendered.splitlines() == [
+        "文档类型：SEMANTIC_CHAPTER",
+        "章节标题：参数设置",
+        "时间范围：[0, 1000)",
+        "章节摘要：介绍参数配置。",
+        "正文：打开设置页面。 参数为 42。",
+        "关键结论：参数可以调整。",
+        "视觉补充：界面显示参数 42。",
+        "不确定性：小字号可能识别有误",
+    ]
+    assert "chapter_001" not in rendered
+    assert "visual_001" not in rendered
+    assert "keyframe_001" not in rendered
+    assert "model" not in rendered.lower()
+
+
+def test_document_retrieval_projection_preserves_labels_under_character_limits() -> None:
+    summary = VideoDocumentSummary(
+        title="测试",
+        duration_ms=1_000,
+        overview_zh="概" * 8_000,
+        key_points=(),
+        retrieval_text="",
+        retrieval_hash=hashlib.sha256(b"").hexdigest(),
+    )
+
+    rendered = render_document_summary_retrieval_text(summary)
+
+    assert len(rendered) <= 8_000
+    assert "文档类型：" in rendered
+    assert "视频标题：" in rendered
+    assert "视频时长：" in rendered
+    assert "核心概览：" in rendered
+    assert "关键结论：" in rendered
