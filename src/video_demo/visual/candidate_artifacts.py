@@ -523,6 +523,13 @@ def _read_verified_candidate_at(
             or _file_identity(before_file) != _file_identity(opened_file)
         ):
             raise OSError
+        # 单图上限是预算拒绝，不是内容损坏。只有在文件身份和声明大小
+        # 已经一致时才允许返回该语义，避免把元数据篡改伪装成预算超限。
+        if opened_file.st_size > max_bytes:
+            raise VideoDemoError(
+                ErrorCode.INPUT_BUDGET_EXCEEDED,
+                "候选帧超过单图读取上限",
+            )
         payload = _read_bounded(file_descriptor, max_bytes)
         after_file = os.fstat(file_descriptor)
         current_file = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
@@ -545,7 +552,9 @@ def _read_verified_candidate_at(
         ):
             raise OSError
         return payload
-    except (OSError, VideoDemoError):
+    except VideoDemoError:
+        raise
+    except OSError:
         raise VideoDemoError(
             ErrorCode.ARTIFACT_SCHEMA_INVALID,
             "候选帧内容完整性校验失败",

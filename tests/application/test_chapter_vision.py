@@ -1118,12 +1118,29 @@ class _ConcurrentVisionPort(_VisionPort):
 
 def test_bounded_concurrency_preserves_chapter_order(tmp_path: Path) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
+    chapter_speeches = tuple(
+        speech.model_copy(
+            update={
+                "evidence_id": f"asr_{index:03d}",
+                "start_ms": (index - 1) * 10_000 + 1_000,
+                "end_ms": (index - 1) * 10_000 + 2_000,
+            },
+        )
+        for index in range(1, 4)
+    )
     chapters = tuple(
         chapter.model_copy(
             update={
                 "chapter_id": f"chapter_{index:03d}",
                 "start_ms": (index - 1) * 10_000,
                 "end_ms": index * 10_000,
+                "semantic_targets": (
+                    chapter.semantic_targets[0].model_copy(
+                        update={
+                            "anchor_evidence_refs": (chapter_speeches[index - 1].evidence_id,),
+                        },
+                    ),
+                ),
             },
         )
         for index in range(1, 4)
@@ -1153,7 +1170,7 @@ def test_bounded_concurrency_preserves_chapter_order(tmp_path: Path) -> None:
     result = _service(tmp_path, port).analyze_all(
         chapters,
         batch,
-        (speech,),
+        chapter_speeches,
         DocumentGenerationConfig(),
         cache=_cache(run_root),
         is_cancel_requested=lambda: False,
@@ -1166,12 +1183,29 @@ def test_bounded_concurrency_preserves_chapter_order(tmp_path: Path) -> None:
 
 def test_cancellation_stops_submitting_and_waits_for_inflight_chapters(tmp_path: Path) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
+    chapter_speeches = tuple(
+        speech.model_copy(
+            update={
+                "evidence_id": f"asr_{index:03d}",
+                "start_ms": (index - 1) * 10_000 + 1_000,
+                "end_ms": (index - 1) * 10_000 + 2_000,
+            },
+        )
+        for index in range(1, 4)
+    )
     chapters = tuple(
         chapter.model_copy(
             update={
                 "chapter_id": f"chapter_{index:03d}",
                 "start_ms": (index - 1) * 10_000,
                 "end_ms": index * 10_000,
+                "semantic_targets": (
+                    chapter.semantic_targets[0].model_copy(
+                        update={
+                            "anchor_evidence_refs": (chapter_speeches[index - 1].evidence_id,),
+                        },
+                    ),
+                ),
             },
         )
         for index in range(1, 4)
@@ -1223,7 +1257,7 @@ def test_cancellation_stops_submitting_and_waits_for_inflight_chapters(tmp_path:
             service.analyze_all,
             chapters,
             batch,
-            (speech,),
+            chapter_speeches,
             DocumentGenerationConfig(),
             cache=_cache(run_root),
             is_cancel_requested=cancelled.is_set,

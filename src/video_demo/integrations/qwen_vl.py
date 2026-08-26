@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
 import httpx
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, StrictInt, ValidationError
 
+from video_demo.domain.base import FrozenModel, Sha256
 from video_demo.domain.document_plan import FrameCandidateArtifact
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.document_port import (
@@ -27,6 +30,9 @@ from video_demo.integrations.document_prompts import (
     vision_payload_json_bytes,
     vision_payload_size_upper_bound,
 )
+from video_demo.integrations.document_validation import (
+    validate_chapter_vision_response,
+)
 from video_demo.storage.workspace import reject_symlink_components, validate_path_component
 from video_demo.visual.candidate_artifacts import read_verified_candidate_jpeg
 
@@ -35,6 +41,76 @@ _MAX_FRAMES = 6
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024
 _MAX_RAW_REQUEST_BYTES = 24 * 1024 * 1024
 _MAX_ENCODED_REQUEST_BYTES = 36 * 1024 * 1024
+
+
+class QwenVisionProviderReceipt(FrozenModel):
+    provider_attempt_count: StrictInt = Field(ge=1, le=5)
+    final_http_status: StrictInt = Field(ge=200, lt=300)
+    response_id_sha256: Sha256 | None = None
+    provider_response_sha256: Sha256
+
+
+class QwenVisionProviderFailureReceipt(FrozenModel):
+    provider_attempt_count: StrictInt = Field(ge=0, le=5)
+    final_http_status: StrictInt | None = Field(default=None, ge=100, le=599)
+    provider_response_sha256: Sha256 | None = None
+
+
+class QwenVisionCallFailure(VideoDemoError):
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str,
+        provider: QwenVisionProviderFailureReceipt,
+    ):
+        super().__init__(code, message)
+        self.provider = provider
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderCallResult:
+    content: bytes | None
+    attempts: int
+    final_http_status: int | None
+    provider_response_sha256: str | None
+    response_id_sha256: str | None
+
+    def success_receipt(self) -> QwenVisionProviderReceipt:
+        if (
+            self.content is None
+            or self.final_http_status is None
+            or self.provider_response_sha256 is None
+        ):
+            raise ValueError("成功回执缺少供应商响应")
+        return QwenVisionProviderReceipt(
+            provider_attempt_count=self.attempts,
+            final_http_status=self.final_http_status,
+            response_id_sha256=self.response_id_sha256,
+            provider_response_sha256=self.provider_response_sha256,
+        )
+
+    def failure_receipt(self) -> QwenVisionProviderFailureReceipt:
+        return QwenVisionProviderFailureReceipt(
+            provider_attempt_count=self.attempts,
+            final_http_status=self.final_http_status,
+            provider_response_sha256=self.provider_response_sha256,
+        )
+
+
+class _ProviderCallError(VideoDemoError):
+    def __init__(self, error: VideoDemoError, result: _ProviderCallResult):
+        super().__init__(error.code, error.message, error.details)
+        self.result = result
+
+
+class _ProviderBoundValidationError(ModelResponseValidationError):
+    def __init__(
+        self,
+        error: ModelResponseValidationError,
+        result: _ProviderCallResult,
+    ) -> None:
+        super().__init__(error.code, error.message, error.invalid_response)
+        self.result = result
 
 
 class QwenVisionClient(ChapterVisionPort):
@@ -76,19 +152,65 @@ class QwenVisionClient(ChapterVisionPort):
         allowed_run_root: Path,
         on_provider_attempt: Callable[[], None] | None = None,
     ) -> ChapterVisionResponse:
-        result, raw_message, parsed = self._call_with_images(
-            request,
-            allowed_run_root=allowed_run_root,
-            prompt=prompt_for_vision(request),
-            schema_name="chapter_vlm_v2",
-            on_provider_attempt=on_provider_attempt,
-        )
+        try:
+            result, raw_message, parsed, _provider = self._call_with_images(
+                request,
+                allowed_run_root=allowed_run_root,
+                prompt=prompt_for_vision(request),
+                schema_name="chapter_vlm_v2",
+                on_provider_attempt=on_provider_attempt,
+            )
+        except _ProviderCallError as error:
+            raise VideoDemoError(error.code, error.message, error.details) from error
         return _validate_or_raise(
             result,
             request,
             raw_message=raw_message,
             parsed=parsed,
         )
+
+    def analyze_chapter_with_receipt(
+        self,
+        request: ChapterVisionRequest,
+        *,
+        allowed_run_root: Path,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> tuple[ChapterVisionResponse, QwenVisionProviderReceipt]:
+        """执行与生产调用相同的请求路径，并返回脱敏供应商回执。"""
+
+        try:
+            result, raw_message, parsed, provider_result = self._call_with_images(
+                request,
+                allowed_run_root=allowed_run_root,
+                prompt=prompt_for_vision(request),
+                schema_name="chapter_vlm_v2",
+                on_provider_attempt=on_provider_attempt,
+            )
+            response = _validate_or_raise(
+                result,
+                request,
+                raw_message=raw_message,
+                parsed=parsed,
+            )
+        except _ProviderCallError as error:
+            raise QwenVisionCallFailure(
+                error.code,
+                error.message,
+                error.result.failure_receipt(),
+            ) from error
+        except _ProviderBoundValidationError as error:
+            raise QwenVisionCallFailure(
+                ErrorCode.QWEN_RESPONSE_INVALID,
+                "Qwen 返回内容不符合视觉契约",
+                error.result.failure_receipt(),
+            ) from error
+        except ModelResponseValidationError as error:
+            raise QwenVisionCallFailure(
+                ErrorCode.QWEN_RESPONSE_INVALID,
+                "Qwen 返回内容不符合视觉契约",
+                provider_result.failure_receipt(),
+            ) from error
+        return response, provider_result.success_receipt()
 
     def repair_chapter(
         self,
@@ -97,21 +219,24 @@ class QwenVisionClient(ChapterVisionPort):
         allowed_run_root: Path,
         on_provider_attempt: Callable[[], None] | None = None,
     ) -> ChapterVisionResponse:
-        result, raw_message, parsed = self._call_with_images(
-            request.request,
-            allowed_run_root=allowed_run_root,
-            prompt=prompt_for_vision_repair(request),
-            schema_name="chapter_vlm_repair_v2",
-            on_provider_attempt=on_provider_attempt,
-        )
+        try:
+            result, raw_message, parsed, _provider = self._call_with_images(
+                request.request,
+                allowed_run_root=allowed_run_root,
+                prompt=prompt_for_vision_repair(request),
+                schema_name="chapter_vlm_repair_v2",
+                on_provider_attempt=on_provider_attempt,
+            )
+        except _ProviderCallError as error:
+            raise VideoDemoError(error.code, error.message, error.details) from error
         return _validate_or_raise(
             result,
             request.request,
             raw_message=raw_message,
             parsed=parsed,
-            allowed_frames=set(request.allowed_frame_ids),
-            allowed_targets=set(request.allowed_target_ids),
-            allowed_transcripts=set(request.allowed_transcript_evidence_ids),
+            allowed_frames=request.allowed_frame_ids,
+            allowed_targets=request.allowed_target_ids,
+            allowed_transcripts=request.allowed_transcript_evidence_ids,
         )
 
     def _call_with_images(
@@ -122,10 +247,10 @@ class QwenVisionClient(ChapterVisionPort):
         prompt: tuple[str, str, str],
         schema_name: str,
         on_provider_attempt: Callable[[], None] | None,
-    ) -> tuple[ChapterVisionResponse, bytes, object]:
+    ) -> tuple[ChapterVisionResponse, bytes, object, _ProviderCallResult]:
         run_root = self._validate_run_root(allowed_run_root)
         response_schema = ChapterVisionResponse.model_json_schema()
-        raw = self._post_with_retry(
+        provider_result = self._post_with_retry_result(
             request,
             run_root=run_root,
             prompt=prompt,
@@ -133,7 +258,12 @@ class QwenVisionClient(ChapterVisionPort):
             response_schema=response_schema,
             on_provider_attempt=on_provider_attempt,
         )
-        return _parse_response(raw)
+        assert provider_result.content is not None
+        try:
+            response, raw_message, parsed = _parse_response(provider_result.content)
+        except ModelResponseValidationError as error:
+            raise _ProviderBoundValidationError(error, provider_result) from error
+        return response, raw_message, parsed, provider_result
 
     def _validate_run_root(self, allowed_run_root: Path) -> Path:
         lexical = allowed_run_root.expanduser()
@@ -174,7 +304,7 @@ class QwenVisionClient(ChapterVisionPort):
             verified.append((frame, base64.b64encode(content).decode("ascii")))
         return verified
 
-    def _post_with_retry(
+    def _post_with_retry_result(
         self,
         request: ChapterVisionRequest,
         *,
@@ -183,11 +313,16 @@ class QwenVisionClient(ChapterVisionPort):
         schema_name: str,
         response_schema: dict[str, object],
         on_provider_attempt: Callable[[], None] | None,
-    ) -> bytes:
+    ) -> _ProviderCallResult:
         last_error: VideoDemoError | None = None
+        attempt_count = 0
+        final_http_status: int | None = None
+        provider_response_sha256: str | None = None
         for attempt in range(1, self._max_attempts + 1):
             frames: list[tuple[FrameCandidateArtifact, str]] = []
             payload: dict[str, object] | None = None
+            final_http_status = None
+            provider_response_sha256 = None
             try:
                 frames = self._verified_frames(request, run_root)
                 payload = self._build_checked_payload(
@@ -198,6 +333,7 @@ class QwenVisionClient(ChapterVisionPort):
                 )
                 if on_provider_attempt is not None:
                     on_provider_attempt()
+                attempt_count += 1
                 with self._http_client.stream(
                     "POST",
                     self._endpoint,
@@ -205,22 +341,58 @@ class QwenVisionClient(ChapterVisionPort):
                     json=payload,
                     timeout=self._timeout_seconds,
                 ) as response:
-                    _raise_response_status(response)
+                    final_http_status = response.status_code
+                    if not 200 <= response.status_code < 300:
+                        provider_response_sha256 = _bounded_error_response_sha256(
+                            response,
+                            self._max_response_bytes,
+                        )
+                        _raise_response_status(response)
                     content = _bounded_response(response, self._max_response_bytes)
-                return content
+                provider_digest = hashlib.sha256(content).hexdigest()
+                response_id_digest = _response_id_sha256(content)
+                return _ProviderCallResult(
+                    content=content,
+                    attempts=attempt_count,
+                    final_http_status=final_http_status,
+                    provider_response_sha256=provider_digest,
+                    response_id_sha256=response_id_digest,
+                )
             except (httpx.RequestError, TimeoutError) as error:
+                final_http_status = None
+                provider_response_sha256 = None
                 last_error = VideoDemoError(
                     ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
                     "Qwen 视觉模型暂时不可用",
                 )
                 if attempt == self._max_attempts:
-                    raise last_error from error
+                    raise _ProviderCallError(
+                        last_error,
+                        _ProviderCallResult(
+                            content=None,
+                            attempts=attempt_count,
+                            final_http_status=None,
+                            provider_response_sha256=None,
+                            response_id_sha256=None,
+                        ),
+                    ) from error
+            except _ProviderCallError:
+                raise
             except VideoDemoError as error:
                 if (
                     error.code != ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
                     or attempt == self._max_attempts
                 ):
-                    raise
+                    raise _ProviderCallError(
+                        error,
+                        _ProviderCallResult(
+                            content=None,
+                            attempts=attempt_count,
+                            final_http_status=final_http_status,
+                            provider_response_sha256=provider_response_sha256,
+                            response_id_sha256=None,
+                        ),
+                    ) from error
                 last_error = error
             finally:
                 frames.clear()
@@ -228,7 +400,20 @@ class QwenVisionClient(ChapterVisionPort):
                     payload["messages"] = []
             if attempt < self._max_attempts:
                 self._sleeper(min(2 ** (attempt - 1), 4))
-        raise last_error or RuntimeError("Qwen 重试状态非法")
+        terminal_error = last_error or VideoDemoError(
+            ErrorCode.SYSTEM_FAILURE,
+            "Qwen 重试状态非法",
+        )
+        raise _ProviderCallError(
+            terminal_error,
+            _ProviderCallResult(
+                content=None,
+                attempts=attempt_count,
+                final_http_status=final_http_status,
+                provider_response_sha256=provider_response_sha256,
+                response_id_sha256=None,
+            ),
+        )
 
     def _build_checked_payload(
         self,
@@ -281,6 +466,37 @@ def _bounded_response(response: httpx.Response, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+def _bounded_error_response_sha256(
+    response: httpx.Response,
+    max_bytes: int,
+) -> str | None:
+    """只对完整落在预算内的错误响应体计算摘要。"""
+
+    digest = hashlib.sha256()
+    total = 0
+    for chunk in response.iter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            return None
+        digest.update(chunk)
+    return digest.hexdigest() if total else None
+
+
+def _response_id_sha256(content: bytes) -> str | None:
+    try:
+        envelope = json.loads(content, parse_constant=_reject_json_constant)
+        if not isinstance(envelope, dict):
+            return None
+        response_id = envelope.get("id")
+        if response_id is None:
+            return None
+        if not isinstance(response_id, str):
+            raise ValueError("供应商响应 ID 必须是字符串")
+        return hashlib.sha256(response_id.encode("utf-8", errors="strict")).hexdigest()
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+
+
 def _raise_response_status(response: httpx.Response) -> None:
     if 200 <= response.status_code < 300:
         return
@@ -298,7 +514,18 @@ def _parse_response(content: bytes) -> tuple[ChapterVisionResponse, bytes, objec
     raw_message: bytes | None = None
     try:
         envelope = json.loads(content, parse_constant=_reject_json_constant)
-        message = envelope["choices"][0]["message"]["content"]  # type: ignore[index]
+        if not isinstance(envelope, dict):
+            raise ValueError
+        provider_id = envelope.get("id")
+        if provider_id is not None and not isinstance(provider_id, str):
+            raise ValueError("供应商响应 ID 必须是字符串")
+        choices = envelope.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ValueError("供应商响应 choices 非法")
+        message_data = choices[0].get("message")
+        if not isinstance(message_data, dict):
+            raise ValueError("供应商响应 message 非法")
+        message = message_data.get("content")
         if not isinstance(message, str):
             raise ValueError
         raw_message = message.encode("utf-8")
@@ -329,80 +556,31 @@ def _validate_or_raise(
     *,
     raw_message: bytes,
     parsed: object,
-    allowed_frames: set[str] | None = None,
-    allowed_targets: set[str] | None = None,
-    allowed_transcripts: set[str] | None = None,
+    allowed_frames: tuple[str, ...] | None = None,
+    allowed_targets: tuple[str, ...] | None = None,
+    allowed_transcripts: tuple[str, ...] | None = None,
 ) -> ChapterVisionResponse:
     try:
-        _validate_observation_references(
+        validate_chapter_vision_response(
             response,
             request,
+            max_selected_frames=3,
             allowed_frames=allowed_frames,
             allowed_targets=allowed_targets,
             allowed_transcripts=allowed_transcripts,
         )
         return response
-    except _ReferenceValidationError as error:
+    except ValueError as error:
+        summary = str(error)
         raise ModelResponseValidationError(
             ErrorCode.QWEN_RESPONSE_INVALID,
             "Qwen 返回内容不符合视觉契约",
             invalid_model_response(
                 raw_message,
-                (error.summary,),
+                (summary,),
                 parsed_json=parsed,
             ),
         ) from None
-
-
-def _validate_observation_references(
-    response: ChapterVisionResponse,
-    request: ChapterVisionRequest,
-    *,
-    allowed_frames: set[str] | None = None,
-    allowed_targets: set[str] | None = None,
-    allowed_transcripts: set[str] | None = None,
-) -> None:
-    frame_ids = allowed_frames or {frame.frame_id for frame in request.frames}
-    target_ids = allowed_targets or {target.target_id for target in request.targets}
-    transcript_ids = allowed_transcripts or {
-        item.evidence_id for item in request.transcript_evidence
-    }
-    frame_targets = {frame.frame_id: set(frame.target_ids) for frame in request.frames}
-    for observation in response.observations:
-        _require_known_ids(
-            observation.selected_frame_ids,
-            frame_ids,
-            "observations.selected_frame_ids",
-        )
-        _require_known_ids(observation.target_ids, target_ids, "observations.target_ids")
-        _require_known_ids(
-            observation.transcript_evidence_refs,
-            transcript_ids,
-            "observations.transcript_evidence_refs",
-        )
-        selected_targets = set().union(
-            *(frame_targets[frame_id] for frame_id in observation.selected_frame_ids),
-        )
-        if (
-            any(
-                not frame_targets[frame_id].intersection(observation.target_ids)
-                for frame_id in observation.selected_frame_ids
-            )
-            or not set(observation.target_ids).issubset(selected_targets)
-        ):
-            raise _ReferenceValidationError("observations.target_ids:frame_binding_mismatch")
-
-
-class _ReferenceValidationError(ValueError):
-    def __init__(self, summary: str) -> None:
-        super().__init__(summary)
-        self.summary = summary
-
-
-def _require_known_ids(values: tuple[str, ...], allowed: set[str], field: str) -> None:
-    if any(value not in allowed for value in values):
-        raise _ReferenceValidationError(f"{field}:unknown_reference")
-
 
 def _pydantic_error_summary(error: object) -> str:
     assert isinstance(error, dict)

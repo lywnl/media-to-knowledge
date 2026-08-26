@@ -54,6 +54,7 @@ from video_demo.integrations.document_prompts import (
     prompt_for_vision_repair,
     vision_payload_size_upper_bound,
 )
+from video_demo.integrations.document_validation import validate_chapter_vision_response
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
 from video_demo.visual.candidate_artifacts import (
     CandidateDirectoryLease,
@@ -328,7 +329,7 @@ class ChapterVisionService:
             _revalidate_candidate_closure(
                 frame_batch.allowed_run_root,
                 frame_sets.values(),
-                max_bytes=self._max_candidate_bytes,
+                max_bytes=self._max_image_bytes,
             )
             cleanup_handoff.start(self._invocation_wait_timeout_seconds)
             analyses = self._analyze_chapters(
@@ -793,11 +794,15 @@ def _revalidate_candidate_closure(
                 raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "同 SHA 候选帧元数据不一致")
             if frame.sha256 in metadata:
                 continue
-            read_verified_candidate_jpeg(
-                allowed_run_root,
-                frame,
-                max_bytes=max_bytes,
-            )
+            try:
+                read_verified_candidate_jpeg(
+                    allowed_run_root,
+                    frame,
+                    max_bytes=max_bytes,
+                )
+            except VideoDemoError as error:
+                if error.code != ErrorCode.INPUT_BUDGET_EXCEEDED:
+                    raise
             metadata[frame.sha256] = current
 
 
@@ -950,58 +955,18 @@ def _validate_response(
     request: ChapterVisionRequest,
     chapter: ChapterPlan,
 ) -> None:
-    frame_by_id = {frame.frame_id: frame for frame in request.frames}
-    target_ids = {target.target_id for target in request.targets}
-    transcript_ids = {item.evidence_id for item in request.transcript_evidence}
-    selected: set[str] = set()
-    observation_ids: set[str] = set()
-    for observation in response.observations:
-        if not set(observation.target_ids) <= target_ids:
-            raise _VisionSemanticValidationError("observations.target_ids:unknown_reference")
-        if not set(observation.selected_frame_ids) <= frame_by_id.keys():
-            raise _VisionSemanticValidationError(
-                "observations.selected_frame_ids:unknown_reference",
-            )
-        if not set(observation.transcript_evidence_refs) <= transcript_ids:
-            raise _VisionSemanticValidationError(
-                "observations.transcript_evidence_refs:unknown_reference",
-            )
-        covered = set().union(
-            *(set(frame_by_id[frame_id].target_ids) for frame_id in observation.selected_frame_ids),
-        )
-        observation_targets = set(observation.target_ids)
-        if (
-            not observation_targets <= covered
-            or any(
-                not observation_targets.intersection(frame_by_id[frame_id].target_ids)
-                for frame_id in observation.selected_frame_ids
-            )
-        ):
-            raise _VisionSemanticValidationError(
-                "observations.target_ids:frame_binding_mismatch",
-            )
-        for relation in observation.frame_relations:
-            if (
-                frame_by_id[relation.from_frame_id].timestamp_ms
-                >= frame_by_id[relation.to_frame_id].timestamp_ms
-            ):
-                raise _VisionSemanticValidationError(
-                    "observations.frame_relations:time_order_invalid",
-                )
-        observation_id = stable_identifier(
-            "visual_observation_draft",
-            observation.model_dump(mode="json"),
-        )
-        if observation_id in observation_ids:
-            raise _VisionSemanticValidationError("observations:duplicate_equivalent")
-        observation_ids.add(observation_id)
-        selected.update(observation.selected_frame_ids)
     cap = min(
         request.document_config.max_visuals_per_chapter,
         3 if chapter.visual_mode in {"COMPARISON", "MULTI_STEP"} else 2,
     )
-    if len(selected) > cap:
-        raise _VisionSemanticValidationError("observations.selected_frame_ids:budget_exceeded")
+    try:
+        validate_chapter_vision_response(
+            response,
+            request,
+            max_selected_frames=cap,
+        )
+    except ValueError as error:
+        raise _VisionSemanticValidationError(str(error)) from None
 
 
 class _VisionSemanticValidationError(ValueError):

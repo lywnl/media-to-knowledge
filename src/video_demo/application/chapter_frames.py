@@ -27,6 +27,7 @@ from video_demo.domain.document_plan import (
     ChapterPlan,
     FrameCandidateArtifact,
     VisualSearchTarget,
+    frame_candidate_id,
 )
 from video_demo.domain.evidence import SceneBoundary, SpeechSegment, SubtitleCue
 from video_demo.errors import ErrorCode, VideoDemoError
@@ -706,7 +707,7 @@ class ChapterFrameSearcher:
     @staticmethod
     def _to_artifact(asset_sha256: str, item: _InternalCandidate) -> FrameCandidateArtifact:
         return FrameCandidateArtifact(
-            frame_id=_frame_identifier(asset_sha256, item),
+        frame_id=frame_candidate_id(asset_sha256, item.frame.timestamp_ms, item.sha256),
             timestamp_ms=item.frame.timestamp_ms,
             sha256=item.sha256,
             size_bytes=item.size_bytes,
@@ -977,18 +978,7 @@ def _candidate_rank(
         -item.frame.sharpness,
         -base_hits,
         item.frame.timestamp_ms,
-        _frame_identifier(asset_sha256, item),
-    )
-
-
-def _frame_identifier(asset_sha256: str, item: _InternalCandidate) -> str:
-    return stable_identifier(
-        "keyframe",
-        {
-            "asset_sha256": asset_sha256,
-            "timestamp_ms": item.frame.timestamp_ms,
-            "sha256": item.sha256,
-        },
+        frame_candidate_id(asset_sha256, item.frame.timestamp_ms, item.sha256),
     )
 
 

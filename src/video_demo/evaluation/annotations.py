@@ -29,7 +29,7 @@ class ReferenceVisualFrame(FrozenModel):
     quality_categories: tuple[
         Literal["GENERAL_TEXT", "CODE", "TABLE", "FORMULA", "DIAGRAM", "UI_SMALL_TEXT"],
         ...,
-    ] = ("GENERAL_TEXT",)
+    ] = Field(default=("GENERAL_TEXT",), min_length=1)
     key_fields: tuple[str, ...] = ()
 
     @field_validator("text_lines")

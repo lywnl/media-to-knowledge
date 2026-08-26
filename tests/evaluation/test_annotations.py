@@ -137,6 +137,21 @@ def test_visual_frame_allows_key_fields_without_text_lines() -> None:
     assert annotation.visual_frames[0].key_fields == ("Latency",)
 
 
+def test_visual_frame_requires_at_least_one_quality_category() -> None:
+    payload = _annotation("a" * 64)
+    payload["visual_frames"] = [
+        {
+            "frame_id": "frame_001",
+            "timestamp_ms": 100,
+            "text_lines": ["你好"],
+            "quality_categories": [],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="quality_categories"):
+        EvaluationAnnotation.model_validate(payload)
+
+
 def test_annotation_contract_rejects_retired_ocr_schema() -> None:
     payload = _annotation("a" * 64)
     payload["schema_version"] = "1.0.0"

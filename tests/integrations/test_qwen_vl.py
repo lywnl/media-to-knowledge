@@ -25,7 +25,10 @@ from video_demo.integrations.document_prompts import (
     prompt_for_vision_repair,
     vision_payload_size_upper_bound,
 )
-from video_demo.integrations.qwen_vl import QwenVisionClient
+from video_demo.integrations.qwen_vl import (
+    QwenVisionCallFailure,
+    QwenVisionClient,
+)
 
 
 def _frame(root: Path, frame_id: str, timestamp_ms: int) -> FrameCandidateArtifact:
@@ -205,6 +208,224 @@ def test_qwen_calls_attempt_callback_before_every_real_http_attempt(tmp_path: Pa
     )
 
     assert attempts == [1, 1]
+
+
+def test_qwen_receipt_records_final_http_and_provider_response_digest(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    provider_envelope = {
+        "id": "provider-response-001",
+        "choices": [{"message": {"content": json.dumps({"observations": []})}}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=provider_envelope, request=request)
+
+    response, receipt = _client(
+        tmp_path, httpx.MockTransport(handler)
+    ).analyze_chapter_with_receipt(_request(run_root), allowed_run_root=run_root)
+
+    assert response.observations == ()
+    assert receipt.provider_attempt_count == 1
+    assert receipt.final_http_status == 200
+    assert receipt.response_id_sha256 == hashlib.sha256(
+        b"provider-response-001"
+    ).hexdigest()
+    assert receipt.provider_response_sha256 == hashlib.sha256(
+        json.dumps(provider_envelope, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def test_qwen_receipt_and_plain_call_share_identical_payload(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    payloads: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(request.content)
+        return _provider_response(request, {"observations": []})
+
+    plain_client = _client(tmp_path, httpx.MockTransport(handler))
+    plain_client.analyze_chapter(_request(run_root), allowed_run_root=run_root)
+    plain_client.analyze_chapter_with_receipt(
+        _request(run_root),
+        allowed_run_root=run_root,
+    )
+
+    assert len(payloads) == 2
+    assert payloads[0] == payloads[1]
+
+
+def test_qwen_receipt_failure_keeps_provider_attempt_and_http_status(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+
+    client = _client(
+        tmp_path,
+        httpx.MockTransport(lambda request: httpx.Response(401, request=request)),
+    )
+
+    with pytest.raises(QwenVisionCallFailure) as raised:
+        client.analyze_chapter_with_receipt(_request(run_root), allowed_run_root=run_root)
+
+    assert raised.value.provider.provider_attempt_count == 1
+    assert raised.value.provider.final_http_status == 401
+    assert raised.value.provider.provider_response_sha256 is None
+
+
+def test_qwen_receipt_failure_hashes_bounded_error_body(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    body = b"provider-error"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=body, request=request)
+
+    with pytest.raises(QwenVisionCallFailure) as raised:
+        _client(
+            tmp_path,
+            httpx.MockTransport(handler),
+            max_response_bytes=len(body),
+        ).analyze_chapter_with_receipt(_request(run_root), allowed_run_root=run_root)
+
+    assert raised.value.provider.final_http_status == 500
+    assert raised.value.provider.provider_response_sha256 == hashlib.sha256(body).hexdigest()
+
+
+def test_qwen_receipt_oversized_error_body_keeps_status_without_digest(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"x" * 11, request=request)
+
+    with pytest.raises(QwenVisionCallFailure) as raised:
+        _client(
+            tmp_path,
+            httpx.MockTransport(handler),
+            max_response_bytes=10,
+        ).analyze_chapter_with_receipt(_request(run_root), allowed_run_root=run_root)
+
+    assert raised.value.code == ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
+    assert raised.value.provider.final_http_status == 500
+    assert raised.value.provider.provider_response_sha256 is None
+
+
+def test_qwen_receipt_timeout_after_http_error_has_no_stale_status_or_digest(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(500, content=b"temporary", request=request)
+        raise httpx.ReadTimeout("timed out")
+
+    with pytest.raises(QwenVisionCallFailure) as raised:
+        _client(
+            tmp_path,
+            httpx.MockTransport(handler),
+            max_attempts=2,
+        ).analyze_chapter_with_receipt(_request(run_root), allowed_run_root=run_root)
+
+    assert raised.value.provider.provider_attempt_count == 2
+    assert raised.value.provider.final_http_status is None
+    assert raised.value.provider.provider_response_sha256 is None
+
+
+def test_qwen_receipt_counts_transport_retry_and_uses_final_response(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    statuses = iter((500, 200))
+    responses: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = next(statuses)
+        responses.append(status)
+        if status == 500:
+            return httpx.Response(status, request=request)
+        return _provider_response(request, {"observations": []})
+
+    _response, receipt = _client(
+        tmp_path,
+        httpx.MockTransport(handler),
+        max_attempts=2,
+    ).analyze_chapter_with_receipt(_request(run_root), allowed_run_root=run_root)
+
+    assert responses == [500, 200]
+    assert receipt.provider_attempt_count == 2
+    assert receipt.final_http_status == 200
+
+
+def test_qwen_receipt_rejects_non_string_provider_id_without_leaking_body(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    provider_envelope = {
+        "id": 123,
+        "choices": [{"message": {"content": json.dumps({"observations": []})}}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=provider_envelope, request=request)
+
+    with pytest.raises(QwenVisionCallFailure) as raised:
+        _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter_with_receipt(
+            _request(run_root),
+            allowed_run_root=run_root,
+        )
+
+    assert raised.value.code == ErrorCode.QWEN_RESPONSE_INVALID
+    assert raised.value.provider.provider_attempt_count == 1
+    assert raised.value.provider.final_http_status == 200
+    assert raised.value.provider.provider_response_sha256 is not None
+    assert "123" not in raised.value.message
+
+
+@pytest.mark.parametrize(
+    "provider_envelope",
+    (
+        {
+            "id": 123,
+            "choices": [{"message": {"content": json.dumps({"observations": []})}}],
+        },
+        {
+            "id": "provider-response-nan",
+            "choices": [
+                {"message": {"content": '{"observations": [], "score": NaN}'}},
+            ],
+        },
+        {
+            "id": "provider-response-infinity",
+            "choices": [
+                {"message": {"content": '{"observations": [], "score": Infinity}'}},
+            ],
+        },
+    ),
+)
+def test_qwen_plain_call_keeps_invalid_provider_response_repairable(
+    tmp_path: Path,
+    provider_envelope: dict[str, object],
+) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=provider_envelope, request=request)
+
+    with pytest.raises(ModelResponseValidationError) as raised:
+        _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+            _request(run_root),
+            allowed_run_root=run_root,
+        )
+
+    assert raised.value.code == ErrorCode.QWEN_RESPONSE_INVALID
+    assert raised.value.invalid_response.validation_errors
 
 
 def test_qwen_rereads_images_before_retry_and_does_not_count_blocked_attempt(
