@@ -396,7 +396,7 @@ class TimelineEvidence(TimeRange):
         return value
 
 
-EvidenceItem: TypeAlias = (
+LegacyEvidenceItem: TypeAlias = (
     SpeechSegment
     | SubtitleCue
     | SceneBoundary
@@ -408,3 +408,5 @@ DocumentEvidenceItem: TypeAlias = Annotated[
     SpeechSegment | SubtitleCue | KeyframeEvidence | VisualObservationEvidence,
     Field(discriminator="evidence_type"),
 ]
+
+EvidenceItem: TypeAlias = DocumentEvidenceItem

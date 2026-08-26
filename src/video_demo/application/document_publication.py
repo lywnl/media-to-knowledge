@@ -5,26 +5,31 @@ import json
 import re
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import Literal, NoReturn, Protocol
 
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from video_demo.application.document_rendering import render_markdown
-from video_demo.application.queries import ResultQueryService, ResultWriteFence
+from video_demo.application.document_rendering import RenderedDocument, render_markdown
 from video_demo.domain.document import (
     TranscriptSource,
     VideoUnderstandingResult,
     validate_evidence_references,
 )
 from video_demo.domain.document_artifact import DocumentArtifactPayload
-from video_demo.domain.evidence import DocumentEvidenceItem, SpeechSegment, SubtitleCue
+from video_demo.domain.evidence import (
+    DocumentEvidenceItem,
+    KeyframeEvidence,
+    SpeechSegment,
+    SubtitleCue,
+)
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
-from video_demo.persistence.document_repository import DocumentResultRepository
+from video_demo.persistence.document_repository import ResultRepository
 from video_demo.persistence.models import (
     JobModel,
     JobStatus,
@@ -34,6 +39,7 @@ from video_demo.persistence.models import (
 )
 from video_demo.persistence.repositories import JobRepository, Scope, VideoRunRepository
 from video_demo.storage.artifacts import (
+    RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION,
     ArtifactBytesReceipt,
     ArtifactReceipt,
     AtomicArtifactStore,
@@ -47,19 +53,59 @@ _PUBLICATION_NAME = re.compile(
 )
 
 
-class DocumentPublicationService:
-    """仅供私有 3.0 组装测试使用的双制品发布服务。"""
+@dataclass(frozen=True, slots=True)
+class ResultWriteFence:
+    job_pk: int
+    worker_id: str
+    attempt_count: int
 
-    def __init__(self, database: Database, artifact_store: AtomicArtifactStore) -> None:
+
+class VisualCleaner(Protocol):
+    def cleanup(
+        self,
+        run_relative_root: Path,
+        keyframes: tuple[KeyframeEvidence, ...],
+    ) -> bool: ...
+
+    def mark_pending(self, run_relative_root: Path) -> None: ...
+
+
+def scope_key(scope: Scope) -> str:
+    encoded = "\x00".join(
+        (scope.tenant_id, scope.application_id, scope.knowledge_base_id),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+class DocumentPublicationService:
+    """原子发布正式 3.0 结构化结果、证据和确定性 Markdown。"""
+
+    def __init__(
+        self,
+        database: Database,
+        artifact_store: AtomicArtifactStore,
+        *,
+        visual_cleaner: VisualCleaner | None = None,
+        max_document_bytes: int = _MAX_DOCUMENT_BYTES,
+        max_bundle_bytes: int = _MAX_BUNDLE_BYTES,
+    ) -> None:
+        if not 1 <= max_document_bytes <= _MAX_DOCUMENT_BYTES:
+            raise ValueError("Markdown 预算超过首版硬上限")
+        if not 1 <= max_bundle_bytes <= _MAX_BUNDLE_BYTES:
+            raise ValueError("结果 bundle 预算超过首版硬上限")
         self._database = database
         self._store = artifact_store
+        self._visual_cleaner = visual_cleaner
+        self._max_document_bytes = max_document_bytes
+        self._max_bundle_bytes = max_bundle_bytes
 
-    def persist_document(
+    def persist(
         self,
         scope: Scope,
         result: VideoUnderstandingResult,
         *,
         evidence: tuple[DocumentEvidenceItem, ...],
+        document: RenderedDocument,
         stage_metrics: dict[str, int],
         model_metrics: dict[str, int],
         status: Literal["SUCCEEDED", "PARTIAL_SUCCEEDED"],
@@ -67,6 +113,7 @@ class DocumentPublicationService:
         fence: ResultWriteFence,
         warnings: tuple[str, ...] = (),
         stage_cache_hits: tuple[str, ...] = (),
+        published_keyframes: tuple[KeyframeEvidence, ...] = (),
     ) -> None:
         if fence is None:
             raise ValueError("fence 不能为空")
@@ -81,6 +128,8 @@ class DocumentPublicationService:
         validate_evidence_references(result, evidence)
         self._validate_target(scope, result)
         rendered = render_markdown(result, evidence)
+        if document != rendered:
+            raise ValueError("document 必须来自同一结果证据闭包")
         payload = DocumentArtifactPayload(
             result=result,
             evidence=evidence,
@@ -93,7 +142,16 @@ class DocumentPublicationService:
             document_sha256=rendered.sha256,
             document_size_bytes=rendered.size_bytes,
         )
-        root = Path("runs") / ResultQueryService.scope_key(scope) / result.run_id / "result"
+        payload_keyframes = tuple(
+            item for item in payload.evidence if isinstance(item, KeyframeEvidence)
+        )
+        if payload_keyframes != published_keyframes:
+            raise VideoDemoError(
+                ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                "发布视觉闭包与待发布 bundle 不一致",
+            )
+        run_root = Path("runs") / scope_key(scope) / result.run_id
+        root = run_root / "result"
         document_path = root / f"knowledge-note-{rendered.sha256}-{uuid.uuid4().hex}.md"
         digest = hashlib.sha256(_canonical_payload(payload)).hexdigest()
         bundle_path = root / f"bundle-{digest}-{uuid.uuid4().hex}.json"
@@ -104,17 +162,17 @@ class DocumentPublicationService:
             document_receipt = self._store.write_bytes(
                 document_path,
                 rendered.content,
-                max_bytes=_MAX_DOCUMENT_BYTES,
+                max_bytes=self._max_document_bytes,
                 exclusive=True,
             )
             bundle_receipt = self._store.write_json(
                 bundle_path,
                 payload.model_dump(mode="json", exclude_computed_fields=True),
-                schema_version="3.0.0",
+                schema_version=RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION,
                 upstream_sha256=result.asset_sha256,
                 file_mode=0o600,
                 exclusive=True,
-                max_bytes=_MAX_BUNDLE_BYTES,
+                max_bytes=self._max_bundle_bytes,
             )
             self._commit(scope, result, fence, status, warnings, document_receipt, bundle_receipt)
         except BaseException:
@@ -122,21 +180,47 @@ class DocumentPublicationService:
                 with suppress(OSError, VideoDemoError):
                     self._store.discard_artifact(
                         bundle_receipt,
-                        max_bytes=_MAX_BUNDLE_BYTES,
+                        max_bytes=self._max_bundle_bytes,
                     )
             if document_receipt is not None and not self._document_is_referenced(document_receipt):
                 with suppress(OSError, VideoDemoError):
                     self._discard_document(document_receipt)
             raise
+        try:
+            artifact, _ = self.get_artifact(scope, result.run_id)
+            bundle_keyframes = tuple(
+                item for item in artifact.evidence if isinstance(item, KeyframeEvidence)
+            )
+            if bundle_keyframes != published_keyframes:
+                raise VideoDemoError(
+                    ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                    "发布视觉闭包与已提交 bundle 不一致",
+                )
+            if self._visual_cleaner is not None:
+                self._visual_cleaner.cleanup(run_root, bundle_keyframes)
+        except Exception:
+            # 发布已经赢得 fence 并提交；清理异常只能由 pending/启动恢复收敛。
+            if self._visual_cleaner is not None:
+                with suppress(Exception):
+                    self._visual_cleaner.mark_pending(run_root)
+            return
 
     def get_document(self, scope: Scope, run_id: str) -> bytes:
+        _, document = self.get_artifact(scope, run_id)
+        return document
+
+    def get_artifact(
+        self,
+        scope: Scope,
+        run_id: str,
+    ) -> tuple[DocumentArtifactPayload, bytes]:
         try:
             with self._database.session() as session:
                 run = VideoRunRepository(session).get(scope, run_id)
                 if run is None:
                     raise VideoDemoError(ErrorCode.VIDEO_RUN_NOT_FOUND, "视频理解运行不存在")
                 asset_sha = self._asset_sha(session, scope, run.asset_id)
-                result = DocumentResultRepository(session).get(scope, run_id, asset_sha)
+                result = ResultRepository(session).get(scope, run_id, asset_sha)
                 bundle_receipt, document_receipt = self._receipts(scope, run_id, asset_sha, run)
                 run_facts = (
                     str(run.status),
@@ -145,12 +229,12 @@ class DocumentPublicationService:
                     run.error_code,
                 )
             payload = self._store.read_verified_json_limited(
-                bundle_receipt, max_bytes=_MAX_BUNDLE_BYTES
+                bundle_receipt, max_bytes=self._max_bundle_bytes
             )
             artifact = DocumentArtifactPayload.model_validate(payload)
             validate_evidence_references(artifact.result, artifact.evidence)
             document = self._store.read_verified_bytes(
-                document_receipt, max_bytes=_MAX_DOCUMENT_BYTES
+                document_receipt, max_bytes=self._max_document_bytes
             )
             expected = render_markdown(artifact.result, artifact.evidence)
             if (
@@ -163,7 +247,7 @@ class DocumentPublicationService:
                 or not _transcript_source_matches(artifact)
             ):
                 _invalid("数据库、bundle 与 Markdown 事实不一致")
-            return document
+            return artifact, document
         except VideoDemoError as error:
             if error.code in {
                 ErrorCode.VIDEO_RUN_NOT_FOUND,
@@ -191,7 +275,7 @@ class DocumentPublicationService:
 
         if not publishers_stopped:
             raise ValueError("孤儿恢复前必须停止当前 Run 的全部发布者")
-        root = Path("runs") / ResultQueryService.scope_key(scope) / run_id / "result"
+        root = Path("runs") / scope_key(scope) / run_id / "result"
         with self._database.session() as session:
             run = VideoRunRepository(session).get(scope, run_id)
             if run is None:
@@ -205,7 +289,11 @@ class DocumentPublicationService:
             match = _PUBLICATION_NAME.fullmatch(name)
             if match is None or (match.group(1) == "knowledge-note") != (match.group(4) == "md"):
                 _invalid("当前 Run 制品目录包含未知文件")
-            max_bytes = _MAX_DOCUMENT_BYTES if match.group(4) == "md" else _MAX_BUNDLE_BYTES
+            max_bytes = (
+                self._max_document_bytes
+                if match.group(4) == "md"
+                else self._max_bundle_bytes
+            )
             encoded, receipt = self._store.inspect_artifact_bytes(
                 relative_path,
                 max_bytes=max_bytes,
@@ -265,7 +353,7 @@ class DocumentPublicationService:
             run = VideoRunRepository(session).get(scope, result.run_id)
             if run is None:
                 raise VideoDemoError(ErrorCode.VIDEO_RUN_NOT_FOUND, "视频理解运行不存在")
-            DocumentResultRepository(session).replace(scope, result)
+            ResultRepository(session).replace(scope, result)
             run.status = RunStatusValue(status)
             run.current_stage = "RESULT"
             run.warning_codes = list(dict.fromkeys(warnings))
@@ -311,8 +399,8 @@ class DocumentPublicationService:
             raise VideoDemoError(ErrorCode.VIDEO_RUN_NOT_FOUND, "视频资产不存在")
         return str(asset.source_sha256)
 
-    @staticmethod
     def _receipts(
+        self,
         scope: Scope, run_id: str, asset_sha: str, run: object
     ) -> tuple[ArtifactReceipt, ArtifactBytesReceipt]:
         bundle_path = getattr(run, "artifact_manifest_relative_path", None)
@@ -320,7 +408,7 @@ class DocumentPublicationService:
         document_path = getattr(run, "document_relative_path", None)
         document_sha = getattr(run, "document_sha256", None)
         document_size = getattr(run, "document_size_bytes", None)
-        expected_parent = Path("runs") / ResultQueryService.scope_key(scope) / run_id / "result"
+        expected_parent = Path("runs") / scope_key(scope) / run_id / "result"
         if not all((bundle_path, bundle_sha, document_path, document_sha, document_size)):
             _invalid("双制品元数据不完整")
         bundle_match = _PUBLICATION_NAME.fullmatch(Path(str(bundle_path)).name)
@@ -340,13 +428,13 @@ class DocumentPublicationService:
             or document_match.group(4) != "md"
             or not isinstance(document_size, int)
             or isinstance(document_size, bool)
-            or not 1 <= document_size <= _MAX_DOCUMENT_BYTES
+            or not 1 <= document_size <= self._max_document_bytes
         ):
             _invalid("双制品路径或大小非法")
         return (
             ArtifactReceipt(
                 relative_path=str(bundle_path),
-                schema_version="3.0.0",
+                schema_version=RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION,
                 sha256=str(bundle_sha),
                 upstream_sha256=asset_sha,
             ),
@@ -410,7 +498,10 @@ def _validate_orphan_bundle(encoded: bytes, run_id: str, asset_sha: str) -> str:
             "payload",
         }:
             _invalid("孤儿 bundle envelope 非法")
-        if envelope["schema_version"] != "3.0.0" or envelope["upstream_sha256"] != asset_sha:
+        if (
+            envelope["schema_version"] != RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION
+            or envelope["upstream_sha256"] != asset_sha
+        ):
             _invalid("孤儿 bundle envelope 版本或上游摘要非法")
         payload = envelope["payload"]
         if not isinstance(payload, dict):
@@ -423,7 +514,11 @@ def _validate_orphan_bundle(encoded: bytes, run_id: str, asset_sha: str) -> str:
             or not _transcript_source_matches(artifact)
         ):
             _invalid("孤儿 bundle 不属于目标 Run 或 Asset")
-        if encoded != canonical_artifact_envelope_bytes(payload, "3.0.0", asset_sha):
+        if encoded != canonical_artifact_envelope_bytes(
+            payload,
+            RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION,
+            asset_sha,
+        ):
             _invalid("孤儿 bundle 不是规范 envelope")
         canonical = json.dumps(
             payload,

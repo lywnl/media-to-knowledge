@@ -14,7 +14,7 @@ from video_demo.api.schemas import ErrorBody, ErrorResponse
 from video_demo.application.queries import ResultQueryService
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
-from video_demo.config import Settings
+from video_demo.config import ApiRuntimeConfig, ApiRuntimeSettings, Settings
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
@@ -31,6 +31,7 @@ _CONFLICT_CODES = {
     ErrorCode.VIDEO_RESULT_NOT_READY,
     ErrorCode.IDEMPOTENCY_CONFLICT,
     ErrorCode.JOB_NOT_RETRYABLE,
+    ErrorCode.RESULT_SCHEMA_UNSUPPORTED,
 }
 _UNAVAILABLE_CODES = {
     ErrorCode.VIDEO_FFMPEG_UNAVAILABLE,
@@ -48,37 +49,48 @@ _PUBLIC_DETAIL_KEYS = frozenset(
         "max_evidence_items",
         "model_id",
         "provider_error_code",
+        "run_id",
         "segment_id",
         "status_code",
+        "supported_schema_version",
     },
 )
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    actual_settings = settings or Settings()
-    actual_settings.require_cloud_asr_configuration()
-    assert actual_settings.runtime_root is not None
-    actual_settings.runtime_root.mkdir(parents=True, exist_ok=True)
-    database_url = f"sqlite+pysqlite:///{actual_settings.runtime_root / 'video-demo.db'}"
+def create_app(
+    settings: Settings | ApiRuntimeConfig | None = None,
+) -> FastAPI:
+    if settings is None:
+        runtime = ApiRuntimeSettings(_env_file=None).to_runtime_config()
+    elif isinstance(settings, Settings):
+        runtime = settings.to_api_runtime_config()
+    else:
+        runtime = settings
+    runtime.runtime_root.mkdir(parents=True, exist_ok=True)
+    database_url = f"sqlite+pysqlite:///{runtime.runtime_root / 'video-demo.db'}"
     upgrade_runtime_database(
-        actual_settings.workspace_root,
-        actual_settings.runtime_root,
+        runtime.workspace_root,
+        runtime.runtime_root,
         database_url,
     )
     database = Database(database_url)
     object_store = LocalVideoObjectStore(
-        actual_settings.runtime_root,
-        max_video_bytes=actual_settings.max_video_bytes,
+        runtime.runtime_root,
+        max_video_bytes=runtime.max_video_bytes,
     )
     container = AppContainer(
-        settings=actual_settings,
+        runtime_root=runtime.runtime_root,
         database=database,
         object_store=object_store,
         upload_service=UploadService(database, object_store),
         run_service=RunService(database),
         result_query_service=ResultQueryService(
             database,
-            AtomicArtifactStore(actual_settings.runtime_root),
+            AtomicArtifactStore(runtime.runtime_root),
+            max_evidence_items=runtime.max_result_evidence_items,
+            max_keyframe_bytes=runtime.vlm_max_image_bytes,
+            max_document_bytes=runtime.max_document_bytes,
+            max_bundle_bytes=runtime.max_result_bundle_bytes,
         ),
     )
 

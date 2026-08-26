@@ -9,8 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from video_demo.application.document_publication import DocumentPublicationService
-from video_demo.application.queries import ResultWriteFence
+from video_demo.application.document_publication import (
+    DocumentPublicationService,
+    ResultWriteFence,
+    scope_key,
+)
+from video_demo.application.document_rendering import render_markdown
 from video_demo.domain.document import (
     DocumentGenerationConfig,
     DocumentGenerationMetadata,
@@ -22,9 +26,10 @@ from video_demo.domain.document import (
     section_id_for,
 )
 from video_demo.domain.document_artifact import MODEL_METRIC_NAMES, RESULT_STAGE_NAMES
+from video_demo.domain.evidence import KeyframeEvidence
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
-from video_demo.persistence.document_repository import DocumentResultRepository
+from video_demo.persistence.document_repository import ResultRepository
 from video_demo.persistence.models import (
     VideoSegmentModel,
     VideoSummaryModel,
@@ -130,16 +135,112 @@ def publication(
 
 
 def _publish(service: DocumentPublicationService, scope: Scope, fence: ResultWriteFence) -> None:
-    service.persist_document(
+    result = _result()
+    service.persist(
         scope,
-        _result(),
+        result,
         evidence=(),
+        document=render_markdown(result, ()),
         stage_metrics=dict.fromkeys(RESULT_STAGE_NAMES, 0),
         model_metrics=dict.fromkeys(MODEL_METRIC_NAMES, 0),
         status="SUCCEEDED",
         transcript_source="NONE",
         fence=fence,
     )
+
+
+class _RecordingVisualCleaner:
+    def __init__(self, *, fail_cleanup: bool = False) -> None:
+        self.fail_cleanup = fail_cleanup
+        self.cleanup_calls: list[tuple[Path, tuple[KeyframeEvidence, ...]]] = []
+        self.pending_calls: list[Path] = []
+
+    def cleanup(
+        self,
+        run_relative_root: Path,
+        keyframes: tuple[KeyframeEvidence, ...],
+    ) -> bool:
+        self.cleanup_calls.append((run_relative_root, keyframes))
+        if self.fail_cleanup:
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "模拟清理失败")
+        return True
+
+    def mark_pending(self, run_relative_root: Path) -> None:
+        self.pending_calls.append(run_relative_root)
+
+
+def _keyframe() -> KeyframeEvidence:
+    return KeyframeEvidence(
+        evidence_id="keyframe_evidence_001",
+        start_ms=500,
+        end_ms=501,
+        keyframe_id="keyframe_001",
+        timestamp_ms=500,
+        relative_path=f"visual/keyframes/{'b' * 64}.jpg",
+        mime_type="image/jpeg",
+        sha256="b" * 64,
+        perceptual_hash="0123456789abcdef",
+        size_bytes=1_024,
+    )
+
+
+def test_document_publication_rejects_precommit_visual_closure_mismatch_without_cleanup(
+    publication: tuple[DocumentPublicationService, Database, Scope, ResultWriteFence, Path],
+) -> None:
+    _, database, scope, fence, runtime_root = publication
+    cleaner = _RecordingVisualCleaner()
+    service = DocumentPublicationService(
+        database,
+        AtomicArtifactStore(runtime_root),
+        visual_cleaner=cleaner,
+    )
+    result = _result()
+
+    with pytest.raises(VideoDemoError) as raised:
+        service.persist(
+            scope,
+            result,
+            evidence=(),
+            document=render_markdown(result, ()),
+            stage_metrics=dict.fromkeys(RESULT_STAGE_NAMES, 0),
+            model_metrics=dict.fromkeys(MODEL_METRIC_NAMES, 0),
+            status="SUCCEEDED",
+            transcript_source="NONE",
+            fence=fence,
+            published_keyframes=(_keyframe(),),
+        )
+
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+    assert cleaner.cleanup_calls == []
+    assert cleaner.pending_calls == []
+    with database.session() as session:
+        assert session.query(VideoSummaryModel).count() == 0
+
+
+def test_document_publication_marks_pending_when_committed_bundle_reread_fails(
+    publication: tuple[DocumentPublicationService, Database, Scope, ResultWriteFence, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, database, scope, fence, runtime_root = publication
+    cleaner = _RecordingVisualCleaner()
+    service = DocumentPublicationService(
+        database,
+        AtomicArtifactStore(runtime_root),
+        visual_cleaner=cleaner,
+    )
+
+    def fail_reread(_scope: Scope, _run_id: str) -> object:
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "模拟提交后重读失败")
+
+    monkeypatch.setattr(service, "get_artifact", fail_reread)
+    _publish(service, scope, fence)
+
+    expected_root = Path("runs") / scope_key(scope) / "run_001"
+    assert cleaner.cleanup_calls == []
+    assert cleaner.pending_calls == [expected_root]
+    with database.session() as session:
+        run = session.query(VideoUnderstandingRunModel).one()
+        assert run.status.value == "SUCCEEDED"
 
 
 @pytest.mark.parametrize(
@@ -162,12 +263,12 @@ def test_document_repository_rejects_unsupported_or_mixed_version_matrix(
 ) -> None:
     _, database, scope, _, _ = publication
     with database.session() as session:
-        repository = DocumentResultRepository(session)
+        repository = ResultRepository(session)
         repository.replace(scope, _result())
         session.query(VideoSummaryModel).one().schema_version = summary_version
         session.query(VideoSegmentModel).one().schema_version = segment_version
     with database.session() as session, pytest.raises(VideoDemoError) as raised:
-        DocumentResultRepository(session).get(scope, "run_001", "a" * 64)
+        ResultRepository(session).get(scope, "run_001", "a" * 64)
     assert raised.value.code == expected
 
 
@@ -176,7 +277,7 @@ def test_document_repository_round_trips_3_result(
 ) -> None:
     _, database, scope, _, _ = publication
     with database.session() as session:
-        repository = DocumentResultRepository(session)
+        repository = ResultRepository(session)
         repository.replace(scope, _result())
         assert repository.get(scope, "run_001", "a" * 64) == _result()
 
@@ -196,13 +297,13 @@ def test_document_repository_distinguishes_empty_and_partial_rows(
 ) -> None:
     _, database, scope, _, _ = publication
     with database.session() as session:
-        DocumentResultRepository(session).replace(scope, _result())
+        ResultRepository(session).replace(scope, _result())
         if remaining in {"NONE", "SUMMARY"}:
             session.query(VideoSegmentModel).delete()
         if remaining in {"NONE", "SEGMENT"}:
             session.query(VideoSummaryModel).delete()
     with database.session() as session, pytest.raises(VideoDemoError) as raised:
-        DocumentResultRepository(session).get(scope, "run_001", "a" * 64)
+        ResultRepository(session).get(scope, "run_001", "a" * 64)
     assert raised.value.code == expected
 
 
@@ -212,15 +313,15 @@ def test_document_repository_validates_before_deleting_existing_rows(
     _, database, scope, _, _ = publication
     original = _result()
     with database.session() as session:
-        DocumentResultRepository(session).replace(scope, original)
+        ResultRepository(session).replace(scope, original)
     forged_summary = original.summary.model_copy(update={"retrieval_hash": "b" * 64})
     forged = original.model_copy(update={"summary": forged_summary})
 
     with database.session() as session, pytest.raises(ValueError):
-        DocumentResultRepository(session).replace(scope, forged)
+        ResultRepository(session).replace(scope, forged)
 
     with database.session() as session:
-        assert DocumentResultRepository(session).get(scope, "run_001", "a" * 64) == original
+        assert ResultRepository(session).get(scope, "run_001", "a" * 64) == original
 
 
 def test_document_publication_atomically_publishes_bundle_markdown_rows_and_job(
@@ -301,6 +402,7 @@ def test_two_real_publishers_compete_and_exactly_one_wins_transaction(
     barrier = threading.Barrier(2)
     original = DocumentPublicationService._commit
     written: list[tuple[str, str]] = []
+    reached_commit: set[int] = set()
     written_lock = threading.Lock()
 
     def synchronize(
@@ -315,24 +417,29 @@ def test_two_real_publishers_compete_and_exactly_one_wins_transaction(
     ) -> None:
         with written_lock:
             written.append((bundle.relative_path, document.relative_path))
+            reached_commit.add(threading.get_ident())
         barrier.wait(timeout=5)
         original(self, candidate_scope, result, candidate, status, warnings, document, bundle)
 
     monkeypatch.setattr(DocumentPublicationService, "_commit", synchronize)
 
-    def attempt() -> ErrorCode | None:
+    def attempt() -> tuple[ErrorCode | None, str | None]:
         try:
             _publish(service, scope, fence)
         except VideoDemoError as error:
-            return error.code
-        return None
+            return error.code, None
+        except Exception as error:
+            return None, type(error).__name__
+        return None, None
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         outcomes = list(executor.map(lambda _index: attempt(), range(2)))
 
-    assert sorted(str(item) for item in outcomes) == sorted(
-        (str(None), str(ErrorCode.JOB_LEASE_LOST))
-    )
+    assert len(reached_commit) == 2
+    assert sorted(outcomes, key=lambda value: value[0] is not None) == [
+        (None, None),
+        (ErrorCode.JOB_LEASE_LOST, None),
+    ]
     assert len(written) == 2
     assert service.get_document(scope, "run_001").startswith(b"# ")
     assert len(tuple((runtime_root / "runs").rglob("*.json"))) == 1

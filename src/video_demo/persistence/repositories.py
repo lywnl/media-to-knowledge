@@ -4,17 +4,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Select, and_, delete, exists, or_, select, update
+from sqlalchemy import Select, and_, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
-from video_demo.domain.result import (
-    SUPPORTED_RESULT_SCHEMA_VERSIONS,
-    VideoSegment,
-    VideoSummary,
-    VideoUnderstandingResult,
-)
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.persistence.document_repository import ResultRepository, Scope
 from video_demo.persistence.models import (
     JobModel,
     JobStatus,
@@ -22,7 +17,6 @@ from video_demo.persistence.models import (
     VideoAssetModel,
     VideoObjectModel,
     VideoObjectStatus,
-    VideoSegmentModel,
     VideoSummaryModel,
     VideoUnderstandingRunModel,
 )
@@ -31,10 +25,10 @@ _SENSITIVE_KEY_PARTS = ("secret", "token", "api_key", "apikey", "authorization",
 
 
 @dataclass(frozen=True, slots=True)
-class Scope:
-    tenant_id: str
-    application_id: str
-    knowledge_base_id: str
+class PublishedRunCleanupRecord:
+    run_pk: int
+    scope: Scope
+    run_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +265,52 @@ class VideoRunRepository:
                 VideoUnderstandingRunModel.knowledge_base_id == scope.knowledge_base_id,
                 VideoUnderstandingRunModel.idempotency_key == idempotency_key,
             ),
+        )
+
+    def list_published_3_for_cleanup(
+        self,
+        *,
+        after_id: int,
+        limit: int = 100,
+    ) -> tuple[PublishedRunCleanupRecord, ...]:
+        """固定 keyset 扫描已发布 3.0 Run；返回轻量恢复记录。"""
+
+        if after_id < 0 or limit != 100:
+            raise ValueError("视觉恢复只允许固定 100 条 keyset 扫描")
+        statement = (
+            select(VideoUnderstandingRunModel)
+            .join(
+                VideoSummaryModel,
+                and_(
+                    VideoSummaryModel.tenant_id == VideoUnderstandingRunModel.tenant_id,
+                    VideoSummaryModel.application_id == VideoUnderstandingRunModel.application_id,
+                    VideoSummaryModel.knowledge_base_id
+                    == VideoUnderstandingRunModel.knowledge_base_id,
+                    VideoSummaryModel.run_id == VideoUnderstandingRunModel.run_id,
+                    VideoSummaryModel.schema_version == "3.0.0",
+                ),
+            )
+            .where(
+                VideoUnderstandingRunModel.id > after_id,
+                VideoUnderstandingRunModel.status.in_(
+                    (RunStatusValue.SUCCEEDED, RunStatusValue.PARTIAL_SUCCEEDED),
+                ),
+                VideoUnderstandingRunModel.artifact_manifest_relative_path.is_not(None),
+                VideoUnderstandingRunModel.artifact_manifest_sha256.is_not(None),
+                VideoUnderstandingRunModel.document_relative_path.is_not(None),
+                VideoUnderstandingRunModel.document_sha256.is_not(None),
+                VideoUnderstandingRunModel.document_size_bytes.is_not(None),
+            )
+            .order_by(VideoUnderstandingRunModel.id)
+            .limit(limit)
+        )
+        return tuple(
+            PublishedRunCleanupRecord(
+                run_pk=run.id,
+                scope=Scope(run.tenant_id, run.application_id, run.knowledge_base_id),
+                run_id=run.run_id,
+            )
+            for run in self._session.scalars(statement)
         )
 
 
@@ -699,6 +739,28 @@ class JobRepository:
             ),
         )
 
+    def has_active_owner(
+        self,
+        scope: Scope,
+        run_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        current_time = now or datetime.now(UTC)
+        return self._session.scalar(
+            select(JobModel.id).where(
+                JobModel.tenant_id == scope.tenant_id,
+                JobModel.application_id == scope.application_id,
+                JobModel.knowledge_base_id == scope.knowledge_base_id,
+                JobModel.resource_type == "VIDEO_UNDERSTANDING_RUN",
+                JobModel.resource_id == run_id,
+                JobModel.status == JobStatus.RUNNING,
+                JobModel.worker_id.is_not(None),
+                func.trim(JobModel.worker_id, " \t\r\n\v\f") != "",
+                JobModel.lease_expires_at > current_time,
+            )
+        ) is not None
+
     def retry(self, scope: Scope, job_id: str, *, now: datetime | None = None) -> JobModel:
         model = self.get(scope, job_id)
         if model is None:
@@ -896,92 +958,14 @@ class JobRepository:
         return value
 
 
-class ResultRepository:
-    """在既有结果表中保存严格领域模型，不持久化证据正文。"""
-
-    def __init__(self, session: Session) -> None:
-        self._session = session
-
-    def replace(
-        self,
-        scope: Scope,
-        result: VideoUnderstandingResult,
-    ) -> None:
-        for model in (VideoSegmentModel, VideoSummaryModel):
-            self._session.execute(
-                delete(model).where(
-                    model.tenant_id == scope.tenant_id,
-                    model.application_id == scope.application_id,
-                    model.knowledge_base_id == scope.knowledge_base_id,
-                    model.run_id == result.run_id,
-                ),
-            )
-        for segment in result.segments:
-            payload = segment.model_dump(mode="json", exclude_computed_fields=True)
-            reject_sensitive_json(payload)
-            self._session.add(
-                VideoSegmentModel(
-                    tenant_id=scope.tenant_id,
-                    application_id=scope.application_id,
-                    knowledge_base_id=scope.knowledge_base_id,
-                    run_id=result.run_id,
-                    segment_id=segment.segment_id,
-                    start_ms=segment.start_ms,
-                    end_ms=segment.end_ms,
-                    schema_version=result.schema_version,
-                    payload_json=payload,
-                    retrieval_text=segment.retrieval_text,
-                    retrieval_hash=segment.retrieval_hash,
-                ),
-            )
-        summary_payload = result.summary.model_dump(mode="json", exclude_computed_fields=True)
-        reject_sensitive_json(summary_payload)
-        self._session.add(
-            VideoSummaryModel(
-                tenant_id=scope.tenant_id,
-                application_id=scope.application_id,
-                knowledge_base_id=scope.knowledge_base_id,
-                run_id=result.run_id,
-                schema_version=result.schema_version,
-                payload_json=summary_payload,
-                retrieval_text=result.summary.retrieval_text,
-                retrieval_hash=result.summary.retrieval_hash,
-            ),
-        )
-        self._session.flush()
-
-    def get(self, scope: Scope, run_id: str, asset_sha256: str) -> VideoUnderstandingResult | None:
-        segments = self._session.scalars(
-            select(VideoSegmentModel)
-            .where(
-                VideoSegmentModel.tenant_id == scope.tenant_id,
-                VideoSegmentModel.application_id == scope.application_id,
-                VideoSegmentModel.knowledge_base_id == scope.knowledge_base_id,
-                VideoSegmentModel.run_id == run_id,
-            )
-            .order_by(VideoSegmentModel.start_ms, VideoSegmentModel.end_ms, VideoSegmentModel.id),
-        ).all()
-        summary = self._session.scalar(
-            select(VideoSummaryModel).where(
-                VideoSummaryModel.tenant_id == scope.tenant_id,
-                VideoSummaryModel.application_id == scope.application_id,
-                VideoSummaryModel.knowledge_base_id == scope.knowledge_base_id,
-                VideoSummaryModel.run_id == run_id,
-            ),
-        )
-        if not segments or summary is None:
-            return None
-        versions = {str(item.schema_version) for item in segments} | {str(summary.schema_version)}
-        if not versions.issubset(SUPPORTED_RESULT_SCHEMA_VERSIONS) or len(versions) != 1:
-            raise VideoDemoError(
-                ErrorCode.ARTIFACT_SCHEMA_INVALID,
-                "结果行 Schema 版本非法或不一致",
-            )
-        return VideoUnderstandingResult(
-            # 旧结果行仍可按 1.0.0 双读，新写入结果由领域模型默认升级到 2.0.0。
-            schema_version=summary.schema_version,
-            run_id=run_id,
-            asset_sha256=asset_sha256,
-            segments=tuple(VideoSegment.model_validate(item.payload_json) for item in segments),
-            summary=VideoSummary.model_validate(summary.payload_json),
-        )
+__all__ = [
+    "ClaimedJob",
+    "JobRepository",
+    "PublishedRunCleanupRecord",
+    "ResultRepository",
+    "RunRecord",
+    "Scope",
+    "VideoObjectRepository",
+    "VideoRunRepository",
+    "reject_sensitive_json",
+]

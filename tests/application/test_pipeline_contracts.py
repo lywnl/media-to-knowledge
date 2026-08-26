@@ -79,6 +79,8 @@ def _observation(
 
 def test_pipeline_only_reexports_cross_stage_contracts() -> None:
     names = (
+        "PipelineContext",
+        "PipelineOutcome",
         "PipelineRunConfig",
         "RegisteredAsset",
         "ProbedAsset",
@@ -90,6 +92,29 @@ def test_pipeline_only_reexports_cross_stage_contracts() -> None:
 
     for name in names:
         assert getattr(pipeline_module, name) is getattr(contracts, name)
+
+
+def test_pipeline_run_config_requires_explicit_3_schema_in_historical_snapshot() -> None:
+    with pytest.raises(VideoDemoError) as raised:
+        contracts.pipeline_run_config_from_snapshot(
+            {"language_hints": [], "hotwords": [], "core_context": None}
+        )
+
+    assert raised.value.code == ErrorCode.RESULT_SCHEMA_UNSUPPORTED
+
+
+def test_pipeline_run_config_round_trips_document_configuration_and_schema() -> None:
+    config = contracts.PipelineRunConfig.model_validate(
+        {
+            "language_hints": ["zh"],
+            "document_config": {"document_title": "知识文档"},
+            "result_schema_version": "3.0.0",
+        }
+    )
+
+    assert config.document_config.document_title == "知识文档"
+    assert config.result_schema_version == "3.0.0"
+    assert contracts.pipeline_run_config_from_snapshot(config.model_dump(mode="json")) == config
 
 
 def test_scene_index_digest_covers_all_canonical_fields() -> None:

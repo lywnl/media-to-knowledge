@@ -21,11 +21,10 @@ from video_demo.application.composition import (
 )
 from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel, Sha256, StableId
-from video_demo.domain.evidence import EvidenceItem, KeyframeEvidence
+from video_demo.domain.evidence import DocumentEvidenceItem, KeyframeEvidence
 from video_demo.domain.result import VideoUnderstandingResult
 from video_demo.domain.result_artifact import (
-    ARTIFACT_ENVELOPE_SCHEMA_VERSION,
-    ResultArtifactPayload,
+    DocumentArtifactPayload,
     TranscriptSource,
 )
 from video_demo.domain.run import ModelIdentity
@@ -46,14 +45,18 @@ from video_demo.evaluation.predictions import (
 from video_demo.evaluation.quality_runner import score_quality
 from video_demo.evaluation.report import BoundQualityReport, GateStatus
 from video_demo.implementation import prediction_implementation_files
-from video_demo.persistence.repositories import Scope, VideoRunRepository
-from video_demo.storage.workspace import safe_runtime_path, validate_path_component
+from video_demo.persistence.repositories import Scope
+from video_demo.storage.artifacts import (
+    RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION,
+    canonical_artifact_envelope_bytes,
+)
+from video_demo.storage.workspace import validate_path_component
 
 _PUBLIC_EVIDENCE_ADAPTER: TypeAdapter[tuple[PublicEvidence, ...]] = TypeAdapter(
     tuple[PublicEvidence, ...]
 )
-_EVIDENCE_ADAPTER: TypeAdapter[tuple[EvidenceItem, ...]] = TypeAdapter(
-    tuple[EvidenceItem, ...]
+_EVIDENCE_ADAPTER: TypeAdapter[tuple[DocumentEvidenceItem, ...]] = TypeAdapter(
+    tuple[DocumentEvidenceItem, ...]
 )
 _SUCCESS_STATUSES = frozenset({"SUCCEEDED", "PARTIAL_SUCCEEDED"})
 _FAILURE_STATUSES = frozenset({"FAILED", "CANCELLED"})
@@ -260,10 +263,8 @@ class PredictionRunner:
             if not _has_dependency("silero_vad"):
                 return "SILERO_DEPENDENCY_UNAVAILABLE"
             self._settings.require_cloud_asr_configuration()
-            if self._settings.qwen_api_key is None or not self._settings.qwen_base_url:
-                return "QWEN_CREDENTIALS_UNAVAILABLE"
-            if self._settings.baidu_api_key is None or self._settings.baidu_secret_key is None:
-                return "BAIDU_OCR_CREDENTIALS_UNAVAILABLE"
+            self._settings.require_text_llm_configuration()
+            self._settings.require_vlm_configuration()
         except (OSError, ValueError, VideoDemoError):
             return "EVALUATION_PREFLIGHT_INVALID"
         return None
@@ -355,7 +356,7 @@ class PredictionRunner:
             _require_status(result_response, 200)
             result = _parse_api_result(result_response.json())
             evidence = self._fetch_evidence(client, run_id, evaluation_run_id, sample.sample_id)
-            _production_manifest_bytes, artifact_payload = _read_published_manifest(
+            artifact_payload, document_bytes = _read_published_manifest(
                 client,
                 run_id=run_id,
                 scope=Scope(
@@ -373,13 +374,8 @@ class PredictionRunner:
             evidence = _rebind_evidence_to_manifest(
                 evidence,
                 artifact_payload.evidence,
-                eval_root=runtime_root / "eval",
             )
-            export_manifest_bytes = _export_manifest_bytes(
-                artifact_payload,
-                evidence,
-                sample.media_sha256,
-            )
+            export_manifest_bytes = _export_manifest_bytes(artifact_payload, sample.media_sha256)
             _write_sample_prediction(
                 runtime_root / "eval",
                 evaluation_run_id,
@@ -392,6 +388,7 @@ class PredictionRunner:
                 models,
                 transcript_source=artifact_payload.transcript_source,
                 manifest_bytes=export_manifest_bytes,
+                document_bytes=document_bytes,
             )
             return _load_index_prediction(
                 runtime_root / "eval",
@@ -429,7 +426,7 @@ class PredictionRunner:
         run_id: str,
         evaluation_run_id: str,
         sample_id: str,
-    ) -> tuple[EvidenceItem, ...]:
+    ) -> tuple[DocumentEvidenceItem, ...]:
         values: list[dict[str, object]] = []
         cursor: str | None = None
         seen: set[str] = set()
@@ -459,52 +456,58 @@ class PredictionRunner:
         public_items = _PUBLIC_EVIDENCE_ADAPTER.validate_python(
             _normalize_public_evidence(values)
         )
-        result: list[EvidenceItem] = []
+        if self._settings.runtime_root is None:
+            raise ValueError("评测运行根未配置")
+        sample_root = (
+            self._settings.runtime_root
+            / "eval"
+            / "predictions"
+            / evaluation_run_id
+            / sample_id
+        )
+        result: list[DocumentEvidenceItem] = []
         for public_item in public_items:
             if isinstance(public_item, PublicKeyframeEvidence):
-                result.append(
-                    KeyframeEvidence(
-                        evidence_id=public_item.evidence_id,
-                        start_ms=public_item.start_ms,
-                        end_ms=public_item.end_ms,
-                        keyframe_id=public_item.keyframe_id,
-                        timestamp_ms=public_item.timestamp_ms,
-                        relative_path=(
-                            f"predictions/{evaluation_run_id}/{sample_id}/keyframes/"
-                            f"{public_item.keyframe_id}."
-                            f"{'png' if public_item.mime_type == 'image/png' else 'jpg'}"
-                        ),
-                        mime_type=public_item.mime_type,
-                        sha256=public_item.sha256,
-                        perceptual_hash=public_item.perceptual_hash,
-                        size_bytes=public_item.size_bytes,
-                    )
+                keyframe = KeyframeEvidence(
+                    evidence_id=public_item.evidence_id,
+                    start_ms=public_item.start_ms,
+                    end_ms=public_item.end_ms,
+                    keyframe_id=public_item.keyframe_id,
+                    timestamp_ms=public_item.timestamp_ms,
+                    relative_path=f"visual/keyframes/{public_item.sha256}.jpg",
+                    mime_type=public_item.mime_type,
+                    sha256=public_item.sha256,
+                    perceptual_hash=public_item.perceptual_hash,
+                    size_bytes=public_item.size_bytes,
                 )
-            else:
-                parsed_item: EvidenceItem = cast(
-                    EvidenceItem,
-                    public_item.model_dump(mode="python"),
-                )
-                result.append(parsed_item)
-        for item in result:
-            if isinstance(item, KeyframeEvidence):
-                if self._settings.runtime_root is None:
-                    raise VideoDemoError(
-                        ErrorCode.EVALUATION_ARTIFACT_INVALID,
-                        "预测缺少可信运行根",
-                    )
-                content = client.get(
-                    f"/api/kb/knowledge-bases/{self._knowledge_base_id}/video-understanding-runs/{run_id}/keyframes/{item.keyframe_id}/content",
+                response = client.get(
+                    f"/api/kb/knowledge-bases/{self._knowledge_base_id}"
+                    f"/video-understanding-runs/{run_id}/keyframes/"
+                    f"{public_item.keyframe_id}/content",
                     headers=self._scope_headers,
                 )
-                _require_status(content, 200)
-                if not content.headers.get("content-type", "").split(";", 1)[0] == item.mime_type:
-                    raise ValueError("关键帧 MIME 与 API 响应不一致")
-                if hashlib.sha256(content.content).hexdigest() != item.sha256:
-                    raise ValueError("关键帧摘要与 API 响应不一致")
-                _atomic_write_bytes(
-                    self._settings.runtime_root / "eval" / item.relative_path,
-                    content.content,
+                _require_status(response, 200)
+                content = response.content
+                if (
+                    response.headers.get("content-type") != "image/jpeg"
+                    or len(content) != keyframe.size_bytes
+                    or hashlib.sha256(content).hexdigest() != keyframe.sha256
+                    or not content.startswith(b"\xff\xd8\xff")
+                    or not content.endswith(b"\xff\xd9")
+                ):
+                    raise ValueError("公开关键帧响应与证据声明不一致")
+                _atomic_write_bytes(sample_root / keyframe.relative_path, content)
+                result.append(keyframe)
+            else:
+                result.append(
+                    _EVIDENCE_ADAPTER.validate_python(
+                        (
+                            public_item.model_dump(
+                                mode="python",
+                                exclude_computed_fields=True,
+                            ),
+                        )
+                    )[0]
                 )
         return tuple(result)
 
@@ -713,7 +716,7 @@ def _persist_failed_prediction(
     _atomic_write_bytes(eval_root / run_relative, run_bytes)
     finished_at = datetime.now(UTC)
     prediction = EvaluationPrediction(
-        schema_version="1.1.0",
+        schema_version="1.2.0",
         evaluation_run_id=evaluation_run_id,
         sample_id=sample.sample_id,
         media_sha256=sample.media_sha256,
@@ -845,7 +848,7 @@ def _write_sample_prediction(
     evaluation_run_id: str,
     sample: EvaluationSample,
     result: VideoUnderstandingResult,
-    evidence: tuple[EvidenceItem, ...],
+    evidence: tuple[DocumentEvidenceItem, ...],
     status: str,
     warnings: tuple[str, ...],
     run_payload: dict[str, object],
@@ -853,6 +856,7 @@ def _write_sample_prediction(
     *,
     transcript_source: TranscriptSource,
     manifest_bytes: bytes,
+    document_bytes: bytes,
 ) -> None:
     directory = eval_root / "predictions" / evaluation_run_id / sample.sample_id
     run_snapshot = PredictionRunSnapshot(
@@ -874,14 +878,28 @@ def _write_sample_prediction(
     relative = Path("predictions") / evaluation_run_id / sample.sample_id
     result_relative = (relative / "result.json").as_posix()
     evidence_relative = (relative / "evidence.jsonl").as_posix()
+    document_relative = (relative / "document.md").as_posix()
     run_relative = (relative / "run.json").as_posix()
     manifest_relative = (relative / "artifact-manifest.json").as_posix()
     _atomic_write_bytes(directory / "run.json", run_bytes)
     _atomic_write_bytes(directory / "result.json", result_bytes)
     _atomic_write_bytes(directory / "evidence.jsonl", evidence_bytes)
+    _atomic_write_bytes(directory / "document.md", document_bytes)
     _atomic_write_bytes(directory / "artifact-manifest.json", manifest_bytes)
+    for item in evidence:
+        if not isinstance(item, KeyframeEvidence):
+            continue
+        source = directory / item.relative_path
+        content = source.read_bytes()
+        if (
+            hashlib.sha256(content).hexdigest() != item.sha256
+            or len(content) != item.size_bytes
+            or not content.startswith(b"\xff\xd8\xff")
+            or not content.endswith(b"\xff\xd9")
+        ):
+            raise ValueError("公开关键帧副本校验失败")
     index = EvaluationPrediction(
-        schema_version="1.1.0",
+        schema_version="1.2.0",
         evaluation_run_id=evaluation_run_id,
         sample_id=sample.sample_id,
         media_sha256=sample.media_sha256,
@@ -894,6 +912,9 @@ def _write_sample_prediction(
         result_sha256=_sha256_bytes(result_bytes),
         evidence_relative_path=evidence_relative,
         evidence_sha256=_sha256_bytes(evidence_bytes),
+        document_relative_path=document_relative,
+        document_sha256=_sha256_bytes(document_bytes),
+        document_size_bytes=len(document_bytes),
         artifact_manifest_relative_path=manifest_relative,
         artifact_manifest_sha256=_sha256_bytes(manifest_bytes),
         transcript_source=transcript_source,
@@ -911,38 +932,21 @@ def _read_published_manifest(
     *,
     run_id: str,
     scope: Scope,
-) -> tuple[bytes, ResultArtifactPayload]:
+) -> tuple[DocumentArtifactPayload, bytes]:
     container = cast(Any, client.app).state.container
-    payload = container.result_query_service._read_bundle(scope, run_id)
-    with container.database.session() as session:
-        run = VideoRunRepository(session).get(scope, run_id)
-        if run is None or run.artifact_manifest_relative_path is None:
-            raise ValueError("生产结果 Manifest 不存在")
-        relative_path = Path(run.artifact_manifest_relative_path)
-        expected_sha256 = run.artifact_manifest_sha256
-    path = safe_runtime_path(container.settings.runtime_root, relative_path)
-    manifest_bytes = path.read_bytes()
-    if expected_sha256 is None or _sha256_bytes(manifest_bytes) != expected_sha256:
-        raise ValueError("生产结果 Manifest 摘要不匹配")
-    return manifest_bytes, ResultArtifactPayload.model_validate(payload)
+    artifact, document = container.result_query_service.get_artifact(scope, run_id)
+    return DocumentArtifactPayload.model_validate(artifact), bytes(document)
 
 
 def _parse_api_result(payload: object) -> VideoUnderstandingResult:
     if not isinstance(payload, dict):
         raise ValueError("结果 API 响应必须是对象")
     normalized = json.loads(json.dumps(payload, ensure_ascii=False))
-    segments = normalized.get("segments")
-    summary = normalized.get("summary")
-    if isinstance(segments, list):
-        for segment in segments:
-            if isinstance(segment, dict):
-                segment.pop("duration_ms", None)
-    if isinstance(summary, dict):
-        chapters = summary.get("chapters")
-        if isinstance(chapters, list):
-            for chapter in chapters:
-                if isinstance(chapter, dict):
-                    chapter.pop("duration_ms", None)
+    chapters = normalized.get("chapters")
+    if isinstance(chapters, list):
+        for chapter in chapters:
+            if isinstance(chapter, dict):
+                chapter.pop("duration_ms", None)
     return VideoUnderstandingResult.model_validate(normalized)
 
 
@@ -958,8 +962,8 @@ def _normalize_public_evidence(values: list[dict[str, object]]) -> list[dict[str
 
 
 def _evidence_matches_api(
-    left: tuple[EvidenceItem, ...],
-    right: tuple[EvidenceItem, ...] | list[dict[str, object]],
+    left: tuple[DocumentEvidenceItem, ...],
+    right: tuple[DocumentEvidenceItem, ...] | list[dict[str, object]],
 ) -> bool:
     if len(left) != len(right):
         return False
@@ -967,7 +971,7 @@ def _evidence_matches_api(
         expected_payload = expected.model_dump(mode="json")
         actual_payload = (
             actual.model_dump(mode="json")
-            if isinstance(actual, EvidenceItem)
+            if not isinstance(actual, dict)
             else dict(actual)
         )
         expected_payload.pop("relative_path", None)
@@ -978,53 +982,35 @@ def _evidence_matches_api(
 
 
 def _rebind_evidence_to_manifest(
-    api_evidence: tuple[EvidenceItem, ...] | list[dict[str, object]],
-    manifest_evidence: tuple[EvidenceItem, ...],
-    *,
-    eval_root: Path,
-) -> tuple[EvidenceItem, ...]:
+    api_evidence: tuple[DocumentEvidenceItem, ...] | list[dict[str, object]],
+    manifest_evidence: tuple[DocumentEvidenceItem, ...],
+) -> tuple[DocumentEvidenceItem, ...]:
     manifest_by_id = {item.evidence_id: item for item in manifest_evidence}
-    rebound: list[EvidenceItem] = []
+    rebound: list[DocumentEvidenceItem] = []
     for item in api_evidence:
         evidence_id = (
             item.evidence_id
-            if isinstance(item, EvidenceItem)
+            if not isinstance(item, dict)
             else str(item.get("evidence_id"))
         )
         source = manifest_by_id.get(evidence_id)
         if source is None:
             raise ValueError("API 证据不在生产 Manifest 中")
-        if isinstance(item, dict) and isinstance(source, KeyframeEvidence):
-            relative_path = str(item.get("relative_path", ""))
-            path = eval_root / relative_path
-            if not path.is_file() or _sha256_file(path) != source.sha256:
-                raise ValueError("关键帧导出内容与生产摘要不一致")
-            rebound.append(source.model_copy(update={"relative_path": relative_path}))
-        else:
-            rebound.append(source)
+        rebound.append(source)
     if len(rebound) != len(manifest_evidence):
         raise ValueError("API 证据未完整覆盖生产 Manifest")
     return tuple(rebound)
 
 
 def _export_manifest_bytes(
-    source: ResultArtifactPayload,
-    evidence: tuple[EvidenceItem, ...],
+    source: DocumentArtifactPayload,
     upstream_sha256: str,
 ) -> bytes:
-    """保留生产阶段指标，只替换评测导出的关键帧相对路径。"""
+    """按生产三层契约重建完整 3.0 bundle。"""
 
-    payload = ResultArtifactPayload(
-        result=source.result,
-        evidence=evidence,
-        stage_metrics=source.stage_metrics,
-        stage_cache_hits=source.stage_cache_hits,
-        status=source.status,
-        warnings=source.warnings,
-        transcript_source=source.transcript_source,
-    )
-    return _envelope_bytes(
-        payload.model_dump(mode="json", exclude_computed_fields=True),
+    return canonical_artifact_envelope_bytes(
+        source.model_dump(mode="json", exclude_computed_fields=True),
+        RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION,
         upstream_sha256,
     )
 
@@ -1036,19 +1022,6 @@ def _load_index_prediction(
 ) -> EvaluationPrediction:
     index_path = eval_root / "predictions" / evaluation_run_id / sample.sample_id / "index.json"
     return EvaluationPrediction.model_validate_json(index_path.read_bytes())
-
-
-def _envelope_bytes(payload: dict[str, object], upstream_sha256: str) -> bytes:
-    return json.dumps(
-        {
-            "schema_version": ARTIFACT_ENVELOPE_SCHEMA_VERSION,
-            "upstream_sha256": upstream_sha256,
-            "payload": payload,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:

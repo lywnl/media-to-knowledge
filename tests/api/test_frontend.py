@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -14,17 +15,18 @@ from video_demo.config import Settings
 from video_demo.errors import ErrorCode, VideoDemoError
 
 
-def test_api_rejects_missing_cloud_asr_configuration_before_writing_runtime(
+def test_api_starts_without_model_configuration(
     tmp_path: Path,
 ) -> None:
+    shutil.copytree(Path.cwd() / "migrations", tmp_path / "migrations")
     settings = Settings(workspace_root=tmp_path, _env_file=None)
     assert settings.runtime_root is not None
 
-    with pytest.raises(VideoDemoError) as raised:
-        create_app(settings)
+    app = create_app(settings)
 
-    assert raised.value.code == ErrorCode.INVALID_CONFIGURATION
-    assert not settings.runtime_root.exists()
+    assert app.state.container.runtime_root == settings.runtime_root
+    assert not hasattr(app.state.container, "settings")
+    assert settings.runtime_root.exists()
 
 
 def test_create_app_runs_migration_before_database_construction(

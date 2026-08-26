@@ -13,7 +13,7 @@ from video_demo.domain.evidence import (
     SpeechSegment,
     SubtitleCue,
 )
-from video_demo.domain.result import (
+from video_demo.domain.legacy_result import (
     SegmentUnderstanding,
     VideoSegment,
     VideoUnderstandingResult,
@@ -42,19 +42,18 @@ def test_retained_evidence_contract_excludes_retired_speech_enrichment_types() -
     retained = {
         "ASR_SEGMENT",
         "SUBTITLE_CUE",
-        "SCENE",
         "KEYFRAME",
-        "OCR",
+        "VISUAL_OBSERVATION",
     }
-    domain_types = get_args(EvidenceItem)
-    domain_discriminators = {
-        model.model_fields["evidence_type"].default for model in domain_types
-    }
+    domain_schema = TypeAdapter(EvidenceItem).json_schema()
+    domain_mapping = domain_schema["discriminator"]["mapping"]
     public_schema = TypeAdapter(PublicEvidence).json_schema()
     public_mapping = public_schema["discriminator"]["mapping"]
 
-    assert domain_discriminators == retained
+    assert set(domain_mapping) == retained
     assert set(public_mapping) == retained
+    assert {"SCENE", "OCR"}.isdisjoint(domain_mapping)
+    assert {"SCENE", "OCR"}.isdisjoint(public_mapping)
     assert "SPEAKER_UNKNOWN" in get_args(SpeakerId)
     understanding = SegmentUnderstanding(
         title="发言",

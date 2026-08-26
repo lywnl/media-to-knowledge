@@ -9,7 +9,7 @@ from pydantic import Field, model_validator
 
 from video_demo.domain.base import FrozenModel, stable_identifier
 from video_demo.domain.evidence import OcrEvidence, SpeechSegment, SubtitleCue, TimedEvidence
-from video_demo.domain.result import SegmentUnderstanding, VideoSegment
+from video_demo.domain.legacy_result import SegmentUnderstanding, VideoSegment
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.fusion.retrieval_text import (

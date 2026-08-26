@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
-from video_demo.application.composition import (
+from video_demo.application.legacy_composition import (
     ProductionDiagnosticComponents,
     ProductionModelIdentityReport,
     _normalized_qwen_model_id,

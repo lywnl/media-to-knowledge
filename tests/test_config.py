@@ -58,26 +58,33 @@ class SettingsTest(unittest.TestCase):
     def test_model_configuration_rejects_partial_values_and_unsafe_http(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
-            for values in (
-                {
-                    "text_llm_base_url": "https://text.example.test/v1",
-                    "text_llm_api_key": "secret",
-                },
-                {
-                    "vlm_base_url": "http://vision.example.test/v1",
-                    "vlm_api_key": "secret",
-                },
+            for values, method in (
+                (
+                    {
+                        "text_llm_base_url": "https://text.example.test/v1",
+                        "text_llm_api_key": "secret",
+                    },
+                    "require_text_llm_configuration",
+                ),
+                (
+                    {
+                        "vlm_base_url": "http://vision.example.test/v1",
+                        "vlm_api_key": "secret",
+                    },
+                    "require_vlm_configuration",
+                ),
             ):
-                with self.subTest(values=values), self.assertRaises(ValidationError):
-                    Settings(workspace_root=workspace, _env_file=None, **values)
+                with self.subTest(values=values), self.assertRaises(VideoDemoError):
+                    settings = Settings(workspace_root=workspace, _env_file=None, **values)
+                    getattr(settings, method)()
 
     def test_explicit_vlm_model_without_endpoint_or_key_is_partial_configuration(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValidationError):
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(VideoDemoError):
             Settings(
                 workspace_root=Path(directory),
                 vlm_model_id="qwen3-vl-plus",
                 _env_file=None,
-            )
+            ).require_vlm_configuration()
 
     def test_local_http_model_endpoint_requires_explicit_localhost_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -311,6 +318,11 @@ class SettingsTest(unittest.TestCase):
                 openai_base_url="https://ai-proxy.example.test/v1",
                 openai_api_key=secret,
                 openai_model="openai/whisper",
+                text_llm_base_url="https://text.example.test/v1",
+                text_llm_api_key="text-key",
+                text_llm_model_id="text-model",
+                vlm_base_url="https://vlm.example.test/v1",
+                vlm_api_key="vlm-key",
                 _env_file=None,
             )
             configuration = settings.require_cloud_asr_configuration()
@@ -319,6 +331,11 @@ class SettingsTest(unittest.TestCase):
                 openai_base_url="https://ai-proxy.example.test/v1",
                 openai_api_key="different-cloud-asr-key",
                 openai_model="openai/whisper",
+                text_llm_base_url="https://text.example.test/v1",
+                text_llm_api_key="text-key",
+                text_llm_model_id="text-model",
+                vlm_base_url="https://vlm.example.test/v1",
+                vlm_api_key="vlm-key",
                 _env_file=None,
             )
             invalid_settings = Settings(
@@ -429,6 +446,11 @@ class SettingsTest(unittest.TestCase):
                 "openai_base_url": "https://ai-proxy.example.test/v1",
                 "openai_api_key": "test-openai-key",
                 "openai_model": "openai/whisper",
+                "text_llm_base_url": "https://text.example.test/v1",
+                "text_llm_api_key": "text-key",
+                "text_llm_model_id": "text-model",
+                "vlm_base_url": "https://vlm.example.test/v1",
+                "vlm_api_key": "vlm-key",
                 "_env_file": None,
             }
             baseline = build_production_model_identity_report(
@@ -458,15 +480,15 @@ class SettingsTest(unittest.TestCase):
             )
 
     def test_partial_oss_configuration_is_rejected(self) -> None:
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            self.assertRaisesRegex(ValidationError, "OSS 配置必须全部提供或全部留空"),
-        ):
-            Settings(
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
                 workspace_root=Path(directory),
                 oss_endpoint="https://oss-cn-hangzhou.aliyuncs.com",
                 oss_bucket="private-video-bucket",
             )
+            self.assertFalse(settings.has_complete_oss_configuration())
+            with self.assertRaisesRegex(ValueError, "OSS 配置必须全部提供或全部留空"):
+                settings._validate_oss_configuration()
 
     def test_oss_prefix_and_signed_url_ttl_are_strictly_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

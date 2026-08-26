@@ -6,7 +6,7 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from video_demo.domain.base import LanguageCode, Probability, StableId
-from video_demo.domain.evidence import BoundingBox
+from video_demo.domain.document import DocumentGenerationConfig
 from video_demo.domain.run import TimeRange
 from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
 
@@ -31,6 +31,10 @@ class CreateRunRequest(ApiModel):
     language_hints: tuple[Literal["zh", "en", "ja", "ko", "es"], ...] = ()
     hotwords: tuple[str, ...] = Field(default=(), max_length=50)
     core_context: str | None = Field(default=None, max_length=1000)
+    document_config: DocumentGenerationConfig = Field(
+        default_factory=DocumentGenerationConfig,
+    )
+    result_schema_version: Literal["3.0.0"] = "3.0.0"
 
     @model_validator(mode="after")
     def normalize_speech_configuration(self) -> Self:
@@ -106,43 +110,53 @@ class PublicSubtitleCue(PublicTimedEvidence):
     stream_index: int = Field(ge=0)
 
 
-class PublicSceneBoundary(PublicTimedEvidence):
-    evidence_type: Literal["SCENE"] = "SCENE"
-    transition: Literal["hard_cut", "gradual", "candidate"]
-    score: Probability
-
-
 class PublicKeyframeEvidence(PublicTimedEvidence):
     evidence_type: Literal["KEYFRAME"] = "KEYFRAME"
     keyframe_id: StableId
     timestamp_ms: int
-    mime_type: Literal["image/jpeg", "image/png"]
+    mime_type: Literal["image/jpeg"]
     sha256: str
     perceptual_hash: str
     size_bytes: int = Field(ge=1)
 
 
-class PublicOcrLine(ApiModel):
-    text: str
-    bounding_box: BoundingBox | None = None
-    confidence: Probability
-
-
-class PublicOcrEvidence(PublicTimedEvidence):
-    evidence_type: Literal["OCR"] = "OCR"
-    keyframe_id: StableId
-    timestamp_ms: int
-    language: LanguageCode
-    lines: tuple[PublicOcrLine, ...]
-    provider_request_id: str
+class PublicVisualObservationEvidence(PublicTimedEvidence):
+    evidence_type: Literal["VISUAL_OBSERVATION"] = "VISUAL_OBSERVATION"
+    chapter_id: StableId
+    target_ids: tuple[StableId, ...]
+    keyframe_refs: tuple[StableId, ...]
+    transcript_evidence_refs: tuple[StableId, ...]
+    visual_type: Literal[
+        "TEXT",
+        "CODE",
+        "TABLE",
+        "FORMULA",
+        "DIAGRAM",
+        "UI_CONTROL",
+        "TERMINAL",
+        "GENERAL",
+    ]
+    caption: str
+    content_blocks: tuple[dict[str, object], ...]
+    visual_facts: tuple[dict[str, object], ...]
+    frame_relations: tuple[dict[str, object], ...]
+    relation_to_transcript: Literal[
+        "SUPPORTING",
+        "COMPLEMENTARY",
+        "DUPLICATE",
+        "CONFLICTING",
+        "INDEPENDENT",
+    ]
+    certainty: Probability
+    quality_flags: tuple[str, ...]
+    uncertainties: tuple[str, ...]
 
 
 PublicEvidence = Annotated[
     PublicSpeechSegment
     | PublicSubtitleCue
-    | PublicSceneBoundary
     | PublicKeyframeEvidence
-    | PublicOcrEvidence,
+    | PublicVisualObservationEvidence,
     Field(discriminator="evidence_type"),
 ]
 

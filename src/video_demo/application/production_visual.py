@@ -17,18 +17,18 @@ from typing import Protocol
 import httpx
 
 from video_demo.application.adaptive_ocr import AdaptiveOcrRunner, ocr_language
-from video_demo.application.pipeline import VisualAnalysis, VisualPreparation
 from video_demo.application.pipeline_contracts import (
     EvidencePreparationLimits,
     PreparedMedia,
     SceneIndex,
     SpeechAnalysis,
+    StageMetric,
     scene_index_sha256,
 )
 from video_demo.domain.base import stable_identifier
 from video_demo.domain.evidence import (
-    EvidenceItem,
     KeyframeEvidence,
+    LegacyEvidenceItem,
     OcrEvidence,
     SceneBoundary,
 )
@@ -92,6 +92,36 @@ VisualComponentFactory = Callable[
     [PreparedMedia, Callable[[], bool]],
     VisualComponents,
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class VisualPreparation:
+    """Task 11 删除旧视觉链前保留的视觉准备 DTO。"""
+
+    proxy_sha256: str
+    proxy_size_bytes: int
+    run_relative_root: Path
+    duration_ms: int
+    frame_tolerance_ms: int
+    scenes: tuple[SceneBoundary, ...]
+    preparation_sha256: str
+    observation_windows: tuple[TimeRange, ...] = ()
+    keyframes: tuple[KeyframeEvidence, ...] = ()
+    ocr: tuple[OcrEvidence, ...] = ()
+    warnings: tuple[str, ...] = ()
+    stage_metrics: tuple[StageMetric, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class VisualAnalysis:
+    """Task 11 删除旧视觉链前保留的视觉分析 DTO。"""
+
+    evidence: tuple[LegacyEvidenceItem, ...]
+    boundaries: tuple[BoundaryPoint, ...]
+    clips: tuple[VideoClipInput, ...] = ()
+    windows: tuple[TimeRange, ...] = ()
+    warnings: tuple[str, ...] = ()
+    stage_metrics: tuple[StageMetric, ...] = ()
 
 
 def frame_tolerance_ms_for_rate(
@@ -346,7 +376,7 @@ class ProductionVisualAnalyzer:
         rebound_keyframes = tuple(_rebind(item, final_windows) for item in selected)
         rebound_ocr = tuple(_rebind(item, final_windows) for item in ocr)
         understanding_windows = merge_adjacent_windows(final_windows)
-        evidence: tuple[EvidenceItem, ...] = (*scenes, *rebound_keyframes, *rebound_ocr)
+        evidence: tuple[LegacyEvidenceItem, ...] = (*scenes, *rebound_keyframes, *rebound_ocr)
         return VisualAnalysis(
             evidence=_sort_visual_evidence(evidence),
             boundaries=_build_boundaries(
@@ -819,7 +849,9 @@ def _build_boundaries(
     )
 
 
-def _sort_visual_evidence(items: Sequence[EvidenceItem]) -> tuple[EvidenceItem, ...]:
+def _sort_visual_evidence(
+    items: Sequence[LegacyEvidenceItem],
+) -> tuple[LegacyEvidenceItem, ...]:
     rank = {SceneBoundary: 0, KeyframeEvidence: 1, OcrEvidence: 2}
     allowed = (SceneBoundary, KeyframeEvidence, OcrEvidence)
     if any(not isinstance(item, allowed) for item in items):

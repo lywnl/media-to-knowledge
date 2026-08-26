@@ -21,13 +21,13 @@ from video_demo.application.pipeline import (
     RegisteredAsset,
     SpeechAnalysis,
     SpeechBoundaryCandidate,
-    VisualAnalysis,
-    VisualPreparation,
 )
 from video_demo.application.production_visual import (
     LazyBaiduOcrClient,
     ProductionVisualAnalyzer,
+    VisualAnalysis,
     VisualComponents,
+    VisualPreparation,
     WindowFrameCandidates,
     _limit_keyframes,
     _normalize_scenes,

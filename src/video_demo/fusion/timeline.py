@@ -4,14 +4,16 @@ import json
 from collections.abc import Sequence
 
 from video_demo.domain.base import stable_identifier
-from video_demo.domain.evidence import EvidenceItem, TimelineEvidence
+from video_demo.domain.evidence import LegacyEvidenceItem, TimelineEvidence
 from video_demo.errors import ErrorCode, VideoDemoError
 
 
-def canonicalize_evidence(evidence: Sequence[EvidenceItem]) -> tuple[EvidenceItem, ...]:
+def canonicalize_evidence(
+    evidence: Sequence[LegacyEvidenceItem],
+) -> tuple[LegacyEvidenceItem, ...]:
     """去除完全相同的输入，并拒绝同一稳定 ID 指向不同内容。"""
 
-    by_id: dict[str, tuple[str, EvidenceItem]] = {}
+    by_id: dict[str, tuple[str, LegacyEvidenceItem]] = {}
     for item in evidence:
         digest_source = _canonical_json(item)
         existing = by_id.get(item.evidence_id)
@@ -34,7 +36,7 @@ def canonicalize_evidence(evidence: Sequence[EvidenceItem]) -> tuple[EvidenceIte
     return tuple(ordered)
 
 
-def build_timeline(evidence: Sequence[EvidenceItem]) -> tuple[TimelineEvidence, ...]:
+def build_timeline(evidence: Sequence[LegacyEvidenceItem]) -> tuple[TimelineEvidence, ...]:
     canonical = canonicalize_evidence(evidence)
     grouped: dict[tuple[int, int], list[str]] = {}
     for item in canonical:
@@ -62,7 +64,7 @@ def build_timeline(evidence: Sequence[EvidenceItem]) -> tuple[TimelineEvidence, 
 
 def validate_timeline(
     timeline: Sequence[TimelineEvidence],
-    evidence: Sequence[EvidenceItem],
+    evidence: Sequence[LegacyEvidenceItem],
 ) -> None:
     evidence_by_id = {
         item.evidence_id: item
@@ -89,7 +91,7 @@ def validate_timeline(
                 )
 
 
-def _canonical_json(item: EvidenceItem) -> str:
+def _canonical_json(item: LegacyEvidenceItem) -> str:
     return json.dumps(
         item.model_dump(mode="json"),
         ensure_ascii=False,

@@ -65,6 +65,7 @@ class CandidateDirectoryLease:
         mode: CandidateLeaseMode,
         is_cancel_requested: Callable[[], bool] | None = None,
         wait_timeout_seconds: float = 300.0,
+        create_candidate_directory: bool = True,
     ) -> None:
         if mode not in {"SHARED", "EXCLUSIVE"}:
             raise ValueError("候选帧目录租约模式非法")
@@ -74,6 +75,7 @@ class CandidateDirectoryLease:
         self._mode = mode
         self._is_cancel_requested = is_cancel_requested or (lambda: False)
         self._wait_timeout_seconds = wait_timeout_seconds
+        self._create_candidate_directory = create_candidate_directory
         self._visual_root = safe_runtime_path(
             self._runtime_root,
             run_relative_root / "visual",
@@ -133,7 +135,8 @@ class CandidateDirectoryLease:
                 deadline=deadline,
                 is_cancel_requested=self._is_cancel_requested,
             )
-            _ensure_private_directory(self._candidate_root, self._runtime_root)
+            if self._create_candidate_directory:
+                _ensure_private_directory(self._candidate_root, self._runtime_root)
             return self
         except Exception:
             self.close()

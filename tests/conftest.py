@@ -51,6 +51,12 @@ def cloud_asr_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     monkeypatch.setenv("OPENAI_MODEL", "openai/whisper")
     monkeypatch.setenv("OPENAI_ASR_TIMEOUT_SECONDS", "300")
     monkeypatch.setenv("OPENAI_ASR_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("VIDEO_DEMO_TEXT_LLM_BASE_URL", "https://text.example.test/v1")
+    monkeypatch.setenv("VIDEO_DEMO_TEXT_LLM_API_KEY", "test-text-key")
+    monkeypatch.setenv("VIDEO_DEMO_TEXT_LLM_MODEL_ID", "text-model")
+    monkeypatch.setenv("VIDEO_DEMO_VLM_BASE_URL", "https://vlm.example.test/v1")
+    monkeypatch.setenv("VIDEO_DEMO_VLM_API_KEY", "test-vlm-key")
+    monkeypatch.setenv("VIDEO_DEMO_VLM_MODEL_ID", "qwen3-vl-flash")
 
     source = Path(__file__).resolve().parents[1] / "migrations"
     destination = tmp_path / "migrations"

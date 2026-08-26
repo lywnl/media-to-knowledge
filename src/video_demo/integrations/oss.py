@@ -16,7 +16,7 @@ from urllib.parse import quote, urlencode, urlsplit
 import httpx
 from pydantic import SecretStr
 
-from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
+from video_demo.domain.legacy_result import SegmentUnderstanding, SummaryUnderstanding
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.video_port import (
     PublishedVideo,

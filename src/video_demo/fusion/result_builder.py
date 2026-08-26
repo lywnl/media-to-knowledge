@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 
-from video_demo.domain.result import (
+from video_demo.domain.legacy_result import (
     SummaryChapter,
     SummaryUnderstanding,
     VideoSegment,

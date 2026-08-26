@@ -5,7 +5,11 @@ import hashlib
 import pytest
 
 from video_demo.domain.evidence import BoundingBox, OcrEvidence, OcrLine, SpeechSegment
-from video_demo.domain.result import SegmentUnderstanding, SummaryChapter, SummaryUnderstanding
+from video_demo.domain.legacy_result import (
+    SegmentUnderstanding,
+    SummaryChapter,
+    SummaryUnderstanding,
+)
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.fusion.merge import BoundaryPoint, WindowUnderstanding, merge_segment_understandings
 from video_demo.fusion.result_builder import build_video_summary

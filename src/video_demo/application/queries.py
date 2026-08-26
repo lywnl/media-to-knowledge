@@ -3,42 +3,41 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import uuid
-from contextlib import suppress
+import os
+import stat
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
-from pydantic import TypeAdapter
-from sqlalchemy import select
+from pydantic import TypeAdapter, ValidationError
 
-from video_demo.domain.evidence import EvidenceItem, KeyframeEvidence
-from video_demo.domain.result import VideoUnderstandingResult, validate_evidence_references
-from video_demo.domain.result_artifact import (
-    ARTIFACT_ENVELOPE_SCHEMA_VERSION,
-    ResultArtifactPayload,
-    TranscriptSource,
+from video_demo.application.document_publication import (
+    DocumentPublicationService,
+    VisualCleaner,
+    scope_key,
 )
-from video_demo.domain.run import RunStatus
+from video_demo.application.document_publication import (
+    ResultWriteFence as ResultWriteFence,
+)
+from video_demo.application.document_rendering import RenderedDocument
+from video_demo.domain.document import TranscriptSource, VideoUnderstandingResult
+from video_demo.domain.document_artifact import DocumentArtifactPayload
+from video_demo.domain.evidence import DocumentEvidenceItem, KeyframeEvidence
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
-from video_demo.persistence.models import JobModel, JobStatus, RunStatusValue, VideoAssetModel
-from video_demo.persistence.repositories import (
-    JobRepository,
-    ResultRepository,
-    Scope,
-    VideoRunRepository,
-)
-from video_demo.storage.artifacts import ArtifactReceipt, AtomicArtifactStore
+from video_demo.persistence.document_repository import ResultRepository
+from video_demo.persistence.repositories import Scope
+from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.workspace import safe_runtime_path
 
-_EVIDENCE_ADAPTER = TypeAdapter(tuple[EvidenceItem, ...])
+_EVIDENCE_ADAPTER = TypeAdapter(tuple[DocumentEvidenceItem, ...])
+_JPEG_PREFIX = b"\xff\xd8\xff"
+_JPEG_SUFFIX = b"\xff\xd9"
 
 
 @dataclass(frozen=True, slots=True)
 class EvidencePage:
-    items: tuple[EvidenceItem, ...]
+    items: tuple[DocumentEvidenceItem, ...]
     next_cursor: str | None
 
 
@@ -50,166 +49,101 @@ class KeyframeContent:
 
 @dataclass(frozen=True, slots=True)
 class ResultRunMetadata:
-    status: RunStatus
+    status: str
     warnings: tuple[str, ...]
     stage_metrics: dict[str, int]
+    model_metrics: dict[str, int]
     stage_cache_hits: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
-class ResultWriteFence:
-    job_pk: int
-    worker_id: str
-    attempt_count: int
-
-
 class ResultQueryService:
+    """唯一 3.0 结果发布与四接口查询服务。"""
+
     def __init__(
         self,
         database: Database,
         artifact_store: AtomicArtifactStore,
         *,
-        max_evidence_items: int = 100_000,
+        max_evidence_items: int = 25_000,
+        max_keyframe_bytes: int = 5 * 1024 * 1024,
+        max_document_bytes: int = 16 * 1024 * 1024,
+        max_bundle_bytes: int = 64 * 1024 * 1024,
+        visual_cleaner: VisualCleaner | None = None,
     ) -> None:
-        if max_evidence_items < 1:
-            raise ValueError("max_evidence_items 必须大于等于 1")
+        if max_evidence_items < 1 or max_keyframe_bytes < 1:
+            raise ValueError("结果查询预算必须大于 0")
         self._database = database
-        self._artifact_store = artifact_store
+        self._store = artifact_store
+        self._publication = DocumentPublicationService(
+            database,
+            artifact_store,
+            visual_cleaner=visual_cleaner,
+            max_document_bytes=max_document_bytes,
+            max_bundle_bytes=max_bundle_bytes,
+        )
         self._max_evidence_items = max_evidence_items
+        self._max_keyframe_bytes = max_keyframe_bytes
 
-    @staticmethod
-    def scope_key(scope: Scope) -> str:
-        encoded = "\x00".join(
-            (scope.tenant_id, scope.application_id, scope.knowledge_base_id),
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()[:24]
+    scope_key = staticmethod(scope_key)
 
     def persist(
         self,
         scope: Scope,
         result: VideoUnderstandingResult,
         *,
-        evidence: tuple[EvidenceItem, ...],
+        evidence: tuple[DocumentEvidenceItem, ...],
+        document: RenderedDocument,
         stage_metrics: dict[str, int],
-        stage_cache_hits: tuple[str, ...] = (),
-        status: RunStatus,
+        model_metrics: dict[str, int],
+        status: Literal["SUCCEEDED", "PARTIAL_SUCCEEDED"],
         transcript_source: TranscriptSource,
         fence: ResultWriteFence,
         warnings: tuple[str, ...] = (),
+        stage_cache_hits: tuple[str, ...] = (),
+        published_keyframes: tuple[KeyframeEvidence, ...] = (),
     ) -> None:
-        if fence is None:
-            raise ValueError("fence 不能为空")
-        if status not in (RunStatus.SUCCEEDED, RunStatus.PARTIAL_SUCCEEDED):
-            raise ValueError("只能持久化成功或部分成功结果")
         self._validate_evidence_count(evidence)
-        validate_evidence_references(result, evidence)
-        self._validate_result_target(scope, result)
-        payload = ResultArtifactPayload(
-            result=result,
+        self._publication.persist(
+            scope,
+            result,
             evidence=evidence,
+            document=document,
             stage_metrics=stage_metrics,
-            stage_cache_hits=stage_cache_hits,
-            status=status.value,
-            warnings=warnings,
+            model_metrics=model_metrics,
+            status=status,
             transcript_source=transcript_source,
-        ).model_dump(mode="json", exclude_computed_fields=True)
-        payload_digest = hashlib.sha256(
-            json.dumps(
-                payload,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8"),
-        ).hexdigest()[:24]
-        relative_path = (
-            Path("runs")
-            / self.scope_key(scope)
-            / result.run_id
-            / "result"
-            / f"bundle-{payload_digest}-{uuid.uuid4().hex}.json"
+            fence=fence,
+            warnings=warnings,
+            stage_cache_hits=stage_cache_hits,
+            published_keyframes=published_keyframes,
         )
-        with self._database.session() as session:
-            self._require_active_fence(session, fence)
-        receipt = self._artifact_store.write_json(
-            relative_path,
-            payload,
-            # 外层产物 envelope 的版本与内部领域结果版本独立。
-            schema_version=ARTIFACT_ENVELOPE_SCHEMA_VERSION,
-            upstream_sha256=result.asset_sha256,
-        )
-        try:
-            with self._database.session() as session:
-                published = JobRepository(session).mark_result_published(
-                    fence.job_pk,
-                    fence.worker_id,
-                    attempt_count=fence.attempt_count,
-                    scope=scope,
-                    run_id=result.run_id,
-                )
-                if not published:
-                    raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "结果已由其他发布者写入")
-                run = VideoRunRepository(session).get(scope, result.run_id)
-                assert run is not None
-                ResultRepository(session).replace(scope, result)
-                run.status = RunStatusValue(status.value)
-                run.current_stage = "RESULT"
-                run.warning_codes = list(dict.fromkeys(warnings))
-                run.error_code = None
-                run.artifact_manifest_relative_path = receipt.relative_path
-                run.artifact_manifest_sha256 = receipt.sha256
-        except BaseException:
-            with suppress(OSError, VideoDemoError):
-                self._artifact_store.discard(receipt)
-            raise
 
-    @staticmethod
-    def _require_active_fence(session: object, fence: ResultWriteFence) -> None:
-        job = session.get(JobModel, fence.job_pk)  # type: ignore[attr-defined]
-        if (
-            job is not None
-            and job.attempt_count == fence.attempt_count
-            and job.status == JobStatus.CANCELLED
-            and job.cancel_requested
-        ):
-            raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
-        if (
-            job is None
-            or job.worker_id != fence.worker_id
-            or job.attempt_count != fence.attempt_count
-            or job.status != JobStatus.RUNNING
-            or job.lease_expires_at is None
-            or job.lease_expires_at <= datetime.now(UTC)
-        ):
-            raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "结果写入租约已丢失")
-        if job.cancel_requested:
-            raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
-
-    def _validate_result_target(
+    def get_artifact(
         self,
         scope: Scope,
-        result: VideoUnderstandingResult,
-    ) -> None:
-        with self._database.session() as session:
-            run = VideoRunRepository(session).get(scope, result.run_id)
-            if run is None:
-                raise VideoDemoError(ErrorCode.VIDEO_RUN_NOT_FOUND, "视频理解运行不存在")
-            asset_sha = self._asset_sha_for_run(session, scope, run.asset_id)
-            if asset_sha != result.asset_sha256:
-                raise VideoDemoError(
-                    ErrorCode.VIDEO_DIGEST_MISMATCH,
-                    "结果资产摘要与运行不匹配",
-                )
+        run_id: str,
+    ) -> tuple[DocumentArtifactPayload, bytes]:
+        """受限读取已发布的 3.0 bundle 与确定性 Markdown。"""
+
+        return self._publication.get_artifact(scope, run_id)
+
+    def require_compatible_result(
+        self,
+        scope: Scope,
+        run_id: str,
+        schema_version: str = "3.0.0",
+    ) -> DocumentArtifactPayload:
+        if schema_version != "3.0.0":
+            raise ValueError("只支持 3.0.0")
+        artifact, _ = self.get_artifact(scope, run_id)
+        return artifact
 
     def get_result(self, scope: Scope, run_id: str) -> VideoUnderstandingResult:
-        with self._database.session() as session:
-            run = VideoRunRepository(session).get(scope, run_id)
-            if run is None:
-                raise VideoDemoError(ErrorCode.VIDEO_RUN_NOT_FOUND, "视频理解运行不存在")
-            asset_sha = self._asset_sha_for_run(session, scope, run.asset_id)
-            result = ResultRepository(session).get(scope, run_id, asset_sha)
-            if result is None:
-                raise VideoDemoError(ErrorCode.VIDEO_RESULT_NOT_READY, "视频理解结果尚未就绪")
-            return result
+        return self.require_compatible_result(scope, run_id).result
+
+    def get_document(self, scope: Scope, run_id: str) -> bytes:
+        self.require_compatible_result(scope, run_id)
+        return self._publication.get_document(scope, run_id)
 
     def get_evidence(
         self,
@@ -223,10 +157,8 @@ class ResultQueryService:
     ) -> EvidencePage:
         if not 1 <= limit <= 100:
             raise ValueError("limit 必须在 1 到 100 之间")
-        bundle = self._read_bundle(scope, run_id)
-        evidence_payload = bundle.get("evidence")
-        self._validate_evidence_count(evidence_payload)
-        evidence = _EVIDENCE_ADAPTER.validate_python(evidence_payload)
+        evidence = self.require_compatible_result(scope, run_id).evidence
+        self._validate_evidence_count(evidence)
         filtered = tuple(
             item
             for item in evidence
@@ -236,8 +168,13 @@ class ResultQueryService:
         ordered = tuple(
             sorted(
                 filtered,
-                key=lambda item: (item.start_ms, item.end_ms, item.evidence_type, item.evidence_id),
-            ),
+                key=lambda item: (
+                    item.start_ms,
+                    item.end_ms,
+                    item.evidence_type,
+                    item.evidence_id,
+                ),
+            )
         )
         filter_key = self._filter_key(run_id, evidence_type, start_ms)
         offset = self._decode_cursor(cursor, filter_key) if cursor else 0
@@ -253,97 +190,86 @@ class ResultQueryService:
         return EvidencePage(items=items, next_cursor=next_cursor)
 
     def get_keyframe(self, scope: Scope, run_id: str, keyframe_id: str) -> KeyframeContent:
-        bundle = self._read_bundle(scope, run_id)
-        evidence_payload = bundle.get("evidence")
-        self._validate_evidence_count(evidence_payload)
-        evidence = _EVIDENCE_ADAPTER.validate_python(evidence_payload)
+        artifact = self.require_compatible_result(scope, run_id)
         keyframe = next(
             (
                 item
-                for item in evidence
+                for item in artifact.evidence
                 if isinstance(item, KeyframeEvidence) and item.keyframe_id == keyframe_id
             ),
             None,
         )
         if keyframe is None:
             raise VideoDemoError(ErrorCode.KEYFRAME_NOT_FOUND, "关键帧不存在")
-        relative_path = Path(keyframe.relative_path)
-        runtime_root = self._artifact_store.runtime_root.resolve(strict=True)
-        expected_root = (
-            runtime_root / "runs" / self.scope_key(scope) / run_id
-        ).resolve(strict=False)
-        resolved_path = (runtime_root / relative_path).resolve(strict=False)
-        if not resolved_path.is_relative_to(expected_root):
-            raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "关键帧不属于当前运行")
-        path = safe_runtime_path(self._artifact_store.runtime_root, relative_path)
-        if path.is_symlink() or not path.is_file():
-            raise VideoDemoError(ErrorCode.KEYFRAME_NOT_FOUND, "关键帧不存在")
-        content = path.read_bytes()
-        if hashlib.sha256(content).hexdigest() != keyframe.sha256:
-            raise VideoDemoError(ErrorCode.ARTIFACT_DIGEST_MISMATCH, "关键帧摘要不匹配")
-        if not _matches_mime_signature(content, keyframe.mime_type):
-            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "关键帧 MIME 与内容不一致")
-        return KeyframeContent(content=content, mime_type=keyframe.mime_type)
+        content = self._read_keyframe(scope, run_id, keyframe)
+        return KeyframeContent(content=content, mime_type="image/jpeg")
 
     def get_run_metadata(self, scope: Scope, run_id: str) -> ResultRunMetadata:
-        bundle = self._read_bundle(scope, run_id)
-        status = bundle.get("status")
-        warnings = bundle.get("warnings")
-        metrics = bundle.get("stage_metrics")
-        cache_hits = bundle.get("stage_cache_hits", [])
-        if (
-            not isinstance(status, str)
-            or not isinstance(warnings, list)
-            or not isinstance(metrics, dict)
-            or not isinstance(cache_hits, list)
-        ):
-            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "结果 bundle 元数据非法")
+        artifact = self.require_compatible_result(scope, run_id)
         return ResultRunMetadata(
-            status=RunStatus(status),
-            warnings=tuple(str(item) for item in warnings),
-            stage_metrics={str(key): int(value) for key, value in metrics.items()},
-            stage_cache_hits=tuple(str(item) for item in cache_hits),
+            status=artifact.status,
+            warnings=artifact.warnings,
+            stage_metrics=dict(artifact.stage_metrics),
+            model_metrics=dict(artifact.model_metrics),
+            stage_cache_hits=artifact.stage_cache_hits,
         )
 
-    def _read_bundle(self, scope: Scope, run_id: str) -> dict[str, object]:
-        with self._database.session() as session:
-            run = VideoRunRepository(session).get(scope, run_id)
-            if run is None:
-                raise VideoDemoError(ErrorCode.VIDEO_RUN_NOT_FOUND, "视频理解运行不存在")
-            if run.artifact_manifest_relative_path is None or run.artifact_manifest_sha256 is None:
-                raise VideoDemoError(ErrorCode.VIDEO_RESULT_NOT_READY, "视频理解结果尚未就绪")
-            asset_sha = self._asset_sha_for_run(session, scope, run.asset_id)
-            receipt = ArtifactReceipt(
-                relative_path=run.artifact_manifest_relative_path,
-                schema_version=ARTIFACT_ENVELOPE_SCHEMA_VERSION,
-                sha256=run.artifact_manifest_sha256,
-                upstream_sha256=asset_sha,
-            )
-        payload = self._artifact_store.read_verified_json(receipt)
-        if not isinstance(payload, dict):
-            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "结果 bundle 必须是对象")
+    def _read_keyframe(
+        self,
+        scope: Scope,
+        run_id: str,
+        keyframe: KeyframeEvidence,
+    ) -> bytes:
+        expected_parent = Path("visual/keyframes")
+        relative = Path(keyframe.relative_path)
+        if (
+            keyframe.mime_type != "image/jpeg"
+            or relative.suffix != ".jpg"
+            or relative.parent != expected_parent
+            or relative.name != f"{keyframe.sha256}.jpg"
+            or keyframe.size_bytes > self._max_keyframe_bytes
+        ):
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "关键帧契约非法")
+        runtime_relative = Path("runs") / scope_key(scope) / run_id / relative
+        path = safe_runtime_path(self._store.runtime_root, runtime_relative)
+        descriptor = -1
         try:
-            ResultArtifactPayload.model_validate(payload)
-        except ValueError as error:
+            before = os.lstat(path)
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_size != keyframe.size_bytes
+                or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                raise OSError
+            content = os.read(descriptor, self._max_keyframe_bytes + 1)
+            after = os.fstat(descriptor)
+            current = os.lstat(path)
+            if (
+                (opened.st_dev, opened.st_ino, opened.st_size)
+                != (after.st_dev, after.st_ino, after.st_size)
+                or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
+                or len(content) != keyframe.size_bytes
+                or not content.startswith(_JPEG_PREFIX)
+                or not content.endswith(_JPEG_SUFFIX)
+                or hashlib.sha256(content).hexdigest() != keyframe.sha256
+            ):
+                raise OSError
+            return content
+        except OSError:
             raise VideoDemoError(
                 ErrorCode.ARTIFACT_SCHEMA_INVALID,
-                "结果 bundle payload 非法",
-            ) from error
-        return payload
+                "关键帧内容完整性校验失败",
+            ) from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
-    @staticmethod
-    def _asset_sha_for_run(session: object, scope: Scope, asset_id: str) -> str:
-        asset = session.scalar(  # type: ignore[attr-defined]
-            select(VideoAssetModel).where(
-                VideoAssetModel.tenant_id == scope.tenant_id,
-                VideoAssetModel.application_id == scope.application_id,
-                VideoAssetModel.knowledge_base_id == scope.knowledge_base_id,
-                VideoAssetModel.asset_id == asset_id,
-            ),
-        )
-        if asset is None:
-            raise VideoDemoError(ErrorCode.VIDEO_RUN_NOT_FOUND, "视频资产不存在")
-        return str(asset.source_sha256)
+    def _validate_evidence_count(self, evidence: object) -> None:
+        if not isinstance(evidence, (list, tuple)) or len(evidence) > self._max_evidence_items:
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "证据数量超过配置上限")
 
     @staticmethod
     def _filter_key(run_id: str, evidence_type: str | None, start_ms: int | None) -> str:
@@ -353,16 +279,6 @@ class ResultQueryService:
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()[:16]
-
-    def _validate_evidence_count(self, evidence: object) -> None:
-        if not isinstance(evidence, (list, tuple)):
-            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "证据集合必须是数组")
-        if len(evidence) > self._max_evidence_items:
-            raise VideoDemoError(
-                ErrorCode.ARTIFACT_SCHEMA_INVALID,
-                "证据数量超过配置上限",
-                {"max_evidence_items": self._max_evidence_items},
-            )
 
     @staticmethod
     def _encode_cursor(offset: int, filter_key: str) -> str:
@@ -380,21 +296,30 @@ class ResultQueryService:
             encoded, checksum = cursor.split(".", 1)
             data = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
             if hashlib.sha256(data).hexdigest()[:16] != checksum:
-                raise ValueError("摘要不匹配")
+                raise ValueError
             payload = json.loads(data)
-            if payload.get("filter") != filter_key:
-                raise ValueError("筛选条件不匹配")
             offset = payload.get("offset")
-            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-                raise ValueError("偏移非法")
+            if (
+                payload.get("filter") != filter_key
+                or isinstance(offset, bool)
+                or not isinstance(offset, int)
+                or offset < 0
+            ):
+                raise ValueError
             return cast(int, offset)
         except (UnicodeDecodeError, ValueError, json.JSONDecodeError, AttributeError) as error:
             raise VideoDemoError(ErrorCode.INVALID_EVIDENCE_CURSOR, "证据游标非法") from error
 
 
-def _matches_mime_signature(content: bytes, mime_type: str) -> bool:
-    if mime_type == "image/png":
-        return content.startswith(b"\x89PNG\r\n\x1a\n")
-    if mime_type == "image/jpeg":
-        return content.startswith(b"\xff\xd8\xff")
-    return False
+def read_result_rows(
+    database: Database,
+    scope: Scope,
+    run_id: str,
+    asset_sha256: str,
+) -> VideoUnderstandingResult:
+    """供闭包校验复用生产 3.0 行映射。"""
+    try:
+        with database.session() as session:
+            return ResultRepository(session).get(scope, run_id, asset_sha256)
+    except (ValidationError, TypeError, ValueError) as error:
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "3.0 结果行非法") from error

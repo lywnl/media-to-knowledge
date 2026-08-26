@@ -94,7 +94,6 @@ _RELATION_VALUE = {
     "COMPLEMENTARY": 3,
     "CONFLICTING": 4,
 }
-_MAX_CANDIDATE_ARTIFACT_BYTES = 512 * 1024 * 1024
 
 
 class ChapterVisionBatch(FrozenModel):
@@ -249,6 +248,7 @@ class ChapterVisionService:
         max_image_bytes: int,
         max_request_image_bytes: int,
         max_encoded_request_bytes: int,
+        max_candidate_bytes: int,
         max_published_keyframe_bytes: int,
         max_published_keyframe_files: int,
         invocation_wait_timeout_seconds: float,
@@ -259,6 +259,7 @@ class ChapterVisionService:
             max_image_bytes,
             max_request_image_bytes,
             max_encoded_request_bytes,
+            max_candidate_bytes,
             max_published_keyframe_bytes,
             max_published_keyframe_files,
         )
@@ -290,6 +291,7 @@ class ChapterVisionService:
         self._max_image_bytes = max_image_bytes
         self._max_request_image_bytes = max_request_image_bytes
         self._max_encoded_request_bytes = max_encoded_request_bytes
+        self._max_candidate_bytes = max_candidate_bytes
         self._max_published_keyframe_bytes = max_published_keyframe_bytes
         self._max_published_keyframe_files = max_published_keyframe_files
         self._invocation_wait_timeout_seconds = invocation_wait_timeout_seconds
@@ -326,7 +328,7 @@ class ChapterVisionService:
             _revalidate_candidate_closure(
                 frame_batch.allowed_run_root,
                 frame_sets.values(),
-                max_bytes=_MAX_CANDIDATE_ARTIFACT_BYTES,
+                max_bytes=self._max_candidate_bytes,
             )
             cleanup_handoff.start(self._invocation_wait_timeout_seconds)
             analyses = self._analyze_chapters(

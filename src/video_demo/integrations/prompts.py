@@ -5,8 +5,8 @@ from collections.abc import Callable, Sequence
 from typing import TypeVar
 
 from video_demo.domain.evidence import (
-    EvidenceItem,
     KeyframeEvidence,
+    LegacyEvidenceItem,
     OcrEvidence,
     SceneBoundary,
     SpeechSegment,
@@ -135,12 +135,12 @@ def whole_video_window_evidence_refs(
 
 
 def _project_window_evidence(
-    evidence: tuple[EvidenceItem, ...],
+    evidence: tuple[LegacyEvidenceItem, ...],
 ) -> tuple[dict[str, object], tuple[str, ...]]:
     groups: dict[str, object] = {}
     evidence_refs: list[str] = []
 
-    def indexes(items: Sequence[EvidenceItem]) -> list[int]:
+    def indexes(items: Sequence[LegacyEvidenceItem]) -> list[int]:
         result: list[int] = []
         for item in items:
             if item.evidence_id not in evidence_refs:
@@ -199,8 +199,8 @@ def _project_window_evidence(
 def _add_anchor_group(
     groups: dict[str, object],
     name: str,
-    items: Sequence[EvidenceItem],
-    indexes: Callable[[Sequence[EvidenceItem]], list[int]],
+    items: Sequence[LegacyEvidenceItem],
+    indexes: Callable[[Sequence[LegacyEvidenceItem]], list[int]],
 ) -> None:
     selected = select_spread_items(tuple(items), limit=2)
     if not selected:

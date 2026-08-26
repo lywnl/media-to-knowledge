@@ -15,7 +15,7 @@ from pydantic import ValidationError
 
 import video_demo.evaluation.evidence as evidence_module
 import video_demo.evaluation.gate as gate_module
-from video_demo.application.composition import build_production_model_identity_report
+from video_demo.application.legacy_composition import build_production_model_identity_report
 from video_demo.config import Settings
 from video_demo.domain.run import ModelIdentity
 from video_demo.errors import ErrorCode

@@ -15,12 +15,17 @@ from xml.etree import ElementTree
 from pydantic import Field, ValidationError, ValidationInfo, model_validator
 
 from video_demo.application.composition import (
-    ProductionModelIdentityReport,
     build_production_model_identity_report,
+)
+from video_demo.application.legacy_composition import (
+    ProductionModelIdentityReport as LegacyProductionModelIdentityReport,
+)
+from video_demo.application.legacy_composition import (
+    build_production_model_identity_report as build_legacy_model_identity_report,
 )
 from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel
-from video_demo.domain.result_artifact import ResultArtifactPayload
+from video_demo.domain.legacy_result_artifact import ResultArtifactPayload
 from video_demo.errors import ErrorCode
 from video_demo.evaluation.annotations import (
     AuthorizationFile,
@@ -160,10 +165,10 @@ FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     "rotation": ("tests/media/test_probe.py::test_parse_rotation_vfr_and_no_audio_warning",),
     "no_audio": (
         "tests/media/test_transcode.py::test_extract_audio_without_track_returns_explicit_no_audio",
-        "tests/application/test_pipeline.py::test_no_audio_or_no_speech_keeps_visual_pipeline_running[False-True-NO_AUDIO_STREAM]",
+        "tests/application/test_document_pipeline.py::test_no_audio_or_no_speech_keeps_visual_pipeline_running[NONE-NO_AUDIO_TRACK]",
     ),
     "no_speech": (
-        "tests/application/test_pipeline.py::test_no_audio_or_no_speech_keeps_visual_pipeline_running[True-False-NO_SPEECH_DETECTED]",
+        "tests/application/test_document_pipeline.py::test_no_audio_or_no_speech_keeps_visual_pipeline_running[ASR-NO_SPEECH_DETECTED]",
     ),
     "black_frames": (
         "tests/visual/test_keyframes.py::test_all_black_candidates_produce_no_keyframe",
@@ -214,11 +219,11 @@ FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
         "tests/media/test_transcode.py::test_transcode_rejects_insufficient_disk_before_starting",
     ),
     "cross_tenant": (
-        "tests/api/test_results.py::test_success_result_is_hidden_from_other_tenant",
+        "tests/api/test_results.py::test_result_routes_are_scope_isolated",
         "tests/worker/test_runtime.py::test_worker_completion_does_not_touch_same_job_id_in_another_scope",
     ),
     "redaction": (
-        "tests/api/test_results.py::test_error_response_does_not_expose_internal_paths",
+        "tests/api/test_runs.py::test_run_status_does_not_expose_internal_paths_or_secret_fields",
         "tests/integrations/test_qwen.py::test_authentication_error_does_not_leak_secret[401]",
         "tests/integrations/test_baidu_ocr.py::test_http_errors_are_classified_without_secret_leak[401-OCR_AUTHENTICATION_FAILED]",
     ),
@@ -1223,7 +1228,7 @@ def _verify_five_language_models(
 def _require_live_settings(
     settings: Settings | None,
     workspace_root: Path,
-) -> ProductionModelIdentityReport:
+) -> LegacyProductionModelIdentityReport:
     if settings is None:
         raise ValueError("已执行 live 门禁必须提供可信 settings")
     workspace = workspace_root.resolve(strict=True)
@@ -1232,12 +1237,12 @@ def _require_live_settings(
         raise ValueError("settings.workspace_root 必须精确匹配 verifier 工作区")
     if settings.runtime_root != expected_runtime:
         raise ValueError("live verifier 只接受工作区固定 runtime root")
-    return build_production_model_identity_report(settings)
+    return build_legacy_model_identity_report(settings)
 
 
 def _verify_settings_fingerprint(
     raw: _LiveRawReport,
-    report: ProductionModelIdentityReport,
+    report: LegacyProductionModelIdentityReport,
 ) -> None:
     if raw.settings_fingerprint != report.settings_fingerprint:
         raise ValueError("live settings fingerprint 不是当前生产配置")
@@ -1245,7 +1250,7 @@ def _verify_settings_fingerprint(
 
 def _verify_canonical_live_models(
     raw: _LiveRawReport,
-    report: ProductionModelIdentityReport,
+    report: LegacyProductionModelIdentityReport,
 ) -> None:
     canonical_components = {model.component for model in report.models}
     required_components: set[str]

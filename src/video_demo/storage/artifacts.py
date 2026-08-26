@@ -19,6 +19,8 @@ from video_demo.storage.workspace import (
     safe_runtime_path,
 )
 
+RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION = "1.0.0"
+
 
 class ArtifactReceipt(FrozenModel):
     relative_path: str = Field(min_length=1, max_length=1024)
@@ -569,7 +571,12 @@ def _open_verified_directory(directory: Path) -> int:
             directory,
             os.O_RDONLY | _require_directory_flag() | _require_no_follow(),
         )
-        _require_same_bytes_file(before, os.fstat(descriptor))
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise OSError
         return descriptor
     except VideoDemoError:
         if descriptor is not None:

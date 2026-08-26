@@ -364,7 +364,7 @@ def _prediction_for_judgment(eval_root: Path) -> VerifiedPrediction:
 
     return VerifiedPrediction(
         index=EvaluationPrediction(
-            schema_version="1.1.0",
+                schema_version="1.2.0",
             evaluation_run_id="eval_001",
             sample_id="sample_001",
             media_sha256="a" * 64,
@@ -392,9 +392,11 @@ def _prediction_for_judgment(eval_root: Path) -> VerifiedPrediction:
         claims=(
             PredictionClaim(
                 claim_id="claim_001",
-                source_kind="VIDEO_SUMMARY",
-                source_id="run_001",
-                text="摘要",
+                    source_kind="CHAPTER_CLAIM",
+                    source_id="chapter_001",
+                    text="摘要",
+                    evidence_refs=("asr_001",),
+                    certainty=0.9,
             ),
         ),
         artifact_manifest_sha256=None,

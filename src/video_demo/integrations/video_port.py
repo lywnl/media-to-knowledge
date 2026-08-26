@@ -7,8 +7,8 @@ from typing import Literal, Protocol, Self, runtime_checkable
 from pydantic import Field, model_validator
 
 from video_demo.domain.base import FrozenModel, Sha256, StableId
-from video_demo.domain.evidence import EvidenceItem, TimelineEvidence
-from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
+from video_demo.domain.evidence import LegacyEvidenceItem, TimelineEvidence
+from video_demo.domain.legacy_result import SegmentUnderstanding, SummaryUnderstanding
 from video_demo.domain.run import TimeRange
 from video_demo.fusion.timeline import canonicalize_evidence, validate_timeline
 
@@ -49,7 +49,7 @@ class SegmentUnderstandingRequest(FrozenModel):
     clip: VideoClipInput
     window: TimeRange
     timeline: tuple[TimelineEvidence, ...] = Field(min_length=1)
-    evidence: tuple[EvidenceItem, ...] = Field(min_length=1)
+    evidence: tuple[LegacyEvidenceItem, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def canonicalize_and_validate(self) -> Self:
@@ -88,7 +88,7 @@ class WholeVideoWindowInput(TimeRange):
 
     window_id: StableId
     timeline: tuple[TimelineEvidence, ...] = Field(min_length=1)
-    evidence: tuple[EvidenceItem, ...] = Field(min_length=1)
+    evidence: tuple[LegacyEvidenceItem, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def canonicalize_and_validate(self) -> Self:

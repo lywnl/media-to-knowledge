@@ -12,6 +12,10 @@ from typing import Literal, cast
 
 from pydantic import StrictInt, field_validator
 
+from video_demo.application.document_retrieval_text import (
+    render_document_chapter_retrieval_text,
+    render_document_summary_retrieval_text,
+)
 from video_demo.application.pipeline_contracts import DocumentWritingContext
 from video_demo.domain.base import FrozenModel
 from video_demo.domain.document import (
@@ -44,10 +48,6 @@ from video_demo.domain.evidence import (
     VisualObservationEvidence,
 )
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.fusion.retrieval_text import (
-    render_document_chapter_retrieval_text,
-    render_document_summary_retrieval_text,
-)
 from video_demo.integrations.document_port import (
     ChapterWritingRepairRequest,
     ChapterWritingRequest,

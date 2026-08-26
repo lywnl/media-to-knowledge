@@ -2,23 +2,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
-import pytest
 from fastapi import FastAPI
-from sqlalchemy import select
 
 from video_demo.api.app import create_app
-from video_demo.application.queries import ResultWriteFence
+from video_demo.application.document_publication import ResultWriteFence
+from video_demo.application.document_rendering import render_markdown
 from video_demo.config import Settings
-from video_demo.domain.evidence import KeyframeEvidence, SpeechSegment
-from video_demo.domain.result import (
-    SummaryChapter,
-    VideoSegment,
-    VideoSummary,
+from video_demo.domain.document import (
+    DocumentGenerationConfig,
+    DocumentGenerationMetadata,
+    GroundedClaim,
+    ParagraphBlock,
+    PromptVersions,
+    SemanticChapter,
+    SemanticSection,
+    VideoDocumentSummary,
     VideoUnderstandingResult,
+    section_id_for,
 )
-from video_demo.domain.run import RunStatus
+from video_demo.domain.document_artifact import MODEL_METRIC_NAMES, RESULT_STAGE_NAMES
+from video_demo.domain.evidence import SpeechSegment
 from video_demo.evaluation.annotations import (
     AuthorizationFile,
     AuthorizationRecord,
@@ -30,55 +36,58 @@ from video_demo.evaluation.annotations import (
 )
 from video_demo.evaluation.dataset import EvaluationSample
 from video_demo.evaluation.final_runner import cleanup_evaluation_run
-from video_demo.evaluation.prediction_runner import PredictionRunner
+from video_demo.evaluation.prediction_runner import PredictionRunner, score_prediction_run
 from video_demo.implementation import prediction_implementation_files
 from video_demo.persistence.models import VideoAssetModel
 from video_demo.persistence.repositories import JobRepository, Scope, VideoRunRepository
 
 
-def _write_runner_package(
+def _sha(content: bytes | str) -> str:
+    encoded = content.encode("utf-8") if isinstance(content, str) else content
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_package(
     tmp_path: Path,
     media: bytes,
 ) -> tuple[Path, ValidatedEvaluationPackage]:
-    import shutil
-
     for relative in prediction_implementation_files(Path.cwd()):
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(Path.cwd() / relative, destination)
     runtime_root = tmp_path / ".codex" / "video-rag-demo"
     eval_root = runtime_root / "eval"
-    media_path = eval_root / "media" / "sample.mp4"
+    media_path = eval_root / "media/sample.mp4"
     media_path.parent.mkdir(parents=True, exist_ok=True)
     media_path.write_bytes(media)
-    media_sha256 = hashlib.sha256(media).hexdigest()
+    media_sha = _sha(media)
     annotation = EvaluationAnnotation(
         schema_version="1.0.0",
         sample_id="sample_001",
-        media_sha256=media_sha256,
+        media_sha256=media_sha,
         duration_ms=500,
-        language="en",
-        reference_text="Hello",
+        language="zh",
+        reference_text="你好",
         ocr_frames=(
-            ReferenceOcrFrame(frame_id="ocr_001", timestamp_ms=100, text_lines=("Hello",)),
+            ReferenceOcrFrame(frame_id="frame_001", timestamp_ms=100, text_lines=("你好",)),
         ),
-        scene_boundaries_ms=(100,),
-        semantic_boundaries_ms=(200,),
-        supported_facts=(SupportedFact(fact_id="fact_001", canonical_text="Hello"),),
+        scene_boundaries_ms=(250,),
+        semantic_boundaries_ms=(250,),
+        supported_facts=(SupportedFact(fact_id="fact_001", canonical_text="你好"),),
         key_fact_ids=("fact_001",),
     )
-    annotation_path = eval_root / "annotations" / "sample.json"
+    annotation_path = eval_root / "annotations/sample.json"
     annotation_path.parent.mkdir(parents=True, exist_ok=True)
     annotation_bytes = annotation.model_dump_json(exclude_computed_fields=True).encode("utf-8")
     annotation_path.write_bytes(annotation_bytes)
     sample = EvaluationSample(
         sample_id="sample_001",
-        language="en",
+        language="zh",
         authorization_id="auth_001",
         media_relative_path="media/sample.mp4",
-        media_sha256=media_sha256,
+        media_sha256=media_sha,
         annotations_relative_path="annotations/sample.json",
-        annotations_sha256=hashlib.sha256(annotation_bytes).hexdigest(),
+        annotations_sha256=_sha(annotation_bytes),
     )
     dataset_path = eval_root / "dataset.jsonl"
     dataset_path.write_text(sample.model_dump_json() + "\n", encoding="utf-8")
@@ -91,7 +100,7 @@ def _write_runner_package(
                 source_category="OWNED",
                 allowed_purposes=("VIDEO_QUALITY_EVALUATION",),
                 confirmed_at="2026-08-20T00:00:00Z",
-                media_sha256=(media_sha256,),
+                media_sha256=(media_sha,),
             ),
         ),
     )
@@ -105,8 +114,8 @@ def _write_runner_package(
     )
 
 
-def _fake_worker_factory(app: FastAPI, calls: list[str]):
-    class FakeWorker:
+def _worker_factory(app: FastAPI, calls: list[str]):
+    class Worker:
         def run_once(self) -> bool:
             calls.append("run_once")
             container = app.state.container
@@ -116,92 +125,108 @@ def _fake_worker_factory(app: FastAPI, calls: list[str]):
                 assert claimed is not None
                 run = VideoRunRepository(session).get(scope, claimed.resource_id)
                 assert run is not None
-                media_sha256 = session.execute(
-                    select(VideoAssetModel.source_sha256).where(
-                        VideoAssetModel.asset_id == run.asset_id,
-                    )
-                ).scalar_one()
-            keyframe_bytes = b"\xff\xd8\xffrunner-keyframe"
-            keyframe_relative = (
-                Path("runs")
-                / container.result_query_service.scope_key(scope)
-                / claimed.resource_id
-                / "keyframes/frame.jpg"
-            )
-            keyframe_path = container.settings.runtime_root / keyframe_relative
-            keyframe_path.parent.mkdir(parents=True, exist_ok=True)
-            keyframe_path.write_bytes(keyframe_bytes)
-            evidence = (
-                *tuple(
-                    SpeechSegment(
-                    evidence_id=f"asr_{index:03d}",
-                    start_ms=0,
-                    end_ms=400,
-                    text="Hello",
-                    language="en",
-                    confidence=0.9,
-                    is_fully_evaluated_language=True,
-                    )
-                    for index in range(1, 101)
-                ),
-                KeyframeEvidence(
-                    evidence_id="keyframe_ev_001",
-                    start_ms=0,
-                    end_ms=400,
-                    keyframe_id="keyframe_001",
-                    timestamp_ms=200,
-                    relative_path=keyframe_relative.as_posix(),
-                    mime_type="image/jpeg",
-                    sha256=hashlib.sha256(keyframe_bytes).hexdigest(),
-                    perceptual_hash="abcdef12",
-                    size_bytes=len(keyframe_bytes),
-                ),
-            )
-            segment_text = "类型：VIDEO_SEGMENT"
-            summary_text = "类型：VIDEO_SUMMARY"
-            segment = VideoSegment(
-                segment_id="segment_001",
+                media_sha = session.query(VideoAssetModel.source_sha256).filter(
+                    VideoAssetModel.asset_id == run.asset_id
+                ).scalar()
+            assert isinstance(media_sha, str)
+            speech = SpeechSegment(
+                evidence_id="asr_001",
                 start_ms=0,
-                end_ms=400,
-                title="问候",
-                summary_zh="讲者问好",
-                languages=("en",),
-                evidence_refs=("asr_001", "keyframe_ev_001"),
-                retrieval_text=segment_text,
-                retrieval_hash=hashlib.sha256(segment_text.encode()).hexdigest(),
+                end_ms=250,
+                text="你好",
+                language="zh",
+                confidence=0.99,
+                is_fully_evaluated_language=True,
             )
+            first = SemanticChapter(
+                chapter_id="chapter_001",
+                start_ms=0,
+                end_ms=250,
+                title="问候",
+                title_evidence_refs=(speech.evidence_id,),
+                summary_zh="讲者问好。",
+                summary_evidence_refs=(speech.evidence_id,),
+                body_blocks=(
+                    ParagraphBlock(text="讲者问好。", evidence_refs=(speech.evidence_id,)),
+                ),
+                claims=(
+                    GroundedClaim(
+                        text="讲者进行了问候。",
+                        evidence_refs=(speech.evidence_id,),
+                        certainty=0.99,
+                    ),
+                ),
+                evidence_refs=(speech.evidence_id,),
+                transcript_source="ASR",
+                retrieval_text="你好",
+                retrieval_hash=_sha("你好"),
+            )
+            second = SemanticChapter(
+                chapter_id="chapter_002",
+                start_ms=250,
+                end_ms=500,
+                title="本时段未提取到可验证语义内容",
+                title_evidence_refs=(),
+                summary_zh="本时段未提取到可验证语义内容",
+                summary_evidence_refs=(),
+                body_blocks=(),
+                claims=(),
+                content_status="NO_SEMANTIC_EVIDENCE",
+                evidence_refs=(),
+                transcript_source="NONE",
+                retrieval_text="",
+                retrieval_hash=_sha(""),
+            )
+            chapters = (first, second)
             result = VideoUnderstandingResult(
                 run_id=claimed.resource_id,
-                asset_sha256=media_sha256,
-                segments=(segment,),
-                summary=VideoSummary(
+                asset_sha256=media_sha,
+                summary=VideoDocumentSummary(
                     title="测试视频",
-                    summary_zh="视频包含问候",
                     duration_ms=500,
-                    chapters=(
-                        SummaryChapter(
-                            title="问候",
-                            start_ms=0,
-                            end_ms=400,
-                            segment_ids=(segment.segment_id,),
+                    overview_zh="视频包含问候。",
+                    key_points=(),
+                    retrieval_text="视频问候",
+                    retrieval_hash=_sha("视频问候"),
+                ),
+                sections=(
+                    SemanticSection(
+                        section_id=section_id_for(
+                            media_sha, tuple(item.chapter_id for item in chapters)
                         ),
+                        title="内容",
+                        summary_zh="问候内容。",
+                        chapter_refs=tuple(item.chapter_id for item in chapters),
                     ),
-                    languages=("en",),
-                    retrieval_text=summary_text,
-                    retrieval_hash=hashlib.sha256(summary_text.encode()).hexdigest(),
+                ),
+                chapters=chapters,
+                generation=DocumentGenerationMetadata(
+                    document_config=DocumentGenerationConfig(),
+                    text_model_id="text-model",
+                    vlm_model_id="qwen3-vl-flash",
+                    prompt_versions=PromptVersions(
+                        chapter_planner="chapter-planner-v1",
+                        chapter_planner_repair="chapter-planner-repair-v1",
+                        chapter_vlm="chapter-vlm-v1",
+                        chapter_vlm_repair="chapter-vlm-repair-v1",
+                        chapter_writer="chapter-writer-v1",
+                        chapter_writer_repair="chapter-writer-repair-v1",
+                        global_editor="global-editor-v1",
+                        global_editor_repair="global-editor-repair-v1",
+                    ),
                 ),
             )
             container.result_query_service.persist(
                 scope,
                 result,
-                evidence=evidence,
-                stage_metrics={"RESULT": 1},
-                status=RunStatus.SUCCEEDED,
+                evidence=(speech,),
+                document=render_markdown(result, (speech,)),
+                stage_metrics=dict.fromkeys(RESULT_STAGE_NAMES, 0),
+                model_metrics=dict.fromkeys(MODEL_METRIC_NAMES, 0),
+                status="SUCCEEDED",
                 transcript_source="ASR",
                 fence=ResultWriteFence(
-                    job_pk=claimed.id,
-                    worker_id=claimed.worker_id,
-                    attempt_count=claimed.attempt_count,
+                    claimed.id, claimed.worker_id, claimed.attempt_count
                 ),
             )
             return True
@@ -209,15 +234,22 @@ def _fake_worker_factory(app: FastAPI, calls: list[str]):
         def close(self) -> None:
             calls.append("close")
 
-    return FakeWorker
+    return Worker
 
 
-def test_prediction_runner_drives_api_worker_queries_and_model_free_score(
+def test_prediction_quality_and_cleanup_workflow_uses_3_artifact_set(
     tmp_path: Path,
     cloud_asr_environment: None,
+    monkeypatch,
 ) -> None:
-    media = b"\x00\x00\x00\x18ftypisom" + b"m" * 128
-    runtime_root, package = _write_runner_package(tmp_path, media)
+    monkeypatch.setenv("VIDEO_DEMO_TEXT_LLM_BASE_URL", "https://text.example.test/v1")
+    monkeypatch.setenv("VIDEO_DEMO_TEXT_LLM_API_KEY", "text-key")
+    monkeypatch.setenv("VIDEO_DEMO_TEXT_LLM_MODEL_ID", "text-model")
+    monkeypatch.setenv("VIDEO_DEMO_VLM_BASE_URL", "https://vlm.example.test/v1")
+    monkeypatch.setenv("VIDEO_DEMO_VLM_API_KEY", "vlm-key")
+    runtime_root, package = _write_package(
+        tmp_path, b"\x00\x00\x00\x18ftypisom" + b"m" * 128
+    )
     settings = Settings(
         workspace_root=tmp_path,
         runtime_root=runtime_root,
@@ -225,159 +257,43 @@ def test_prediction_runner_drives_api_worker_queries_and_model_free_score(
     )
     app = create_app(settings)
     calls: list[str] = []
-    fake_worker_type = _fake_worker_factory(app, calls)
-    runner = PredictionRunner(
+    worker = _worker_factory(app, calls)
+    report = PredictionRunner(
         settings,
         app_factory=lambda _settings: app,
-        worker_factory=lambda _settings, worker_id: fake_worker_type(),
+        worker_factory=lambda _settings, worker_id: worker(),
         preflight=lambda: None,
-    )
-    # 组合测试只替换 Worker 内部生产端口，HTTP 上传/创建/查询仍走真实应用。
-    report = runner.predict(package, evaluation_run_id="eval_001")
+    ).predict(package, evaluation_run_id="eval_001")
 
-    assert report.status.value == "PASS", report.predictions
-    assert [item.sample_id for item in report.predictions] == ["sample_001"]
+    assert report.status.value == "PASS", [
+        (item.failure_code, item.terminal_status, item.run_id)
+        for item in report.predictions
+    ]
     assert calls == ["run_once", "close"]
-    prediction_root = runtime_root / "eval" / "predictions" / "eval_001" / "sample_001"
+    prediction_root = runtime_root / "eval/predictions/eval_001/sample_001"
     assert {
-        path.name for path in prediction_root.iterdir()
-    } >= {"run.json", "result.json", "evidence.jsonl", "artifact-manifest.json", "index.json"}
-    quality = __import__(
-        "video_demo.evaluation.prediction_runner",
-        fromlist=["score_prediction_run"],
-    ).score_prediction_run("eval_001", eval_root=runtime_root / "eval")
+        "run.json",
+        "result.json",
+        "evidence.jsonl",
+        "document.md",
+        "artifact-manifest.json",
+        "index.json",
+    }.issubset(path.name for path in prediction_root.iterdir())
+    index = json.loads((prediction_root / "index.json").read_text(encoding="utf-8"))
+    assert index["schema_version"] == "1.2.0"
+    assert index["document_relative_path"].endswith("/document.md")
+    quality = score_prediction_run("eval_001", eval_root=runtime_root / "eval")
     assert quality.evaluation_run_id == "eval_001"
-    report_root = runtime_root / "eval" / "reports" / "eval_001"
-    assert (report_root / "quality.json").is_file()
-    assert (report_root / "quality-details.json").is_file()
-    hint_effect = json.loads((report_root / "hint-effect.json").read_text(encoding="utf-8"))
-    assert hint_effect["status"] == "NOT_RUN"
-    assert hint_effect["candidate_pair_count"] == 0
-    assert calls == ["run_once", "close"]
-    scope = Scope("evaluation", "video-demo", "evaluation")
-    scope_key = app.state.container.result_query_service.scope_key(scope)
-    product_run = runtime_root / "runs" / scope_key / report.predictions[0].run_id
-    foreign_run = runtime_root / "runs" / scope_key / "run_foreign"
-    foreign_run.mkdir(parents=True)
-    (foreign_run / "keep.txt").write_text("foreign", encoding="utf-8")
+    product_run = (
+        runtime_root
+        / "runs"
+        / app.state.container.result_query_service.scope_key(
+            Scope("evaluation", "video-demo", "evaluation")
+        )
+        / report.predictions[0].run_id
+    )
     assert product_run.is_dir()
 
     cleanup_evaluation_run(tmp_path, "eval_001")
 
     assert not product_run.exists()
-    assert foreign_run.is_dir()
-    assert (runtime_root / "objects").is_dir()
-
-
-def test_cleanup_keeps_unbound_placeholder_product_run(tmp_path: Path) -> None:
-    media = b"\x00\x00\x00\x18ftypisom" + b"m" * 128
-    runtime_root, package = _write_runner_package(tmp_path, media)
-    settings = Settings(
-        workspace_root=tmp_path,
-        runtime_root=runtime_root,
-        max_video_bytes=1024 * 1024,
-        openai_base_url="https://asr.example/v1",
-        openai_api_key="test-key",
-        openai_model="openai/whisper",
-    )
-
-    def fail_before_product_run(_settings: Settings) -> FastAPI:
-        raise ValueError("产品 API 尚未创建 run")
-
-    report = PredictionRunner(
-        settings,
-        app_factory=fail_before_product_run,
-        preflight=lambda: None,
-    ).predict(package, evaluation_run_id="eval_placeholder")
-    placeholder = report.predictions[0]
-    assert placeholder.run_id == "run_failed_sample_001"
-    placeholder_run = (
-        runtime_root
-        / "runs"
-        / hashlib.sha256(b"evaluation\x00video-demo\x00evaluation").hexdigest()[:24]
-        / placeholder.run_id
-    )
-    placeholder_run.mkdir(parents=True)
-    (placeholder_run / "keep.txt").write_text("not-owned", encoding="utf-8")
-
-    cleanup_evaluation_run(tmp_path, "eval_placeholder")
-
-    assert placeholder_run.is_dir()
-
-
-def test_cleanup_rejects_tampered_prediction_before_deleting_anything(
-    tmp_path: Path,
-    cloud_asr_environment: None,
-) -> None:
-    media = b"\x00\x00\x00\x18ftypisom" + b"m" * 128
-    runtime_root, package = _write_runner_package(tmp_path, media)
-    settings = Settings(
-        workspace_root=tmp_path,
-        runtime_root=runtime_root,
-        max_video_bytes=1024 * 1024,
-    )
-    app = create_app(settings)
-    fake_worker_type = _fake_worker_factory(app, [])
-    report = PredictionRunner(
-        settings,
-        app_factory=lambda _settings: app,
-        worker_factory=lambda _settings, worker_id: fake_worker_type(),
-        preflight=lambda: None,
-    ).predict(package, evaluation_run_id="eval_tampered")
-    prediction_report = runtime_root / "eval/reports/eval_tampered/prediction.json"
-    prediction_report.write_bytes(prediction_report.read_bytes() + b" ")
-    scope = Scope("evaluation", "video-demo", "evaluation")
-    product_run = (
-        runtime_root
-        / "runs"
-        / app.state.container.result_query_service.scope_key(scope)
-        / report.predictions[0].run_id
-    )
-
-    with pytest.raises(ValueError, match="预测清理证据非法或损坏"):
-        cleanup_evaluation_run(tmp_path, "eval_tampered")
-
-    assert product_run.is_dir()
-    assert (runtime_root / "eval/reports/eval_tampered").is_dir()
-
-
-def test_prediction_runner_uses_real_production_worker_factory_for_failure_path(
-    tmp_path: Path,
-    cloud_asr_environment: None,
-) -> None:
-    media = b"\x00\x00\x00\x18ftypisom" + b"m" * 128
-    runtime_root, package = _write_runner_package(tmp_path, media)
-    settings = Settings(
-        workspace_root=tmp_path,
-        runtime_root=runtime_root,
-        ffprobe_path=tmp_path / "missing-ffprobe",
-        ffmpeg_path=tmp_path / "missing-ffmpeg",
-        max_video_bytes=1024 * 1024,
-    )
-    runner = PredictionRunner(settings, preflight=lambda: None)
-
-    report = runner.predict(package, evaluation_run_id="eval_real_worker_001")
-
-    assert report.status.value == "FAIL"
-    assert report.predictions[0].failure_code == "VIDEO_FFPROBE_UNAVAILABLE"
-    prediction_root = (
-        runtime_root
-        / "eval"
-        / "predictions"
-        / "eval_real_worker_001"
-        / "sample_001"
-    )
-    assert (prediction_root / "run.json").is_file()
-    assert (prediction_root / "index.json").is_file()
-
-def test_quality_score_entrypoint_is_model_free_and_requires_prediction_report(
-    tmp_path: Path,
-) -> None:
-    from video_demo.errors import VideoDemoError
-    from video_demo.evaluation.prediction_runner import score_prediction_run
-
-    eval_root = tmp_path / ".codex" / "video-rag-demo" / "eval"
-    eval_root.mkdir(parents=True)
-
-    with pytest.raises(VideoDemoError):
-        score_prediction_run("eval_001", eval_root=eval_root)

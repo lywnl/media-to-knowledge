@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from video_demo.domain.evidence import SpeechSegment
-from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
+from video_demo.domain.legacy_result import SegmentUnderstanding, SummaryUnderstanding
 from video_demo.domain.run import TimeRange
 from video_demo.fusion.timeline import build_timeline
 from video_demo.integrations.video_port import (

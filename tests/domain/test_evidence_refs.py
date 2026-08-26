@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from video_demo.domain.evidence import SpeechSegment
-from video_demo.domain.result import (
+from video_demo.domain.legacy_result import (
     SummaryChapter,
     VideoSegment,
     VideoSummary,

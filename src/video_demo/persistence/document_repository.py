@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import NoReturn
 
 from pydantic import ValidationError
@@ -17,11 +18,38 @@ from video_demo.domain.document import (
 )
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.models import VideoSegmentModel, VideoSummaryModel
-from video_demo.persistence.repositories import Scope, reject_sensitive_json
+
+_SENSITIVE_KEY_PARTS = (
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "password",
+)
 
 
-class DocumentResultRepository:
-    """3.0 私有结果行映射；旧生产 ResultRepository 在切换前保持不变。"""
+@dataclass(frozen=True, slots=True)
+class Scope:
+    tenant_id: str
+    application_id: str
+    knowledge_base_id: str
+
+
+def _reject_sensitive_json(value: object, path: str = "$") -> None:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized = str(key).lower().replace("-", "_")
+            if any(part in normalized for part in _SENSITIVE_KEY_PARTS):
+                raise ValueError(f"检测到敏感字段: {path}.{key}")
+            _reject_sensitive_json(nested, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            _reject_sensitive_json(nested, f"{path}[{index}]")
+
+
+class ResultRepository:
+    """生产 3.0 结果行的唯一映射。"""
 
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -34,7 +62,7 @@ class DocumentResultRepository:
         for chapter in validated.chapters:
             _require_retrieval_hash(chapter.retrieval_text, chapter.retrieval_hash)
             payload = chapter.model_dump(mode="json", exclude_computed_fields=True)
-            reject_sensitive_json(payload)
+            _reject_sensitive_json(payload)
             segment_payloads.append((chapter, payload))
         _require_retrieval_hash(
             validated.summary.retrieval_text,
@@ -50,7 +78,7 @@ class DocumentResultRepository:
                 mode="json", exclude_computed_fields=True
             ),
         }
-        reject_sensitive_json(summary_payload)
+        _reject_sensitive_json(summary_payload)
 
         self._delete_existing(scope, validated.run_id)
         for chapter, payload in segment_payloads:

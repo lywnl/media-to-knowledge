@@ -20,7 +20,6 @@ from video_demo.domain.document_artifact import (
 )
 from video_demo.domain.evidence import (
     DocumentEvidenceItem,
-    EvidenceItem,
     KeyframeEvidence,
     SceneBoundary,
     SpeechSegment,
@@ -31,7 +30,6 @@ from video_demo.domain.manifest import VideoAssetManifest
 from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.probe import ProbeLimits, SupportedMime
-from video_demo.persistence.repositories import Scope
 
 if TYPE_CHECKING:
     from video_demo.application.chapter_frames import ChapterFrameSearchBatch
@@ -39,11 +37,12 @@ if TYPE_CHECKING:
     from video_demo.application.document_rendering import RenderedDocument
     from video_demo.domain.document import VideoUnderstandingResult
     from video_demo.media.subtitles import ParsedSubtitle
+    from video_demo.persistence.repositories import Scope
 
 
 @dataclass(frozen=True, slots=True)
-class DocumentPipelineContext:
-    """私有 3.0 文档流水线一次运行所需的全部显式输入。"""
+class PipelineContext:
+    """3.0 生产流水线一次运行所需的全部显式输入。"""
 
     run_id: str
     scope: Scope
@@ -58,7 +57,7 @@ class DocumentPipelineContext:
 
 
 @dataclass(frozen=True, slots=True)
-class DocumentPipelineOutcome:
+class PipelineOutcome:
     """尚未发布的 3.0 结果及发布后清理所需的内部闭包。"""
 
     status: Literal["SUCCEEDED", "PARTIAL_SUCCEEDED"]
@@ -111,6 +110,10 @@ class PipelineRunConfig(FrozenModel):
     language_hints: tuple[LanguageCode, ...] = ()
     hotwords: tuple[str, ...] = ()
     core_context: str | None = None
+    document_config: DocumentGenerationConfig = Field(
+        default_factory=DocumentGenerationConfig,
+    )
+    result_schema_version: Literal["3.0.0"] = "3.0.0"
 
     @model_validator(mode="after")
     def normalize_speech_configuration(self) -> Self:
@@ -130,6 +133,13 @@ def pipeline_run_config_from_snapshot(
     snapshot: Mapping[str, object],
 ) -> PipelineRunConfig:
     """只在读取历史数据库快照时丢弃三个已退役语音字段。"""
+
+    if snapshot.get("result_schema_version") != "3.0.0":
+        raise VideoDemoError(
+            ErrorCode.RESULT_SCHEMA_UNSUPPORTED,
+            "运行配置快照不是 3.0",
+            {"supported_schema_version": "3.0.0"},
+        )
 
     normalized = {
         key: value
@@ -193,7 +203,7 @@ class StageMetric:
 @dataclass(frozen=True, slots=True)
 class SpeechAnalysis:
     transcript_source: TranscriptSource
-    evidence: tuple[EvidenceItem, ...] = ()
+    evidence: tuple[SpeechSegment | SubtitleCue, ...] = ()
     warnings: tuple[str, ...] = ()
     boundary_candidates: tuple[SpeechBoundaryCandidate, ...] = ()
     stage_metrics: tuple[StageMetric, ...] = ()

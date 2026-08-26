@@ -12,12 +12,12 @@ import pytest
 from video_demo.application.chapter_frames import ChapterFrameSearchBatch
 from video_demo.application.chapter_planning import ChapterPlanningBatch
 from video_demo.application.chapter_vision import ChapterVisionBatch
-from video_demo.application.document_pipeline import DocumentPipeline
+from video_demo.application.document_pipeline import VideoUnderstandingPipeline
 from video_demo.application.document_rendering import render_markdown
 from video_demo.application.document_writing import WrittenDocument
 from video_demo.application.pipeline_contracts import (
-    DocumentPipelineContext,
     EvidencePreparationLimits,
+    PipelineContext,
     PipelineRunConfig,
     PreparedMedia,
     ProbedAsset,
@@ -146,6 +146,62 @@ def _result(run_id: str, asset_sha256: str, speech: SpeechSegment) -> VideoUnder
     )
 
 
+def _empty_result(run_id: str, asset_sha256: str) -> VideoUnderstandingResult:
+    retrieval_text = ""
+    chapter = SemanticChapter(
+        chapter_id="chapter_001",
+        start_ms=0,
+        end_ms=1_000,
+        title="无语义内容",
+        title_evidence_refs=(),
+        summary_zh="本时段未提取到可验证语义内容。",
+        summary_evidence_refs=(),
+        body_blocks=(),
+        claims=(),
+        content_status="NO_SEMANTIC_EVIDENCE",
+        evidence_refs=(),
+        transcript_source="NONE",
+        retrieval_text=retrieval_text,
+        retrieval_hash=_digest(retrieval_text),
+    )
+    return VideoUnderstandingResult(
+        run_id=run_id,
+        asset_sha256=asset_sha256,
+        summary=VideoDocumentSummary(
+            title="测试知识文档",
+            duration_ms=1_000,
+            overview_zh="未提取到可验证语义内容。",
+            key_points=(),
+            retrieval_text="无语义内容",
+            retrieval_hash=_digest("无语义内容"),
+        ),
+        sections=(
+            SemanticSection(
+                section_id=section_id_for(asset_sha256, (chapter.chapter_id,)),
+                title="全部内容",
+                summary_zh="未提取到可验证语义内容。",
+                chapter_refs=(chapter.chapter_id,),
+            ),
+        ),
+        chapters=(chapter,),
+        generation=DocumentGenerationMetadata(
+            document_config=DocumentGenerationConfig(),
+            text_model_id="text-model",
+            vlm_model_id="vlm-model",
+            prompt_versions=PromptVersions(
+                chapter_planner="chapter-planner-v1",
+                chapter_planner_repair="chapter-planner-repair-v1",
+                chapter_vlm="chapter-vlm-v1",
+                chapter_vlm_repair="chapter-vlm-repair-v1",
+                chapter_writer="chapter-writer-v1",
+                chapter_writer_repair="chapter-writer-repair-v1",
+                global_editor="global-editor-v1",
+                global_editor_repair="global-editor-repair-v1",
+            ),
+        ),
+    )
+
+
 class _RunCache:
     def __init__(self, run_root: Path) -> None:
         self.run_root = run_root
@@ -158,6 +214,7 @@ class _PipelineFixture:
         *,
         visual_evidence: bool = False,
         speech_error: VideoDemoError | None = None,
+        speech_analysis: SpeechAnalysis | None = None,
         planning_status: str = "SUCCEEDED",
         visual_status: str = "SUCCEEDED",
         writing_status: str = "SUCCEEDED",
@@ -166,6 +223,7 @@ class _PipelineFixture:
     ) -> None:
         self.runtime_root = runtime_root
         self.speech_error = speech_error
+        self.speech_analysis = speech_analysis
         self.planning_status = planning_status
         self.visual_status = visual_status
         self.writing_status = writing_status
@@ -189,7 +247,7 @@ class _PipelineFixture:
         self.writer_calls = 0
         self._visual_evidence = visual_evidence
 
-    def register(self, context: DocumentPipelineContext) -> RegisteredAsset:
+    def register(self, context: PipelineContext) -> RegisteredAsset:
         self.calls.append("REGISTER_CALL")
         source = self.runtime_root / f"{context.run_id}.mp4"
         return RegisteredAsset(
@@ -255,6 +313,8 @@ class _PipelineFixture:
         if self.speech_error is not None:
             raise self.speech_error
         self.speech_finished.set()
+        if self.speech_analysis is not None:
+            return self.speech_analysis
         return SpeechAnalysis(
             transcript_source="ASR",
             evidence=(_speech(),),
@@ -466,6 +526,19 @@ class _PipelineFixture:
         self.writer_calls += 1
         self.writer_caches.append(cache)
         self.writing_finished.set()
+        if not transcript_evidence:
+            return WrittenDocument(
+                result=_empty_result(
+                    context.run_id,  # type: ignore[attr-defined]
+                    context.asset_sha256,  # type: ignore[attr-defined]
+                ),
+                warnings=("WRITING_WARNING", "SHARED_WARNING"),
+                status=cast(
+                    Literal["SUCCEEDED", "PARTIAL_SUCCEEDED"],
+                    self.writing_status,
+                ),
+                metrics={"chapter_writer_logical_calls": 1},
+            )
         return WrittenDocument(
             result=_result(
                 context.run_id,  # type: ignore[attr-defined]
@@ -486,8 +559,8 @@ def _pipeline(
     fixture: _PipelineFixture,
     *,
     max_result_evidence_items: int = 25_000,
-) -> DocumentPipeline:
-    return DocumentPipeline(
+) -> VideoUnderstandingPipeline:
+    return VideoUnderstandingPipeline(
         fixture,
         fixture,
         fixture,
@@ -514,8 +587,8 @@ def _context(
     *,
     is_cancel_requested: Callable[[], bool] = lambda: False,
     on_stage_start: Callable[[str], None] = lambda _stage: None,
-) -> DocumentPipelineContext:
-    return DocumentPipelineContext(
+) -> PipelineContext:
+    return PipelineContext(
         run_id=run_id,
         scope=Scope("tenant-a", "app-a", "kb-a"),
         title_hint="测试知识文档",
@@ -613,6 +686,36 @@ def test_document_pipeline_treats_normal_no_frame_and_no_visual_as_succeeded(
     assert outcome.frame_batch.chapter_status == (("chapter_001", "NO_CANDIDATE"),)
     assert outcome.visual_batch.chapter_status == (("chapter_001", "NO_VALUE"),)
     assert outcome.status == "SUCCEEDED"
+
+
+@pytest.mark.parametrize(
+    ("transcript_source", "warning"),
+    [
+        ("NONE", "NO_AUDIO_TRACK"),
+        ("ASR", "NO_SPEECH_DETECTED"),
+    ],
+)
+def test_no_audio_or_no_speech_keeps_visual_pipeline_running(
+    tmp_path: Path,
+    transcript_source: Literal["NONE", "ASR"],
+    warning: str,
+) -> None:
+    fixture = _PipelineFixture(
+        tmp_path,
+        speech_analysis=SpeechAnalysis(
+            transcript_source=transcript_source,
+            evidence=(),
+            warnings=(warning,),
+        ),
+    )
+
+    outcome = _pipeline(fixture).run(_context("run_001"))
+
+    assert outcome.transcript_source == transcript_source
+    assert warning in outcome.warnings
+    assert "FRAME_CALL" in fixture.calls
+    assert "VISION_CALL" in fixture.calls
+    assert outcome.result.chapters[0].content_status == "NO_SEMANTIC_EVIDENCE"
 
 
 def test_document_pipeline_outcome_metrics_are_read_only(tmp_path: Path) -> None:

@@ -15,7 +15,7 @@ from video_demo.api.schemas import (
     RunResponse,
 )
 from video_demo.application.runs import RunView
-from video_demo.domain.evidence import EvidenceItem
+from video_demo.domain.evidence import DocumentEvidenceItem
 from video_demo.domain.result import VideoUnderstandingResult
 from video_demo.persistence.repositories import Scope
 
@@ -50,6 +50,8 @@ def create_video_run(
             language_hints=payload.language_hints,
             hotwords=payload.hotwords,
             core_context=payload.core_context,
+            document_config=payload.document_config,
+            result_schema_version=payload.result_schema_version,
         ),
     )
 
@@ -126,6 +128,21 @@ def get_video_evidence(
     )
 
 
+@router.get("/{run_id}/document")
+def get_video_document(
+    run_id: str,
+    scope: Annotated[Scope, Depends(get_scope)],
+    container: Annotated[AppContainer, Depends(get_container)],
+) -> Response:
+    container.run_service.require_result_ready(scope, run_id)
+    document = container.result_query_service.get_document(scope, run_id)
+    return Response(
+        content=document,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": 'inline; filename="knowledge-note.md"'},
+    )
+
+
 @router.get("/{run_id}/keyframes/{keyframe_id}/content")
 def get_keyframe_content(
     run_id: str,
@@ -138,7 +155,7 @@ def get_keyframe_content(
     return Response(content=content.content, media_type=content.mime_type)
 
 
-def _public_evidence(item: EvidenceItem) -> PublicEvidence:
+def _public_evidence(item: DocumentEvidenceItem) -> PublicEvidence:
     payload: dict[str, object] = item.model_dump(
         mode="json",
         exclude_computed_fields=True,

@@ -21,7 +21,7 @@ from video_demo.domain.evidence import (
     SpeechSegment,
     SubtitleCue,
 )
-from video_demo.domain.result import SegmentUnderstanding, SummaryUnderstanding
+from video_demo.domain.legacy_result import SegmentUnderstanding, SummaryUnderstanding
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.fusion.timeline import build_timeline

@@ -1113,7 +1113,7 @@ def _verify_production_queries(
             raise ValueError("耐久证据分页游标非法")
     normalized = _normalize_public_evidence(raw_evidence)
     public_evidence = _PUBLIC_EVIDENCE_ADAPTER.validate_python(normalized)
-    manifest_bytes, artifact = _read_published_manifest(
+    artifact, document_bytes = _read_published_manifest(
         client,
         run_id=run_id,
         scope=Scope("evaluation", "video-demo", "evaluation"),
@@ -1139,4 +1139,4 @@ def _verify_production_queries(
             or hashlib.sha256(content.content).hexdigest() != public_item.sha256
         ):
             raise ValueError("耐久关键帧内容与证据不一致")
-    return manifest_bytes
+    return document_bytes

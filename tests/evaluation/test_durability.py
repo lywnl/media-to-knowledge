@@ -33,6 +33,11 @@ def _cloud_settings(tmp_path: Path) -> Settings:
         openai_base_url="https://asr.example/v1",
         openai_api_key="test-key",
         openai_model="openai/whisper",
+        text_llm_base_url="https://text.example/v1",
+        text_llm_api_key="text-key",
+        text_llm_model_id="text-model",
+        vlm_base_url="https://vlm.example/v1",
+        vlm_api_key="vlm-key",
     )
 
 
@@ -596,12 +601,12 @@ def test_production_query_chain_checks_job_evidence_page_and_keyframe_content(
         durability_module,
         "_read_published_manifest",
         lambda *_args, **_kwargs: (
-            b"manifest",
             SimpleNamespace(
                 result=result,
                 evidence=manifest_evidence,
                 status="SUCCEEDED",
             ),
+            b"document",
         ),
     )
     monkeypatch.setattr(

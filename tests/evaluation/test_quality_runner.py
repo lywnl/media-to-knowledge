@@ -5,933 +5,322 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pytest
-
-from video_demo.domain.evidence import (
-    BoundingBox,
-    OcrEvidence,
-    OcrLine,
-    SceneBoundary,
-    SpeechSegment,
-    SubtitleCue,
+from video_demo.application.document_rendering import render_markdown
+from video_demo.domain.document import (
+    DocumentGenerationConfig,
+    DocumentGenerationMetadata,
+    GroundedClaim,
+    ParagraphBlock,
+    PromptVersions,
+    SemanticChapter,
+    SemanticSection,
+    VideoDocumentSummary,
+    VideoUnderstandingResult,
+    section_id_for,
 )
-from video_demo.domain.result import VideoSegment, VideoSummary, VideoUnderstandingResult
+from video_demo.domain.document_artifact import (
+    MODEL_METRIC_NAMES,
+    RESULT_STAGE_NAMES,
+    DocumentArtifactPayload,
+)
+from video_demo.domain.evidence import SpeechSegment
 from video_demo.domain.run import ModelIdentity
-from video_demo.errors import VideoDemoError
 from video_demo.evaluation.annotations import (
     AuthorizationFile,
     AuthorizationRecord,
-    ClaimJudgment,
     EvaluationAnnotation,
     ReferenceOcrFrame,
-    SemanticJudgment,
     SupportedFact,
     ValidatedEvaluationPackage,
-    VerifiedAnnotation,
     load_evaluation_package,
-    pair_reference_sha256,
 )
-from video_demo.evaluation.dataset import EvaluationDataset, EvaluationSample
+from video_demo.evaluation.dataset import EvaluationSample
 from video_demo.evaluation.predictions import (
     EvaluationPrediction,
-    PredictionClaim,
     PredictionRunSnapshot,
     VerifiedPrediction,
     load_verified_prediction,
 )
-from video_demo.evaluation.report import GateStatus
+from video_demo.evaluation.quality_runner import score_quality
+from video_demo.storage.artifacts import (
+    RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION,
+    canonical_artifact_envelope_bytes,
+)
 
 _NOW = datetime(2026, 8, 18, tzinfo=UTC)
 _MEDIA_BYTES = b"fixture-media"
-_SHA = hashlib.sha256(_MEDIA_BYTES).hexdigest()
 
 
-def _hash(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+def _hash(content: bytes | str) -> str:
+    encoded = content.encode("utf-8") if isinstance(content, str) else content
+    return hashlib.sha256(encoded).hexdigest()
 
 
-def _segment(sample_id: str, index: int, start: int, end: int, evidence_ref: str) -> VideoSegment:
-    text = f"segment {sample_id} {index}"
-    return VideoSegment(
-        segment_id=f"seg_{sample_id}_{index}",
-        start_ms=start,
-        end_ms=end,
-        title="片段",
-        summary_zh="片段事实",
-        speakers=("SPEAKER_01",),
-        languages=("zh",),
-        evidence_refs=(evidence_ref,),
-        retrieval_text=text,
-        retrieval_hash=_hash(text),
+def _write_prediction(
+    eval_root: Path,
+    sample: EvaluationSample,
+) -> Path:
+    directory = eval_root / "predictions" / "eval_001" / sample.sample_id
+    directory.mkdir(parents=True)
+    speech = SpeechSegment(
+        evidence_id="asr_001",
+        start_ms=0,
+        end_ms=250,
+        text="你好",
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
     )
-
-
-def _successful_prediction(
-    sample_id: str,
-    language: str,
-    predicted_words: tuple[str, ...],
-    *,
-    run_id: str = "eval_001",
-) -> VerifiedPrediction:
-    words = tuple(
-        SpeechSegment(
-            evidence_id=f"speech_{sample_id}_{index}",
-            start_ms=index * 500 + 100,
-            end_ms=index * 500 + 450,
-            text=text,
-            language=language,
-            confidence=0.9,
-            is_fully_evaluated_language=True,
-        )
-        for index, text in enumerate(predicted_words)
-    )
-    first_ref = words[0].evidence_id
-    ocr = OcrEvidence(
-        evidence_id=f"ocr_{sample_id}",
-        start_ms=7_000,
-        end_ms=9_000,
-        keyframe_id=f"key_{sample_id}",
-        timestamp_ms=8_000,
-        language=language,
-        lines=(
-            OcrLine(
-                text="A",
-                bounding_box=BoundingBox(x=0, y=0, width=10, height=10),
-                confidence=0.9,
+    first_chapter = SemanticChapter(
+        chapter_id="chapter_001",
+        start_ms=0,
+        end_ms=250,
+        title="问候",
+        title_evidence_refs=(speech.evidence_id,),
+        summary_zh="讲者问好。",
+        summary_evidence_refs=(speech.evidence_id,),
+        body_blocks=(ParagraphBlock(text="讲者问好。", evidence_refs=(speech.evidence_id,)),),
+        claims=(
+            GroundedClaim(
+                text="讲者进行了问候。",
+                evidence_refs=(speech.evidence_id,),
+                certainty=0.9,
             ),
         ),
-        provider_request_id=f"request-{sample_id}",
+        evidence_refs=(speech.evidence_id,),
+        transcript_source="ASR",
+        retrieval_text="你好",
+        retrieval_hash=_hash("你好"),
     )
-    segments = (
-        _segment(sample_id, 1, 0, 7_000, first_ref),
-        _segment(sample_id, 2, 7_000, 10_000, ocr.evidence_id),
+    second_chapter = SemanticChapter(
+        chapter_id="chapter_002",
+        start_ms=250,
+        end_ms=500,
+        title="本时段未提取到可验证语义内容",
+        title_evidence_refs=(),
+        summary_zh="本时段未提取到可验证语义内容",
+        summary_evidence_refs=(),
+        body_blocks=(),
+        claims=(),
+        content_status="NO_SEMANTIC_EVIDENCE",
+        evidence_refs=(),
+        transcript_source="NONE",
+        retrieval_text="",
+        retrieval_hash=_hash(""),
     )
-    summary_text = f"summary {sample_id}"
     result = VideoUnderstandingResult(
-        run_id=f"run_{sample_id}",
-        asset_sha256=_SHA,
-        segments=segments,
-        summary=VideoSummary(
-            title="摘要",
-            summary_zh="视频事实",
-            speakers=("SPEAKER_01",),
-            languages=(language,),
-            duration_ms=10_000,
-            chapters=(),
-            retrieval_text=summary_text,
-            retrieval_hash=_hash(summary_text),
+        run_id="run_001",
+        asset_sha256=sample.media_sha256,
+        summary=VideoDocumentSummary(
+            title="视频",
+            duration_ms=500,
+            overview_zh="视频包含问候。",
+            key_points=(),
+            retrieval_text="视频问候",
+            retrieval_hash=_hash("视频问候"),
+        ),
+        sections=(
+            SemanticSection(
+                section_id=section_id_for(
+                    sample.media_sha256,
+                    (first_chapter.chapter_id, second_chapter.chapter_id),
+                ),
+                title="内容",
+                summary_zh="问候内容。",
+                chapter_refs=(first_chapter.chapter_id, second_chapter.chapter_id),
+            ),
+        ),
+        chapters=(first_chapter, second_chapter),
+        generation=DocumentGenerationMetadata(
+            document_config=DocumentGenerationConfig(),
+            text_model_id="text-model",
+            vlm_model_id="qwen3-vl-flash",
+            prompt_versions=PromptVersions(
+                chapter_planner="chapter-planner-v1",
+                chapter_planner_repair="chapter-planner-repair-v1",
+                chapter_vlm="chapter-vlm-v1",
+                chapter_vlm_repair="chapter-vlm-repair-v1",
+                chapter_writer="chapter-writer-v1",
+                chapter_writer_repair="chapter-writer-repair-v1",
+                global_editor="global-editor-v1",
+                global_editor_repair="global-editor-repair-v1",
+            ),
         ),
     )
-    evidence = (
-        *words,
-        ocr,
-        SceneBoundary(
-            evidence_id=f"scene_{sample_id}_1",
-            start_ms=0,
-            end_ms=4_000,
-            transition="candidate",
-            score=0.9,
-        ),
-        SceneBoundary(
-            evidence_id=f"scene_{sample_id}_2",
-            start_ms=4_000,
-            end_ms=10_000,
-            transition="hard_cut",
-            score=0.9,
-        ),
-    )
-    index_sha = _hash(f"index-{sample_id}-{run_id}")
-    claims = tuple(
-        PredictionClaim(
-            claim_id=f"claim_{sample_id}_{position}",
-            source_kind="SEGMENT_SUMMARY" if position < 2 else "VIDEO_SUMMARY",
-            source_id=(segments[position].segment_id if position < 2 else result.run_id),
-            text="事实",
-        )
-        for position in range(3)
-    )
-    return VerifiedPrediction(
-        index=EvaluationPrediction(
-            schema_version="1.1.0",
-            evaluation_run_id=run_id,
-            sample_id=sample_id,
-            media_sha256=_SHA,
-            run_id=result.run_id,
-            job_id=f"job_{sample_id}",
-            terminal_status="SUCCEEDED",
-            run_relative_path=f"predictions/{sample_id}/run.json",
-            run_sha256=_hash(f"run-{sample_id}"),
-            result_relative_path=f"predictions/{sample_id}/result.json",
-            result_sha256=_hash(f"result-{sample_id}"),
-            evidence_relative_path=f"predictions/{sample_id}/evidence.jsonl",
-            evidence_sha256=_hash(f"evidence-{sample_id}"),
-            artifact_manifest_relative_path=f"predictions/{sample_id}/manifest.json",
-            artifact_manifest_sha256=_hash(f"manifest-{sample_id}"),
-            transcript_source="ASR",
-            started_at=_NOW,
-            finished_at=_NOW,
-        ),
-        index_sha256=index_sha,
-        run=PredictionRunSnapshot(
-            schema_version="1.0.0",
-            run_id=result.run_id,
-            job_id=f"job_{sample_id}",
-            terminal_status="SUCCEEDED",
-            current_stage="RESULT",
-            models=(ModelIdentity(component="asr", provider="local", model_id="m1"),),
-        ),
+    evidence = (speech,)
+    document = render_markdown(result, evidence)
+    artifact = DocumentArtifactPayload(
         result=result,
         evidence=evidence,
-        claims=claims,
-        artifact_manifest_sha256=_hash(f"manifest-{sample_id}"),
-        eval_root=Path("."),
+        stage_metrics=dict.fromkeys(RESULT_STAGE_NAMES, 0),
+        model_metrics=dict.fromkeys(MODEL_METRIC_NAMES, 0),
+        status="SUCCEEDED",
+        warnings=(),
+        transcript_source="ASR",
+        document_sha256=document.sha256,
+        document_size_bytes=document.size_bytes,
     )
-
-
-def _failed_prediction(sample_id: str, *, run_id: str = "eval_001") -> VerifiedPrediction:
-    return VerifiedPrediction(
-        index=EvaluationPrediction(
-            schema_version="1.1.0",
-            evaluation_run_id=run_id,
-            sample_id=sample_id,
-            media_sha256=_SHA,
-            run_id=f"run_{sample_id}",
-            job_id=f"job_{sample_id}",
-            terminal_status="FAILED",
-            run_relative_path=f"predictions/{sample_id}/run.json",
-            run_sha256=_hash(f"run-{sample_id}"),
-            failure_code="MODEL_FAILED",
-            started_at=_NOW,
-            finished_at=_NOW,
-        ),
-        index_sha256=_hash(f"index-{sample_id}-{run_id}"),
-        run=PredictionRunSnapshot(
-            schema_version="1.0.0",
-            run_id=f"run_{sample_id}",
-            job_id=f"job_{sample_id}",
-            terminal_status="FAILED",
-            current_stage="SPEECH",
-            error_code="MODEL_FAILED",
-            models=(ModelIdentity(component="asr", provider="local", model_id="m1"),),
-        ),
-        result=None,
-        evidence=(),
-        claims=(),
-        artifact_manifest_sha256=None,
-        eval_root=Path("."),
-    )
-
-
-def _subtitle_prediction(
-    sample_id: str,
-    language: str,
-    cues: tuple[tuple[int, int, str, str], ...],
-) -> VerifiedPrediction:
-    base = _successful_prediction(sample_id, language, ("占位",))
-    subtitle_cues = tuple(
-        SubtitleCue(
-            evidence_id=evidence_id,
-            start_ms=start_ms,
-            end_ms=end_ms,
-            text=text,
-            language=language,
-            stream_index=2,
-        )
-        for start_ms, end_ms, evidence_id, text in cues
-    )
-    visual_evidence = tuple(
-        item
-        for item in base.evidence
-        if isinstance(item, (OcrEvidence, SceneBoundary))
-    )
-    segments = (
-        base.result.segments[0].model_copy(
-            update={"evidence_refs": (subtitle_cues[0].evidence_id,)}
-        ),
-        base.result.segments[1],
-    )
-    result = base.result.model_copy(update={"segments": segments})
-    return base.model_copy(
-        update={
-            "index": base.index.model_copy(update={"transcript_source": "SUBTITLE"}),
-            "result": result,
-            "evidence": (*subtitle_cues, *visual_evidence),
-        }
-    )
-
-
-def _none_prediction(sample_id: str, language: str) -> VerifiedPrediction:
-    base = _successful_prediction(sample_id, language, ("占位",))
-    visual_evidence = tuple(
-        item
-        for item in base.evidence
-        if isinstance(item, (OcrEvidence, SceneBoundary))
-    )
-    first_visual_id = visual_evidence[0].evidence_id
-    result = base.result.model_copy(
-        update={
-            "segments": tuple(
-                segment.model_copy(update={"evidence_refs": (first_visual_id,)})
-                for segment in base.result.segments
-            )
-        }
-    )
-    return base.model_copy(
-        update={
-            "index": base.index.model_copy(update={"transcript_source": "NONE"}),
-            "result": result,
-            "evidence": visual_evidence,
-        }
-    )
-
-
-def _annotation(sample_id: str, language: str, text: str) -> VerifiedAnnotation:
-    annotation = EvaluationAnnotation(
+    snapshot = PredictionRunSnapshot(
         schema_version="1.0.0",
-        sample_id=sample_id,
-        media_sha256=_SHA,
-        duration_ms=10_000,
-        language=language,
-        reference_text=text,
-        ocr_frames=(
-            ReferenceOcrFrame(
-                frame_id=f"frame_{sample_id}",
-                timestamp_ms=8_000,
-                text_lines=("\uff21",),
-            ),
-        ),
-        scene_boundaries_ms=(3_000,),
-        semantic_boundaries_ms=(5_000,),
-        supported_facts=(SupportedFact(fact_id=f"fact_{sample_id}", canonical_text="事实"),),
-        key_fact_ids=(f"fact_{sample_id}",),
+        run_id=result.run_id,
+        job_id="job_001",
+        terminal_status="SUCCEEDED",
+        current_stage="RESULT",
+        models=(ModelIdentity(component="asr", provider="test", model_id="model"),),
     )
-    return VerifiedAnnotation(annotation=annotation, sha256=_hash(f"annotation-{sample_id}"))
+    result_bytes = result.model_dump_json(exclude_computed_fields=True).encode("utf-8")
+    evidence_bytes = speech.model_dump_json(exclude_computed_fields=True).encode("utf-8") + b"\n"
+    run_bytes = snapshot.model_dump_json(exclude_none=True).encode("utf-8")
+    manifest_bytes = canonical_artifact_envelope_bytes(
+        artifact.model_dump(mode="json", exclude_computed_fields=True),
+        RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION,
+        sample.media_sha256,
+    )
+    files = {
+        "run.json": run_bytes,
+        "result.json": result_bytes,
+        "evidence.jsonl": evidence_bytes,
+        "document.md": document.content,
+        "artifact-manifest.json": manifest_bytes,
+    }
+    for name, content in files.items():
+        (directory / name).write_bytes(content)
+    prefix = f"predictions/eval_001/{sample.sample_id}"
+    index = EvaluationPrediction(
+        schema_version="1.2.0",
+        evaluation_run_id="eval_001",
+        sample_id=sample.sample_id,
+        media_sha256=sample.media_sha256,
+        run_id=result.run_id,
+        job_id="job_001",
+        terminal_status="SUCCEEDED",
+        run_relative_path=f"{prefix}/run.json",
+        run_sha256=_hash(run_bytes),
+        result_relative_path=f"{prefix}/result.json",
+        result_sha256=_hash(result_bytes),
+        evidence_relative_path=f"{prefix}/evidence.jsonl",
+        evidence_sha256=_hash(evidence_bytes),
+        document_relative_path=f"{prefix}/document.md",
+        document_sha256=document.sha256,
+        document_size_bytes=document.size_bytes,
+        artifact_manifest_relative_path=f"{prefix}/artifact-manifest.json",
+        artifact_manifest_sha256=_hash(manifest_bytes),
+        transcript_source="ASR",
+        started_at=_NOW,
+        finished_at=_NOW,
+    )
+    index_path = directory / "index.json"
+    index_path.write_bytes(index.model_dump_json(exclude_none=True).encode("utf-8"))
+    return index_path
 
 
-def _fixture(tmp_path: Path) -> tuple[ValidatedEvaluationPackage, tuple[VerifiedPrediction, ...]]:
-    specs = (
-        ("sample_zh_1", "zh", "甲乙", ("甲", "丙")),
-        ("sample_zh_2", "zh", "甲乙丙丁戊己庚辛", tuple("甲乙丙丁戊己庚辛")),
-        ("sample_ja", "ja", "かな", tuple("かな")),
-        ("sample_ko", "ko", "가나", tuple("가나")),
-        ("sample_en", "en", "one two three", ("one", "three")),
-        ("sample_es", "es", "uno dos", ("uno", "dos")),
-        ("sample_failed", "en", "lost", ()),
-    )
-    annotations = tuple(
-        _annotation(sample_id, language, text)
-        for sample_id, language, text, _ in specs
-    )
-    samples = tuple(
-        EvaluationSample(
-            sample_id=sample_id,
-            language=language,
-            authorization_id="auth_001",
-            media_relative_path=f"media/{sample_id}.mp4",
-            media_sha256=_SHA,
-            annotations_relative_path=f"annotations/{sample_id}.json",
-            annotations_sha256=annotation.sha256,
-        )
-        for (sample_id, language, _text, _predicted), annotation in zip(
-            specs, annotations, strict=True
-        )
-    )
-    package = ValidatedEvaluationPackage(
-        dataset=EvaluationDataset(
-            samples=samples,
-            eval_root=Path("."),
-            runtime_root=Path("."),
-            workspace_root=Path("."),
-        ),
-        authorization=AuthorizationFile(
-            schema_version="1.0.0",
-            records=(
-                AuthorizationRecord(
-                    schema_version="1.0.0",
-                    authorization_id="auth_001",
-                    source_category="OWNED",
-                    allowed_purposes=("VIDEO_QUALITY_EVALUATION",),
-                    confirmed_at=_NOW,
-                    media_sha256=(_SHA,),
-                ),
-            ),
-        ),
-        annotations=annotations,
-        dataset_sha256=_hash("dataset"),
-        authorization_sha256=_hash("authorization"),
-    )
-    predictions = tuple(
-        _failed_prediction(sample_id)
-        if sample_id == "sample_failed"
-        else _successful_prediction(sample_id, language, predicted)
-        for sample_id, language, _text, predicted in specs
-    )
-    return _materialize_fixture(tmp_path, package, predictions)
-
-
-def _materialize_fixture(
+def _materialized_fixture(
     tmp_path: Path,
-    package: ValidatedEvaluationPackage,
-    predictions: tuple[VerifiedPrediction, ...],
 ) -> tuple[ValidatedEvaluationPackage, tuple[VerifiedPrediction, ...]]:
     runtime_root = tmp_path / ".codex" / "video-rag-demo"
     eval_root = runtime_root / "eval"
+    media_path = eval_root / "media/sample.mp4"
+    media_path.parent.mkdir(parents=True, exist_ok=True)
+    media_path.write_bytes(_MEDIA_BYTES)
+    annotation = EvaluationAnnotation(
+        schema_version="1.0.0",
+        sample_id="sample_001",
+        media_sha256=_hash(_MEDIA_BYTES),
+        duration_ms=500,
+        language="zh",
+        reference_text="你好",
+        ocr_frames=(
+            ReferenceOcrFrame(
+                frame_id="frame_001",
+                timestamp_ms=100,
+                text_lines=("你好",),
+            ),
+        ),
+        scene_boundaries_ms=(250,),
+        semantic_boundaries_ms=(250,),
+        supported_facts=(SupportedFact(fact_id="fact_001", canonical_text="你好"),),
+        key_fact_ids=("fact_001",),
+    )
+    annotation_path = eval_root / "annotations/sample.json"
+    annotation_path.parent.mkdir(parents=True, exist_ok=True)
+    annotation_bytes = annotation.model_dump_json(exclude_computed_fields=True).encode("utf-8")
+    annotation_path.write_bytes(annotation_bytes)
+    sample = EvaluationSample(
+        sample_id="sample_001",
+        language="zh",
+        authorization_id="auth_001",
+        media_relative_path="media/sample.mp4",
+        media_sha256=_hash(_MEDIA_BYTES),
+        annotations_relative_path="annotations/sample.json",
+        annotations_sha256=_hash(annotation_bytes),
+    )
     dataset_path = eval_root / "dataset.jsonl"
+    dataset_path.write_text(sample.model_dump_json() + "\n", encoding="utf-8")
+    authorization = AuthorizationFile(
+        schema_version="1.0.0",
+        records=(
+            AuthorizationRecord(
+                schema_version="1.0.0",
+                authorization_id="auth_001",
+                source_category="OWNED",
+                allowed_purposes=("VIDEO_QUALITY_EVALUATION",),
+                confirmed_at=_NOW,
+                media_sha256=(sample.media_sha256,),
+            ),
+        ),
+    )
     authorization_path = eval_root / "authorization.json"
-    annotation_by_id = {item.annotation.sample_id: item.annotation for item in package.annotations}
-    dataset_lines = []
-    for sample in package.dataset.samples:
-        media_path = eval_root / sample.media_relative_path
-        media_path.parent.mkdir(parents=True, exist_ok=True)
-        media_path.write_bytes(_MEDIA_BYTES)
-        annotation_path = eval_root / sample.annotations_relative_path
-        annotation_path.parent.mkdir(parents=True, exist_ok=True)
-        annotation_path.write_text(
-            annotation_by_id[sample.sample_id].model_dump_json(exclude_computed_fields=True),
-            encoding="utf-8",
-        )
-        dataset_lines.append(
-            sample.model_copy(
-                update={
-                    "annotations_sha256": hashlib.sha256(
-                        annotation_path.read_bytes()
-                    ).hexdigest()
-                }
-            ).model_dump_json()
-        )
-    dataset_path.write_text("\n".join(dataset_lines), encoding="utf-8")
-    authorization_path.write_text(package.authorization.model_dump_json(), encoding="utf-8")
-    loaded_package = load_evaluation_package(
+    authorization_path.write_text(authorization.model_dump_json(), encoding="utf-8")
+    index = _write_prediction(eval_root, sample)
+    package = load_evaluation_package(
         dataset_path,
         authorization_path,
         workspace_root=tmp_path,
         runtime_root=runtime_root,
     )
-    samples = {sample.sample_id: sample for sample in loaded_package.dataset.samples}
-    loaded_predictions = []
-    for prediction in predictions:
-        sample_id = prediction.index.sample_id
-        prediction_dir = eval_root / "predictions" / "eval_001" / sample_id
-        prediction_dir.mkdir(parents=True, exist_ok=True)
-        run_path = prediction_dir / "run.json"
-        run_path.write_text(
-            prediction.run.model_dump_json(exclude_computed_fields=True), encoding="utf-8"
+    prediction = load_verified_prediction(
+        index,
+        eval_root=eval_root,
+        workspace_root=tmp_path,
+        runtime_root=runtime_root,
+        sample=sample,
+    )
+    return package, (prediction,)
+
+
+def test_quality_uses_chapter_boundaries_and_marks_retired_visual_metrics_not_run(
+    tmp_path: Path,
+) -> None:
+    package, predictions = _materialized_fixture(tmp_path)
+
+    artifacts = score_quality(package, predictions, (), evaluation_run_id="eval_001")
+
+    metrics = {item.name: item for item in artifacts.report.metrics}
+    assert metrics["ocr_accuracy"].value is None
+    assert metrics["ocr_accuracy"].not_run_reason == "3.0 生产链不再执行 OCR 指标"
+    assert metrics["scene_f1"].value is None
+    assert metrics["scene_f1"].not_run_reason == "3.0 生产结果不再公开场景边界证据"
+    assert metrics["semantic_boundary_f1"].value == 1.0
+    assert metrics["schema_time_valid_rate"].value == 1.0
+    assert artifacts.sample_details[0].metric_inputs["semantic_boundary_f1"] == 1.0
+
+
+def test_quality_report_is_bound_to_prediction_index_and_has_no_runtime_metrics(
+    tmp_path: Path,
+) -> None:
+    package, predictions = _materialized_fixture(tmp_path)
+
+    artifacts = score_quality(package, predictions, (), evaluation_run_id="eval_001")
+
+    assert artifacts.report.evaluation_run_id == "eval_001"
+    assert artifacts.report.prediction_index_sha256 == _hash(
+        json.dumps(
+            [predictions[0].index_sha256],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
-        updates: dict[str, object] = {
-            "run_relative_path": run_path.relative_to(eval_root).as_posix(),
-            "run_sha256": hashlib.sha256(run_path.read_bytes()).hexdigest(),
-        }
-        if prediction.result is not None:
-            result_path = prediction_dir / "result.json"
-            result_path.write_text(
-                prediction.result.model_dump_json(exclude_computed_fields=True),
-                encoding="utf-8",
-            )
-            evidence_path = prediction_dir / "evidence.jsonl"
-            evidence_path.write_text(
-                "\n".join(
-                    item.model_dump_json(exclude_computed_fields=True)
-                    for item in prediction.evidence
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            manifest_path = prediction_dir / "manifest.json"
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": "1.0.0",
-                        "upstream_sha256": _SHA,
-                        "payload": {
-                            "result": prediction.result.model_dump(
-                                mode="json", exclude_computed_fields=True
-                            ),
-                            "evidence": [
-                                item.model_dump(mode="json", exclude_computed_fields=True)
-                                for item in prediction.evidence
-                            ],
-                            "stage_metrics": {"RESULT": 1},
-                            "status": prediction.index.terminal_status,
-                            "warnings": list(prediction.run.warning_codes),
-                            "transcript_source": prediction.index.transcript_source,
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            updates.update(
-                result_relative_path=result_path.relative_to(eval_root).as_posix(),
-                result_sha256=hashlib.sha256(result_path.read_bytes()).hexdigest(),
-                evidence_relative_path=evidence_path.relative_to(eval_root).as_posix(),
-                evidence_sha256=hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
-                artifact_manifest_relative_path=manifest_path.relative_to(eval_root).as_posix(),
-                artifact_manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-            )
-        index_path = prediction_dir / "index.json"
-        index_path.write_text(
-            prediction.index.model_copy(update=updates).model_dump_json(), encoding="utf-8"
-        )
-        loaded_predictions.append(
-            load_verified_prediction(
-                index_path,
-                eval_root=eval_root,
-                workspace_root=tmp_path,
-                runtime_root=runtime_root,
-                sample=samples[sample_id],
-            )
-        )
-    return loaded_package, tuple(loaded_predictions)
-
-
-def _judgments(
-    package: ValidatedEvaluationPackage,
-    predictions: tuple[VerifiedPrediction, ...],
-) -> tuple[SemanticJudgment, ...]:
-    annotations = {item.annotation.sample_id: item for item in package.annotations}
-    result = []
-    for prediction in predictions:
-        sample_id = prediction.index.sample_id
-        result.append(
-            SemanticJudgment(
-                schema_version="1.0.0",
-                sample_id=sample_id,
-                annotation_sha256=annotations[sample_id].sha256,
-                prediction_sha256=prediction.index_sha256,
-                claim_judgments=tuple(
-                    ClaimJudgment(
-                        claim_id=claim.claim_id,
-                        verdict="UNSUPPORTED" if index == 2 else "SUPPORTED",
-                    )
-                    for index, claim in enumerate(prediction.claims)
-                ),
-                matched_key_fact_ids=(
-                    () if sample_id == "sample_failed" else (f"fact_{sample_id}",)
-                ),
-                fabricated_names=(("虚构姓名",) if sample_id == "sample_es" else ()),
-                reviewer_id="reviewer_001",
-                reviewed_at=_NOW,
-                rubric_version="v1",
-            )
-        )
-    return tuple(result)
-
-
-def _score(
-    package: ValidatedEvaluationPackage,
-    predictions: tuple[VerifiedPrediction, ...],
-    judgments: tuple[SemanticJudgment, ...] = (),
-):
-    from video_demo.evaluation.quality_runner import score_quality
-
-    return score_quality(package, predictions, judgments, evaluation_run_id="eval_001")
-
-
-def _hint_effect_fixture(
-    tmp_path: Path,
-    *,
-    exclusion: str | None = None,
-) -> tuple[ValidatedEvaluationPackage, tuple[VerifiedPrediction, ...]]:
-    pair_specs = (
-        (
-            "pair_b_zh",
-            "zh",
-            "向量 数据库",
-            ("向量 数据库",),
-            ("向量", "数据湖"),
-            ("向量", "数据库"),
-        ),
-        (
-            "pair_a_en",
-            "en",
-            "Milvus DB course",
-            ("Milvus   DB",),
-            ("milvus", "da", "course"),
-            ("MILVUS", "db", "course"),
-        ),
     )
-    samples: list[EvaluationSample] = []
-    annotations: list[VerifiedAnnotation] = []
-    predictions: list[VerifiedPrediction] = []
-    for pair_index, (
-        pair_id,
-        language,
-        reference_text,
-        original_terms,
-        none_words,
-        correct_words,
-    ) in enumerate(pair_specs):
-        terms = () if exclusion == "TERMS_EMPTY" and pair_index == 0 else original_terms
-        source_annotation = _annotation(
-            f"{pair_id}_none", language, reference_text
-        ).annotation
-        base = source_annotation.model_copy(update={"terms": terms})
-        # model_copy 不执行字段校验，因此显式从 JSON 重新解析，冻结术语规范化契约。
-        base = EvaluationAnnotation.model_validate_json(
-            base.model_dump_json(exclude_computed_fields=True)
-        )
-        reference_sha = pair_reference_sha256(base)
-        for variant, predicted_words in (("NONE", none_words), ("CORRECT", correct_words)):
-            sample_id = f"{pair_id}_{variant.lower()}"
-            annotation = base.model_copy(update={"sample_id": sample_id})
-            verified = VerifiedAnnotation(
-                annotation=annotation,
-                sha256=_hash(f"annotation-{sample_id}"),
-            )
-            annotations.append(verified)
-            samples.append(
-                EvaluationSample(
-                    sample_id=sample_id,
-                    language=language,
-                    authorization_id="auth_001",
-                    media_relative_path=f"media/{sample_id}.mp4",
-                    media_sha256=_SHA,
-                    annotations_relative_path=f"annotations/{sample_id}.json",
-                    annotations_sha256=verified.sha256,
-                    hotwords=(
-                        original_terms
-                        if variant == "CORRECT" and original_terms
-                        else ()
-                    ),
-                    pair_id=pair_id,
-                    hint_variant=variant,
-                    pair_reference_sha256=reference_sha,
-                )
-            )
-            prediction = _successful_prediction(sample_id, language, predicted_words)
-            if pair_index == 0 and variant == "CORRECT":
-                if exclusion == "PREDICTION_NOT_SUCCESSFUL":
-                    prediction = _failed_prediction(sample_id)
-                elif exclusion == "TRANSCRIPT_SOURCE_NOT_ASR":
-                    prediction = _subtitle_prediction(
-                        sample_id,
-                        language,
-                        ((0, 900, f"subtitle_{sample_id}", " ".join(predicted_words)),),
-                    )
-            predictions.append(prediction)
-    package = ValidatedEvaluationPackage(
-        dataset=EvaluationDataset(
-            samples=tuple(samples),
-            eval_root=Path("."),
-            runtime_root=Path("."),
-            workspace_root=Path("."),
-        ),
-        authorization=AuthorizationFile(
-            schema_version="1.0.0",
-            records=(
-                AuthorizationRecord(
-                    schema_version="1.0.0",
-                    authorization_id="auth_001",
-                    source_category="OWNED",
-                    allowed_purposes=("VIDEO_QUALITY_EVALUATION",),
-                    confirmed_at=_NOW,
-                    media_sha256=(_SHA,),
-                ),
-            ),
-        ),
-        annotations=tuple(annotations),
-        dataset_sha256=_hash("hint-dataset"),
-        authorization_sha256=_hash("hint-authorization"),
-    )
-    return _materialize_fixture(tmp_path, package, tuple(predictions))
-
-
-def test_score_quality_micro_averages_languages_and_counts_failed_schema_denominator(
-    tmp_path: Path,
-) -> None:
-    package, predictions = _fixture(tmp_path)
-
-    artifacts = _score(package, predictions)
-    metrics = {metric.name: metric for metric in artifacts.report.metrics}
-
-    assert metrics["zh_cer"].value == 0.1
-    assert metrics["ja_cer"].value == 0.0
-    assert metrics["ko_cer"].value == 0.0
-    assert metrics["en_wer"].value == 0.5  # (1 删除 + 失败样本 1 删除) / 4 词
-    assert metrics["es_wer"].value == 0.0
-    assert metrics["schema_time_valid_rate"].value == 6 / 7
-    assert [detail.sample_id for detail in artifacts.sample_details] == [
-        sample.sample_id for sample in package.dataset.samples
-    ]
-
-
-def test_score_quality_uses_nfkc_and_fixed_boundary_tolerances(
-    tmp_path: Path,
-) -> None:
-    package, predictions = _fixture(tmp_path)
-
-    artifacts = _score(package, predictions)
-    metrics = {metric.name: metric for metric in artifacts.report.metrics}
-    assert metrics["ocr_accuracy"].value == pytest.approx(6 / 7)
-    assert metrics["scene_f1"].value == pytest.approx(12 / 13)
-    assert metrics["semantic_boundary_f1"].value == pytest.approx(12 / 13)
-
-
-def test_subtitle_sample_uses_sorted_cues() -> None:
-    from video_demo.evaluation import quality_runner
-
-    annotation = _annotation("sample_subtitle", "en", "vector database")
-    prediction = _subtitle_prediction(
-        "sample_subtitle",
-        "en",
-        (
-            (500, 900, "subtitle_002", "database"),
-            (0, 400, "subtitle_001", "vector"),
-        ),
-    )
-    accumulators = quality_runner._Accumulators()
-
-    detail = quality_runner._score_sample(annotation, prediction, accumulators)
-    observations = accumulators.observations()
-
-    assert observations["en_wer"].value == 0
-    assert detail.transcript_source == "SUBTITLE"
-    assert "en_wer" in observations
-
-
-def test_hint_effect_report_uses_bound_pairs_and_normalized_exact_terms(
-    tmp_path: Path,
-) -> None:
-    from video_demo.evaluation.thresholds import QUALITY_THRESHOLDS
-
-    package, predictions = _hint_effect_fixture(tmp_path)
-
-    artifacts = _score(package, predictions)
-    report = artifacts.hint_effect_report
-
-    assert report.status == "RUN"
-    assert report.candidate_pair_count == 2
-    assert report.eligible_pair_count == 2
-    assert report.excluded_pair_counts == {}
-    assert [pair.pair_id for pair in report.pairs] == ["pair_a_en", "pair_b_zh"]
-    english, chinese = report.pairs
-    assert english.metric_name == "WER"
-    assert english.none_term_recall == 0
-    assert english.correct_term_recall == 1
-    assert english.term_recall_delta == 1
-    assert english.none_text_error_rate == pytest.approx(1 / 3)
-    assert english.correct_text_error_rate == 0
-    assert english.text_error_rate_delta == pytest.approx(-1 / 3)
-    assert chinese.metric_name == "CER"
-    assert chinese.none_term_recall == 0
-    assert chinese.correct_term_recall == 1
-    assert chinese.none_text_error_rate == pytest.approx(1 / 5)
-    assert chinese.correct_text_error_rate == 0
-    assert not any(name.startswith("hint_") for name in QUALITY_THRESHOLDS)
-    assert not any(
-        metric.name.startswith("hint_") for metric in artifacts.report.metrics
-    )
-
-
-def test_hint_effect_report_not_run_without_candidate_pairs(tmp_path: Path) -> None:
-    package, predictions = _fixture(tmp_path)
-
-    report = _score(package, predictions).hint_effect_report
-
-    assert report.status == "NOT_RUN"
-    assert report.candidate_pair_count == 0
-    assert report.eligible_pair_count == 0
-    assert report.excluded_pair_counts == {}
-    assert report.pairs == ()
-    assert report.not_run_reason == "数据集没有 NONE/CORRECT 提示效果配对"
-
-
-@pytest.mark.parametrize(
-    "exclusion",
-    [
-        "PREDICTION_NOT_SUCCESSFUL",
-        "TERMS_EMPTY",
-        "TRANSCRIPT_SOURCE_NOT_ASR",
-    ],
-)
-def test_hint_effect_report_counts_stable_pair_exclusions(
-    exclusion: str,
-    tmp_path: Path,
-) -> None:
-    package, predictions = _hint_effect_fixture(tmp_path, exclusion=exclusion)
-
-    report = _score(package, predictions).hint_effect_report
-
-    assert report.status == "RUN"
-    assert report.candidate_pair_count == 2
-    assert report.eligible_pair_count == 1
-    assert report.excluded_pair_counts == {exclusion: 1}
-    assert len(report.pairs) == 1
-
-
-@pytest.mark.parametrize(
-    ("prediction", "expected_source"),
-    [
-        (_failed_prediction("sample_failed_scope"), None),
-        (_none_prediction("sample_none_scope", "en"), "NONE"),
-    ],
-)
-def test_failed_and_none_samples_keep_existing_metric_denominators(
-    prediction: VerifiedPrediction,
-    expected_source: str | None,
-) -> None:
-    from video_demo.evaluation import quality_runner
-
-    annotation = _annotation(prediction.index.sample_id, "en", "lost term")
-    accumulators = quality_runner._Accumulators()
-
-    detail = quality_runner._score_sample(annotation, prediction, accumulators)
-
-    assert detail.transcript_source == expected_source
-    assert accumulators.text_counts["en_wer"].reference_units == 2
-
-
-def test_semantic_metrics_only_come_from_bound_complete_reviews(tmp_path: Path) -> None:
-    package, predictions = _fixture(tmp_path)
-    judgments = _judgments(package, predictions)
-
-    no_review = _score(package, predictions)
-    partial = _score(package, predictions, judgments[:-1])
-    complete = _score(package, predictions, judgments)
-    no_review_metrics = {metric.name: metric for metric in no_review.report.metrics}
-    complete_metrics = {metric.name: metric for metric in complete.report.metrics}
-
-    assert no_review_metrics["fact_support_rate"].status == GateStatus.NOT_RUN
-    assert no_review.report.status != GateStatus.PASS
-    assert partial.report.status == GateStatus.FAIL
-    assert partial.report.failure_code == "SEMANTIC_REVIEW_INCOMPLETE"
-    assert complete_metrics["fact_support_rate"].value == 12 / 18
-    assert complete_metrics["key_fact_recall"].value == 6 / 7
-    assert complete_metrics["fabricated_name_count"].value == 1
-
-
-@pytest.mark.parametrize("mutation", ["duplicate", "missing", "foreign", "cross_run"])
-def test_predictions_must_exactly_cover_dataset_and_run(
-    mutation: str, tmp_path: Path
-) -> None:
-    package, predictions = _fixture(tmp_path)
-    if mutation == "duplicate":
-        invalid = (*predictions[:-1], predictions[0])
-    elif mutation == "missing":
-        invalid = predictions[:-1]
-    elif mutation == "foreign":
-        invalid = (*predictions[:-1], _failed_prediction("sample_foreign"))
-    else:
-        invalid = (*predictions[:-1], _failed_prediction("sample_failed", run_id="eval_other"))
-
-    with pytest.raises(ValueError):
-        _score(package, tuple(invalid))
-
-
-@pytest.mark.parametrize("mutation", ["duplicate", "foreign", "annotation", "prediction"])
-def test_present_judgments_must_be_unique_and_bound(
-    mutation: str, tmp_path: Path
-) -> None:
-    package, predictions = _fixture(tmp_path)
-    judgments = list(_judgments(package, predictions))
-    if mutation == "duplicate":
-        judgments[-1] = judgments[0]
-    elif mutation == "foreign":
-        judgments[-1] = judgments[-1].model_copy(update={"sample_id": "sample_foreign"})
-    elif mutation == "annotation":
-        judgments[-1] = judgments[-1].model_copy(update={"annotation_sha256": "f" * 64})
-    else:
-        judgments[-1] = judgments[-1].model_copy(update={"prediction_sha256": "f" * 64})
-
-    with pytest.raises(ValueError):
-        _score(package, predictions, tuple(judgments))
-
-
-def test_unknown_evidence_and_schema_validity_are_recomputed_from_verified_prediction(
-    tmp_path: Path,
-) -> None:
-    package, predictions = _fixture(tmp_path)
-    first = predictions[0]
-    assert first.result is not None
-    bad_segment = first.result.segments[0].model_copy(
-        update={"evidence_refs": ("missing_001",)}
-    )
-    bad_result = first.result.model_copy(
-        update={"segments": (bad_segment, *first.result.segments[1:])}
-    )
-    bad_prediction = first.model_copy(update={"result": bad_result})
-
-    with pytest.raises(Exception, match="来源"):
-        _score(package, (bad_prediction, *predictions[1:]))
-
-
-def test_bound_report_digests_use_one_canonical_json_rule_and_bind_details(
-    tmp_path: Path,
-) -> None:
-    package, predictions = _fixture(tmp_path)
-    judgments = _judgments(package, predictions)
-
-    artifacts = _score(package, predictions, judgments)
-
-    def digest(value: object) -> str:
-        encoded = json.dumps(
-            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
-
-    assert artifacts.report.prediction_index_sha256 == digest(
-        [prediction.index_sha256 for prediction in predictions]
-    )
-    assert artifacts.report.judgment_index_sha256 == digest(
-        [judgment.model_dump(mode="json") for judgment in judgments]
-    )
-    assert artifacts.report.sample_details_sha256 == digest(
-        [detail.model_dump(mode="json") for detail in artifacts.sample_details]
-    )
-    tampered = list(detail.model_dump(mode="json") for detail in artifacts.sample_details)
-    tampered[0]["metric_inputs"]["ocr_errors"] = 999
-    assert digest(tampered) != artifacts.report.sample_details_sha256
-    assert digest(["f" * 64, *(item.index_sha256 for item in predictions[1:])]) != (
-        artifacts.report.prediction_index_sha256
-    )
-    tampered_judgments = [judgment.model_dump(mode="json") for judgment in judgments]
-    tampered_judgments[0]["rubric_version"] = "tampered"
-    assert digest(tampered_judgments) != artifacts.report.judgment_index_sha256
-
-
-def test_score_quality_rejects_predictions_and_package_without_loader_sources(
-    tmp_path: Path,
-) -> None:
-    package, predictions = _fixture(tmp_path)
-    package = package.model_copy(
-        update={"dataset_path": None, "authorization_path": None}
-    )
-
-    with pytest.raises(Exception, match="来源"):
-        _score(package, predictions)
-
-
-@pytest.mark.parametrize("field", ["index_path", "workspace_root", "runtime_root"])
-def test_score_quality_rejects_prediction_missing_real_source_without_path_leak(
-    field: str, tmp_path: Path
-) -> None:
-    package, predictions = _fixture(tmp_path)
-    altered = predictions[0].model_copy(update={field: None})
-
-    with pytest.raises(VideoDemoError) as raised:
-        _score(package, (altered, *predictions[1:]))
-
-    assert raised.value.__cause__ is None
-    assert "来源" in raised.value.message
-    assert str(tmp_path) not in raised.value.message
-
-
-def test_loader_source_paths_are_excluded_from_all_serialization(tmp_path: Path) -> None:
-    package, predictions = _fixture(tmp_path)
-    source_fields = {
-        "source_path",
-        "dataset_path",
-        "authorization_path",
-        "workspace_root",
-        "runtime_root",
-        "max_video_bytes",
-        "index_path",
-        "eval_root",
-    }
-    models = (package.dataset, package, predictions[0])
-
-    for model in models:
-        dumped = model.model_dump(mode="json")
-        encoded = model.model_dump_json()
-        assert source_fields.isdisjoint(dumped)
-        assert all(f'"{field}"' not in encoded for field in source_fields)
+    metrics = {item.name: item for item in artifacts.report.metrics}
+    assert metrics["rtf"].value is None
+    assert artifacts.hint_effect_report.status == "NOT_RUN"

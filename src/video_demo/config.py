@@ -112,6 +112,53 @@ class VlmConfiguration(FrozenModel):
     concurrency: int
 
 
+class ApiRuntimeConfig(FrozenModel):
+    """API 进程唯一可持有的非敏感运行配置。"""
+
+    workspace_root: Path
+    runtime_root: Path
+    max_video_bytes: int = Field(ge=1)
+    max_result_bundle_bytes: int = Field(ge=1, le=64 * 1024 * 1024)
+    max_document_bytes: int = Field(ge=1, le=16 * 1024 * 1024)
+    max_result_evidence_items: int = Field(ge=1, le=25_000)
+    vlm_max_image_bytes: int = Field(ge=1, le=5 * 1024 * 1024)
+
+
+class ApiRuntimeSettings(BaseSettings):
+    """只从环境变量读取 API 所需非敏感字段，固定不读取 dotenv。"""
+
+    model_config = SettingsConfigDict(
+        env_prefix="VIDEO_DEMO_",
+        env_file=None,
+        extra="ignore",
+        validate_default=True,
+    )
+
+    workspace_root: Path = Field(default_factory=Path.cwd)
+    runtime_root: Path | None = None
+    max_video_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
+    max_result_bundle_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+    max_document_bytes: int = Field(default=16 * 1024 * 1024, ge=1)
+    max_result_evidence_items: int = Field(default=25_000, ge=1)
+    vlm_max_image_bytes: int = Field(default=5 * 1024 * 1024, ge=1)
+
+    def to_runtime_config(self) -> ApiRuntimeConfig:
+        workspace = self.workspace_root.expanduser().resolve(strict=False)
+        runtime = resolve_workspace_path(
+            workspace,
+            self.runtime_root or Path(".codex/video-rag-demo"),
+        )
+        return ApiRuntimeConfig(
+            workspace_root=workspace,
+            runtime_root=runtime,
+            max_video_bytes=self.max_video_bytes,
+            max_result_bundle_bytes=self.max_result_bundle_bytes,
+            max_document_bytes=self.max_document_bytes,
+            max_result_evidence_items=self.max_result_evidence_items,
+            vlm_max_image_bytes=self.vlm_max_image_bytes,
+        )
+
+
 class Settings(BaseSettings):
     """只从显式参数或 `VIDEO_DEMO_` 环境变量加载的运行配置。"""
 
@@ -297,12 +344,23 @@ class Settings(BaseSettings):
             > self.vlm_max_inflight_encoded_bytes
         ):
             raise ValueError("视觉模型在途字节预算不足以覆盖最大并发请求")
-        self._validate_document_model_configuration_presence()
-        self._validate_oss_configuration()
+        _validate_first_release_budgets(self)
         return self
 
     def has_complete_oss_configuration(self) -> bool:
         return all(self._oss_configuration_presence())
+
+    def to_api_runtime_config(self) -> ApiRuntimeConfig:
+        assert self.runtime_root is not None
+        return ApiRuntimeConfig(
+            workspace_root=self.workspace_root,
+            runtime_root=self.runtime_root,
+            max_video_bytes=self.max_video_bytes,
+            max_result_bundle_bytes=self.max_result_bundle_bytes,
+            max_document_bytes=self.max_document_bytes,
+            max_result_evidence_items=self.max_result_evidence_items,
+            vlm_max_image_bytes=self.vlm_max_image_bytes,
+        )
 
     def require_text_llm_configuration(self) -> TextLlmConfiguration:
         """返回完整文本 LLM 配置；配置缺失时不在错误中回显密钥或端点。"""
@@ -384,6 +442,8 @@ class Settings(BaseSettings):
         )
 
     def _validate_oss_configuration(self) -> None:
+        """只供 Task 11 前的 legacy 诊断构造器显式调用。"""
+
         presence = self._oss_configuration_presence()
         if any(presence) and not all(presence):
             raise ValueError("OSS 配置必须全部提供或全部留空")
@@ -436,6 +496,40 @@ class Settings(BaseSettings):
                 and self.oss_access_key_secret.get_secret_value().strip()
             ),
         )
+
+
+def _validate_first_release_budgets(settings: Settings) -> None:
+    """保证 Settings 不会放宽领域层和受限读取器的首版硬上限。"""
+
+    limits = (
+        (settings.vlm_max_image_bytes, 5 * 1024 * 1024, "单图"),
+        (
+            settings.max_candidate_frame_files_per_run,
+            20_000,
+            "候选文件数",
+        ),
+        (
+            settings.max_candidate_frame_bytes_per_run,
+            512 * 1024 * 1024,
+            "候选字节",
+        ),
+        (
+            settings.max_published_keyframe_files_per_run,
+            20_000,
+            "正式关键帧文件数",
+        ),
+        (
+            settings.max_published_keyframe_bytes_per_run,
+            256 * 1024 * 1024,
+            "正式关键帧字节",
+        ),
+        (settings.max_result_evidence_items, 25_000, "结果证据"),
+        (settings.max_result_bundle_bytes, 64 * 1024 * 1024, "结果 bundle"),
+        (settings.max_document_bytes, 16 * 1024 * 1024, "Markdown"),
+    )
+    for actual, hard_limit, name in limits:
+        if actual > hard_limit:
+            raise ValueError(f"{name}预算不得超过首版硬上限")
 
 
 def _normalize_cloud_asr_base_url(value: str | None) -> str:

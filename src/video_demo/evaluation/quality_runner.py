@@ -11,9 +11,7 @@ from pydantic import Field, TypeAdapter, field_validator, model_validator
 
 from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.domain.evidence import (
-    EvidenceItem,
-    OcrEvidence,
-    SceneBoundary,
+    DocumentEvidenceItem,
     SpeechSegment,
     SubtitleCue,
 )
@@ -34,7 +32,6 @@ from video_demo.evaluation.metrics import (
     boundary_match_counts,
     character_edit_counts,
     match_counts_f1,
-    nfkc_character_edit_counts,
     word_edit_counts,
 )
 from video_demo.evaluation.predictions import VerifiedPrediction, reverify_verified_prediction
@@ -45,7 +42,6 @@ from video_demo.evaluation.report import (
 )
 from video_demo.evaluation.thresholds import (
     QUALITY_THRESHOLDS,
-    SCENE_BOUNDARY_TOLERANCE_MS,
     SEMANTIC_BOUNDARY_TOLERANCE_MS,
 )
 
@@ -57,7 +53,7 @@ _LANGUAGE_METRICS: Mapping[ValidationLanguage, str] = {
     "en": "en_wer",
     "es": "es_wer",
 }
-_EVIDENCE_ADAPTER = TypeAdapter(tuple[EvidenceItem, ...])
+_EVIDENCE_ADAPTER = TypeAdapter(tuple[DocumentEvidenceItem, ...])
 class SampleQualityDetail(FrozenModel):
     sample_id: StableId
     language: ValidationLanguage
@@ -246,9 +242,6 @@ class _Accumulators:
         self.text_counts: dict[str, EditCounts] = {
             name: EditCounts(0, 0) for name in _LANGUAGE_METRICS.values()
         }
-        self.ocr_errors = 0
-        self.ocr_units = 0
-        self.scene_counts = MatchCounts(0, 0, 0)
         self.semantic_boundary_counts = MatchCounts(0, 0, 0)
         self.unknown_evidence_count = 0
         self.valid_results = 0
@@ -258,11 +251,13 @@ class _Accumulators:
         observations: dict[str, MetricObservation] = {}
         for name, counts in self.text_counts.items():
             observations[name] = _count_observation(counts)
-        observations["ocr_accuracy"] = _accuracy_observation(
-            self.ocr_errors, self.ocr_units, "没有 OCR 参考字符"
+        observations["ocr_accuracy"] = MetricObservation(
+            value=None,
+            not_run_reason="3.0 生产链不再执行 OCR 指标",
         )
         observations["scene_f1"] = MetricObservation(
-            value=match_counts_f1(self.scene_counts)
+            value=None,
+            not_run_reason="3.0 生产结果不再公开场景边界证据",
         )
         observations["semantic_boundary_f1"] = MetricObservation(
             value=match_counts_f1(self.semantic_boundary_counts)
@@ -299,48 +294,18 @@ def _score_sample(
         previous.errors + counts.errors,
         previous.reference_units + counts.reference_units,
     )
-    reference_ocr = "".join(
-        line
-        for frame in sorted(annotation.ocr_frames, key=lambda item: item.timestamp_ms)
-        for line in frame.text_lines
-    )
-    predicted_ocr = "".join(
-        line.text
-        for item in sorted(
-            (item for item in prediction.evidence if isinstance(item, OcrEvidence)),
-            key=lambda item: item.timestamp_ms,
-        )
-        for line in item.lines
-    )
-    ocr_counts = nfkc_character_edit_counts(predicted_ocr, reference_ocr)
-    accumulators.ocr_errors += ocr_counts.errors
-    accumulators.ocr_units += ocr_counts.reference_units
-
-    scene_counts = boundary_match_counts(
-        reference_ms=annotation.scene_boundaries_ms,
-        hypothesis_ms=tuple(
-            item.start_ms
-            for item in prediction.evidence
-            if isinstance(item, SceneBoundary) and item.start_ms > 0
-        ),
-        tolerance_ms=SCENE_BOUNDARY_TOLERANCE_MS,
-    )
     semantic_counts = boundary_match_counts(
         reference_ms=annotation.semantic_boundaries_ms,
         hypothesis_ms=tuple(
-            segment.start_ms
-            for segment in (() if prediction.result is None else prediction.result.segments)
-            if segment.start_ms > 0
+            chapter.start_ms
+            for chapter in (() if prediction.result is None else prediction.result.chapters)
+            if chapter.start_ms > 0
         ),
         tolerance_ms=SEMANTIC_BOUNDARY_TOLERANCE_MS,
-    )
-    accumulators.scene_counts = _sum_match_counts(
-        accumulators.scene_counts, scene_counts
     )
     accumulators.semantic_boundary_counts = _sum_match_counts(
         accumulators.semantic_boundary_counts, semantic_counts
     )
-    scene_score = match_counts_f1(scene_counts)
     semantic_score = match_counts_f1(semantic_counts)
 
     unknown_count, is_valid = _schema_time_check(annotation, prediction)
@@ -351,9 +316,6 @@ def _score_sample(
         "text_reference_units": counts.reference_units,
         "unknown_evidence_count": unknown_count,
         "schema_time_valid": float(is_valid),
-        "ocr_errors": ocr_counts.errors,
-        "ocr_reference_units": ocr_counts.reference_units,
-        "scene_f1": scene_score,
         "semantic_boundary_f1": semantic_score,
     }
     return SampleQualityDetail(
@@ -638,8 +600,8 @@ def _schema_time_check(
     evidence_id_set = set(evidence_ids)
     references = [
         reference
-        for segment in prediction.result.segments
-        for reference in segment.evidence_refs
+        for chapter in prediction.result.chapters
+        for reference in chapter.evidence_refs
     ]
     unknown_count = sum(reference not in evidence_id_set for reference in references)
     try:

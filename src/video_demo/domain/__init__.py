@@ -1,25 +1,23 @@
 """视频理解领域契约。"""
 
+from video_demo.domain.document import VideoUnderstandingResult
 from video_demo.domain.evidence import (
+    DocumentEvidenceItem,
     KeyframeEvidence,
-    OcrEvidence,
-    SceneBoundary,
     SpeechSegment,
-    TimelineEvidence,
+    SubtitleCue,
+    VisualObservationEvidence,
 )
 from video_demo.domain.manifest import VideoAssetManifest
-from video_demo.domain.result import VideoSegment, VideoSummary, VideoUnderstandingResult
 from video_demo.domain.run import TimeRange
 
 __all__ = [
+    "DocumentEvidenceItem",
     "KeyframeEvidence",
-    "OcrEvidence",
-    "SceneBoundary",
     "SpeechSegment",
+    "SubtitleCue",
     "TimeRange",
-    "TimelineEvidence",
     "VideoAssetManifest",
-    "VideoSegment",
-    "VideoSummary",
     "VideoUnderstandingResult",
+    "VisualObservationEvidence",
 ]

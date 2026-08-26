@@ -19,6 +19,7 @@ from video_demo.application.production_media import (
 )
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
+from video_demo.domain.document import DocumentGenerationConfig
 from video_demo.domain.manifest import (
     AudioStream,
     Rational,
@@ -65,7 +66,12 @@ def test_production_registrar_materializes_scoped_input_and_carries_run_config(
     )
 
     registered = ProductionAssetRegistrar(database, store).register(
-        PipelineContext(run_id=run.run_id, scope=scope),
+        PipelineContext(
+            run_id=run.run_id,
+            scope=scope,
+            title_hint="lesson",
+            document_config=DocumentGenerationConfig(),
+        ),
     )
 
     expected_root = Path("runs") / store.scope_key(scope) / run.run_id

@@ -49,6 +49,41 @@ def test_bytes_artifact_round_trip_receipt_permissions_and_fsync(
     assert any(stat.S_ISDIR(mode) for mode in fsynced_modes)
 
 
+def test_open_runtime_directory_allows_entry_changes_after_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    original_open = os.open
+    changed = False
+
+    def change_directory_after_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal changed
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if Path(path) == runtime_root and not changed:
+            (runtime_root / "concurrent-directory").mkdir()
+            changed = True
+        return descriptor
+
+    monkeypatch.setattr(artifacts_module.os, "open", change_directory_after_open)
+
+    receipt = AtomicArtifactStore(runtime_root).write_bytes(
+        Path("runs/run_001/result.md"),
+        b"document",
+        max_bytes=100,
+    )
+
+    assert changed is True
+    assert (runtime_root / receipt.relative_path).read_bytes() == b"document"
+
+
 @pytest.mark.parametrize("max_bytes", (0, -1))
 def test_bytes_artifact_requires_positive_limits(tmp_path: Path, max_bytes: int) -> None:
     store = AtomicArtifactStore(tmp_path)

@@ -29,7 +29,7 @@ from video_demo.domain.evidence import (
     SpeechSegment,
     SubtitleCue,
 )
-from video_demo.domain.result import (
+from video_demo.domain.legacy_result import (
     SegmentUnderstanding,
     SummaryUnderstanding,
     normalize_keyword_fields,

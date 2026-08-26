@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from video_demo.application.composition import (
+from video_demo.application.legacy_composition import (
     ProductionDiagnosticComponents,
     ProductionModelIdentityReport,
     build_production_model_identity_report,
@@ -1671,7 +1671,7 @@ def test_default_production_qwen_execution_records_probe_and_segment_receipts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import video_demo.evaluation.live_runner as live_runner_module
-    from video_demo.domain.result import SegmentUnderstanding
+    from video_demo.domain.legacy_result import SegmentUnderstanding
     from video_demo.evaluation.live_runner import LiveValidationRunner
     from video_demo.integrations.qwen import QwenCapabilities, QwenProviderReceipt
 

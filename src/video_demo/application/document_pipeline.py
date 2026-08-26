@@ -14,10 +14,10 @@ from video_demo.application.chapter_vision import ChapterVisionBatch
 from video_demo.application.document_rendering import RenderedDocument, render_markdown
 from video_demo.application.document_writing import WrittenDocument
 from video_demo.application.pipeline_contracts import (
-    DocumentPipelineContext,
-    DocumentPipelineOutcome,
     DocumentWritingContext,
     EvidencePreparationLimits,
+    PipelineContext,
+    PipelineOutcome,
     PreparedMedia,
     ProbedAsset,
     RegisteredAsset,
@@ -52,7 +52,7 @@ StageResult = TypeVar("StageResult")
 
 
 class AssetRegistrar(Protocol):
-    def register(self, context: DocumentPipelineContext) -> RegisteredAsset: ...
+    def register(self, context: PipelineContext) -> RegisteredAsset: ...
 
 
 class AssetProbe(Protocol):
@@ -165,8 +165,8 @@ class _StageMetrics:
         return dict(self._values)
 
 
-class DocumentPipeline:
-    """从注册到确定性 Markdown 的私有 3.0 垂直编排。"""
+class VideoUnderstandingPipeline:
+    """从注册到确定性 Markdown 的唯一 3.0 生产编排。"""
 
     def __init__(
         self,
@@ -203,7 +203,43 @@ class DocumentPipeline:
         self._max_result_evidence_items = max_result_evidence_items
         self._clock = clock
 
-    def run(self, context: DocumentPipelineContext) -> DocumentPipelineOutcome:
+    @property
+    def registrar(self) -> AssetRegistrar:
+        return self._registrar
+
+    @property
+    def probe(self) -> AssetProbe:
+        return self._probe
+
+    @property
+    def transcoder(self) -> MediaTranscoder:
+        return self._transcoder
+
+    @property
+    def speech_analyzer(self) -> SpeechAnalyzer:
+        return self._speech_analyzer
+
+    @property
+    def scene_index_provider(self) -> SceneIndexProvider:
+        return self._scene_index_provider
+
+    @property
+    def chapter_planner(self) -> ChapterPlannerPort:
+        return self._chapter_planner
+
+    @property
+    def frame_searcher(self) -> ChapterFrameSearcherPort:
+        return self._frame_searcher
+
+    @property
+    def chapter_vision(self) -> ChapterVisionPort:
+        return self._chapter_vision
+
+    @property
+    def document_writer(self) -> DocumentWriterPort:
+        return self._document_writer
+
+    def run(self, context: PipelineContext) -> PipelineOutcome:
         stage_metrics = _StageMetrics()
         registered = self._run_stage(
             context,
@@ -305,7 +341,7 @@ class DocumentPipeline:
 
     def _run_chapter_planning(
         self,
-        context: DocumentPipelineContext,
+        context: PipelineContext,
         stage_metrics: _StageMetrics,
         model_cache: DocumentModelCache,
         registered: RegisteredAsset,
@@ -333,7 +369,7 @@ class DocumentPipeline:
 
     def _run_document_writing(
         self,
-        context: DocumentPipelineContext,
+        context: PipelineContext,
         stage_metrics: _StageMetrics,
         model_cache: DocumentModelCache,
         registered: RegisteredAsset,
@@ -367,7 +403,7 @@ class DocumentPipeline:
 
     def _run_evidence_preparation(
         self,
-        context: DocumentPipelineContext,
+        context: PipelineContext,
         registered: RegisteredAsset,
         prepared: PreparedMedia,
         stage_metrics: _StageMetrics,
@@ -466,7 +502,7 @@ class DocumentPipeline:
 
     def _run_result_stage(
         self,
-        context: DocumentPipelineContext,
+        context: PipelineContext,
         stage_metrics: _StageMetrics,
         speech: SpeechAnalysis,
         planning_batch: ChapterPlanningBatch,
@@ -475,7 +511,7 @@ class DocumentPipeline:
         written: WrittenDocument,
         evidence: tuple[DocumentEvidenceItem, ...],
         document: RenderedDocument,
-    ) -> DocumentPipelineOutcome:
+    ) -> PipelineOutcome:
         self._start_stage(context, "RESULT")
         started_at = self._clock()
         status = merge_run_statuses(
@@ -502,7 +538,7 @@ class DocumentPipeline:
             speech.stage_cache_hits,
             complete_stage_metrics,
         )
-        return DocumentPipelineOutcome(
+        return PipelineOutcome(
             status=status,
             result=written.result,
             evidence=evidence,
@@ -518,7 +554,7 @@ class DocumentPipeline:
 
     def _run_stage(
         self,
-        context: DocumentPipelineContext,
+        context: PipelineContext,
         stage_metrics: _StageMetrics,
         stage: str,
         operation: Callable[[], StageResult],
@@ -552,12 +588,12 @@ class DocumentPipeline:
         return cache_hits
 
     @staticmethod
-    def _check_cancelled(context: DocumentPipelineContext) -> None:
+    def _check_cancelled(context: PipelineContext) -> None:
         if context.is_cancel_requested():
             raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
 
     @classmethod
-    def _start_stage(cls, context: DocumentPipelineContext, stage: str) -> None:
+    def _start_stage(cls, context: PipelineContext, stage: str) -> None:
         cls._check_cancelled(context)
         context.on_stage_start(stage)
         cls._check_cancelled(context)

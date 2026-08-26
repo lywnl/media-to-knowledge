@@ -1,1008 +1,248 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, datetime, timedelta
+import json
 from pathlib import Path
-from threading import Barrier, Thread
-from typing import cast
 
 import pytest
-from sqlalchemy.orm import Session
 
-from video_demo.application.queries import ResultQueryService, ResultWriteFence
-from video_demo.domain.evidence import (
-    EvidenceItem,
-    KeyframeEvidence,
-    SceneBoundary,
-    SpeechSegment,
-    SubtitleCue,
-)
-from video_demo.domain.result import (
-    SummaryChapter,
-    VideoSegment,
-    VideoSummary,
+from video_demo.application.document_publication import ResultWriteFence, scope_key
+from video_demo.application.document_rendering import render_markdown
+from video_demo.application.queries import ResultQueryService
+from video_demo.domain.document import (
+    DocumentGenerationConfig,
+    DocumentGenerationMetadata,
+    GroundedClaim,
+    ParagraphBlock,
+    PromptVersions,
+    SemanticChapter,
+    SemanticSection,
+    VideoDocumentSummary,
     VideoUnderstandingResult,
+    section_id_for,
 )
-from video_demo.domain.result_artifact import (
-    ARTIFACT_ENVELOPE_SCHEMA_VERSION,
-    ResultArtifactPayload,
-    TranscriptSource,
-)
-from video_demo.domain.run import RunStatus
+from video_demo.domain.document_artifact import MODEL_METRIC_NAMES, RESULT_STAGE_NAMES
+from video_demo.domain.evidence import SpeechSegment
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
-from video_demo.persistence.models import (
-    JobStatus,
-    RunStatusValue,
-    VideoSegmentModel,
-    VideoSummaryModel,
-)
+from video_demo.persistence.models import VideoSegmentModel, VideoSummaryModel
 from video_demo.persistence.repositories import JobRepository, Scope, VideoRunRepository
 from video_demo.storage.artifacts import AtomicArtifactStore
 
 
-def _result(evidence_refs: tuple[str, ...] = ("asr_001",)) -> VideoUnderstandingResult:
-    segment_text = "类型：VIDEO_SEGMENT"
-    segment = VideoSegment(
-        segment_id="segment_001",
-        start_ms=0,
-        end_ms=1_000,
-        title="问候",
-        summary_zh="讲者问好。",
-        languages=("en",),
-        topics=("问候",),
-        keywords=("问候",),
-        original_keywords=("Hello",),
-        evidence_refs=evidence_refs,
-        retrieval_text=segment_text,
-        retrieval_hash=hashlib.sha256(segment_text.encode("utf-8")).hexdigest(),
-    )
-    summary_text = "类型：VIDEO_SUMMARY"
-    summary = VideoSummary(
-        title="测试视频",
-        summary_zh="视频包含一段问候。",
-        duration_ms=1_000,
-        chapters=(
-            SummaryChapter(
-                title="问候",
-                start_ms=0,
-                end_ms=1_000,
-                segment_ids=(segment.segment_id,),
-            ),
-        ),
-        languages=("en",),
-        topics=("问候",),
-        keywords=("问候",),
-        original_keywords=("Hello",),
-        retrieval_text=summary_text,
-        retrieval_hash=hashlib.sha256(summary_text.encode("utf-8")).hexdigest(),
-    )
-    return VideoUnderstandingResult(
-        run_id="run_001",
-        asset_sha256="a" * 64,
-        segments=(segment,),
-        summary=summary,
-    )
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _speech_fixture() -> SpeechSegment:
-    return SpeechSegment(
+def _result() -> tuple[VideoUnderstandingResult, SpeechSegment]:
+    speech = SpeechSegment(
         evidence_id="asr_001",
         start_ms=0,
         end_ms=1_000,
-        text="Hello",
-        language="en",
-        confidence=0.9,
+        text="faster-whisper 提供高效语音识别。",
+        language="zh",
+        confidence=0.99,
         is_fully_evaluated_language=True,
     )
-
-
-def _subtitle_fixture() -> SubtitleCue:
-    return SubtitleCue(
-        evidence_id="subtitle_001",
+    chapter = SemanticChapter(
+        chapter_id="chapter_001",
         start_ms=0,
         end_ms=1_000,
-        text="字幕正文",
-        language="zh",
-        stream_index=2,
-    )
-
-
-def _scene_fixture() -> SceneBoundary:
-    return SceneBoundary(
-        evidence_id="scene_001",
-        start_ms=0,
-        end_ms=1_000,
-        transition="candidate",
-        score=0.8,
-    )
-
-
-def test_result_artifact_rejects_unknown_stage_and_invalid_cache_hit() -> None:
-    result = _result()
-    evidence = (_speech_fixture(),)
-    with pytest.raises(ValueError, match="阶段名称"):
-        ResultArtifactPayload(
-            result=result,
-            evidence=evidence,
-            stage_metrics={"UNKNOWN": 1},
-            status="SUCCEEDED",
-            warnings=(),
-            transcript_source="ASR",
-        )
-    with pytest.raises(ValueError, match="缓存命中"):
-        ResultArtifactPayload(
-            result=result,
-            evidence=evidence,
-            stage_metrics={"SPEECH_ASR": 1},
-            stage_cache_hits=("RESULT",),
-            status="SUCCEEDED",
-            warnings=(),
-            transcript_source="ASR",
-        )
-
-
-def test_result_artifact_requires_cache_hit_stage_to_have_zero_duration() -> None:
-    with pytest.raises(ValueError, match="耗时必须为 0"):
-        ResultArtifactPayload(
-            result=_result(),
-            evidence=(_speech_fixture(),),
-            stage_metrics={"SPEECH_ASR": 1},
-            stage_cache_hits=("SPEECH_ASR",),
-            status="SUCCEEDED",
-            warnings=(),
-            transcript_source="ASR",
-        )
-
-
-def test_result_artifact_rejects_non_speech_cache_hit_stage() -> None:
-    with pytest.raises(ValueError, match="语音子阶段"):
-        ResultArtifactPayload(
-            result=_result(),
-            evidence=(_speech_fixture(),),
-            stage_metrics={"RESULT": 0},
-            stage_cache_hits=("RESULT",),
-            status="SUCCEEDED",
-            warnings=(),
-            transcript_source="ASR",
-        )
-
-
-def test_result_repository_rejects_inconsistent_schema_versions(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    service.persist(
-        scope,
-        _result(),
-        evidence=(_speech_fixture(),),
-        stage_metrics={},
-        status=RunStatus.SUCCEEDED,
+        title="模型概览",
+        title_evidence_refs=(speech.evidence_id,),
+        summary_zh="介绍 faster-whisper。",
+        summary_evidence_refs=(speech.evidence_id,),
+        body_blocks=(
+            ParagraphBlock(
+                text="faster-whisper 提供高效语音识别。",
+                evidence_refs=(speech.evidence_id,),
+            ),
+        ),
+        claims=(
+            GroundedClaim(
+                text="faster-whisper 用于语音识别。",
+                evidence_refs=(speech.evidence_id,),
+                certainty=0.99,
+            ),
+        ),
+        evidence_refs=(speech.evidence_id,),
         transcript_source="ASR",
-        fence=_claim_fence(runtime_root),
+        retrieval_text="faster-whisper 语音识别",
+        retrieval_hash=_digest("faster-whisper 语音识别"),
     )
-    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
-    with database.session() as session:
-        summary = session.query(VideoSummaryModel).one()
-        segment = session.query(VideoSegmentModel).one()
-        summary.schema_version = "1.0.0"
-        segment.schema_version = "2.0.0"
-
-    with pytest.raises(VideoDemoError) as raised:
-        service.get_result(scope, "run_001")
-    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
-
-
-def _claim_fence(runtime_root: Path, worker_id: str = "worker-a") -> ResultWriteFence:
-    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
-    with database.session() as session:
-        claimed = JobRepository(session).claim(worker_id, lease_seconds=60)
-    assert claimed is not None
-    return ResultWriteFence(
-        job_pk=claimed.id,
-        worker_id=claimed.worker_id,
-        attempt_count=claimed.attempt_count,
+    result = VideoUnderstandingResult(
+        run_id="run_001",
+        asset_sha256="a" * 64,
+        summary=VideoDocumentSummary(
+            title="faster-whisper 教程",
+            duration_ms=1_000,
+            overview_zh="介绍模型用途。",
+            key_points=(),
+            retrieval_text="模型用途",
+            retrieval_hash=_digest("模型用途"),
+        ),
+        sections=(
+            SemanticSection(
+                section_id=section_id_for("a" * 64, (chapter.chapter_id,)),
+                title="基础",
+                summary_zh="模型基础",
+                chapter_refs=(chapter.chapter_id,),
+            ),
+        ),
+        chapters=(chapter,),
+        generation=DocumentGenerationMetadata(
+            document_config=DocumentGenerationConfig(),
+            text_model_id="text-model",
+            vlm_model_id="qwen3-vl-flash",
+            prompt_versions=PromptVersions(
+                chapter_planner="chapter-planner-v1",
+                chapter_planner_repair="chapter-planner-repair-v1",
+                chapter_vlm="chapter-vlm-v1",
+                chapter_vlm_repair="chapter-vlm-repair-v1",
+                chapter_writer="chapter-writer-v1",
+                chapter_writer_repair="chapter-writer-repair-v1",
+                global_editor="global-editor-v1",
+                global_editor_repair="global-editor-repair-v1",
+            ),
+        ),
     )
+    return result, speech
 
 
 @pytest.fixture
-def result_service(tmp_path: Path) -> tuple[ResultQueryService, Scope, Path]:
-    runtime_root = tmp_path / ".codex" / "video-rag-demo"
-    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
-    runtime_root.mkdir(parents=True)
+def service(
+    tmp_path: Path,
+) -> tuple[ResultQueryService, Database, Scope, ResultWriteFence, Path]:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    database = Database(f"sqlite+pysqlite:///{runtime_root / 'queries.db'}")
     database.create_schema()
     scope = Scope("tenant-a", "app-a", "kb-a")
     with database.session() as session:
-        run_repository = VideoRunRepository(session)
-        run_repository.get_or_create_asset(
+        runs = VideoRunRepository(session)
+        runs.get_or_create_asset(
             scope=scope,
             asset_id="asset_001",
-            object_ref="obj_001",
+            object_ref="object_001",
             source_sha256="a" * 64,
         )
-        run_repository.add(
+        runs.add(
             scope=scope,
             run_id="run_001",
             asset_id="asset_001",
-            object_ref="obj_001",
-            idempotency_key="idempotency-key-0001",
-            config_snapshot={},
+            object_ref="object_001",
+            idempotency_key="query-001",
+            config_snapshot={"result_schema_version": "3.0.0"},
         )
         JobRepository(session).enqueue_video_run(
             scope=scope,
             job_id="job_001",
             run_id="run_001",
         )
+    with database.session() as session:
+        claimed = JobRepository(session).claim("worker-a", lease_seconds=60)
+    assert claimed is not None
     return (
-        ResultQueryService(
-            database,
-            AtomicArtifactStore(runtime_root),
-            max_evidence_items=3,
-        ),
+        ResultQueryService(database, AtomicArtifactStore(runtime_root)),
+        database,
         scope,
+        ResultWriteFence(claimed.id, claimed.worker_id, claimed.attempt_count),
         runtime_root,
     )
 
 
-def test_result_bundle_persists_segments_summary_evidence_and_status(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    speech = SpeechSegment(
-        evidence_id="asr_001",
-        start_ms=0,
-        end_ms=1_000,
-        text="Hello",
-        language="en",
-        confidence=0.9,
-        is_fully_evaluated_language=True,
-    )
-
+def _publish(
+    service: ResultQueryService,
+    scope: Scope,
+    fence: ResultWriteFence,
+) -> tuple[VideoUnderstandingResult, SpeechSegment]:
+    result, speech = _result()
     service.persist(
         scope,
-        _result(),
+        result,
         evidence=(speech,),
-        stage_metrics={"RESULT": 12, "SPEECH_ASR": 0},
-        stage_cache_hits=("SPEECH_ASR",),
-        status=RunStatus.PARTIAL_SUCCEEDED,
-        transcript_source="ASR",
-        fence=_claim_fence(runtime_root),
-        warnings=("WINDOW_FAILED",),
-    )
-
-    assert service.get_result(scope, "run_001") == _result()
-    page = service.get_evidence(scope, "run_001", limit=10)
-    assert page.items == (speech,)
-    assert page.next_cursor is None
-    assert service.get_run_metadata(scope, "run_001").status == RunStatus.PARTIAL_SUCCEEDED
-    metadata = service.get_run_metadata(scope, "run_001")
-    assert metadata.stage_metrics == {"RESULT": 12, "SPEECH_ASR": 0}
-    assert metadata.stage_cache_hits == ("SPEECH_ASR",)
-    bundle = service._read_bundle(scope, "run_001")
-    assert bundle["result"]["schema_version"] == "2.0.0"
-
-
-def test_production_query_reads_legacy_bundle_without_stage_cache_hits(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    service.persist(
-        scope,
-        _result(),
-        evidence=(_speech_fixture(),),
-        stage_metrics={"RESULT": 12},
-        status=RunStatus.SUCCEEDED,
-        transcript_source="ASR",
-        fence=_claim_fence(runtime_root),
-    )
-    legacy_bundle = service._read_bundle(scope, "run_001")
-    legacy_bundle.pop("stage_cache_hits")
-    result_payload = legacy_bundle["result"]
-    assert isinstance(result_payload, dict)
-    result_payload["schema_version"] = "1.0.0"
-    replacement = AtomicArtifactStore(runtime_root).write_json(
-        Path("runs")
-        / service.scope_key(scope)
-        / "run_001"
-        / "result"
-        / "bundle-legacy.json",
-        legacy_bundle,
-        schema_version=ARTIFACT_ENVELOPE_SCHEMA_VERSION,
-        upstream_sha256="a" * 64,
-    )
-    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
-    with database.session() as session:
-        run = VideoRunRepository(session).get(scope, "run_001")
-        assert run is not None
-        run.artifact_manifest_relative_path = replacement.relative_path
-        run.artifact_manifest_sha256 = replacement.sha256
-
-    bundle = service._read_bundle(scope, "run_001")
-    metadata = service.get_run_metadata(scope, "run_001")
-
-    assert "stage_cache_hits" not in bundle
-    assert metadata.stage_cache_hits == ()
-
-
-@pytest.mark.parametrize(
-    ("transcript_source", "evidence"),
-    [
-        ("SUBTITLE", (_scene_fixture(),)),
-        ("SUBTITLE", (_speech_fixture(),)),
-        ("ASR", (_subtitle_fixture(),)),
-        ("NONE", (_speech_fixture(),)),
-    ],
-)
-def test_result_bundle_rejects_transcript_source_evidence_mismatch(
-    result_service: tuple[ResultQueryService, Scope, Path],
-    transcript_source: TranscriptSource,
-    evidence: tuple[EvidenceItem, ...],
-) -> None:
-    service, scope, runtime_root = result_service
-    result = _result((evidence[0].evidence_id,))
-
-    with pytest.raises(ValueError):
-        service.persist(
-            scope,
-            result,
-            evidence=evidence,
-            stage_metrics={},
-            status=RunStatus.SUCCEEDED,
-            transcript_source=transcript_source,
-            fence=_claim_fence(runtime_root),
-        )
-
-
-def test_result_bundle_persists_verified_subtitle_source(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    subtitle = _subtitle_fixture()
-
-    service.persist(
-        scope,
-        _result((subtitle.evidence_id,)),
-        evidence=(subtitle,),
-        stage_metrics={"RESULT": 1},
-        status=RunStatus.SUCCEEDED,
-        transcript_source="SUBTITLE",
-        fence=_claim_fence(runtime_root),
-    )
-
-    bundle = service._read_bundle(scope, "run_001")
-    assert bundle["transcript_source"] == "SUBTITLE"
-    assert bundle["evidence"][0]["evidence_type"] == "SUBTITLE_CUE"  # type: ignore[index]
-
-
-def test_evidence_cursor_is_stable_and_filter_aware(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    evidence = tuple(
-        SpeechSegment(
-            evidence_id=f"asr_{index:03d}",
-            start_ms=index * 100,
-            end_ms=(index + 1) * 100,
-            text=f"word-{index}",
-            language="en",
-            confidence=0.9,
-            is_fully_evaluated_language=True,
-        )
-        for index in range(3)
-    )
-    service.persist(
-        scope,
-        _result(),
-        evidence=evidence,
-        stage_metrics={},
-        status=RunStatus.SUCCEEDED,
-        transcript_source="ASR",
-        fence=_claim_fence(runtime_root),
-    )
-
-    first = service.get_evidence(
-        scope,
-        "run_001",
-        evidence_type="ASR_SEGMENT",
-        start_ms=100,
-        limit=1,
-    )
-    second = service.get_evidence(
-        scope,
-        "run_001",
-        evidence_type="ASR_SEGMENT",
-        start_ms=100,
-        limit=1,
-        cursor=first.next_cursor,
-    )
-
-    assert [item.evidence_id for item in first.items] == ["asr_001"]
-    assert [item.evidence_id for item in second.items] == ["asr_002"]
-    assert second.next_cursor is None
-
-
-def test_keyframe_bytes_are_digest_checked_and_return_correct_mime(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    keyframe_bytes = b"\x89PNG\r\n\x1a\ncontent"
-    relative_path = Path("runs") / service.scope_key(scope) / "run_001" / "keyframes" / "kf.png"
-    keyframe_path = runtime_root / relative_path
-    keyframe_path.parent.mkdir(parents=True)
-    keyframe_path.write_bytes(keyframe_bytes)
-    keyframe = KeyframeEvidence(
-        evidence_id="keyframe_ev_001",
-        start_ms=0,
-        end_ms=1_000,
-        keyframe_id="keyframe_001",
-        timestamp_ms=500,
-        relative_path=relative_path.as_posix(),
-        mime_type="image/png",
-        sha256=hashlib.sha256(keyframe_bytes).hexdigest(),
-        perceptual_hash="abcdef12",
-        size_bytes=len(keyframe_bytes),
-    )
-    service.persist(
-        scope,
-        _result(("keyframe_ev_001",)),
-        evidence=(keyframe,),
-        stage_metrics={},
-        status=RunStatus.SUCCEEDED,
-        transcript_source="NONE",
-        fence=_claim_fence(runtime_root),
-    )
-
-    content = service.get_keyframe(scope, "run_001", "keyframe_001")
-
-    assert content.content == keyframe_bytes
-    assert content.mime_type == "image/png"
-
-
-def test_keyframe_path_cannot_escape_to_another_run(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    content = b"\x89PNG\r\n\x1a\nother-run"
-    scope_root = Path("runs") / service.scope_key(scope)
-    other_path = runtime_root / scope_root / "run_other" / "keyframes" / "kf.png"
-    other_path.parent.mkdir(parents=True)
-    other_path.write_bytes(content)
-    traversal = scope_root / "run_001" / ".." / "run_other" / "keyframes" / "kf.png"
-    keyframe = KeyframeEvidence(
-        evidence_id="keyframe_ev_001",
-        start_ms=0,
-        end_ms=1_000,
-        keyframe_id="keyframe_001",
-        timestamp_ms=500,
-        relative_path=traversal.as_posix(),
-        mime_type="image/png",
-        sha256=hashlib.sha256(content).hexdigest(),
-        perceptual_hash="abcdef12",
-        size_bytes=len(content),
-    )
-    service.persist(
-        scope,
-        _result((keyframe.evidence_id,)),
-        evidence=(keyframe,),
-        stage_metrics={},
-        status=RunStatus.SUCCEEDED,
-        transcript_source="NONE",
-        fence=_claim_fence(runtime_root),
-    )
-
-    with pytest.raises(VideoDemoError) as raised:
-        service.get_keyframe(scope, "run_001", "keyframe_001")
-
-    assert raised.value.code == ErrorCode.WORKSPACE_PATH_ESCAPE
-
-
-def test_invalid_asset_digest_cannot_overwrite_existing_result_bundle(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    speech = SpeechSegment(
-        evidence_id="asr_001",
-        start_ms=0,
-        end_ms=1_000,
-        text="Hello",
-        language="en",
-        confidence=0.9,
-        is_fully_evaluated_language=True,
-    )
-    fence = _claim_fence(runtime_root)
-    service.persist(
-        scope,
-        _result(),
-        evidence=(speech,),
-        stage_metrics={},
-        status=RunStatus.SUCCEEDED,
+        document=render_markdown(result, (speech,)),
+        stage_metrics=dict.fromkeys(RESULT_STAGE_NAMES, 0),
+        model_metrics=dict.fromkeys(MODEL_METRIC_NAMES, 0),
+        status="SUCCEEDED",
         transcript_source="ASR",
         fence=fence,
     )
-    valid_result = service.get_result(scope, "run_001")
-    invalid = _result().model_copy(update={"asset_sha256": "f" * 64})
-
-    with pytest.raises(VideoDemoError) as raised:
-        service.persist(
-            scope,
-            invalid,
-            evidence=(speech,),
-            stage_metrics={},
-            status=RunStatus.SUCCEEDED,
-            transcript_source="ASR",
-            fence=fence,
-        )
-
-    assert raised.value.code == ErrorCode.VIDEO_DIGEST_MISMATCH
-    assert service.get_result(scope, "run_001") == valid_result
-    assert service.get_evidence(scope, "run_001").items == (speech,)
+    return result, speech
 
 
-def test_evidence_persistence_has_explicit_count_limit(
-    result_service: tuple[ResultQueryService, Scope, Path],
+def test_query_service_round_trips_result_document_evidence_and_public_artifact(
+    service: tuple[ResultQueryService, Database, Scope, ResultWriteFence, Path],
 ) -> None:
-    service, scope, runtime_root = result_service
-    evidence = tuple(
-        SpeechSegment(
-            evidence_id=f"asr_{index:05d}",
-            start_ms=index,
-            end_ms=index + 1,
-            text="x",
-            language="en",
-            confidence=0.9,
-            is_fully_evaluated_language=True,
-        )
-        for index in range(4)
-    )
-    with pytest.raises(VideoDemoError) as raised:
-        service.persist(
-            scope,
-            _result(),
-            evidence=evidence,
-            stage_metrics={},
-            status=RunStatus.SUCCEEDED,
-            transcript_source="ASR",
-            fence=_claim_fence(runtime_root),
-        )
+    queries, _database, scope, fence, _runtime_root = service
+    result, speech = _publish(queries, scope, fence)
 
+    artifact, document = queries.get_artifact(scope, result.run_id)
+
+    assert queries.get_result(scope, result.run_id) == result
+    assert queries.get_document(scope, result.run_id) == document
+    assert queries.get_evidence(scope, result.run_id).items == (speech,)
+    assert artifact.result == result
+    assert artifact.evidence == (speech,)
+    assert artifact.document_sha256 == hashlib.sha256(document).hexdigest()
+    assert artifact.document_size_bytes == len(document)
+
+
+def test_query_service_rejects_old_uniform_result_rows_as_unsupported(
+    service: tuple[ResultQueryService, Database, Scope, ResultWriteFence, Path],
+) -> None:
+    queries, database, scope, fence, _runtime_root = service
+    _publish(queries, scope, fence)
+    with database.session() as session:
+        session.query(VideoSummaryModel).one().schema_version = "2.0.0"
+        session.query(VideoSegmentModel).one().schema_version = "2.0.0"
+
+    for query in (
+        lambda: queries.get_result(scope, "run_001"),
+        lambda: queries.get_document(scope, "run_001"),
+        lambda: queries.get_evidence(scope, "run_001"),
+        lambda: queries.get_keyframe(scope, "run_001", "missing"),
+    ):
+        with pytest.raises(VideoDemoError) as raised:
+            query()
+        assert raised.value.code == ErrorCode.RESULT_SCHEMA_UNSUPPORTED
+
+
+@pytest.mark.parametrize("tamper", ["mixed_rows", "bundle_payload"])
+def test_query_service_rejects_mixed_or_corrupted_bundle_as_artifact_invalid(
+    service: tuple[ResultQueryService, Database, Scope, ResultWriteFence, Path],
+    tamper: str,
+) -> None:
+    queries, database, scope, fence, runtime_root = service
+    _publish(queries, scope, fence)
+    if tamper == "mixed_rows":
+        with database.session() as session:
+            session.query(VideoSegmentModel).one().schema_version = "2.0.0"
+    else:
+        with database.session() as session:
+            run = VideoRunRepository(session).get(scope, "run_001")
+            assert run is not None and run.artifact_manifest_relative_path
+            path = runtime_root / run.artifact_manifest_relative_path
+        envelope = json.loads(path.read_bytes())
+        envelope["payload"]["artifact_schema_version"] = "2.0.0"
+        path.write_text(json.dumps(envelope), encoding="utf-8")
+
+    with pytest.raises(VideoDemoError) as raised:
+        queries.get_artifact(scope, "run_001")
     assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
 
 
-def test_evidence_cursor_rejects_tampering_and_filter_reuse(
-    result_service: tuple[ResultQueryService, Scope, Path],
+def test_query_service_isolates_scope_and_run(
+    service: tuple[ResultQueryService, Database, Scope, ResultWriteFence, Path],
 ) -> None:
-    service, scope, runtime_root = result_service
-    evidence = tuple(
-        SpeechSegment(
-            evidence_id=f"asr_{index:03d}",
-            start_ms=index * 100,
-            end_ms=(index + 1) * 100,
-            text=f"word-{index}",
-            language="en",
-            confidence=0.9,
-            is_fully_evaluated_language=True,
-        )
-        for index in range(2)
-    )
-    service.persist(
-        scope,
-        _result(),
-        evidence=evidence,
-        stage_metrics={},
-        status=RunStatus.SUCCEEDED,
-        transcript_source="ASR",
-        fence=_claim_fence(runtime_root),
-    )
-    cursor = service.get_evidence(scope, "run_001", limit=1).next_cursor
-    assert cursor is not None
+    queries, _database, scope, fence, _runtime_root = service
+    _publish(queries, scope, fence)
 
-    for invalid_cursor, evidence_type in (
-        (cursor[:-1] + ("0" if cursor[-1] != "0" else "1"), None),
-        (cursor, "ASR_SEGMENT"),
+    for foreign_scope, run_id in (
+        (Scope("tenant-b", "app-a", "kb-a"), "run_001"),
+        (scope, "run_other"),
     ):
-        with pytest.raises(VideoDemoError) as raised:
-            service.get_evidence(
-                scope,
-                "run_001",
-                cursor=invalid_cursor,
-                evidence_type=evidence_type,
-                limit=1,
-            )
-        assert raised.value.code == ErrorCode.INVALID_EVIDENCE_CURSOR
+        with pytest.raises(VideoDemoError):
+            queries.get_artifact(foreign_scope, run_id)
 
-
-def test_stale_worker_fence_cannot_publish_result(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
-    now = datetime.now(UTC)
-    with database.session() as session:
-        first = JobRepository(session).claim(
-            "worker-old",
-            lease_seconds=1,
-            now=now,
-        )
-    assert first is not None
-    with database.session() as session:
-        replacement = JobRepository(session).claim(
-            "worker-new",
-            lease_seconds=60,
-            now=now + timedelta(seconds=2),
-        )
-    assert replacement is not None
-    speech = SpeechSegment(
-        evidence_id="asr_001",
-        start_ms=0,
-        end_ms=1_000,
-        text="Hello",
-        language="en",
-        confidence=0.9,
-        is_fully_evaluated_language=True,
-    )
-
-    with pytest.raises(VideoDemoError) as raised:
-        service.persist(
-            scope,
-            _result(),
-            evidence=(speech,),
-            stage_metrics={},
-            status=RunStatus.SUCCEEDED,
-            transcript_source="ASR",
-            fence=ResultWriteFence(
-                job_pk=first.id,
-                worker_id=first.worker_id,
-                attempt_count=first.attempt_count,
-            ),
-        )
-
-    assert raised.value.code == ErrorCode.JOB_LEASE_LOST
-    with pytest.raises(VideoDemoError) as not_ready:
-        service.get_result(scope, "run_001")
-    assert not_ready.value.code == ErrorCode.VIDEO_RESULT_NOT_READY
-    assert list(runtime_root.rglob("bundle-*.json")) == []
-
-
-def test_same_fence_can_publish_only_one_result_bundle(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    _service, scope, runtime_root = result_service
-    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
-    with database.session() as session:
-        claimed = JobRepository(session).claim("worker-a", lease_seconds=60)
-    assert claimed is not None
-    both_bundles_written = Barrier(2)
-
-    class SynchronizedArtifactStore(AtomicArtifactStore):
-        def write_json(
-            self,
-            relative_path: Path,
-            payload: dict[str, object] | list[object],
-            *,
-            schema_version: str,
-            upstream_sha256: str,
-        ) -> object:
-            receipt = super().write_json(
-                relative_path,
-                payload,
-                schema_version=schema_version,
-                upstream_sha256=upstream_sha256,
-            )
-            both_bundles_written.wait(timeout=5)
-            return receipt
-
-    service = ResultQueryService(database, SynchronizedArtifactStore(runtime_root))
-    speech = SpeechSegment(
-        evidence_id="asr_001",
-        start_ms=0,
-        end_ms=1_000,
-        text="Hello",
-        language="en",
-        confidence=0.9,
-        is_fully_evaluated_language=True,
-    )
-    fence = ResultWriteFence(
-        job_pk=claimed.id,
-        worker_id=claimed.worker_id,
-        attempt_count=claimed.attempt_count,
-    )
-    errors: list[BaseException] = []
-
-    def publish() -> None:
-        try:
-            service.persist(
-                scope,
-                _result(),
-                evidence=(speech,),
-                stage_metrics={"RESULT": 1},
-                status=RunStatus.SUCCEEDED,
-                transcript_source="ASR",
-                fence=fence,
-            )
-        except BaseException as error:
-            errors.append(error)
-
-    publishers = [Thread(target=publish) for _ in range(2)]
-    for publisher in publishers:
-        publisher.start()
-    for publisher in publishers:
-        publisher.join(timeout=10)
-
-    assert all(not publisher.is_alive() for publisher in publishers)
-    assert len(errors) == 1
-    assert isinstance(errors[0], VideoDemoError)
-    assert errors[0].code == ErrorCode.JOB_LEASE_LOST
-    assert service.get_result(scope, "run_001") == _result()
-    assert len(list(runtime_root.rglob("bundle-*.json"))) == 1
-
-
-def test_result_publish_rejects_runtime_none_fence_before_writing_bundle(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    speech = SpeechSegment(
-        evidence_id="asr_001",
-        start_ms=0,
-        end_ms=1_000,
-        text="Hello",
-        language="en",
-        confidence=0.9,
-        is_fully_evaluated_language=True,
-    )
-
-    with pytest.raises(ValueError, match="fence"):
-        service.persist(
-            scope,
-            _result(),
-            evidence=(speech,),
-            stage_metrics={},
-            status=RunStatus.SUCCEEDED,
-            transcript_source="ASR",
-            fence=cast(ResultWriteFence, None),
-        )
-
-    assert list(runtime_root.rglob("bundle-*.json")) == []
-
-
-@pytest.mark.parametrize(
-    "target_scope",
-    (
-        Scope("tenant-a", "app-a", "kb-a"),
-        Scope("tenant-b", "app-a", "kb-a"),
-    ),
-    ids=("other-run", "other-scope"),
-)
-def test_result_publish_fence_must_belong_to_target_scope_and_run(
-    result_service: tuple[ResultQueryService, Scope, Path],
-    target_scope: Scope,
-) -> None:
-    _service, source_scope, runtime_root = result_service
-    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
-    target_run_id = "run_002"
-    with database.session() as session:
-        runs = VideoRunRepository(session)
-        runs.get_or_create_asset(
-            scope=target_scope,
-            asset_id="asset_002",
-            object_ref="obj_002",
-            source_sha256="b" * 64,
-        )
-        runs.add(
-            scope=target_scope,
-            run_id=target_run_id,
-            asset_id="asset_002",
-            object_ref="obj_002",
-            idempotency_key="idempotency-key-0002",
-            config_snapshot={},
-        )
-        JobRepository(session).enqueue_video_run(
-            scope=target_scope,
-            job_id="job_002",
-            run_id=target_run_id,
-        )
-    with database.session() as session:
-        source_job = JobRepository(session).claim("worker-a", lease_seconds=60)
-    assert source_job is not None
-    assert source_job.scope == source_scope
-    service = ResultQueryService(database, AtomicArtifactStore(runtime_root))
-    speech = SpeechSegment(
-        evidence_id="asr_001",
-        start_ms=0,
-        end_ms=1_000,
-        text="Hello",
-        language="en",
-        confidence=0.9,
-        is_fully_evaluated_language=True,
-    )
-    target_result = _result().model_copy(
-        update={"run_id": target_run_id, "asset_sha256": "b" * 64},
-    )
-
-    with pytest.raises(VideoDemoError) as raised:
-        service.persist(
-            target_scope,
-            target_result,
-            evidence=(speech,),
-            stage_metrics={},
-            status=RunStatus.SUCCEEDED,
-            transcript_source="ASR",
-            fence=ResultWriteFence(
-                job_pk=source_job.id,
-                worker_id=source_job.worker_id,
-                attempt_count=source_job.attempt_count,
-            ),
-        )
-
-    assert raised.value.code == ErrorCode.JOB_LEASE_LOST
-    with database.session() as session:
-        source = JobRepository(session).get(source_scope, "job_001")
-        target = JobRepository(session).get(target_scope, "job_002")
-        target_run = VideoRunRepository(session).get(target_scope, target_run_id)
-        assert source is not None
-        assert target is not None
-        assert target_run is not None
-        assert source.status == JobStatus.RUNNING
-        assert target.status == JobStatus.PENDING
-        assert target_run.status == RunStatusValue.PENDING
-    with pytest.raises(VideoDemoError) as not_ready:
-        service.get_result(target_scope, target_run_id)
-    assert not_ready.value.code == ErrorCode.VIDEO_RESULT_NOT_READY
-    assert list(runtime_root.rglob("bundle-*.json")) == []
-
-
-def test_cancellation_after_bundle_write_rolls_back_and_removes_unpublished_bundle(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    _service, scope, runtime_root = result_service
-    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
-    with database.session() as session:
-        claimed = JobRepository(session).claim("worker-a", lease_seconds=60)
-    assert claimed is not None
-
-    class CancellingArtifactStore(AtomicArtifactStore):
-        def write_json(
-            self,
-            relative_path: Path,
-            payload: dict[str, object] | list[object],
-            *,
-            schema_version: str,
-            upstream_sha256: str,
-        ) -> object:
-            receipt = super().write_json(
-                relative_path,
-                payload,
-                schema_version=schema_version,
-                upstream_sha256=upstream_sha256,
-            )
-            with database.session() as session:
-                assert JobRepository(session).request_cancel(scope, "job_001") is True
-            return receipt
-
-    service = ResultQueryService(database, CancellingArtifactStore(runtime_root))
-    speech = SpeechSegment(
-        evidence_id="asr_001",
-        start_ms=0,
-        end_ms=1_000,
-        text="Hello",
-        language="en",
-        confidence=0.9,
-        is_fully_evaluated_language=True,
-    )
-
-    with pytest.raises(VideoDemoError) as raised:
-        service.persist(
-            scope,
-            _result(),
-            evidence=(speech,),
-            stage_metrics={},
-            status=RunStatus.SUCCEEDED,
-            transcript_source="ASR",
-            fence=ResultWriteFence(
-                job_pk=claimed.id,
-                worker_id=claimed.worker_id,
-                attempt_count=claimed.attempt_count,
-            ),
-        )
-
-    assert raised.value.code == ErrorCode.JOB_CANCELLED
-    assert list(runtime_root.rglob("bundle-*.json")) == []
-
-
-def test_late_cancellation_cannot_overwrite_published_success(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
-    with database.session() as session:
-        claimed = JobRepository(session).claim("worker-a", lease_seconds=60)
-    assert claimed is not None
-    speech = SpeechSegment(
-        evidence_id="asr_001",
-        start_ms=0,
-        end_ms=1_000,
-        text="Hello",
-        language="en",
-        confidence=0.9,
-        is_fully_evaluated_language=True,
-    )
-    service.persist(
-        scope,
-        _result(),
-        evidence=(speech,),
-        stage_metrics={},
-        status=RunStatus.SUCCEEDED,
-        transcript_source="ASR",
-        fence=ResultWriteFence(
-            job_pk=claimed.id,
-            worker_id=claimed.worker_id,
-            attempt_count=claimed.attempt_count,
-        ),
-    )
-
-    with database.session() as session:
-        assert JobRepository(session).request_cancel(scope, "job_001") is True
-
-    with database.session() as session:
-        job = JobRepository(session).get(scope, "job_001")
-        run = VideoRunRepository(session).get(scope, "run_001")
-        assert job is not None
-        assert run is not None
-        assert job.status == JobStatus.SUCCEEDED
-        assert job.cancel_requested is False
-        assert run.status == RunStatusValue.SUCCEEDED
-    assert service.get_result(scope, "run_001") == _result()
-    assert len(list(runtime_root.rglob("bundle-*.json"))) == 1
-
-
-def test_stale_cancel_reader_cannot_overwrite_published_success(
-    result_service: tuple[ResultQueryService, Scope, Path],
-) -> None:
-    service, scope, runtime_root = result_service
-    database = Database(f"sqlite+pysqlite:///{runtime_root / 'result.db'}")
-    with database.session() as session:
-        claimed = JobRepository(session).claim("worker-a", lease_seconds=60)
-    assert claimed is not None
-    stale_session = Session(bind=database.engine, expire_on_commit=False)
-    try:
-        stale_repository = JobRepository(stale_session)
-        stale = stale_repository.get(scope, "job_001")
-        assert stale is not None
-        assert stale.status == JobStatus.RUNNING
-        stale_session.commit()
-
-        speech = SpeechSegment(
-            evidence_id="asr_001",
-            start_ms=0,
-            end_ms=1_000,
-            text="Hello",
-            language="en",
-            confidence=0.9,
-            is_fully_evaluated_language=True,
-        )
-        service.persist(
-            scope,
-            _result(),
-            evidence=(speech,),
-            stage_metrics={},
-            status=RunStatus.SUCCEEDED,
-            transcript_source="ASR",
-            fence=ResultWriteFence(
-                job_pk=claimed.id,
-                worker_id=claimed.worker_id,
-                attempt_count=claimed.attempt_count,
-            ),
-        )
-
-        assert stale_repository.request_cancel(scope, "job_001") is True
-        stale_session.commit()
-    finally:
-        stale_session.close()
-
-    with database.session() as session:
-        job = JobRepository(session).get(scope, "job_001")
-        run = VideoRunRepository(session).get(scope, "run_001")
-        assert job is not None
-        assert run is not None
-        assert job.status == JobStatus.SUCCEEDED
-        assert job.cancel_requested is False
-        assert run.status == RunStatusValue.SUCCEEDED
+    assert scope_key(scope) not in queries.get_document(scope, "run_001").decode("utf-8")
