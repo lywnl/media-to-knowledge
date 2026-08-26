@@ -251,9 +251,13 @@ class _Accumulators:
         observations: dict[str, MetricObservation] = {}
         for name, counts in self.text_counts.items():
             observations[name] = _count_observation(counts)
-        observations["ocr_accuracy"] = MetricObservation(
+        observations["visual_text_accuracy"] = MetricObservation(
             value=None,
-            not_run_reason="3.0 生产链不再执行 OCR 指标",
+            not_run_reason="代表性视觉质量事实尚未接入",
+        )
+        observations["visual_key_field_recall"] = MetricObservation(
+            value=None,
+            not_run_reason="代表性视觉质量事实尚未接入",
         )
         observations["scene_f1"] = MetricObservation(
             value=None,

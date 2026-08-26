@@ -29,7 +29,7 @@ from video_demo.evaluation.annotations import (
     AuthorizationFile,
     AuthorizationRecord,
     EvaluationAnnotation,
-    ReferenceOcrFrame,
+    ReferenceVisualFrame,
     SupportedFact,
     ValidatedEvaluationPackage,
     load_evaluation_package,
@@ -223,14 +223,14 @@ def _materialized_fixture(
     media_path.parent.mkdir(parents=True, exist_ok=True)
     media_path.write_bytes(_MEDIA_BYTES)
     annotation = EvaluationAnnotation(
-        schema_version="1.0.0",
+        schema_version="2.0.0",
         sample_id="sample_001",
         media_sha256=_hash(_MEDIA_BYTES),
         duration_ms=500,
         language="zh",
         reference_text="你好",
-        ocr_frames=(
-            ReferenceOcrFrame(
+        visual_frames=(
+            ReferenceVisualFrame(
                 frame_id="frame_001",
                 timestamp_ms=100,
                 text_lines=("你好",),
@@ -296,8 +296,16 @@ def test_quality_uses_chapter_boundaries_and_marks_retired_visual_metrics_not_ru
     artifacts = score_quality(package, predictions, (), evaluation_run_id="eval_001")
 
     metrics = {item.name: item for item in artifacts.report.metrics}
-    assert metrics["ocr_accuracy"].value is None
-    assert metrics["ocr_accuracy"].not_run_reason == "3.0 生产链不再执行 OCR 指标"
+    assert metrics["visual_text_accuracy"].value is None
+    assert (
+        metrics["visual_text_accuracy"].not_run_reason
+        == "代表性视觉质量事实尚未接入"
+    )
+    assert metrics["visual_key_field_recall"].value is None
+    assert (
+        metrics["visual_key_field_recall"].not_run_reason
+        == "代表性视觉质量事实尚未接入"
+    )
     assert metrics["scene_f1"].value is None
     assert metrics["scene_f1"].not_run_reason == "3.0 生产结果不再公开场景边界证据"
     assert metrics["semantic_boundary_f1"].value == 1.0

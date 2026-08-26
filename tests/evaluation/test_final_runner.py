@@ -58,13 +58,13 @@ _SHA = "a" * 64
 
 def _annotation(sample_id: str, media_sha256: str, language: str) -> dict[str, object]:
     return {
-        "schema_version": "1.0.0",
+        "schema_version": "2.0.0",
         "sample_id": sample_id,
         "media_sha256": media_sha256,
         "duration_ms": 1_000,
         "language": language,
         "reference_text": "测试",
-        "ocr_frames": [
+        "visual_frames": [
             {
                 "frame_id": f"frame_{sample_id}",
                 "timestamp_ms": 100,
@@ -296,10 +296,10 @@ def test_requirement_report_keeps_stable_ids_after_retired_requirements(tmp_path
     assert tuple(row.requirement for row in report.rows) == tuple(
         spec.requirement for spec in REQUIREMENT_SPECS
     )
-    assert len(QUALITY_THRESHOLDS) == 14
+    assert len(QUALITY_THRESHOLDS) == 15
     assert next(
         spec.requirement for spec in REQUIREMENT_SPECS if spec.requirement_id == 35
-    ) == "十四项质量与资源阈值全部满足"
+    ) == "十五项质量与资源阈值全部满足"
     assert all(row.status == GateStatus.NOT_RUN for row in report.rows)
     assert set(check for row in report.rows for check in row.check_ids) <= set(
         FINAL_GATE_CHECKS

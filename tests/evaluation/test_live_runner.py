@@ -109,13 +109,13 @@ def _runner_package(
         media.write_bytes(f"authorized-media-{sample_id}".encode())
         media_sha256 = hashlib.sha256(media.read_bytes()).hexdigest()
         annotation_payload = {
-            "schema_version": "1.0.0",
+            "schema_version": "2.0.0",
             "sample_id": sample_id,
             "media_sha256": media_sha256,
             "duration_ms": 1_000,
             "language": language,
             "reference_text": "你好",
-            "ocr_frames": [
+            "visual_frames": [
                 {
                     "frame_id": "frame-001",
                     "timestamp_ms": 100,

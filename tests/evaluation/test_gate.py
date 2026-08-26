@@ -474,13 +474,13 @@ def _live_annotation(
     language: str = "zh",
 ) -> dict[str, object]:
     return {
-        "schema_version": "1.0.0",
+        "schema_version": "2.0.0",
         "sample_id": sample_id,
         "media_sha256": media_sha256,
         "duration_ms": 1_000,
         "language": language,
         "reference_text": "测试",
-        "ocr_frames": [
+        "visual_frames": [
             {
                 "frame_id": "frame-001",
                 "timestamp_ms": 100,

@@ -112,7 +112,7 @@ REQUIREMENT_SPECS: tuple[RequirementSpec, ...] = (
     RequirementSpec(34, "质量指标由绑定预测和人工审阅重算", ("five_language_models",)),
     RequirementSpec(
         35,
-        "十四项质量与资源阈值全部满足",
+        "十五项质量与资源阈值全部满足",
         ("authorized_dataset", "five_language_models", "m1_durability"),
     ),
     RequirementSpec(

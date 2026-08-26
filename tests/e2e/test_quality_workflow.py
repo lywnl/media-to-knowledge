@@ -29,7 +29,7 @@ from video_demo.evaluation.annotations import (
     AuthorizationFile,
     AuthorizationRecord,
     EvaluationAnnotation,
-    ReferenceOcrFrame,
+    ReferenceVisualFrame,
     SupportedFact,
     ValidatedEvaluationPackage,
     load_evaluation_package,
@@ -62,14 +62,16 @@ def _write_package(
     media_path.write_bytes(media)
     media_sha = _sha(media)
     annotation = EvaluationAnnotation(
-        schema_version="1.0.0",
+        schema_version="2.0.0",
         sample_id="sample_001",
         media_sha256=media_sha,
         duration_ms=500,
         language="zh",
         reference_text="你好",
-        ocr_frames=(
-            ReferenceOcrFrame(frame_id="frame_001", timestamp_ms=100, text_lines=("你好",)),
+        visual_frames=(
+            ReferenceVisualFrame(
+                frame_id="frame_001", timestamp_ms=100, text_lines=("你好",)
+            ),
         ),
         scene_boundaries_ms=(250,),
         semantic_boundaries_ms=(250,),
