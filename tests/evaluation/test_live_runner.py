@@ -1994,7 +1994,7 @@ def test_demo_mode_allows_custom_qwen_model_id_to_reach_capability_probe(
 
 
 def test_production_model_identity_report_is_complete_and_redacted(tmp_path: Path) -> None:
-    from importlib.metadata import version
+    from importlib.metadata import PackageNotFoundError, version
 
     settings = Settings(
         workspace_root=tmp_path,
@@ -2014,11 +2014,15 @@ def test_production_model_identity_report_is_complete_and_redacted(tmp_path: Pat
     assert isinstance(report, ProductionModelIdentityReport)
     assert report.schema_version == "2.0.0"
     assert re.fullmatch(r"[0-9a-f]{64}", report.settings_fingerprint)
+    try:
+        silero_revision = version("silero-vad")
+    except PackageNotFoundError:
+        silero_revision = "NOT_INSTALLED"
     assert {
         (model.component, model.provider, model.model_id, model.device, model.revision)
         for model in report.models
     } == {
-        ("silero_vad", "local", "silero-vad", "cpu", version("silero-vad")),
+        ("silero_vad", "local", "silero-vad", "cpu", silero_revision),
         ("cloud_whisper", "openai_compatible", "openai/whisper", None, None),
         ("baidu_ocr", "baidu_ocr", "accurate_basic", None, None),
         ("qwen", "qwen", "qwen3-vl-plus", None, None),

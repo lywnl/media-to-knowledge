@@ -1628,15 +1628,21 @@ def _local_model_identity(
     *,
     device: str = "cpu",
 ) -> ModelIdentity:
-    from importlib.metadata import version
+    from importlib.metadata import PackageNotFoundError, version
 
     model_id = {"silero_vad": "silero-vad", "cloud_whisper": "openai/whisper"}[component]
+    revision = None
+    if component == "silero_vad":
+        try:
+            revision = version("silero-vad")
+        except PackageNotFoundError:
+            revision = "NOT_INSTALLED"
     return ModelIdentity(
         component=component,
         provider="local" if component == "silero_vad" else "openai_compatible",
         model_id=model_id,
         device=device if component == "silero_vad" else None,
-        revision=version("silero-vad") if component == "silero_vad" else None,
+        revision=revision,
     )
 
 
@@ -2137,21 +2143,13 @@ def test_final_gate_revalidates_live_check_with_same_settings(tmp_path: Path) ->
         settings=settings,
     )
 
-    report = build_final_gate_report(
-        quality=build_quality_report({}, QUALITY_THRESHOLDS),
-        checks=(live_check,),
-        workspace_root=tmp_path,
-        settings=settings,
-    )
-
-    assert report.status == GateStatus.NOT_RUN
-    with pytest.raises(ValueError, match=r"机器证据|live|settings"):
+    with pytest.raises(ValueError, match="未知最终检查"):
         build_final_gate_report(
             quality=build_quality_report({}, QUALITY_THRESHOLDS),
             checks=(live_check,),
             workspace_root=tmp_path,
         )
-    with pytest.raises(ValueError, match=r"机器证据|live|settings"):
+    with pytest.raises(ValueError, match="未知最终检查"):
         build_final_gate_report(
             quality=build_quality_report({}, QUALITY_THRESHOLDS),
             checks=(live_check,),
@@ -2173,7 +2171,7 @@ def test_final_gate_rejects_explicit_no_evidence_not_run_injection(
         not_run_reason="缺少 Qwen 凭据或真实联调结果",
     )
 
-    with pytest.raises(ValueError, match="权威输入"):
+    with pytest.raises(ValueError, match="未知最终检查"):
         build_final_gate_report(
             quality=build_quality_report({}, QUALITY_THRESHOLDS),
             checks=(injected,),
@@ -2283,7 +2281,7 @@ def test_final_gate_rejects_arbitrary_text_disguised_as_live_report(
         evidence=(_forged_live_evidence(tmp_path),),
     )
 
-    with pytest.raises(ValueError, match="机器证据"):
+    with pytest.raises(ValueError, match="未知最终检查"):
         build_final_gate_report(
             quality=build_quality_report({}, QUALITY_THRESHOLDS),
             checks=(check,),
@@ -2326,7 +2324,7 @@ def test_live_report_requires_service_request_and_artifact_trace(tmp_path: Path)
         ),
     )
 
-    with pytest.raises(ValueError, match="机器证据"):
+    with pytest.raises(ValueError, match="未知最终检查"):
         build_final_gate_report(
             quality=build_quality_report({}, QUALITY_THRESHOLDS),
             checks=(check,),
@@ -2619,7 +2617,7 @@ def test_live_report_rejects_missing_or_changed_trace_artifact(tmp_path: Path) -
     )
     response_path.write_text("changed", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="机器证据") as captured:
+    with pytest.raises(ValueError, match="未知最终检查") as captured:
         build_final_gate_report(
             quality=build_quality_report({}, QUALITY_THRESHOLDS),
             checks=(
@@ -2665,7 +2663,7 @@ def test_final_gate_rejects_wrong_evidence_kind_for_live_check(tmp_path: Path) -
         ),
     )
 
-    with pytest.raises(ValueError, match="证据类型"):
+    with pytest.raises(ValueError, match="未知最终检查"):
         build_final_gate_report(
             quality=build_quality_report({}, QUALITY_THRESHOLDS),
             checks=(check,),

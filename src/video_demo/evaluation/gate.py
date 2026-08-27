@@ -271,6 +271,7 @@ _HISTORICAL_LIVE_GATE_CHECKS = frozenset(
     {"baidu_ocr_live", "qwen_live"}
 )
 _LIVE_AUTHORITY_CHECKS = _LIVE_GATE_CHECKS
+_LIVE_IMPLEMENTATION_CHECKS = _LIVE_AUTHORITY_CHECKS | _HISTORICAL_LIVE_GATE_CHECKS
 
 _LOCAL_MODEL_FAILURE_CODES = frozenset(
     {
@@ -2545,7 +2546,7 @@ def _derive_preflight_status(
     if check_id == "real_media_chain":
         _verify_real_media_artifact_roles(artifacts, allow_media=False)
         _verify_real_media_preflight_artifacts(raw, report, artifacts, raw_artifact)
-    if check_id in _LIVE_AUTHORITY_CHECKS:
+    if check_id in _LIVE_IMPLEMENTATION_CHECKS:
         if raw.implementation_sha256 != _current_live_implementation_sha256(workspace_root):
             raise ValueError("live preflight 实现摘要不是当前实现")
         _verify_live_preflight_artifacts(raw, report, artifacts, raw_artifact)
