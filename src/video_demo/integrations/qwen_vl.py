@@ -48,6 +48,9 @@ class QwenVisionProviderReceipt(FrozenModel):
     final_http_status: StrictInt = Field(ge=200, lt=300)
     response_id_sha256: Sha256 | None = None
     provider_response_sha256: Sha256
+    request_json_bytes: StrictInt = Field(ge=0)
+    encoded_request_bytes: StrictInt = Field(ge=0)
+    elapsed_ms: StrictInt = Field(ge=0)
 
 
 class QwenVisionProviderFailureReceipt(FrozenModel):
@@ -74,6 +77,9 @@ class _ProviderCallResult:
     final_http_status: int | None
     provider_response_sha256: str | None
     response_id_sha256: str | None
+    request_json_bytes: int = 0
+    encoded_request_bytes: int = 0
+    elapsed_ms: int = 0
 
     def success_receipt(self) -> QwenVisionProviderReceipt:
         if (
@@ -87,6 +93,9 @@ class _ProviderCallResult:
             final_http_status=self.final_http_status,
             response_id_sha256=self.response_id_sha256,
             provider_response_sha256=self.provider_response_sha256,
+            request_json_bytes=self.request_json_bytes,
+            encoded_request_bytes=self.encoded_request_bytes,
+            elapsed_ms=self.elapsed_ms,
         )
 
     def failure_receipt(self) -> QwenVisionProviderFailureReceipt:
@@ -321,6 +330,9 @@ class QwenVisionClient(ChapterVisionPort):
         for attempt in range(1, self._max_attempts + 1):
             frames: list[tuple[FrameCandidateArtifact, str]] = []
             payload: dict[str, object] | None = None
+            request_json_bytes = 0
+            encoded_request_bytes = 0
+            elapsed_ms = 0
             final_http_status = None
             provider_response_sha256 = None
             try:
@@ -331,9 +343,28 @@ class QwenVisionClient(ChapterVisionPort):
                     schema_name=schema_name,
                     response_schema=response_schema,
                 )
+                # `request_json_bytes` 是同一请求在图片尚未编码时的 JSON 基线；
+                # `encoded_request_bytes` 是 httpx 最终发送的、含 Base64 图片的
+                # 完整紧凑 JSON 请求体。两者都来自实际 payload 结构，不能用图片
+                # Base64 字符串之和近似后者。
+                request_json_bytes = len(
+                    vision_payload_json_bytes(
+                        build_vision_payload(
+                            prompt,
+                            model_id=self._model_id,
+                            schema_name=schema_name,
+                            response_schema=response_schema,
+                            ordered_encoded_frames=tuple(
+                                (frame.frame_id, "") for frame, _encoded in frames
+                            ),
+                        )
+                    )
+                )
+                encoded_request_bytes = len(vision_payload_json_bytes(payload))
                 if on_provider_attempt is not None:
                     on_provider_attempt()
                 attempt_count += 1
+                started_at = time.monotonic()
                 with self._http_client.stream(
                     "POST",
                     self._endpoint,
@@ -343,12 +374,9 @@ class QwenVisionClient(ChapterVisionPort):
                 ) as response:
                     final_http_status = response.status_code
                     if not 200 <= response.status_code < 300:
-                        provider_response_sha256 = _bounded_error_response_sha256(
-                            response,
-                            self._max_response_bytes,
-                        )
                         _raise_response_status(response)
                     content = _bounded_response(response, self._max_response_bytes)
+                elapsed_ms = max(0, round((time.monotonic() - started_at) * 1000))
                 provider_digest = hashlib.sha256(content).hexdigest()
                 response_id_digest = _response_id_sha256(content)
                 return _ProviderCallResult(
@@ -357,6 +385,9 @@ class QwenVisionClient(ChapterVisionPort):
                     final_http_status=final_http_status,
                     provider_response_sha256=provider_digest,
                     response_id_sha256=response_id_digest,
+                    request_json_bytes=request_json_bytes,
+                    encoded_request_bytes=encoded_request_bytes,
+                    elapsed_ms=elapsed_ms,
                 )
             except (httpx.RequestError, TimeoutError) as error:
                 final_http_status = None
@@ -374,6 +405,9 @@ class QwenVisionClient(ChapterVisionPort):
                             final_http_status=None,
                             provider_response_sha256=None,
                             response_id_sha256=None,
+                            request_json_bytes=request_json_bytes,
+                            encoded_request_bytes=encoded_request_bytes,
+                            elapsed_ms=elapsed_ms,
                         ),
                     ) from error
             except _ProviderCallError:
@@ -391,6 +425,9 @@ class QwenVisionClient(ChapterVisionPort):
                             final_http_status=final_http_status,
                             provider_response_sha256=provider_response_sha256,
                             response_id_sha256=None,
+                            request_json_bytes=request_json_bytes,
+                            encoded_request_bytes=encoded_request_bytes,
+                            elapsed_ms=elapsed_ms,
                         ),
                     ) from error
                 last_error = error
@@ -412,6 +449,9 @@ class QwenVisionClient(ChapterVisionPort):
                 final_http_status=final_http_status,
                 provider_response_sha256=provider_response_sha256,
                 response_id_sha256=None,
+                request_json_bytes=request_json_bytes,
+                encoded_request_bytes=encoded_request_bytes,
+                elapsed_ms=elapsed_ms,
             ),
         )
 
@@ -428,18 +468,14 @@ class QwenVisionClient(ChapterVisionPort):
             model_id=self._model_id,
             schema_name=schema_name,
             response_schema=response_schema,
-            ordered_encoded_frames=tuple(
-                (frame.frame_id, encoded) for frame, encoded in frames
-            ),
+            ordered_encoded_frames=tuple((frame.frame_id, encoded) for frame, encoded in frames),
         )
         upper_bound = vision_payload_size_upper_bound(
             prompt,
             model_id=self._model_id,
             schema_name=schema_name,
             response_schema=response_schema,
-            ordered_frames=tuple(
-                (frame.frame_id, frame.size_bytes) for frame, _encoded in frames
-            ),
+            ordered_frames=tuple((frame.frame_id, frame.size_bytes) for frame, _encoded in frames),
         )
         actual_size = len(vision_payload_json_bytes(payload))
         if actual_size > upper_bound or actual_size > self._max_encoded_request_bytes:
@@ -464,22 +500,6 @@ def _bounded_response(response: httpx.Response, max_bytes: int) -> bytes:
             raise VideoDemoError(ErrorCode.QWEN_RESPONSE_INVALID, "Qwen 响应超过大小上限")
         chunks.append(chunk)
     return b"".join(chunks)
-
-
-def _bounded_error_response_sha256(
-    response: httpx.Response,
-    max_bytes: int,
-) -> str | None:
-    """只对完整落在预算内的错误响应体计算摘要。"""
-
-    digest = hashlib.sha256()
-    total = 0
-    for chunk in response.iter_bytes():
-        total += len(chunk)
-        if total > max_bytes:
-            return None
-        digest.update(chunk)
-    return digest.hexdigest() if total else None
 
 
 def _response_id_sha256(content: bytes) -> str | None:
@@ -581,6 +601,7 @@ def _validate_or_raise(
                 parsed_json=parsed,
             ),
         ) from None
+
 
 def _pydantic_error_summary(error: object) -> str:
     assert isinstance(error, dict)

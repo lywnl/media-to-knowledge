@@ -236,6 +236,24 @@ def test_qwen_receipt_records_final_http_and_provider_response_digest(tmp_path: 
     ).hexdigest()
 
 
+def test_qwen_receipt_measures_real_encoded_json_request_bytes(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    sent_bodies: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent_bodies.append(request.content)
+        return _provider_response(request, {"observations": []})
+
+    _response, receipt = _client(
+        tmp_path,
+        httpx.MockTransport(handler),
+    ).analyze_chapter_with_receipt(_request(run_root), allowed_run_root=run_root)
+
+    assert receipt.encoded_request_bytes == len(sent_bodies[0])
+    assert 0 < receipt.request_json_bytes < receipt.encoded_request_bytes
+
+
 def test_qwen_receipt_and_plain_call_share_identical_payload(tmp_path: Path) -> None:
     run_root = tmp_path / "runs/scope_001/run_001"
     run_root.mkdir(parents=True)
@@ -273,7 +291,7 @@ def test_qwen_receipt_failure_keeps_provider_attempt_and_http_status(tmp_path: P
     assert raised.value.provider.provider_response_sha256 is None
 
 
-def test_qwen_receipt_failure_hashes_bounded_error_body(tmp_path: Path) -> None:
+def test_qwen_receipt_failure_does_not_hash_bounded_error_body(tmp_path: Path) -> None:
     run_root = tmp_path / "runs/scope_001/run_001"
     run_root.mkdir(parents=True)
     body = b"provider-error"
@@ -289,6 +307,25 @@ def test_qwen_receipt_failure_hashes_bounded_error_body(tmp_path: Path) -> None:
         ).analyze_chapter_with_receipt(_request(run_root), allowed_run_root=run_root)
 
     assert raised.value.provider.final_http_status == 500
+    assert raised.value.provider.provider_response_sha256 is None
+
+
+def test_qwen_receipt_invalidates_two_xx_non_json_with_provider_digest(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    body = b"not-json"
+
+    with pytest.raises(QwenVisionCallFailure) as raised:
+        _client(
+            tmp_path,
+            httpx.MockTransport(
+                lambda request: httpx.Response(200, content=body, request=request)
+            ),
+        ).analyze_chapter_with_receipt(_request(run_root), allowed_run_root=run_root)
+
+    assert raised.value.provider.final_http_status == 200
     assert raised.value.provider.provider_response_sha256 == hashlib.sha256(body).hexdigest()
 
 

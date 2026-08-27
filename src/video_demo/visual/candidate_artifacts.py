@@ -230,6 +230,7 @@ class CandidateArtifactSession:
         self._owned: dict[str, OwnedCandidateArtifact] = {}
         self._candidate_root: Path | None = None
         self._lease: CandidateDirectoryLease | None = None
+        self._owns_lease = False
 
     @property
     def unique_bytes(self) -> int:
@@ -239,7 +240,12 @@ class CandidateArtifactSession:
     def owned_artifacts(self) -> tuple[OwnedCandidateArtifact, ...]:
         return tuple(self._owned.values())
 
-    def prepare_run(self, run_relative_root: Path) -> None:
+    def prepare_run(
+        self,
+        run_relative_root: Path,
+        *,
+        lease: CandidateDirectoryLease | None = None,
+    ) -> None:
         candidate_root = safe_runtime_path(
             self._runtime_root,
             run_relative_root / "visual" / "candidates",
@@ -248,7 +254,8 @@ class CandidateArtifactSession:
             if candidate_root != self._candidate_root:
                 raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "候选帧会话跨越多个 Run")
             return
-        lease = CandidateDirectoryLease(
+        owns_lease = lease is None
+        active_lease = lease or CandidateDirectoryLease(
             runtime_root=self._runtime_root,
             run_relative_root=run_relative_root,
             mode="EXCLUSIVE",
@@ -256,13 +263,22 @@ class CandidateArtifactSession:
             wait_timeout_seconds=self._lock_timeout_seconds,
         )
         try:
-            lease.acquire()
-            self._lease = lease
+            if owns_lease:
+                active_lease.acquire()
+            elif not active_lease.is_acquired or active_lease.candidate_root != candidate_root:
+                raise VideoDemoError(
+                    ErrorCode.INVALID_CONFIGURATION,
+                    "外部候选帧租约未持有或不属于当前 Run",
+                )
+            self._lease = active_lease
+            self._owns_lease = owns_lease
             self._candidate_root = candidate_root
             self._snapshot_existing_candidates()
         except Exception:
-            lease.close()
+            if owns_lease:
+                active_lease.close()
             self._lease = None
+            self._owns_lease = False
             self._candidate_root = None
             raise
 
@@ -339,8 +355,10 @@ class CandidateArtifactSession:
 
     def close(self) -> None:
         if self._lease is not None:
-            self._lease.close()
+            if self._owns_lease:
+                self._lease.close()
             self._lease = None
+            self._owns_lease = False
         self._candidate_root = None
 
     def _snapshot_existing_candidates(self) -> None:
@@ -427,10 +445,7 @@ class CandidateArtifactSession:
             destination,
             message="候选帧输出路径不能包含符号链接",
         )
-        if (
-            destination.parent != self._candidate_root
-            or destination.name != f"{sha256}.jpg"
-        ):
+        if destination.parent != self._candidate_root or destination.name != f"{sha256}.jpg":
             raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "候选帧内容地址路径非法")
         return destination
 
@@ -468,11 +483,19 @@ def read_verified_candidate_jpeg(
     expected_relative = Path("visual/candidates") / f"{frame.sha256}.jpg"
     if Path(frame.relative_path) != expected_relative or frame.mime_type != "image/jpeg":
         raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "候选帧内容地址路径非法")
-    candidate_root = reject_symlink_components(
-        run_root,
-        run_root / "visual/candidates",
-        message="候选帧必须位于当前 Run 且不能包含符号链接",
-    )
+    try:
+        candidate_root = reject_symlink_components(
+            run_root,
+            run_root / "visual/candidates",
+            message="候选帧必须位于当前 Run 且不能包含符号链接",
+        )
+    except VideoDemoError as error:
+        if error.code == ErrorCode.WORKSPACE_PATH_ESCAPE:
+            raise VideoDemoError(
+                ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                "候选帧目录在读取期间被替换",
+            ) from error
+        raise
     return _read_verified_candidate_at(
         run_root,
         candidate_root,
@@ -504,8 +527,7 @@ def _read_verified_candidate_at(
         if (
             not stat.S_ISDIR(opened_directory.st_mode)
             or stat.S_IMODE(opened_directory.st_mode) != 0o700
-            or _directory_identity(before_directory)
-            != _directory_identity(opened_directory)
+            or _directory_identity(before_directory) != _directory_identity(opened_directory)
         ):
             raise OSError
         before_file = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
@@ -534,19 +556,25 @@ def _read_verified_candidate_at(
         after_file = os.fstat(file_descriptor)
         current_file = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
         current_directory = os.fstat(directory_descriptor)
-        reject_symlink_components(
-            run_root,
-            candidate_root,
-            message="候选帧必须位于当前 Run 且不能包含符号链接",
-        )
+        try:
+            reject_symlink_components(
+                run_root,
+                candidate_root,
+                message="候选帧必须位于当前 Run 且不能包含符号链接",
+            )
+        except VideoDemoError as error:
+            if error.code == ErrorCode.WORKSPACE_PATH_ESCAPE:
+                raise VideoDemoError(
+                    ErrorCode.ARTIFACT_SCHEMA_INVALID,
+                    "候选帧目录在读取期间被替换",
+                ) from error
+            raise
         after_directory = os.lstat(candidate_root)
         if (
             _file_identity(opened_file) != _file_identity(after_file)
             or _file_identity(after_file) != _file_identity(current_file)
-            or _directory_identity(opened_directory)
-            != _directory_identity(current_directory)
-            or _directory_identity(current_directory)
-            != _directory_identity(after_directory)
+            or _directory_identity(opened_directory) != _directory_identity(current_directory)
+            or _directory_identity(current_directory) != _directory_identity(after_directory)
             or not _is_jpeg(payload)
             or hashlib.sha256(payload).hexdigest() != expected_digest
         ):
@@ -659,8 +687,7 @@ def _publish_new_jpeg(
         published = os.lstat(destination)
         if (
             not stat.S_ISREG(published.st_mode)
-            or (published.st_dev, published.st_ino, published.st_size)
-            != destination_identity
+            or (published.st_dev, published.st_ino, published.st_size) != destination_identity
         ):
             raise OSError
         temporary.unlink()
