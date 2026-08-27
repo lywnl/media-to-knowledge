@@ -155,6 +155,22 @@ def test_dense_sentence_end_candidates_do_not_recreate_one_segment_per_asr() -> 
     assert sum(len(item.evidence_refs) for item in segments) == len(transcript)
 
 
+def test_short_asr_crossing_grid_does_not_create_extra_boundaries() -> None:
+    transcript = (
+        _speech("asr_001", 29_000, 31_000),
+        _speech("asr_002", 31_000, 33_000),
+    )
+
+    segments = _build(120_000, transcript)
+
+    assert [(item.start_ms, item.end_ms) for item in segments] == [
+        (0, 60_000),
+        (60_000, 90_000),
+        (90_000, 120_000),
+    ]
+    assert sum(len(item.evidence_refs) for item in segments) == len(transcript)
+
+
 def test_boundary_inside_subtitle_is_removed_and_evidence_has_unique_owner() -> None:
     cue = _subtitle("subtitle_001", 25_000, 35_000)
     segments = _build(60_000, (cue,))

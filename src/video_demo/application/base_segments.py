@@ -188,6 +188,13 @@ def _add_blocking_transcript_boundaries(
 ) -> tuple[int, ...]:
     boundaries = set(safe)
     for item in transcript:
+        # ASR 通常是 1~3 秒的密集短片段；如果网格/镜头边界恰好穿过它，
+        # 为每条 ASR 补首尾会重新退化成“一条 ASR 一个基础片段”。ASR
+        # 只需由 `_exclude_evidence_interiors()` 保证不被切穿，边界继续
+        # 使用下一个安全候选。字幕 cue 更稀疏，仍保留精确起止边界，
+        # 维持字幕时间轴的可追溯性和既有契约。
+        if not isinstance(item, SubtitleCue):
+            continue
         if not any(item.start_ms < candidate < item.end_ms for candidate in candidates):
             continue
         for endpoint in (item.start_ms, item.end_ms):
