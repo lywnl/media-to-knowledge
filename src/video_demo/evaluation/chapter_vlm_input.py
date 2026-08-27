@@ -20,6 +20,7 @@ from video_demo.evaluation.annotations import (
     EvaluationAnnotation,
     ValidatedEvaluationPackage,
     VerifiedAnnotation,
+    select_reference_visual_frames,
 )
 from video_demo.evaluation.dataset import EvaluationSample
 from video_demo.media.probe import FFprobeClient, ProbeLimits, SupportedMime
@@ -391,24 +392,14 @@ def validate_chapter_vlm_input_manifest(
 
 
 def _choose_reference_frames(annotation: EvaluationAnnotation) -> tuple[tuple[str, int], ...]:
-    buckets: dict[int, list[str]] = {}
-    for frame in sorted(
-        annotation.visual_frames, key=lambda item: (item.timestamp_ms, item.frame_id)
-    ):
-        buckets.setdefault(frame.timestamp_ms, []).append(frame.frame_id)
-    values = tuple((timestamp, min(ids)) for timestamp, ids in sorted(buckets.items()))
-    best: tuple[tuple[int, str], ...] = ()
-    for start in range(len(values)):
-        for end in range(start + 1, len(values)):
-            candidate = values[start : end + 1]
-            if candidate[-1][0] - candidate[0][0] > _MAX_CHAPTER_SPAN_MS:
-                break
-            if len(candidate) > len(best) or (len(candidate) == len(best) and candidate < best):
-                best = candidate
-    if len(best) > 4:
-        indexes = (0, round((len(best) - 1) / 3), round(2 * (len(best) - 1) / 3), len(best) - 1)
-        best = tuple(best[index] for index in indexes)
-    return tuple((frame_id, timestamp) for timestamp, frame_id in best)
+    return tuple(
+        (frame.frame_id, frame.timestamp_ms)
+        for frame in select_reference_visual_frames(
+            annotation,
+            max_span_ms=_MAX_CHAPTER_SPAN_MS,
+            max_frames=4,
+        )
+    )
 
 
 def _mime_for_path(path: Path) -> SupportedMime:

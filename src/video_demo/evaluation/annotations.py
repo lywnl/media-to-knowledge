@@ -201,6 +201,44 @@ class EvaluationAnnotation(FrozenModel):
             raise ValueError("边界时间必须严格递增且不重复")
 
 
+def select_reference_visual_frames(
+    annotation: EvaluationAnnotation,
+    *,
+    max_span_ms: int = 300_000,
+    max_frames: int = 4,
+) -> tuple[ReferenceVisualFrame, ...]:
+    """选择最早的最大合法章节帧簇，并以首尾等距规则限制帧数。"""
+
+    if type(max_span_ms) is not int or max_span_ms < 0:
+        raise ValueError("视觉帧簇跨度必须是非负整数")
+    if type(max_frames) is not int or max_frames < 2:
+        raise ValueError("视觉帧簇至少允许两帧")
+    by_timestamp: dict[int, ReferenceVisualFrame] = {}
+    for frame in sorted(
+        annotation.visual_frames,
+        key=lambda item: (item.timestamp_ms, item.frame_id),
+    ):
+        by_timestamp.setdefault(frame.timestamp_ms, frame)
+    frames = tuple(by_timestamp.values())
+    left = 0
+    best: tuple[ReferenceVisualFrame, ...] = ()
+    for right, frame in enumerate(frames):
+        while frame.timestamp_ms - frames[left].timestamp_ms > max_span_ms:
+            left += 1
+        candidate = frames[left : right + 1]
+        if len(candidate) > len(best):
+            best = candidate
+    if len(best) <= max_frames:
+        return best
+    last_index = len(best) - 1
+    denominator = max_frames - 1
+    indexes = tuple(
+        (last_index * position + denominator // 2) // denominator
+        for position in range(max_frames)
+    )
+    return tuple(best[index] for index in indexes)
+
+
 class ClaimJudgment(FrozenModel):
     claim_id: StableId
     verdict: Literal["SUPPORTED", "UNSUPPORTED"]

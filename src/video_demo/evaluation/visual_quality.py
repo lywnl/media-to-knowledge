@@ -16,7 +16,10 @@ from video_demo.domain.base import FrozenModel, Sha256, StableId, stable_identif
 from video_demo.domain.manifest import Rational
 from video_demo.domain.run import ModelIdentity
 from video_demo.errors import ErrorCode
-from video_demo.evaluation.annotations import ValidatedEvaluationPackage
+from video_demo.evaluation.annotations import (
+    ValidatedEvaluationPackage,
+    select_reference_visual_frames,
+)
 from video_demo.evaluation.chapter_vlm_live import (
     ChapterVlmCallReceipt,
     VisualTextScoreFact,
@@ -71,24 +74,18 @@ def build_visual_quality_set(
 ) -> VisualQualitySet:
     """从已重验标注确定性生成代表性质量集身份闭包。"""
 
-    frames_by_sample = {
-        verified.annotation.sample_id: verified.annotation.visual_frames
-        for verified in package.annotations
-    }
     samples: list[VisualQualitySample] = []
     media_ids: set[str] = set()
     category_counts: dict[str, int] = {"CODE": 0, "TABLE": 0, "UI_SMALL_TEXT": 0}
     frame_count = 0
     for sample in sorted(package.dataset.samples, key=lambda item: item.sample_id):
-        frames = sorted(
-            frames_by_sample.get(sample.sample_id, ()),
-            key=lambda item: (item.timestamp_ms, item.frame_id),
+        verified = next(
+            item for item in package.annotations if item.annotation.sample_id == sample.sample_id
         )
+        frames = select_reference_visual_frames(verified.annotation)
         if len(frames) < 2:
             continue
-        selected_indexes = _representative_frame_indexes(len(frames))
-        selected_frames = tuple(frames[index] for index in selected_indexes)
-        selected = tuple(frame.frame_id for frame in selected_frames)
+        selected = tuple(frame.frame_id for frame in frames)
         samples.append(
             VisualQualitySample(
                 sample_id=sample.sample_id,
@@ -97,7 +94,7 @@ def build_visual_quality_set(
         )
         media_ids.add(sample.media_sha256)
         frame_count += len(selected)
-        for frame in selected_frames:
+        for frame in frames:
             for category in frame.quality_categories:
                 if category in category_counts:
                     category_counts[category] += 1
@@ -131,18 +128,6 @@ def build_visual_quality_set(
         proxy_max_edge=proxy_max_edge,
         jpeg_quality=jpeg_quality,
     )
-
-
-def _representative_frame_indexes(frame_count: int) -> tuple[int, ...]:
-    """稳定保留首尾，并在中间使用等距分位点，避免前段帧垄断质量集。"""
-
-    if frame_count <= 4:
-        return tuple(range(frame_count))
-    last_index = frame_count - 1
-    interior = tuple((last_index * position + 1) // 3 for position in (1, 2))
-    return (0, *interior, last_index)
-
-
 def visual_quality_case_id(
     parent_evaluation_run_id: StableId,
     sample_id: StableId,

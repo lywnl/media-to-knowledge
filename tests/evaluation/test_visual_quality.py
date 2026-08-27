@@ -54,7 +54,11 @@ def _not_run_case(edge: int = 1920) -> VisualQualityCase:
     )
 
 
-def _package_with_frames(frames: tuple[ReferenceVisualFrame, ...]) -> ValidatedEvaluationPackage:
+def _package_with_frames(
+    frames: tuple[ReferenceVisualFrame, ...],
+    *,
+    duration_ms: int = 10_000,
+) -> ValidatedEvaluationPackage:
     media_sha = "a" * 64
     sample = EvaluationSample(
         sample_id="sample_001",
@@ -69,7 +73,7 @@ def _package_with_frames(frames: tuple[ReferenceVisualFrame, ...]) -> ValidatedE
         schema_version="2.0.0",
         sample_id=sample.sample_id,
         media_sha256=media_sha,
-        duration_ms=10_000,
+        duration_ms=duration_ms,
         language="zh",
         reference_text="参考文本",
         visual_frames=frames,
@@ -130,6 +134,29 @@ def test_quality_set_selects_first_last_and_evenly_spaced_frames() -> None:
         "frame_002",
         "frame_003",
         "frame_005",
+    )
+
+
+def test_quality_set_selects_the_earliest_largest_five_minute_frame_cluster() -> None:
+    timestamps = (0, 100_000, 200_000, 300_000, 700_000, 800_000, 900_000)
+    frames = tuple(
+        ReferenceVisualFrame(
+            frame_id=f"frame_{index:03d}",
+            timestamp_ms=timestamp_ms,
+            text_lines=(f"文本 {index}",),
+        )
+        for index, timestamp_ms in enumerate(timestamps)
+    )
+    quality_set = build_visual_quality_set(
+        _package_with_frames(frames, duration_ms=1_000_000),
+        parent_evaluation_run_id="eval_parent",
+    )
+
+    assert quality_set.samples[0].requested_reference_frame_ids == (
+        "frame_000",
+        "frame_001",
+        "frame_002",
+        "frame_003",
     )
 
 
