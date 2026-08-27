@@ -34,6 +34,7 @@ from video_demo.evaluation.chapter_vlm_input import (
 from video_demo.evaluation.metrics import nfkc_character_edit_counts
 from video_demo.integrations.document_port import ChapterVisionRequest, ChapterVisionResponse
 from video_demo.integrations.document_validation import (
+    chapter_vision_response_bytes,
     chapter_vision_response_sha256,
     validate_chapter_vision_response,
 )
@@ -49,6 +50,16 @@ VisualTextCategory = Literal[
     "FORMULA",
     "DIAGRAM",
     "UI_SMALL_TEXT",
+]
+
+__all__ = [
+    "ChapterVlmCallReceipt",
+    "VisualTextScoreFact",
+    "build_visual_text_score_fact",
+    "chapter_vision_response_bytes",
+    "execute_chapter_vlm_live",
+    "has_selected_frame_selection",
+    "has_visual_text_projection",
 ]
 
 
@@ -210,6 +221,32 @@ def build_visual_text_score_fact(
         quality_categories=categories or ("GENERAL_TEXT",),
         selected_reference_frame_count=len(selected),
     )
+
+
+def has_visual_text_projection(
+    response: ChapterVisionResponse,
+    manifest: ChapterVlmInputManifest,
+) -> bool:
+    """判断响应是否至少包含一个绑定当前输入帧的非空文字投影。"""
+
+    frame_order = {frame.frame_id: index for index, frame in enumerate(manifest.frames)}
+    try:
+        return bool(_visual_text_units(response, frame_order))
+    except (KeyError, ValueError):
+        return False
+
+
+def has_selected_frame_selection(
+    response: ChapterVisionResponse,
+    manifest: ChapterVlmInputManifest,
+) -> bool:
+    """判断响应是否至少选中了一个当前 Manifest 中的输入帧。"""
+
+    frame_order = {frame.frame_id: index for index, frame in enumerate(manifest.frames)}
+    try:
+        return bool(_selected_frame_ids(response, frame_order))
+    except (KeyError, ValueError):
+        return False
 
 
 def _frame_descriptor(frame: ChapterVlmInputFrame) -> FrameCandidateArtifact:

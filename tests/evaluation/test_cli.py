@@ -71,13 +71,12 @@ def _gate_check(check_id: str, status: GateStatus) -> GateCheck:
     return GateCheck(check_id=check_id, status=status, evidence=(evidence,))
 
 
-def test_live_dispatch_writes_outer_summary_instead_of_returning_baidu_report(
+def test_live_dispatch_writes_outer_summary_instead_of_returning_chapter_vlm_report(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     checks = {
-        "baidu": _gate_check("baidu_ocr_live", GateStatus.PASS),
-        "qwen": _gate_check("qwen_live", GateStatus.FAIL),
+        "chapter_vlm": _gate_check("chapter_vlm_live", GateStatus.PASS),
         "models": _gate_check("five_language_models", GateStatus.PASS),
     }
 
@@ -85,11 +84,8 @@ def test_live_dispatch_writes_outer_summary_instead_of_returning_baidu_report(
         def __init__(self, *_args: object) -> None:
             pass
 
-        def run_workspace_baidu(self, _run_id: str) -> GateCheck:
-            return checks["baidu"]
-
-        def run_workspace_qwen(self, _run_id: str) -> GateCheck:
-            return checks["qwen"]
+        def run_workspace_chapter_vlm(self, _run_id: str) -> GateCheck:
+            return checks["chapter_vlm"]
 
         def run_workspace_local_model_stack(self, _run_id: str) -> GateCheck:
             return checks["models"]
@@ -101,15 +97,14 @@ def test_live_dispatch_writes_outer_summary_instead_of_returning_baidu_report(
         settings,
     )
 
-    assert result.status == GateStatus.FAIL
-    assert result.reason == "失败门禁: qwen_live"
+    assert result.status == GateStatus.PASS
+    assert result.reason is None
     assert result.report_path.endswith("eval/reports/eval_live/live-summary.json")
     summary = __import__("json").loads(
         (tmp_path / result.report_path).read_text(encoding="utf-8")
     )
     assert [item["check_id"] for item in summary["checks"]] == [
-        "baidu_ocr_live",
-        "qwen_live",
+        "chapter_vlm_live",
         "five_language_models",
     ]
 

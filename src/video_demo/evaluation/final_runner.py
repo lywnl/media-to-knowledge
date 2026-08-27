@@ -98,11 +98,15 @@ REQUIREMENT_SPECS: tuple[RequirementSpec, ...] = (
     RequirementSpec(20, "真实 scene 检测生成候选边界", ("real_media_chain",)),
     RequirementSpec(21, "音画证据构造确定性混合窗口", ("real_media_chain",)),
     RequirementSpec(22, "关键帧选择过滤黑帧并去重", ("real_media_chain",)),
-    RequirementSpec(23, "百度 OCR 对授权五语画面真实调用", ("baidu_ocr_live",)),
+    RequirementSpec(23, "Qwen3-VL 对授权多图中的画面文字执行真实取证", ("chapter_vlm_live",)),
     RequirementSpec(24, "时间轴证据稳定排序且引用合法", ("automated_tests",)),
     RequirementSpec(25, "多模态理解端口只接收冻结证据", ("automated_tests",)),
-    RequirementSpec(26, "Qwen 对实际视频和 Schema 完成能力探测", ("qwen_live",)),
-    RequirementSpec(27, "Qwen 输出严格校验且提示词与数据隔离", ("qwen_live",)),
+    RequirementSpec(
+        26,
+        "章节 VLM 对 2~4 张本地 JPEG 完成一次有序多图逻辑调用",
+        ("chapter_vlm_live",),
+    ),
+    RequirementSpec(27, "Qwen 输出严格校验且提示词与数据隔离", ("chapter_vlm_live",)),
     RequirementSpec(28, "边界合并仅吸附已有候选", ("automated_tests",)),
     RequirementSpec(29, "生产音画流水线发布结构化结果", ("five_language_models",)),
     RequirementSpec(30, "retrieval_text 稳定生成且不建设检索索引", ("no_indexing",)),
@@ -252,18 +256,14 @@ class LiveValidationSummary(FrozenModel):
     schema_version: Literal["1.0.0"]
     evaluation_run_id: StableId
     status: GateStatus
-    checks: tuple[LiveCheckSummary, LiveCheckSummary, LiveCheckSummary]
+    checks: tuple[LiveCheckSummary, LiveCheckSummary]
     created_at: datetime
 
     @model_validator(mode="after")
     def validate_checks(self) -> LiveValidationSummary:
-        expected = (
-            "baidu_ocr_live",
-            "qwen_live",
-            "five_language_models",
-        )
+        expected = ("chapter_vlm_live", "five_language_models")
         if tuple(item.check_id for item in self.checks) != expected:
-            raise ValueError("live 汇总必须按固定顺序覆盖三项检查")
+            raise ValueError("live 汇总必须按固定顺序覆盖章节 VLM 与五语检查")
         if self.status != _aggregate_status(tuple(item.status for item in self.checks)):
             raise ValueError("live 汇总状态与检查状态不一致")
         return self
@@ -283,14 +283,16 @@ class FinalValidationRunner:
         stage_reasons: dict[str, str] = {}
         if capabilities.issues:
             stage_reasons["media"] = "工作区 FFmpeg/ffprobe 前置条件不足"
-        if not (eval_root / "dataset.jsonl").is_file() or not (
-            eval_root / "authorization.json"
-        ).is_file():
+        if (
+            not (eval_root / "dataset.jsonl").is_file()
+            or not (eval_root / "authorization.json").is_file()
+        ):
             stage_reasons["quality"] = "缺少授权五语评测集或授权记录"
             stage_reasons["live"] = "缺少授权五语评测集或授权记录"
-        if not (eval_root / "durability/dataset.jsonl").is_file() or not (
-            eval_root / "durability/authorization.json"
-        ).is_file():
+        if (
+            not (eval_root / "durability/dataset.jsonl").is_file()
+            or not (eval_root / "durability/authorization.json").is_file()
+        ):
             stage_reasons["durability"] = "缺少两段 30 分钟 1080p 耐久素材或授权记录"
         summary = PreflightSummary(
             schema_version="1.0.0",
@@ -308,11 +310,7 @@ class FinalValidationRunner:
         return StageExecutionResult(
             status=summary.status,
             report_path=path.relative_to(self._settings.workspace_root).as_posix(),
-            reason=(
-                "；".join(dict.fromkeys(stage_reasons.values()))
-                if stage_reasons
-                else None
-            ),
+            reason=("；".join(dict.fromkeys(stage_reasons.values())) if stage_reasons else None),
         )
 
     def final(self, evaluation_run_id: str) -> StageExecutionResult:
@@ -335,10 +333,7 @@ class FinalValidationRunner:
         ):
             quality = self._bind_verified_durability(quality, durability)
             _atomic_write_json(
-                self._store.runtime_root
-                / "eval/reports"
-                / evaluation_run_id
-                / "quality.json",
+                self._store.runtime_root / "eval/reports" / evaluation_run_id / "quality.json",
                 quality.model_dump(mode="json", exclude_none=True),
                 workspace_root=self._settings.workspace_root,
             )
@@ -402,9 +397,7 @@ class FinalValidationRunner:
         eval_root = self._store.runtime_root / "eval"
         manifest = eval_root / "dataset.jsonl"
         authorization = eval_root / "authorization.json"
-        report_relative = (
-            Path("eval/reports") / evaluation_run_id / "authorized_dataset.json"
-        )
+        report_relative = Path("eval/reports") / evaluation_run_id / "authorized_dataset.json"
         report_path = self._store.runtime_root / report_relative
         if report_path.is_file():
             return build_verified_gate_check(
@@ -425,9 +418,7 @@ class FinalValidationRunner:
                 runtime_root=self._store.runtime_root,
                 max_video_bytes=self._settings.max_video_bytes,
             )
-            package.dataset.validate_final_gate(
-                max_video_bytes=self._settings.max_video_bytes
-            )
+            package.dataset.validate_final_gate(max_video_bytes=self._settings.max_video_bytes)
         except Exception:
             raise ValueError("授权数据集非法或损坏") from None
         language_counts = Counter(sample.language for sample in package.dataset.samples)
@@ -536,8 +527,7 @@ class FinalValidationRunner:
             "secret_scan",
         )
         return tuple(
-            runner.run(check_id, evaluation_run_id=evaluation_run_id)
-            for check_id in check_ids
+            runner.run(check_id, evaluation_run_id=evaluation_run_id) for check_id in check_ids
         )
 
     def _load_external_checks(self, evaluation_run_id: str) -> tuple[GateCheck, ...]:
@@ -546,13 +536,9 @@ class FinalValidationRunner:
                 stage_evaluation_run_id(evaluation_run_id, "media"),
                 "real-media.json",
             ),
-            "baidu_ocr_live": (
-                stage_evaluation_run_id(evaluation_run_id, "baidu"),
-                "baidu_ocr_live.json",
-            ),
-            "qwen_live": (
-                stage_evaluation_run_id(evaluation_run_id, "qwen"),
-                "qwen_live.json",
+            "chapter_vlm_live": (
+                stage_evaluation_run_id(evaluation_run_id, "chapter-vlm"),
+                "chapter_vlm_live.json",
             ),
             "five_language_models": (
                 stage_evaluation_run_id(evaluation_run_id, "models"),
@@ -578,11 +564,7 @@ class FinalValidationRunner:
         return tuple(checks)
 
     def _load_quality(self, evaluation_run_id: str) -> QualityReport:
-        report_root = (
-            self._store.runtime_root
-            / "eval/reports"
-            / evaluation_run_id
-        )
+        report_root = self._store.runtime_root / "eval/reports" / evaluation_run_id
         prediction = report_root / "prediction.json"
         if not prediction.is_file():
             if (report_root / "quality.json").is_file():
@@ -655,9 +637,7 @@ class OfflineGateRunner:
 
     def run(self, check_id: OfflineCheckId, *, evaluation_run_id: str) -> GateCheck:
         validate_path_component(evaluation_run_id, "evaluation_run_id")
-        report_relative = (
-            Path("eval/reports") / evaluation_run_id / f"{check_id}.json"
-        )
+        report_relative = Path("eval/reports") / evaluation_run_id / f"{check_id}.json"
         report_path = self._store.runtime_root / report_relative
         if report_path.is_file():
             return build_verified_gate_check(
@@ -674,11 +654,7 @@ class OfflineGateRunner:
             audited_paths,
         )
         exit_code, stdout_bytes, stderr_bytes, observations = self._execute(check_id)
-        status = (
-            GateStatus.PASS
-            if exit_code == 0 and not observations
-            else GateStatus.FAIL
-        )
+        status = GateStatus.PASS if exit_code == 0 and not observations else GateStatus.FAIL
         root = Path("eval/reports") / evaluation_run_id
         stdout = self._store.write_artifact(
             root / f"{check_id}.stdout.txt",
@@ -782,9 +758,7 @@ class OfflineGateRunner:
             timeout=600,
         )
         observations = (
-            ()
-            if completed.returncode == 0
-            else (f"COMMAND_EXIT_{completed.returncode}",)
+            () if completed.returncode == 0 else (f"COMMAND_EXIT_{completed.returncode}",)
         )
         return completed.returncode, completed.stdout, completed.stderr, observations
 
@@ -852,9 +826,7 @@ def build_requirement_evidence_report(
         raise ValueError("最终报告文件与已重验对象不一致")
     final_relative = trusted_final.relative_to(workspace).as_posix()
     checks = {check.check_id: check for check in final.checks}
-    rows = tuple(
-        _requirement_row(spec, checks, final_relative) for spec in REQUIREMENT_SPECS
-    )
+    rows = tuple(_requirement_row(spec, checks, final_relative) for spec in REQUIREMENT_SPECS)
     return RequirementEvidenceReport(
         schema_version="1.0.0",
         evaluation_run_id=evaluation_run_id,
@@ -866,7 +838,7 @@ def build_requirement_evidence_report(
 def write_live_validation_summary(
     *,
     evaluation_run_id: str,
-    checks: tuple[GateCheck, GateCheck, GateCheck],
+    checks: tuple[GateCheck, GateCheck],
     workspace_root: Path,
 ) -> StageExecutionResult:
     validate_path_component(evaluation_run_id, "evaluation_run_id")
@@ -880,10 +852,7 @@ def write_live_validation_summary(
         created_at=datetime.now(UTC),
     )
     path = (
-        workspace
-        / ".codex/video-rag-demo/eval/reports"
-        / evaluation_run_id
-        / "live-summary.json"
+        workspace / ".codex/video-rag-demo/eval/reports" / evaluation_run_id / "live-summary.json"
     )
     _atomic_write_json(
         path,
@@ -915,12 +884,7 @@ def write_stage_not_run_summary(
         created_at=datetime.now(UTC),
     )
     filename = stage.replace("_", "-") + "-summary.json"
-    path = (
-        workspace
-        / ".codex/video-rag-demo/eval/reports"
-        / evaluation_run_id
-        / filename
-    )
+    path = workspace / ".codex/video-rag-demo/eval/reports" / evaluation_run_id / filename
     _atomic_write_json(
         path,
         summary.model_dump(mode="json"),
@@ -1061,11 +1025,7 @@ def _requirement_row(
         dict.fromkeys(
             (
                 final_relative,
-                *(
-                    evidence.relative_path
-                    for check in selected
-                    for evidence in check.evidence
-                ),
+                *(evidence.relative_path for check in selected for evidence in check.evidence),
             )
         )
     )
@@ -1101,9 +1061,7 @@ def _checks_status_reason(checks: Sequence[GateCheck]) -> str | None:
     failed = tuple(check.check_id for check in checks if check.status == GateStatus.FAIL)
     if failed:
         return f"失败门禁: {', '.join(failed)}"
-    not_run = tuple(
-        check.check_id for check in checks if check.status == GateStatus.NOT_RUN
-    )
+    not_run = tuple(check.check_id for check in checks if check.status == GateStatus.NOT_RUN)
     if not_run:
         return f"未运行门禁: {', '.join(not_run)}"
     return None
@@ -1119,10 +1077,7 @@ def _trusted_regular_file(workspace: Path, path: Path) -> Path:
 
 
 def _any_dataset_input_present(manifest: Path, authorization: Path) -> bool:
-    return any(
-        path.exists() or path.is_symlink()
-        for path in (manifest, authorization)
-    )
+    return any(path.exists() or path.is_symlink() for path in (manifest, authorization))
 
 
 def _reject_symlink_path(root: Path, candidate: Path) -> None:
@@ -1140,7 +1095,7 @@ def _reject_symlink_path(root: Path, candidate: Path) -> None:
 def _cleanup_targets(runtime: Path, evaluation_run_id: str) -> tuple[Path, ...]:
     stage_ids = {
         stage: stage_evaluation_run_id(evaluation_run_id, stage)
-        for stage in ("media", "baidu", "qwen", "models", "durability")
+        for stage in ("media", "chapter-vlm", "models", "durability")
     }
     candidates = (
         runtime / "eval/reports" / evaluation_run_id,
@@ -1148,7 +1103,7 @@ def _cleanup_targets(runtime: Path, evaluation_run_id: str) -> tuple[Path, ...]:
         *(runtime / "eval/reports" / run_id for run_id in stage_ids.values()),
         *(
             runtime / "eval/live-authority" / stage_ids[stage]
-            for stage in ("baidu", "qwen", "models")
+            for stage in ("chapter-vlm", "models")
         ),
     )
     return tuple(path for path in candidates if path.exists() or path.is_symlink())
@@ -1170,9 +1125,7 @@ def _bound_product_run_targets(
             settings=settings,
         ),
     }
-    scope_key = hashlib.sha256(
-        b"evaluation\x00video-demo\x00evaluation"
-    ).hexdigest()[:24]
+    scope_key = hashlib.sha256(b"evaluation\x00video-demo\x00evaluation").hexdigest()[:24]
     candidates = tuple(runtime / "runs" / scope_key / run_id for run_id in run_ids)
     return tuple(path for path in candidates if path.exists() or path.is_symlink())
 
@@ -1297,9 +1250,7 @@ def _verified_durability_run_ids(
                 or sample.job_id is None
             ):
                 continue
-            digest = hashlib.sha256(
-                f"{durability_run_id}:{sample.sample_id}".encode()
-            ).hexdigest()
+            digest = hashlib.sha256(f"{durability_run_id}:{sample.sample_id}".encode()).hexdigest()
             bound_in_database = _database_run_is_owned(
                 runtime,
                 idempotency_key=f"durability-{digest[:40]}",
@@ -1407,10 +1358,7 @@ def _cleanup_inventory(targets: tuple[Path, ...], workspace: Path) -> tuple[str,
     entries: list[str] = []
     for target in targets:
         entries.append(target.relative_to(workspace).as_posix())
-        entries.extend(
-            path.relative_to(workspace).as_posix()
-            for path in sorted(target.rglob("*"))
-        )
+        entries.extend(path.relative_to(workspace).as_posix() for path in sorted(target.rglob("*")))
     return tuple(entries)
 
 
@@ -1421,8 +1369,7 @@ def _atomic_write_json(
     workspace_root: Path,
 ) -> None:
     encoded = (
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        + "\n"
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
     _atomic_write_bytes(path, encoded, workspace_root=workspace_root)
 
@@ -1544,8 +1491,6 @@ def _final_reason(final: FinalGateReport) -> str | None:
     if failed or final.quality.status == GateStatus.FAIL:
         parts = (("quality",) if final.quality.status == GateStatus.FAIL else ()) + failed
         return f"失败门禁: {', '.join(parts)}"
-    not_run = tuple(
-        check.check_id for check in final.checks if check.status == GateStatus.NOT_RUN
-    )
+    not_run = tuple(check.check_id for check in final.checks if check.status == GateStatus.NOT_RUN)
     parts = (("quality",) if final.quality.status == GateStatus.NOT_RUN else ()) + not_run
     return f"未运行门禁: {', '.join(parts)}"

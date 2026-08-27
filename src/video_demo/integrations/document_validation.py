@@ -146,14 +146,19 @@ def _without_computed_fields(value: object) -> object:
 def chapter_vision_response_sha256(response: ChapterVisionResponse) -> str:
     """计算通过模型和语义校验后的规范章节视觉响应摘要。"""
 
-    encoded = json.dumps(
+    return hashlib.sha256(chapter_vision_response_bytes(response)).hexdigest()
+
+
+def chapter_vision_response_bytes(response: ChapterVisionResponse) -> bytes:
+    """返回与响应摘要完全一致的规范 JSON 字节，供制品闭包复验。"""
+
+    return json.dumps(
         response.model_dump(mode="json"),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _covered_targets(

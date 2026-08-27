@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import threading
@@ -52,7 +53,6 @@ from video_demo.evaluation.gate import (
     _current_durability_implementation_sha256,
     build_durability_not_run_reason,
 )
-from video_demo.evaluation.live_runner import collect_production_environment_issues
 from video_demo.evaluation.prediction_runner import (
     _evidence_matches_api,
     _mime_for_path,
@@ -84,6 +84,54 @@ _DEFAULT_SCOPE_HEADERS = {
     "X-Tenant-Id": "evaluation",
     "X-Application-Id": "video-demo",
 }
+
+
+def _collect_active_production_environment_issues(
+    settings: Settings,
+    store: EvidenceStore,
+) -> tuple[ErrorCode, ...]:
+    """检查耐久活动链依赖；保持 durability 不导入历史 live 组合根。"""
+
+    issues: list[ErrorCode] = []
+    try:
+        settings.require_text_llm_configuration()
+    except VideoDemoError:
+        issues.append(ErrorCode.INVALID_CONFIGURATION)
+    try:
+        settings.require_vlm_configuration()
+    except VideoDemoError:
+        issues.append(ErrorCode.INVALID_CONFIGURATION)
+    if not _module_available("cv2"):
+        issues.append(ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE)
+    assert settings.runtime_root is not None
+    ffmpeg = settings.ffmpeg_path or settings.runtime_root / "tools" / "ffmpeg"
+    ffprobe = settings.ffprobe_path or settings.runtime_root / "tools" / "ffprobe"
+    if not ffmpeg.is_file():
+        issues.append(ErrorCode.VIDEO_FFMPEG_UNAVAILABLE)
+    if not ffprobe.is_file():
+        issues.append(ErrorCode.VIDEO_FFPROBE_UNAVAILABLE)
+    try:
+        if shutil.disk_usage(store.runtime_root).free < settings.min_free_disk_reserve_bytes:
+            issues.append(ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT)
+    except OSError:
+        issues.append(ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT)
+    model_root = store.runtime_root / "models"
+    if not _module_available("silero_vad"):
+        issues.append(ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE)
+    if not (model_root / "silero/model-id.txt").is_file():
+        issues.append(ErrorCode.SILERO_MODEL_UNAVAILABLE)
+    try:
+        settings.require_cloud_asr_configuration()
+    except VideoDemoError:
+        issues.append(ErrorCode.INVALID_CONFIGURATION)
+    return tuple(dict.fromkeys(issues))
+
+
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
 _PREFLIGHT_ORDER = (
     ErrorCode.M1_SAMPLE_COUNT_INVALID,
     ErrorCode.M1_DURATION_TOO_SHORT,
@@ -99,11 +147,7 @@ _PREFLIGHT_ORDER = (
     ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE,
     ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE,
     ErrorCode.SILERO_MODEL_UNAVAILABLE,
-    ErrorCode.QWEN_ENDPOINT_UNAVAILABLE,
-    ErrorCode.QWEN_API_KEY_UNAVAILABLE,
-    ErrorCode.QWEN_MODEL_ID_UNAVAILABLE,
-    ErrorCode.BAIDU_API_KEY_UNAVAILABLE,
-    ErrorCode.BAIDU_SECRET_KEY_UNAVAILABLE,
+    ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT,
 )
 
 _AUDIT_WRITE_EVENTS: dict[str, tuple[int, ...]] = {
@@ -184,8 +228,7 @@ def _audit_write_targets(
             marker in mode for marker in ("w", "a", "x", "+")
         )
         writes_by_flags = isinstance(flags, int) and bool(
-            flags
-            & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+            flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
         )
         return (args[0],) if writes_by_mode or writes_by_flags else ()
     indexes = _AUDIT_WRITE_EVENTS.get(event, ())
@@ -372,20 +415,15 @@ class DurabilityRunner:
                 settings=self._settings,
             )
         started = datetime.now(UTC)
-        samples, media_paths, probes, manifest, authorization, issues = (
-            self._preflight(manifest_path)
+        samples, media_paths, probes, manifest, authorization, issues = self._preflight(
+            manifest_path
         )
         writer = self._writer(evaluation_run_id)
         try:
             if issues:
                 return self._write_not_run(writer, evaluation_run_id, issues)
-            facts = tuple(
-                self._run_sample(sample, evaluation_run_id) for sample in samples
-            )
-            if (
-                self._facts_all_pass(samples, facts)
-                and not self._allows_performance_pass
-            ):
+            facts = tuple(self._run_sample(sample, evaluation_run_id) for sample in samples)
+            if self._facts_all_pass(samples, facts) and not self._allows_performance_pass:
                 raise VideoDemoError(
                     ErrorCode.SYSTEM_FAILURE,
                     "受控耐久执行端口不得发布正式 PASS",
@@ -443,8 +481,19 @@ class DurabilityRunner:
             issues.append(ErrorCode.M1_RESOLUTION_TOO_SMALL)
         media_paths = self._media_paths(manifest, values, issues)
         self._verify_authorization(authorization_path, values, issues)
-        probes = self._verify_probes(media_paths, values, issues)
+        # 基础契约 (样本数量、授权、媒体摘要) 已经失败时，不再探测环境或
+        # 启动任何运行时依赖；否则 NOT_RUN 原因会被无关机器缺项污染。
+        if issues:
+            return (
+                values,
+                media_paths,
+                (),
+                manifest,
+                authorization_path,
+                tuple(dict.fromkeys(issues)),
+            )
         self._append_runtime_issues(issues)
+        probes = () if issues else self._verify_probes(media_paths, values, issues)
         return (
             values,
             media_paths,
@@ -536,9 +585,7 @@ class DurabilityRunner:
                 issues.append(ErrorCode.M1_PROBE_MISMATCH)
         return tuple(probes)
 
-    def _probe_with_ffprobe(
-        self, path: Path, sample: DurabilityManifestSample
-    ) -> DurabilityProbe:
+    def _probe_with_ffprobe(self, path: Path, sample: DurabilityManifestSample) -> DurabilityProbe:
         root = self._settings.runtime_root
         assert root is not None
         executable = self._settings.ffprobe_path or root / "tools/ffprobe"
@@ -569,6 +616,13 @@ class DurabilityRunner:
             issues.append(ErrorCode.INVALID_CONFIGURATION)
         if psutil is None:
             issues.append(ErrorCode.M1_PSUTIL_UNAVAILABLE)
+        try:
+            free_bytes = shutil.disk_usage(self._store.runtime_root).free
+        except OSError:
+            issues.append(ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT)
+        else:
+            if free_bytes < self._settings.min_free_disk_reserve_bytes:
+                issues.append(ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT)
         if self._probe_media is None:
             capabilities = probe_runtime_capabilities(self._settings)
             issues.extend(issue.code for issue in capabilities.issues)
@@ -580,7 +634,7 @@ class DurabilityRunner:
                 if not available:
                     issues.append(ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE)
             issues.extend(
-                collect_production_environment_issues(self._settings, self._store)
+                _collect_active_production_environment_issues(self._settings, self._store)
             )
 
     def _run_sample(
@@ -588,9 +642,7 @@ class DurabilityRunner:
         sample: DurabilityManifestSample,
         evaluation_run_id: str,
     ) -> DurabilitySample:
-        active_run_root = [
-            self._store.runtime_root / "eval/reports" / evaluation_run_id
-        ]
+        active_run_root = [self._store.runtime_root / "eval/reports" / evaluation_run_id]
 
         def set_run_root(run_id: str) -> None:
             active_run_root[0] = self._production_run_root(run_id)
@@ -885,11 +937,11 @@ class DurabilityRunner:
                     duration_ms=probe.duration_ms,
                     width=probe.width,
                     height=probe.height,
-                ).model_dump_json().encode("utf-8"),
+                )
+                .model_dump_json()
+                .encode("utf-8"),
             )
-            for index, (sample, probe) in enumerate(
-                zip(samples, probes, strict=True)
-            )
+            for index, (sample, probe) in enumerate(zip(samples, probes, strict=True))
         )
         samples = cast(
             tuple[PerformanceSampleDetails, PerformanceSampleDetails],
@@ -906,23 +958,21 @@ class DurabilityRunner:
                     schema_version="1.0.0",
                     evaluation_run_id=evaluation_run_id,
                     sample=sample,
-                ).model_dump_json().encode("utf-8"),
+                )
+                .model_dump_json()
+                .encode("utf-8"),
             )
             for index, sample in enumerate(samples)
         )
         result_artifacts = tuple(
             self._store.bind_artifact(
-                Path(sample.result_manifest_relative_path).relative_to(
-                    ".codex/video-rag-demo"
-                ),
+                Path(sample.result_manifest_relative_path).relative_to(".codex/video-rag-demo"),
                 "PRODUCTION_RESULT",
             )
             for sample in samples
             if sample.result_manifest_relative_path is not None
         )
-        implementation = _current_durability_implementation_sha256(
-            self._settings.workspace_root
-        )
+        implementation = _current_durability_implementation_sha256(self._settings.workspace_root)
         settings_fingerprint = build_production_model_identity_report(
             self._settings
         ).settings_fingerprint

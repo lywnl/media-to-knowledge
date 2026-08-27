@@ -475,7 +475,7 @@ def test_final_runner_writes_exact_current_checks_and_is_idempotent(
     requirements = RequirementEvidenceReport.model_validate_json(paths[1].read_bytes())
     assert first.status == second.status == GateStatus.FAIL
     assert tuple(check.check_id for check in final.checks) == FINAL_GATE_CHECKS
-    assert len(final.checks) == 14
+    assert len(final.checks) == 13
     assert len(requirements.rows) == 33
     assert tuple(path.read_bytes() for path in paths) == first_bytes
     assert (
@@ -514,13 +514,13 @@ def test_cleanup_only_removes_bound_eval_subtrees_and_writes_manifest(tmp_path: 
     prediction = runtime / "eval/predictions/eval_cleanup"
     stage_ids = tuple(
         stage_evaluation_run_id("eval_cleanup", stage)
-        for stage in ("media", "baidu", "qwen", "models", "durability")
+        for stage in ("media", "chapter-vlm", "models", "durability")
     )
     stage_reports = tuple(runtime / "eval/reports" / run_id for run_id in stage_ids)
     live_authorities = tuple(
         runtime / "eval/live-authority" / run_id
         for run_id in stage_ids
-        if any(marker in run_id for marker in ("baidu", "qwen", "models"))
+        if any(marker in run_id for marker in ("chapter-vlm", "models"))
     )
     foreign = runtime / "eval/reports/eval_other"
     product = runtime / "runs/scope/run-unbound"

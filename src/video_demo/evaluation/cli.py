@@ -67,11 +67,8 @@ def dispatch(args: argparse.Namespace, settings: Settings) -> StageExecutionResu
     if args.command == "live":
         runner = LiveValidationRunner(settings, store)
         checks = (
-            runner.run_workspace_baidu(stage_evaluation_run_id(run_id, "baidu")),
-            runner.run_workspace_qwen(stage_evaluation_run_id(run_id, "qwen")),
-            runner.run_workspace_local_model_stack(
-                stage_evaluation_run_id(run_id, "models")
-            ),
+            runner.run_workspace_chapter_vlm(stage_evaluation_run_id(run_id, "chapter-vlm")),
+            runner.run_workspace_local_model_stack(stage_evaluation_run_id(run_id, "models")),
         )
         return write_live_validation_summary(
             evaluation_run_id=run_id,
@@ -126,16 +123,12 @@ def dispatch(args: argparse.Namespace, settings: Settings) -> StageExecutionResu
                 prediction_report.not_run_reason
                 if prediction_report.status == GateStatus.NOT_RUN
                 else (
-                    "预测阶段存在失败样本"
-                    if prediction_report.status == GateStatus.FAIL
-                    else None
+                    "预测阶段存在失败样本" if prediction_report.status == GateStatus.FAIL else None
                 )
             ),
         )
     if args.command == "quality" and args.quality_command == "score":
-        prediction_path = (
-            settings.runtime_root / "eval/reports" / run_id / "prediction.json"
-        )
+        prediction_path = settings.runtime_root / "eval/reports" / run_id / "prediction.json"
         if not prediction_path.is_file():
             return write_stage_not_run_summary(
                 evaluation_run_id=run_id,
@@ -162,11 +155,7 @@ def dispatch(args: argparse.Namespace, settings: Settings) -> StageExecutionResu
             reason=(
                 "质量指标存在未运行项"
                 if quality_report.status == GateStatus.NOT_RUN
-                else (
-                    "质量指标存在失败项"
-                    if quality_report.status == GateStatus.FAIL
-                    else None
-                )
+                else ("质量指标存在失败项" if quality_report.status == GateStatus.FAIL else None)
             ),
         )
     raise ValueError("未知验收子命令")

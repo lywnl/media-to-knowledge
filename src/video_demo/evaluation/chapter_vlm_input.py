@@ -278,6 +278,7 @@ class ChapterVlmInputPreparation(FrozenModel):
     execution_started: StrictBool
     manifest: ChapterVlmInputManifest | None = None
     manifest_sha256: Sha256 | None = None
+    context: ValidatedChapterVlmInputContext | None = None
     error_code: ErrorCode | None = None
 
     @model_validator(mode="after")
@@ -287,6 +288,7 @@ class ChapterVlmInputPreparation(FrozenModel):
         if self.status == "READY" and (
             not self.execution_started
             or self.manifest is None
+            or self.context is None
             or self.error_code is not None
             or self.manifest_sha256 != chapter_vlm_input_manifest_sha256(self.manifest)
         ):
@@ -295,6 +297,7 @@ class ChapterVlmInputPreparation(FrozenModel):
             self.execution_started
             or self.manifest is not None
             or self.manifest_sha256 is not None
+            or self.context is not None
             or self.error_code not in _PREFLIGHT_CODES
         ):
             raise ValueError("NOT_RUN 必须是未开始执行的前置失败")
@@ -302,6 +305,10 @@ class ChapterVlmInputPreparation(FrozenModel):
             raise ValueError("FAIL 必须已开始执行且有稳定错误码")
         if self.manifest is None and self.manifest_sha256 is not None:
             raise ValueError("没有 manifest 时不得保存 manifest_sha256")
+        if self.manifest is None and self.context is not None:
+            raise ValueError("没有 manifest 时不得保存已验证输入上下文")
+        if self.manifest is not None and self.context is None:
+            raise ValueError("已有 manifest 时必须保存已验证输入上下文")
         if self.manifest is not None and self.manifest_sha256 != chapter_vlm_input_manifest_sha256(
             self.manifest
         ):
@@ -501,7 +508,6 @@ def _write_manifest(
             separators=(",", ":"),
             allow_nan=False,
         )
-        + "\n"
     ).encode("utf-8")
     if len(encoded) > _MAX_MANIFEST_BYTES:
         raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "评测 Manifest 超过大小上限")
@@ -660,6 +666,7 @@ def prepare_chapter_vlm_input(
                     execution_started=True,
                     manifest=existing,
                     manifest_sha256=chapter_vlm_input_manifest_sha256(existing),
+                    context=context,
                 )
             proxy_path = safe_runtime_path(run_root, Path("media/proxy.mp4"))
             if proxy_path.exists() or proxy_path.is_symlink():
@@ -823,6 +830,7 @@ def prepare_chapter_vlm_input(
                     execution_started=True,
                     manifest=manifest,
                     manifest_sha256=chapter_vlm_input_manifest_sha256(manifest),
+                    context=context,
                 )
             except BaseException:
                 session.cleanup_unretained(frozenset())
