@@ -158,6 +158,9 @@ def prompt_for_vision(request: ChapterVisionRequest) -> tuple[str, str, str]:
             "evidence_id。每个 observation 最多选择 2 张图片；整份响应最多使用 2 张不同图片。"
             "如果图片无法确认目标，返回 observations=[]，不要猜测或选择额外图片。"
             "selected_frame_ids 必须是实际最能支持该 observation 的最少图片。"
+            "INDEPENDENT 时 transcript_evidence_refs 必须为空；"
+            "CONFLICTING 时 uncertainties 必须非空；"
+            "其他音画关系必须至少引用 1 条当前转写证据。"
         ),
         _vision_context(request),
     )

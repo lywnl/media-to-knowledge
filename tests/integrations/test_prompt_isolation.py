@@ -85,3 +85,11 @@ def test_vision_prompt_limits_selected_frames_and_allows_empty_observations(
     assert "每个 observation 最多选择 2 张图片" in instruction
     assert "整份响应最多使用 2 张不同图片" in instruction
     assert "返回 observations=[]" in instruction
+
+
+def test_vision_prompt_states_transcript_relation_contract(tmp_path: Path) -> None:
+    _version, instruction, _data = prompt_for_vision(_request(tmp_path, "画面文字"))
+
+    assert "INDEPENDENT 时 transcript_evidence_refs 必须为空" in instruction
+    assert "CONFLICTING 时 uncertainties 必须非空" in instruction
+    assert "其他音画关系必须至少引用 1 条当前转写证据" in instruction
