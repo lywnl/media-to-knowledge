@@ -253,7 +253,11 @@ def test_repair_request_keeps_original_request_and_uses_repair_prompt() -> None:
     )
     assert "chapter-planner-repair-v1" in payload["messages"][0]["content"]  # type: ignore[index]
     sent = json.loads(payload["messages"][1]["content"].split("\n", 1)[1])  # type: ignore[index]
-    assert sent["request"]["segments"][0]["segment_id"] == "segment_001"
+    assert sent["request"]["segments"][0] == [
+        "segment_001",
+        10_000,
+        [0],
+    ]
     assert "confidence" not in json.dumps(sent["request"], ensure_ascii=False)
     assert sent["invalid_response"]["content_sha256"] == "b" * 64
     assert "original" not in sent

@@ -28,7 +28,9 @@ def prompt_for_planning(request: ChapterPlanningRequest) -> tuple[str, str, str]
             "1~3 个按时间排序的转写 evidence_id，首个锚点起点到末个锚点终点不得超过 "
             "30 秒。章节粒度优先目标为 fine 60~120 秒、standard 60~180 秒、"
             "coarse 120~300 秒；证据不可拆分时允许偏离目标范围，但任何章节不得超过 "
-            "300 秒。不得生成时间、章节 ID 或未知引用。"
+            "300 秒。不得生成时间、章节 ID 或未知引用。segments 数组每项依次为 "
+            "[segment_id, duration_ms, transcript_evidence_indexes]；索引对应 "
+            "transcript_evidence 数组，按输入顺序解释。"
         ),
         _planning_context(request),
     )
@@ -42,26 +44,29 @@ def _planning_context(request: ChapterPlanningRequest) -> dict[str, object]:
     改变缓存指纹或程序侧的证据闭包校验。
     """
 
+    evidence_ids = {
+        evidence.evidence_id: index
+        for index, evidence in enumerate(request.transcript_evidence)
+    }
     return {
         "title_hint": request.title_hint,
         "duration_ms": request.duration_ms,
         "chapter_granularity": request.document_config.chapter_granularity,
         "segments": tuple(
-            {
-                "segment_id": segment.segment_id,
-                "start_ms": segment.start_ms,
-                "end_ms": segment.end_ms,
-                "evidence_refs": segment.evidence_refs,
-            }
+            (
+                segment.segment_id,
+                segment.duration_ms,
+                tuple(evidence_ids[ref] for ref in segment.evidence_refs),
+            )
             for segment in request.segments
         ),
         "transcript_evidence": tuple(
-            {
-                "evidence_id": evidence.evidence_id,
-                "start_ms": evidence.start_ms,
-                "end_ms": evidence.end_ms,
-                "text": evidence.text,
-            }
+            (
+                evidence.evidence_id,
+                evidence.start_ms,
+                evidence.end_ms,
+                evidence.text,
+            )
             for evidence in request.transcript_evidence
         ),
     }

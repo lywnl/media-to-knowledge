@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -547,8 +548,20 @@ def test_chapter_planning_prompt_uses_compact_fact_projection() -> None:
 
     assert "language" not in data
     assert "confidence" not in data
-    assert '"segment_id":"segment_000"' in data
-    assert '"evidence_id":"asr_000"' in data
+    assert '"segment_000"' in data
+    assert '"asr_000"' in data
+    payload = json.loads(data)
+    assert payload["segments"][0] == [
+        "segment_000",
+        segments[0].duration_ms,
+        [0],
+    ]
+    assert payload["transcript_evidence"][0] == [
+        "asr_000",
+        transcript[0].start_ms,
+        transcript[0].end_ms,
+        "紧凑输入",
+    ]
 
 
 def test_chapter_planner_applies_utf8_byte_budget_independently_of_char_budget(
