@@ -46,9 +46,10 @@ _MAX_CHAPTER_DURATION_MS = 300_000
 _MAX_TARGET_ANCHOR_SPAN_MS = 30_000
 _DEFAULT_MAX_PLANNING_BATCHES = 64
 _DEFAULT_PLANNING_CONCURRENCY = 2
-# 思考模式会把推理 token 计入输出预算；批次过大时供应商容易超时或返回空内容。
-# 15 个基础片段通常覆盖 7.5 分钟以内的时间轴，在保持上下文的同时控制单次延迟。
-_MAX_PLANNING_SEGMENTS_PER_BATCH = 15
+# 思考模式会把推理 token 计入输出预算；紧凑索引协议允许提高片段上限，
+# 但仍由字符数和 UTF-8 字节数预算决定最终批次大小。48 个片段通常可覆盖
+# 约 24 分钟时间轴，既能显著减少请求次数，也避免一次请求过大导致截断。
+_MAX_PLANNING_SEGMENTS_PER_BATCH = 48
 _GRANULARITY_TARGET_DURATION_MS = {
     "fine": 120_000,
     "standard": 180_000,

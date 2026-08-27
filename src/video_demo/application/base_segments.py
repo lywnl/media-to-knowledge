@@ -106,21 +106,29 @@ def _safe_boundaries(
     scenes: Sequence[SceneBoundary],
     speech_boundaries: Sequence[SpeechBoundaryCandidate],
 ) -> tuple[int, ...]:
+    # ASR 通常每 1~3 秒产生一条证据；把每条证据的首尾都作为切点会把
+    # 章节规划输入膨胀成数百个基础片段。优先使用稀疏的网格、镜头和
+    # 高价值语音边界，只有在这些边界无法满足 5 分钟硬上限时才补充
+    # 转写结束点。
     candidates = {
         *range(_GRID_INTERVAL_MS, duration_ms, _GRID_INTERVAL_MS),
         *(scene.start_ms for scene in scenes[1:]),
-        *(candidate.timestamp_ms for candidate in speech_boundaries),
-        *(item.start_ms for item in transcript),
-        *(item.end_ms for item in transcript),
-    }
-    safe = _exclude_evidence_interiors(
-        tuple(
-            timestamp
-            for timestamp in sorted(candidates)
-            if 0 < timestamp < duration_ms
+        *(
+            candidate.timestamp_ms
+            for candidate in speech_boundaries
+            if candidate.source != "sentence_end"
+            or candidate.score >= 0.95
         ),
+    }
+    ordered_candidates = _ordered_candidates(candidates, duration_ms)
+    safe = _exclude_evidence_interiors(ordered_candidates, transcript)
+    safe = _add_blocking_transcript_boundaries(
+        safe,
+        ordered_candidates,
+        duration_ms,
         transcript,
     )
+    safe = _add_required_transcript_boundaries(safe, duration_ms, transcript)
     ranges = pairwise((0, *safe, duration_ms))
     if any(
         end_ms - start_ms > _MAX_SEGMENT_DURATION_MS
@@ -128,6 +136,74 @@ def _safe_boundaries(
     ):
         raise _budget_error("缺少可安全切分的基础片段边界")
     return safe
+
+
+def _ordered_candidates(candidates: set[int], duration_ms: int) -> tuple[int, ...]:
+    return tuple(
+        timestamp
+        for timestamp in sorted(candidates)
+        if 0 < timestamp < duration_ms
+    )
+
+
+def _add_required_transcript_boundaries(
+    safe: tuple[int, ...],
+    duration_ms: int,
+    transcript: Sequence[SpeechSegment | SubtitleCue],
+) -> tuple[int, ...]:
+    boundaries = list(safe)
+    while True:
+        ranges = tuple(pairwise((0, *boundaries, duration_ms)))
+        oversized = next(
+            (
+                (start_ms, end_ms)
+                for start_ms, end_ms in ranges
+                if end_ms - start_ms > _MAX_SEGMENT_DURATION_MS
+            ),
+            None,
+        )
+        if oversized is None:
+            return tuple(boundaries)
+        start_ms, end_ms = oversized
+        endpoint = next(
+            (
+                item.end_ms
+                for item in transcript
+                if start_ms < item.end_ms <= min(end_ms, start_ms + _MAX_SEGMENT_DURATION_MS)
+                and _is_safe_transcript_endpoint(item.end_ms, transcript)
+            ),
+            None,
+        )
+        if endpoint is None or endpoint in boundaries:
+            return tuple(boundaries)
+        boundaries.append(endpoint)
+        boundaries.sort()
+
+
+def _add_blocking_transcript_boundaries(
+    safe: tuple[int, ...],
+    candidates: Sequence[int],
+    duration_ms: int,
+    transcript: Sequence[SpeechSegment | SubtitleCue],
+) -> tuple[int, ...]:
+    boundaries = set(safe)
+    for item in transcript:
+        if not any(item.start_ms < candidate < item.end_ms for candidate in candidates):
+            continue
+        for endpoint in (item.start_ms, item.end_ms):
+            if (
+                0 < endpoint < duration_ms
+                and _is_safe_transcript_endpoint(endpoint, transcript)
+            ):
+                boundaries.add(endpoint)
+    return tuple(sorted(boundaries))
+
+
+def _is_safe_transcript_endpoint(
+    timestamp_ms: int,
+    transcript: Sequence[SpeechSegment | SubtitleCue],
+) -> bool:
+    return not any(item.start_ms < timestamp_ms < item.end_ms for item in transcript)
 
 
 def _exclude_evidence_interiors(

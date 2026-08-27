@@ -113,6 +113,48 @@ def test_grid_starts_at_thirty_seconds_and_keeps_short_tail() -> None:
     ]
 
 
+def test_dense_transcript_prefers_sparse_grid_boundaries() -> None:
+    transcript = tuple(
+        _speech(
+            f"asr_{index:03d}",
+            index * 2_000,
+            index * 2_000 + 1_000,
+        )
+        for index in range(60)
+    )
+
+    segments = _build(120_000, transcript)
+
+    assert [(item.start_ms, item.end_ms) for item in segments] == [
+        (0, 30_000),
+        (30_000, 60_000),
+        (60_000, 90_000),
+        (90_000, 120_000),
+    ]
+    assert sum(len(item.evidence_refs) for item in segments) == len(transcript)
+
+
+def test_dense_sentence_end_candidates_do_not_recreate_one_segment_per_asr() -> None:
+    transcript = tuple(
+        _speech(
+            f"asr_{index:03d}",
+            index * 2_000,
+            index * 2_000 + 1_000,
+        )
+        for index in range(60)
+    )
+    boundaries = tuple(
+        SpeechBoundaryCandidate(item.end_ms, "sentence_end", 0.8)
+        for item in transcript
+        if item.end_ms < 120_000
+    )
+
+    segments = _build(120_000, transcript, boundaries=boundaries)
+
+    assert len(segments) <= 5
+    assert sum(len(item.evidence_refs) for item in segments) == len(transcript)
+
+
 def test_boundary_inside_subtitle_is_removed_and_evidence_has_unique_owner() -> None:
     cue = _subtitle("subtitle_001", 25_000, 35_000)
     segments = _build(60_000, (cue,))

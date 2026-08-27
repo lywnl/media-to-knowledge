@@ -535,7 +535,7 @@ def test_chapter_planner_processes_independent_batches_concurrently(
     assert batch.metrics["chapter_planner_logical_calls"] == 4
 
 
-def test_chapter_planner_caps_thinking_batches_at_fifteen_segments(
+def test_chapter_planner_caps_thinking_batches_at_forty_eight_segments(
     tmp_path: Path,
 ) -> None:
     segments, transcript, scenes = _planning_fixture(16, text="短文本")
@@ -555,8 +555,32 @@ def test_chapter_planner_caps_thinking_batches_at_fifteen_segments(
     port = _PlanningTextPort(response, response)
     batch = _plan(_planner(port, compact_planning=True), tmp_path, segments, transcript, scenes)
 
-    assert len(port.main_requests) == 2
-    assert sorted(len(request.segments) for request in port.main_requests) == [1, 15]
+    assert len(port.main_requests) == 1
+    assert [len(request.segments) for request in port.main_requests] == [16]
+    assert batch.metrics["chapter_planner_logical_calls"] == 1
+
+
+def test_compact_planning_splits_only_after_forty_eight_segments(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(60, text="短文本")
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        return ChapterPlanningResponse(
+            chapter_drafts=(
+                ChapterDraft(
+                    segment_refs=tuple(item.segment_id for item in request.segments),
+                    title_hint="批次边界",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                ),
+            ),
+        )
+
+    port = _PlanningTextPort(response, response)
+    batch = _plan(_planner(port, compact_planning=True), tmp_path, segments, transcript, scenes)
+
+    assert [len(request.segments) for request in port.main_requests] == [48, 12]
     assert batch.metrics["chapter_planner_logical_calls"] == 2
 
 
