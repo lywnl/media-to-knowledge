@@ -23,7 +23,10 @@ from video_demo.integrations.document_port import (
     InvalidModelResponse,
     ModelResponseValidationError,
 )
-from video_demo.integrations.document_prompts import prompt_for_planning
+from video_demo.integrations.document_prompts import (
+    prompt_for_compact_planning,
+    prompt_for_planning,
+)
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
 
 _ASSET_SHA256 = "a" * 64
@@ -535,7 +538,7 @@ def test_chapter_planner_processes_independent_batches_concurrently(
     assert batch.metrics["chapter_planner_logical_calls"] == 4
 
 
-def test_chapter_planner_caps_thinking_batches_at_forty_eight_segments(
+def test_chapter_planner_caps_thinking_batches_at_twenty_segments(
     tmp_path: Path,
 ) -> None:
     segments, transcript, scenes = _planning_fixture(16, text="短文本")
@@ -560,7 +563,7 @@ def test_chapter_planner_caps_thinking_batches_at_forty_eight_segments(
     assert batch.metrics["chapter_planner_logical_calls"] == 1
 
 
-def test_compact_planning_splits_only_after_forty_eight_segments(
+def test_compact_planning_splits_only_after_twenty_segments(
     tmp_path: Path,
 ) -> None:
     segments, transcript, scenes = _planning_fixture(60, text="短文本")
@@ -580,8 +583,8 @@ def test_compact_planning_splits_only_after_forty_eight_segments(
     port = _PlanningTextPort(response, response)
     batch = _plan(_planner(port, compact_planning=True), tmp_path, segments, transcript, scenes)
 
-    assert [len(request.segments) for request in port.main_requests] == [48, 12]
-    assert batch.metrics["chapter_planner_logical_calls"] == 2
+    assert [len(request.segments) for request in port.main_requests] == [20, 20, 20]
+    assert batch.metrics["chapter_planner_logical_calls"] == 3
 
 
 def test_chapter_planning_prompt_uses_compact_fact_projection() -> None:
@@ -613,6 +616,24 @@ def test_chapter_planning_prompt_uses_compact_fact_projection() -> None:
         transcript[0].end_ms,
         "紧凑输入",
     ]
+
+
+def test_compact_planning_prompt_uses_programmatic_visual_targets() -> None:
+    segments, transcript, _scenes = _planning_fixture(1, text="快速规划")
+    request = ChapterPlanningRequest(
+        title_hint="测试视频",
+        duration_ms=segments[-1].end_ms,
+        segments=segments,
+        transcript_evidence=transcript,
+        document_config=DocumentGenerationConfig(),
+        prompt_version="chapter-planner-v1",
+    )
+
+    _version, instruction, _data = prompt_for_compact_planning(request)
+
+    assert "semantic_targets 必须返回空数组" in instruction
+    assert "visual_mode=NONE 时 semantic_targets 必须为空" in instruction
+    assert "end_segment_index 只能引用 segments 数组位置" in instruction
 
 
 def test_chapter_planner_applies_utf8_byte_budget_independently_of_char_budget(

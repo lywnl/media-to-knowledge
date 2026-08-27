@@ -44,13 +44,17 @@ def prompt_for_compact_planning(request: ChapterPlanningRequest) -> tuple[str, s
         (
             "你只能根据输入的基础片段和转写证据规划连续章节。使用数组索引返回范围："
             "start_segment_index 包含、end_segment_index 不包含，所有范围必须按顺序从 0 开始"
-            "完整覆盖 segments (最后一个 end_segment_index 必须等于 segments 长度)。"
-            "语义目标的 anchor_transcript_indexes 必须是当前章节内"
+            "完整覆盖 segments (最后一个 end_segment_index 必须等于 segments 长度)；"
+            "end_segment_index 只能引用 segments 数组位置，不得使用毫秒时间或全片位置。"
+            "segments 每项为 [segment_index, start_ms, end_ms, transcript_evidence_indexes]；"
+            "visual_mode=NONE 时 semantic_targets 必须为空；"
+            "否则语义目标的 anchor_transcript_indexes 必须是当前章节内；"
+            "如果无法确认章节边界，semantic_targets 必须返回空数组；"
             "1~3 个按时间排序且不重复的 transcript_evidence 索引，跨度不得超过 30 秒。"
             "章节粒度优先目标为 fine 60~120 秒、standard 60~180 秒、coarse 120~300 秒；"
-            "任何章节不得超过 300 秒。不得生成时间、ID 或未知索引。segments 每项为"
-            "[duration_ms, transcript_evidence_indexes]；transcript_evidence 每项为"
-            "[start_ms, end_ms, text]。只返回 JSON。"
+            "任何章节不得超过 300 秒。不得生成时间、ID 或未知索引。transcript_evidence 每项为"
+            "[transcript_index, start_ms, end_ms, text]。每条转写证据的 transcript_index "
+            "必须使用输入数组位置；只返回 JSON。"
         ),
         _compact_planning_context(request),
     )
@@ -63,7 +67,10 @@ def prompt_for_compact_plan_repair(request: ChapterPlanRepairRequest) -> tuple[s
     }
     return _prompt(
         request.prompt_version,
-        "只修复结构和索引；必须保留原请求的事实边界，不得添加新事实。只返回 JSON。",
+        "只修复结构和索引；chapter_drafts 必须按顺序完整覆盖 request.segments，"
+        "所有 end_segment_index 不得超过 request.segments 长度，"
+        "anchor_transcript_indexes 必须属于对应章节的 transcript_evidence_indexes；"
+        "必须保留原请求的事实边界，不得添加新事实。只返回 JSON。",
         context,
     )
 
@@ -105,24 +112,30 @@ def _planning_context(request: ChapterPlanningRequest) -> dict[str, object]:
 
 
 def _compact_planning_context(request: ChapterPlanningRequest) -> dict[str, object]:
-    evidence_indexes = {
+    transcript_index_by_id = {
         evidence.evidence_id: index
         for index, evidence in enumerate(request.transcript_evidence)
     }
+    segments = tuple(
+        (
+            index,
+            segment.start_ms,
+            segment.end_ms,
+            tuple(
+                transcript_index_by_id[ref]
+                for ref in segment.evidence_refs
+            ),
+        )
+        for index, segment in enumerate(request.segments)
+    )
     return {
         "title_hint": request.title_hint,
         "duration_ms": request.duration_ms,
         "chapter_granularity": request.document_config.chapter_granularity,
-        "segments": tuple(
-            (
-                segment.duration_ms,
-                tuple(evidence_indexes[ref] for ref in segment.evidence_refs),
-            )
-            for segment in request.segments
-        ),
+        "segments": segments,
         "transcript_evidence": tuple(
-            (evidence.start_ms, evidence.end_ms, evidence.text)
-            for evidence in request.transcript_evidence
+            (index, evidence.start_ms, evidence.end_ms, evidence.text)
+            for index, evidence in enumerate(request.transcript_evidence)
         ),
     }
 
