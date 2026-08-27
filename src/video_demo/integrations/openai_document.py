@@ -42,9 +42,9 @@ from video_demo.integrations.document_prompts import (
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 Prompt = tuple[str, str, str]
 _DEFAULT_MAX_OUTPUT_TOKENS = 8_192
-# DeepSeek 的思考 token 也计入 max_tokens；索引协议虽显著缩短正文，仍需给
-# 思考阶段留出与普通规划相同的上限，否则大批次会得到空 content/length 截断。
-_COMPACT_PLANNING_MAX_OUTPUT_TOKENS = _DEFAULT_MAX_OUTPUT_TOKENS
+# 紧凑索引协议的正文很短；保留足够的 thinking 预算，同时避免 8192 的过大
+# 输出上限让服务端为一次章节规划预留不必要的生成空间。
+_COMPACT_PLANNING_MAX_OUTPUT_TOKENS = 4_096
 
 
 class _CompactVisualTargetDraft(BaseModel):
