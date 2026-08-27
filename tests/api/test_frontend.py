@@ -157,3 +157,31 @@ def test_frontend_script_renders_untrusted_result_as_text(client: TestClient) ->
     assert ".textContent" in script
     assert ".innerHTML" not in script
     assert 'behavior: "smooth"' not in script
+
+
+def test_frontend_script_exposes_structured_document_reading_contract(
+    client: TestClient,
+) -> None:
+    html = client.get("/").text
+    script = client.get("/static/app.js").text
+
+    assert 'id="document-overview"' in html
+    assert 'id="document-key-points"' in html
+    assert 'id="document-toc"' in html
+    assert 'id="download-status"' in html
+    assert "fetchEvidence" in script
+    assert "visual_content_refs" in script
+    assert "source_keyframe_refs" in script
+    assert "new Set(chapter.selected_keyframe_refs)" in script
+    assert "AbortController" in script
+    assert "URL.revokeObjectURL" in script
+    assert "下载 Markdown失败" in script
+
+
+def test_frontend_styles_include_document_reading_states(client: TestClient) -> None:
+    stylesheet = client.get("/static/styles.css").text
+
+    assert ".document-reader" in stylesheet
+    assert ".document-toc" in stylesheet
+    assert ".chapter-body--quote" in stylesheet
+    assert ".chapter-keyframe.is-failed" in stylesheet

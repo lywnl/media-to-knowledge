@@ -46,8 +46,15 @@
   const historyStatus = document.querySelector("#history-status");
   const historyList = document.querySelector("#history-list");
   const refreshHistoryButton = document.querySelector("#refresh-history");
+  const documentOverview = document.querySelector("#document-overview");
+  const documentKeyPoints = document.querySelector("#document-key-points");
+  const documentToc = document.querySelector("#document-toc");
+  const documentChapters = document.querySelector("#document-chapters");
+  const downloadStatus = document.querySelector("#download-status");
   let activeController = null;
   let activeKeyframeUrls = [];
+  let keyframeController = null;
+  let documentRenderVersion = 0;
 
   class RequestError extends Error {
     constructor(message, code = null, httpStatus = null) {
@@ -94,14 +101,14 @@
     try {
       updateStatus("正在上传本地视频", "文件将上传到本机后端", 0);
       const videoObject = await uploadVideo(file, controller.signal);
-      updateStatus("视频已上传，正在创建任务", `对象 ${videoObject.object_ref}`, 1);
+      updateStatus("视频已上传，正在创建任务", "对象已登记", 1);
       const createdRun = await createRun(videoObject.object_ref, controller.signal);
       const completedRun = await waitForCompletion(createdRun.run_id, controller.signal);
-      updateStatus("处理完成，正在读取结果", `运行 ${completedRun.run_id}`, 3);
+      updateStatus("处理完成，正在读取结果", "正在读取结构化知识文档", 3);
       const result = await fetchResult(completedRun.run_id, controller.signal);
-      renderResult(result, { ...completedRun, original_filename: videoObject.original_filename });
+      await renderResult(result, { ...completedRun, original_filename: videoObject.original_filename });
       await loadHistory();
-      updateStatus("处理完成", `运行 ${completedRun.run_id}`, 4);
+      updateStatus("处理完成", "知识文档已准备就绪", 4);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         return;
@@ -118,6 +125,7 @@
 
   window.addEventListener("beforeunload", () => {
     activeController?.abort();
+    keyframeController?.abort();
     revokeKeyframeUrls();
   });
 
@@ -271,7 +279,7 @@
     try {
       updateStatus("正在读取历史解析文本", item.original_filename, 3);
       const result = await fetchResult(item.run_id);
-      renderResult(result, item);
+      await renderResult(result, item);
     } catch (error) {
       renderError(error);
     }
@@ -322,74 +330,246 @@
     });
   }
 
-  function renderResult(result, run) {
+  async function renderResult(result, run) {
+    const version = ++documentRenderVersion;
     revokeKeyframeUrls();
-    const fragment = document.createDocumentFragment();
-    const summary = result.summary;
-    const summaryCard = element("article", "result-summary");
-    summaryCard.append(
-      element("p", "result-source", run.original_filename ? `视频文件：${run.original_filename}` : `运行：${run.run_id}`),
-      element("h3", null, summary.title),
-      element("p", null, summary.overview_zh),
-    );
-    fragment.append(summaryCard);
+    keyframeController?.abort();
+    keyframeController = new AbortController();
+    downloadStatus.textContent = "";
+    const evidenceById = await fetchEvidence(run.run_id, result, keyframeController.signal);
+    if (version !== documentRenderVersion) return;
 
-    if (run.status === "PARTIAL_SUCCEEDED" && run.warning_codes.length > 0) {
-      fragment.append(
-        element("p", "warning-message", `部分处理完成：${run.warning_codes.join("、")}`),
-      );
-    }
-
-    const download = element("a", "document-download", "下载 Markdown");
-    download.href = `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs/${encodeURIComponent(run.run_id)}/document`;
-    download.target = "_blank";
-    fragment.append(download, element("h3", "result-section-title", "知识章节"));
-
+    renderDocumentOverview(result.summary, run);
+    renderDocumentToc(result.sections ?? [], result.chapters ?? []);
     const chapterList = element("ol", "segment-list");
-    result.chapters.forEach((chapter) => {
+    const keyframePromises = new Map();
+    result.chapters.forEach((chapter, chapterIndex) => {
       const item = element("li", "segment-card");
+      item.id = `chapter-${chapterIndex + 1}`;
       item.append(
         element("span", "timecode", timeRange(chapter.start_ms, chapter.end_ms)),
         element("h4", null, chapter.title),
         element("p", "segment-summary", chapter.summary_zh),
       );
+      const renderedFrames = new Set();
       chapter.body_blocks.forEach((block) => {
-        item.append(renderBodyBlock(block));
+        item.append(renderBodyBlock(block, evidenceById, chapter, run.run_id, keyframePromises, renderedFrames));
       });
-      chapter.selected_keyframe_refs.forEach((keyframeId) => {
-        const figure = element("figure", "chapter-keyframe");
-        const image = element("img");
-        image.alt = `${chapter.title}关键画面`;
-        figure.append(image);
-        loadKeyframe(image, run.run_id, keyframeId);
-        item.append(figure);
+      appendUncertainties(item, chapter, evidenceById);
+      [...new Set(chapter.selected_keyframe_refs)].forEach((keyframeId) => {
+        if (renderedFrames.has(keyframeId)) return;
+        renderedFrames.add(keyframeId);
+        item.append(renderKeyframeFigure(chapter.title, run.run_id, keyframeId, keyframePromises));
       });
       chapterList.append(item);
     });
-    fragment.append(chapterList);
-
-    resultContent.replaceChildren(fragment);
+    documentChapters.replaceChildren(chapterList);
+    if (run.status === "PARTIAL_SUCCEEDED" && run.warning_codes?.length > 0) {
+      documentChapters.prepend(element("p", "warning-message", `部分处理完成：${run.warning_codes.join("、")}`));
+    }
+    resultContent.replaceChildren(
+      documentOverview,
+      documentKeyPoints,
+      documentToc,
+      createDownloadLink(run.run_id),
+      downloadStatus,
+      documentChapters,
+    );
     resultPanel.hidden = false;
     resultPanel.scrollIntoView({ block: "start" });
   }
 
-  function renderBodyBlock(block) {
-    if (block.block_type === "VISUAL") {
-      return element("p", "chapter-body", block.caption || "视觉补充");
-    }
-    const text = block.text ?? block.code ?? block.latex ?? (block.items || []).join("；") ?? "";
-    return element("p", "chapter-body", text);
+  function renderDocumentOverview(summary, run) {
+    const card = element("article", "result-summary");
+    card.append(
+      element("p", "result-source", run.original_filename ? `视频文件：${run.original_filename}` : "知识文档"),
+      element("h3", null, summary.title),
+      element("p", null, summary.overview_zh),
+    );
+    documentOverview.replaceChildren(card);
+    const points = element("section", "key-points");
+    points.append(element("h3", "result-section-title", "关键结论"));
+    const list = element("ul");
+    (summary.key_points ?? []).forEach((point) => list.append(element("li", null, point.text)));
+    points.append(list);
+    documentKeyPoints.replaceChildren(points);
   }
 
-  async function loadKeyframe(image, runId, keyframeId) {
-    const response = await fetch(
-      `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs/${encodeURIComponent(runId)}/keyframes/${encodeURIComponent(keyframeId)}/content`,
-      { headers: { "X-Tenant-Id": SCOPE.tenantId, "X-Application-Id": SCOPE.applicationId } },
-    );
-    if (!response.ok) return;
-    const url = URL.createObjectURL(await response.blob());
-    activeKeyframeUrls.push(url);
-    image.src = url;
+  function renderDocumentToc(sections, chapters) {
+    documentToc.replaceChildren(element("h3", "result-section-title", "目录"));
+    const list = element("ol");
+    chapters.forEach((chapter, index) => {
+      const link = element("a", null, `${index + 1}. ${chapter.title}`);
+      link.href = `#chapter-${index + 1}`;
+      const item = element("li");
+      item.append(link, element("span", "toc-time", timeRange(chapter.start_ms, chapter.end_ms)));
+      list.append(item);
+    });
+    if (sections.length > 0) {
+      documentToc.append(element("p", "toc-sections", sections.map((section) => section.title).join(" · ")));
+    }
+    documentToc.append(list);
+  }
+
+  function createDownloadLink(runId) {
+    const link = element("a", "document-download", "下载 Markdown");
+    link.href = `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs/${encodeURIComponent(runId)}/document`;
+    link.addEventListener("click", (event) => downloadMarkdown(event, link.href));
+    return link;
+  }
+
+  async function downloadMarkdown(event, url) {
+    event.preventDefault();
+    downloadStatus.textContent = "正在准备 Markdown 下载";
+    try {
+      const response = await fetch(url, { headers: scopeHeaders() });
+      if (!response.ok) throw new RequestError(`下载失败（HTTP ${response.status}）`, null, response.status);
+      const blobUrl = URL.createObjectURL(await response.blob());
+      const link = element("a");
+      link.href = blobUrl;
+      link.download = "knowledge-note.md";
+      link.click();
+      URL.revokeObjectURL(blobUrl);
+      downloadStatus.textContent = "Markdown 已准备下载";
+    } catch (error) {
+      downloadStatus.textContent = `下载 Markdown失败：${error instanceof Error ? error.message : "请求失败"}`;
+    }
+  }
+
+  function renderBodyBlock(block, evidenceById, chapter, runId, keyframePromises, renderedFrames) {
+    switch (block.block_type) {
+      case "PARAGRAPH": return element("p", "chapter-body", block.text);
+      case "BULLET_LIST": {
+        const list = element("ul", "chapter-body chapter-body--list");
+        block.items.forEach((item) => list.append(element("li", null, item)));
+        return list;
+      }
+      case "QUOTE": return element("blockquote", "chapter-body chapter-body--quote", block.text);
+      case "CODE": {
+        const pre = element("pre", "chapter-body chapter-body--code");
+        pre.append(element("code", null, block.code));
+        return pre;
+      }
+      case "TABLE": return renderTableBlock(block);
+      case "FORMULA": {
+        const formula = element("div", "chapter-body chapter-body--formula");
+        formula.append(element("code", null, block.latex), element("p", null, block.explanation));
+        return formula;
+      }
+      case "VISUAL": {
+        const visual = element("div", "chapter-body chapter-body--visual");
+        visual.append(element("p", null, block.caption || "视觉补充"));
+        const observation = evidenceById.get(block.visual_observation_ref);
+        const frameRefs = visualFrameRefs(block, observation);
+        frameRefs.forEach((keyframeId) => {
+          if (renderedFrames.has(keyframeId)) return;
+          renderedFrames.add(keyframeId);
+          visual.append(renderKeyframeFigure(chapter.title, runId, keyframeId, keyframePromises));
+        });
+        return visual;
+      }
+      default: return element("p", "chapter-body", "未识别的正文块");
+    }
+  }
+
+  function renderTableBlock(block) {
+    const table = element("table", "chapter-body chapter-body--table");
+    const head = element("thead");
+    const headRow = element("tr");
+    block.columns.forEach((column) => headRow.append(element("th", null, column)));
+    head.append(headRow);
+    const body = element("tbody");
+    block.rows.forEach((row) => {
+      const rowNode = element("tr");
+      row.forEach((cell) => rowNode.append(element("td", null, cell)));
+      body.append(rowNode);
+    });
+    table.append(head, body);
+    return table;
+  }
+
+  function visualFrameRefs(block, observation) {
+    if (!observation) return [];
+    const byContent = new Map();
+    [...(observation.content_blocks ?? []), ...(observation.visual_facts ?? [])].forEach((content) => {
+      const id = content.visual_content_id ?? content.visual_fact_id;
+      if (id) byContent.set(id, content.source_keyframe_refs ?? []);
+    });
+    const mapped = [...new Set(block.visual_content_refs.flatMap((ref) => byContent.get(ref) ?? []))];
+    return mapped.length > 0 ? mapped : [...new Set(observation.keyframe_refs ?? [])];
+  }
+
+  function appendUncertainties(parent, chapter, evidenceById) {
+    const uncertainties = [];
+    chapter.body_blocks.forEach((block) => {
+      if (block.block_type !== "VISUAL") return;
+      const observation = evidenceById.get(block.visual_observation_ref);
+      (observation?.uncertainties ?? []).forEach((value) => uncertainties.push(value));
+    });
+    if (uncertainties.length === 0) return;
+    const note = element("aside", "uncertainty-note");
+    note.append(element("strong", null, "不确定性"));
+    const list = element("ul");
+    [...new Set(uncertainties)].forEach((value) => list.append(element("li", null, value)));
+    note.append(list);
+    parent.append(note);
+  }
+
+  async function fetchEvidence(runId, result, signal) {
+    const hasVisual = result.chapters.some((chapter) => chapter.body_blocks.some((block) => block.block_type === "VISUAL"));
+    if (!hasVisual) return new Map();
+    const items = [];
+    let cursor = null;
+    try {
+      do {
+        const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
+        const page = await requestJson(`/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs/${encodeURIComponent(runId)}/evidence?limit=100${suffix}`, { signal });
+        items.push(...(page.items ?? []));
+        cursor = page.next_cursor;
+      } while (cursor);
+    } catch {
+      return new Map();
+    }
+    return new Map(items.map((item) => [item.evidence_id, item]));
+  }
+
+  function renderKeyframeFigure(chapterTitle, runId, keyframeId, keyframePromises) {
+    const figure = element("figure", "chapter-keyframe");
+    const image = element("img");
+    image.alt = `${chapterTitle}关键画面`;
+    const caption = element("figcaption", null, "正在加载关键画面");
+    figure.append(image, caption);
+    if (!keyframePromises.has(keyframeId)) {
+      keyframePromises.set(keyframeId, loadKeyframe(image, caption, runId, keyframeId));
+    } else {
+      keyframePromises.get(keyframeId).then((url) => { if (url) image.src = url; });
+    }
+    return figure;
+  }
+
+  async function loadKeyframe(image, caption, runId, keyframeId) {
+    try {
+      const response = await fetch(
+        `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs/${encodeURIComponent(runId)}/keyframes/${encodeURIComponent(keyframeId)}/content`,
+        { headers: scopeHeaders(), signal: keyframeController?.signal },
+      );
+      if (!response.ok) throw new RequestError(`关键画面加载失败（HTTP ${response.status}）`, null, response.status);
+      const url = URL.createObjectURL(await response.blob());
+      activeKeyframeUrls.push(url);
+      image.src = url;
+      caption.textContent = "关键画面";
+      return url;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return null;
+      image.hidden = true;
+      caption.textContent = "关键画面暂时无法加载，正文仍可阅读";
+      image.closest(".chapter-keyframe")?.classList.add("is-failed");
+      return null;
+    }
+  }
+
+  function scopeHeaders() {
+    return { "X-Tenant-Id": SCOPE.tenantId, "X-Application-Id": SCOPE.applicationId };
   }
 
   function revokeKeyframeUrls() {
