@@ -57,6 +57,16 @@ def test_parser_accepts_cleanup_as_the_only_destructive_subcommand() -> None:
     assert args.evaluation_run_id == "eval_cleanup"
 
 
+@pytest.mark.parametrize("quality_command", ["visual", "visual-resolution"])
+def test_parser_accepts_visual_quality_commands(quality_command: str) -> None:
+    args = cli.parse_args(
+        ["quality", quality_command, "--evaluation-run-id", "eval_visual"]
+    )
+
+    assert args.command == "quality"
+    assert args.quality_command == quality_command
+
+
 def _gate_check(check_id: str, status: GateStatus) -> GateCheck:
     evidence = EvidenceReference(
         kind=EvidenceKind.LIVE_SERVICE_REPORT,

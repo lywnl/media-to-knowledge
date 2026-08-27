@@ -44,6 +44,7 @@ from video_demo.evaluation.predictions import (
 )
 from video_demo.evaluation.quality_runner import score_quality
 from video_demo.evaluation.report import BoundQualityReport, GateStatus
+from video_demo.evaluation.visual_quality import VerifiedVisualQualityReport
 from video_demo.implementation import prediction_implementation_files
 from video_demo.persistence.repositories import Scope
 from video_demo.storage.artifacts import (
@@ -65,6 +66,8 @@ _DEFAULT_SCOPE_HEADERS = {
     "X-Tenant-Id": "evaluation",
     "X-Application-Id": "video-demo",
 }
+
+
 class PredictionRunReport(FrozenModel):
     schema_version: str = Field(pattern=r"^1\.0\.0$")
     evaluation_run_id: StableId
@@ -99,8 +102,7 @@ class PredictionRunReport(FrozenModel):
             if self.not_run_reason is not None:
                 raise ValueError("已执行预测报告不得包含 NOT_RUN 原因")
             has_failure = any(
-                item.terminal_status in _FAILURE_STATUSES
-                for item in self.predictions
+                item.terminal_status in _FAILURE_STATUSES for item in self.predictions
             )
             expected = GateStatus.FAIL if has_failure else GateStatus.PASS
             if self.status != expected:
@@ -147,10 +149,7 @@ class PredictionRunner:
         validate_path_component(evaluation_run_id, "evaluation_run_id")
         started_at = datetime.now(UTC)
         verified_package = reverify_evaluation_package(package)
-        if (
-            verified_package.workspace_root is None
-            or verified_package.runtime_root is None
-        ):
+        if verified_package.workspace_root is None or verified_package.runtime_root is None:
             raise VideoDemoError(
                 ErrorCode.EVALUATION_DATASET_INVALID,
                 "评测包缺少可信工作区来源",
@@ -404,9 +403,7 @@ class PredictionRunner:
             VideoDemoError,
         ) as error:
             code = (
-                error.code.value
-                if isinstance(error, VideoDemoError)
-                else "API_UNEXPECTED_RESPONSE"
+                error.code.value if isinstance(error, VideoDemoError) else "API_UNEXPECTED_RESPONSE"
             )
             return self._failed_prediction_without_run(
                 sample,
@@ -453,17 +450,11 @@ class PredictionRunner:
                 break
             if not isinstance(cursor, str):
                 raise ValueError("证据分页游标非法")
-        public_items = _PUBLIC_EVIDENCE_ADAPTER.validate_python(
-            _normalize_public_evidence(values)
-        )
+        public_items = _PUBLIC_EVIDENCE_ADAPTER.validate_python(_normalize_public_evidence(values))
         if self._settings.runtime_root is None:
             raise ValueError("评测运行根未配置")
         sample_root = (
-            self._settings.runtime_root
-            / "eval"
-            / "predictions"
-            / evaluation_run_id
-            / sample_id
+            self._settings.runtime_root / "eval" / "predictions" / evaluation_run_id / sample_id
         )
         result: list[DocumentEvidenceItem] = []
         for public_item in public_items:
@@ -555,11 +546,14 @@ class PredictionRunner:
                         runtime_root=package.runtime_root,
                         sample=by_id[prediction.sample_id],
                     )
-                if _prediction_index_digest(
-                    package.runtime_root / "eval",
-                    report.evaluation_run_id,
-                    report.predictions,
-                ) != report.prediction_index_sha256:
+                if (
+                    _prediction_index_digest(
+                        package.runtime_root / "eval",
+                        report.evaluation_run_id,
+                        report.predictions,
+                    )
+                    != report.prediction_index_sha256
+                ):
                     raise ValueError("预测索引摘要与当前产物不匹配")
             return report
         except (OSError, ValueError, ValidationError, KeyError):
@@ -740,6 +734,7 @@ def score_prediction_run(
     evaluation_run_id: str,
     *,
     eval_root: Path,
+    visual_quality_report: VerifiedVisualQualityReport | None = None,
 ) -> BoundQualityReport:
     """只加载已落盘预测和人工审阅并重建质量，不调用生产模型。"""
 
@@ -818,6 +813,7 @@ def score_prediction_run(
             predictions,
             tuple(judgments),
             evaluation_run_id=evaluation_run_id,
+            visual_quality_report=visual_quality_report,
         )
         _atomic_write_bytes(
             safe_eval_root / "reports" / evaluation_run_id / "quality.json",
@@ -834,9 +830,7 @@ def score_prediction_run(
         )
         _atomic_write_bytes(
             safe_eval_root / "reports" / evaluation_run_id / "hint-effect.json",
-            artifacts.hint_effect_report.model_dump_json(exclude_none=True).encode(
-                "utf-8"
-            ),
+            artifacts.hint_effect_report.model_dump_json(exclude_none=True).encode("utf-8"),
         )
         return artifacts.report
     except (OSError, ValueError, ValidationError, KeyError, StopIteration, VideoDemoError):
@@ -970,9 +964,7 @@ def _evidence_matches_api(
     for expected, actual in zip(left, right, strict=True):
         expected_payload = expected.model_dump(mode="json")
         actual_payload = (
-            actual.model_dump(mode="json")
-            if not isinstance(actual, dict)
-            else dict(actual)
+            actual.model_dump(mode="json") if not isinstance(actual, dict) else dict(actual)
         )
         expected_payload.pop("relative_path", None)
         actual_payload.pop("relative_path", None)
@@ -989,9 +981,7 @@ def _rebind_evidence_to_manifest(
     rebound: list[DocumentEvidenceItem] = []
     for item in api_evidence:
         evidence_id = (
-            item.evidence_id
-            if not isinstance(item, dict)
-            else str(item.get("evidence_id"))
+            item.evidence_id if not isinstance(item, dict) else str(item.get("evidence_id"))
         )
         source = manifest_by_id.get(evidence_id)
         if source is None:

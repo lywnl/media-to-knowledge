@@ -44,6 +44,7 @@ from video_demo.evaluation.thresholds import (
     QUALITY_THRESHOLDS,
     SEMANTIC_BOUNDARY_TOLERANCE_MS,
 )
+from video_demo.evaluation.visual_quality import VerifiedVisualQualityReport
 
 _CER_LANGUAGES = frozenset({"zh", "ja", "ko"})
 _LANGUAGE_METRICS: Mapping[ValidationLanguage, str] = {
@@ -54,6 +55,8 @@ _LANGUAGE_METRICS: Mapping[ValidationLanguage, str] = {
     "es": "es_wer",
 }
 _EVIDENCE_ADAPTER = TypeAdapter(tuple[DocumentEvidenceItem, ...])
+
+
 class SampleQualityDetail(FrozenModel):
     sample_id: StableId
     language: ValidationLanguage
@@ -79,15 +82,15 @@ class HintPairEffect(FrozenModel):
 
     @model_validator(mode="after")
     def validate_deltas(self) -> HintPairEffect:
-        if abs(
-            self.term_recall_delta
-            - (self.correct_term_recall - self.none_term_recall)
-        ) > 1e-12:
+        if abs(self.term_recall_delta - (self.correct_term_recall - self.none_term_recall)) > 1e-12:
             raise ValueError("术语召回差值与两端结果不一致")
-        if abs(
-            self.text_error_rate_delta
-            - (self.correct_text_error_rate - self.none_text_error_rate)
-        ) > 1e-12:
+        if (
+            abs(
+                self.text_error_rate_delta
+                - (self.correct_text_error_rate - self.none_text_error_rate)
+            )
+            > 1e-12
+        ):
             raise ValueError("文本错误率差值与两端结果不一致")
         return self
 
@@ -154,13 +157,12 @@ def score_quality(
     judgments: tuple[SemanticJudgment, ...],
     *,
     evaluation_run_id: str,
+    visual_quality_report: VerifiedVisualQualityReport | None = None,
 ) -> QualityScoreArtifacts:
     """从受验签来源确定性重建非运行时质量指标及逐样本明细。"""
 
     verified_package = reverify_evaluation_package(package)
-    ordered_predictions = _ordered_predictions(
-        verified_package, predictions, evaluation_run_id
-    )
+    ordered_predictions = _ordered_predictions(verified_package, predictions, evaluation_run_id)
     ordered_predictions = tuple(
         reverify_verified_prediction(prediction, sample=sample)
         for sample, prediction in zip(
@@ -168,17 +170,36 @@ def score_quality(
         )
     )
     ordered_annotations = _ordered_annotations(verified_package)
-    ordered_judgments = _ordered_judgments(
-        ordered_annotations, ordered_predictions, judgments
-    )
+    ordered_judgments = _ordered_judgments(ordered_annotations, ordered_predictions, judgments)
     accumulators = _Accumulators()
     details = tuple(
         _score_sample(annotation, prediction, accumulators)
-        for annotation, prediction in zip(
-            ordered_annotations, ordered_predictions, strict=True
-        )
+        for annotation, prediction in zip(ordered_annotations, ordered_predictions, strict=True)
     )
     observations = accumulators.observations()
+    visual_failure_code: str | None = None
+    if visual_quality_report is not None:
+        visual = visual_quality_report.report
+        if (
+            visual.parent_evaluation_run_id != evaluation_run_id
+            or visual.dataset_sha256 != verified_package.dataset_sha256
+            or visual.authorization_sha256 != verified_package.authorization_sha256
+        ):
+            raise ValueError("视觉质量报告与当前质量 Run 闭包不一致")
+        observations["visual_text_accuracy"] = MetricObservation(
+            value=visual.visual_text_accuracy,
+            not_run_reason=visual.visual_text_accuracy_not_run_reason,
+        )
+        observations["visual_key_field_recall"] = MetricObservation(
+            value=visual.visual_key_field_recall,
+            not_run_reason=visual.visual_key_field_recall_not_run_reason,
+        )
+        if visual.status == "FAIL":
+            visual_failure_code = (
+                visual.failure_code.value
+                if visual.failure_code is not None
+                else "VISUAL_QUALITY_FAILED"
+            )
     prediction_index_sha256 = _canonical_digest(
         [prediction.index_sha256 for prediction in ordered_predictions]
     )
@@ -191,7 +212,7 @@ def score_quality(
         authorization_sha256=verified_package.authorization_sha256,
         prediction_index_sha256=prediction_index_sha256,
     )
-    failure_code: str | None = None
+    failure_code: str | None = visual_failure_code
     if not judgments:
         reason = "尚未提供人工语义审阅"
         for name in ("fact_support_rate", "key_fact_recall", "fabricated_name_count"):
@@ -272,9 +293,7 @@ class _Accumulators:
         observations["schema_time_valid_rate"] = MetricObservation(
             value=self.valid_results / self.attempted_results
         )
-        observations["rtf"] = MetricObservation(
-            value=None, not_run_reason="本切片不执行运行时测量"
-        )
+        observations["rtf"] = MetricObservation(value=None, not_run_reason="本切片不执行运行时测量")
         return observations
 
 
@@ -336,9 +355,7 @@ def _transcript_text(
     prediction: VerifiedPrediction,
 ) -> str:
     transcript_type = (
-        SubtitleCue
-        if prediction.index.transcript_source == "SUBTITLE"
-        else SpeechSegment
+        SubtitleCue if prediction.index.transcript_source == "SUBTITLE" else SpeechSegment
     )
     items = sorted(
         (item for item in prediction.evidence if isinstance(item, transcript_type)),
@@ -358,29 +375,20 @@ def _build_hint_effect_report(
     prediction_index_sha256: str,
 ) -> HintEffectReport:
     sample_by_id = {sample.sample_id: sample for sample in samples}
-    annotation_by_id = {
-        item.annotation.sample_id: item.annotation for item in annotations
-    }
-    prediction_by_id = {
-        prediction.index.sample_id: prediction for prediction in predictions
-    }
-    pair_ids = sorted(
-        {sample.pair_id for sample in samples if sample.pair_id is not None}
-    )
+    annotation_by_id = {item.annotation.sample_id: item.annotation for item in annotations}
+    prediction_by_id = {prediction.index.sample_id: prediction for prediction in predictions}
+    pair_ids = sorted({sample.pair_id for sample in samples if sample.pair_id is not None})
     pairs: list[HintPairEffect] = []
     exclusions: dict[HintPairExclusion, int] = defaultdict(int)
     for pair_id in pair_ids:
-        pair_samples = tuple(
-            sample for sample in samples if sample.pair_id == pair_id
-        )
+        pair_samples = tuple(sample for sample in samples if sample.pair_id == pair_id)
         by_variant = {sample.hint_variant: sample for sample in pair_samples}
         none_sample = by_variant["NONE"]
         correct_sample = by_variant["CORRECT"]
         none_prediction = prediction_by_id[none_sample.sample_id]
         correct_prediction = prediction_by_id[correct_sample.sample_id]
         if any(
-            prediction.index.terminal_status
-            not in {"SUCCEEDED", "PARTIAL_SUCCEEDED"}
+            prediction.index.terminal_status not in {"SUCCEEDED", "PARTIAL_SUCCEEDED"}
             for prediction in (none_prediction, correct_prediction)
         ):
             exclusions["PREDICTION_NOT_SUCCESSFUL"] += 1
@@ -490,9 +498,7 @@ def _text_edit_counts(
 
 def _exact_term_recall(hypothesis: str, terms: tuple[str, ...]) -> float:
     normalized_hypothesis = _normalize_hint_text(hypothesis)
-    matches = sum(
-        _normalize_hint_text(term) in normalized_hypothesis for term in terms
-    )
+    matches = sum(_normalize_hint_text(term) in normalized_hypothesis for term in terms)
     return matches / len(terms)
 
 
@@ -509,10 +515,7 @@ def _ordered_predictions(
     supplied_ids = tuple(prediction.index.sample_id for prediction in predictions)
     if len(supplied_ids) != len(set(supplied_ids)) or set(supplied_ids) != set(expected_ids):
         raise ValueError("预测必须恰好覆盖数据集且不得重复或包含外来样本")
-    if any(
-        prediction.index.evaluation_run_id != evaluation_run_id
-        for prediction in predictions
-    ):
+    if any(prediction.index.evaluation_run_id != evaluation_run_id for prediction in predictions):
         raise ValueError("预测必须全部属于指定评测运行")
     by_id = {prediction.index.sample_id: prediction for prediction in predictions}
     if any(
@@ -542,9 +545,7 @@ def _ordered_judgments(
         return None
     expected_ids = tuple(item.annotation.sample_id for item in annotations)
     supplied_ids = tuple(judgment.sample_id for judgment in judgments)
-    if len(supplied_ids) != len(set(supplied_ids)) or not set(supplied_ids).issubset(
-        expected_ids
-    ):
+    if len(supplied_ids) != len(set(supplied_ids)) or not set(supplied_ids).issubset(expected_ids):
         raise ValueError("审阅不得重复或包含外来样本")
     annotations_by_id = {item.annotation.sample_id: item for item in annotations}
     predictions_by_id = {item.index.sample_id: item for item in predictions}
@@ -561,9 +562,7 @@ def _ordered_judgments(
             claim.claim_id for claim in prediction.claims
         }:
             raise ValueError("审阅必须恰好覆盖当前预测 claims")
-        if not set(judgment.matched_key_fact_ids).issubset(
-            annotation.annotation.key_fact_ids
-        ):
+        if not set(judgment.matched_key_fact_ids).issubset(annotation.annotation.key_fact_ids):
             raise ValueError("审阅引用了未知关键事实")
     return tuple(by_id[sample_id] for sample_id in expected_ids if sample_id in by_id)
 
@@ -576,9 +575,7 @@ def _add_semantic_observations(
 ) -> None:
     total_claims = sum(len(prediction.claims) for prediction in predictions)
     supported_claims = sum(
-        item.verdict == "SUPPORTED"
-        for judgment in judgments
-        for item in judgment.claim_judgments
+        item.verdict == "SUPPORTED" for judgment in judgments for item in judgment.claim_judgments
     )
     total_key_facts = sum(len(item.annotation.key_fact_ids) for item in annotations)
     matched_key_facts = sum(len(judgment.matched_key_fact_ids) for judgment in judgments)
@@ -587,9 +584,7 @@ def _add_semantic_observations(
         if total_claims
         else MetricObservation(value=None, not_run_reason="完整审阅中没有预测 claim")
     )
-    observations["key_fact_recall"] = MetricObservation(
-        value=matched_key_facts / total_key_facts
-    )
+    observations["key_fact_recall"] = MetricObservation(value=matched_key_facts / total_key_facts)
     observations["fabricated_name_count"] = MetricObservation(
         value=float(sum(len(judgment.fabricated_names) for judgment in judgments))
     )
@@ -603,9 +598,7 @@ def _schema_time_check(
     evidence_ids = [item.evidence_id for item in prediction.evidence]
     evidence_id_set = set(evidence_ids)
     references = [
-        reference
-        for chapter in prediction.result.chapters
-        for reference in chapter.evidence_refs
+        reference for chapter in prediction.result.chapters for reference in chapter.evidence_refs
     ]
     unknown_count = sum(reference not in evidence_id_set for reference in references)
     try:
@@ -641,9 +634,7 @@ def _count_observation(counts: EditCounts) -> MetricObservation:
     )
 
 
-def _accuracy_observation(
-    errors: int, units: int, not_run_reason: str
-) -> MetricObservation:
+def _accuracy_observation(errors: int, units: int, not_run_reason: str) -> MetricObservation:
     if not units:
         return MetricObservation(value=None, not_run_reason=not_run_reason)
     return MetricObservation(value=1 - errors / units)
@@ -658,9 +649,9 @@ def _ratio_observation(
 
 
 def _canonical_digest(value: Sequence[object]) -> str:
-    encoded = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     return hashlib.sha256(encoded).hexdigest()
 
 

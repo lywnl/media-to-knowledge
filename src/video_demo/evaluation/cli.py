@@ -46,7 +46,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         _add_run_id(command)
     quality = commands.add_parser("quality")
     quality_commands = quality.add_subparsers(dest="quality_command", required=True)
-    for name in ("predict", "score"):
+    for name in ("predict", "score", "visual", "visual-resolution"):
         command = quality_commands.add_parser(name)
         _add_run_id(command)
     return parser.parse_args(argv)
@@ -144,9 +144,38 @@ def dispatch(args: argparse.Namespace, settings: Settings) -> StageExecutionResu
                 reason="预测阶段未运行",
                 workspace_root=settings.workspace_root,
             )
+        visual_quality = None
+        visual_path = settings.runtime_root / "eval/reports" / run_id / "visual-quality.json"
+        dataset_path = settings.runtime_root / "eval/dataset.jsonl"
+        authorization_path = settings.runtime_root / "eval/authorization.json"
+        if visual_path.is_file() and dataset_path.is_file() and authorization_path.is_file():
+            from video_demo.evaluation.visual_quality import verify_visual_quality_report
+
+            package = load_evaluation_package(
+                dataset_path,
+                authorization_path,
+                workspace_root=settings.workspace_root,
+                runtime_root=settings.runtime_root,
+                max_video_bytes=settings.max_video_bytes,
+            )
+            visual_report = __import__(
+                "video_demo.evaluation.visual_quality",
+                fromlist=["VisualQualityReport"],
+            ).VisualQualityReport.model_validate_json(visual_path.read_bytes())
+            quality_set = __import__(
+                "video_demo.evaluation.visual_quality",
+                fromlist=["build_visual_quality_set"],
+            ).build_visual_quality_set(
+                package,
+                parent_evaluation_run_id=run_id,
+                proxy_max_edge=1_920,
+                jpeg_quality=settings.keyframe_jpeg_quality,
+            )
+            visual_quality = verify_visual_quality_report(visual_report, quality_set, package)
         quality_report = score_prediction_run(
             run_id,
             eval_root=settings.runtime_root / "eval",
+            visual_quality_report=visual_quality,
         )
         path = settings.runtime_root / "eval/reports" / run_id / "quality.json"
         return StageExecutionResult(
@@ -157,6 +186,84 @@ def dispatch(args: argparse.Namespace, settings: Settings) -> StageExecutionResu
                 if quality_report.status == GateStatus.NOT_RUN
                 else ("质量指标存在失败项" if quality_report.status == GateStatus.FAIL else None)
             ),
+        )
+    if args.command == "quality" and args.quality_command in {
+        "visual",
+        "visual-resolution",
+    }:
+        dataset_path = settings.runtime_root / "eval/dataset.jsonl"
+        authorization_path = settings.runtime_root / "eval/authorization.json"
+        if not dataset_path.is_file() or not authorization_path.is_file():
+            return StageExecutionResult(
+                status=GateStatus.NOT_RUN,
+                report_path=(
+                    settings.runtime_root
+                    / "eval"
+                    / "reports"
+                    / run_id
+                    / f"{args.quality_command}.json"
+                )
+                .relative_to(settings.workspace_root)
+                .as_posix(),
+                reason="缺少授权视觉评测集或授权记录",
+            )
+        from video_demo.evaluation.visual_quality_runner import VisualQualityRunner
+
+        package = load_evaluation_package(
+            dataset_path,
+            authorization_path,
+            workspace_root=settings.workspace_root,
+            runtime_root=settings.runtime_root,
+            max_video_bytes=settings.max_video_bytes,
+        )
+        visual_runner = VisualQualityRunner(settings)
+        if args.quality_command == "visual":
+            report = visual_runner.run(package, evaluation_run_id=run_id)
+            path = settings.runtime_root / "eval" / "reports" / run_id / "visual-quality.json"
+            return StageExecutionResult(
+                status=_visual_gate_status(report.status),
+                report_path=path.relative_to(settings.workspace_root).as_posix(),
+                reason=report.not_run_reason
+                or ("视觉质量报告存在失败 case" if report.status == "FAIL" else None),
+            )
+        from video_demo.evaluation.visual_quality import (
+            build_visual_resolution_pair,
+            build_visual_resolution_report,
+        )
+
+        quality_set_1920 = visual_runner.build_quality_set(
+            package, evaluation_run_id=run_id, proxy_max_edge=1_920
+        )
+        report_1280 = visual_runner.run(package, evaluation_run_id=run_id, proxy_max_edge=1_280)
+        report_1920 = visual_runner.run(package, evaluation_run_id=run_id, proxy_max_edge=1_920)
+        pairs = tuple(
+            build_visual_resolution_pair(
+                next(case for case in report_1280.cases if case.sample_id == sample.sample_id),
+                next(case for case in report_1920.cases if case.sample_id == sample.sample_id),
+                expected_parent_evaluation_run_id=run_id,
+                expected_sample_id=sample.sample_id,
+                expected_requested_reference_frame_ids=sample.requested_reference_frame_ids,
+                expected_jpeg_quality=quality_set_1920.jpeg_quality,
+                quality_report_1280=report_1280,
+                quality_report_1920=report_1920,
+            )
+            for sample in quality_set_1920.samples
+        )
+        resolution = build_visual_resolution_report(
+            quality_set_1920,
+            package,
+            pairs,
+            report_1280,
+            report_1920,
+        )
+        path = visual_runner.write_report(
+            resolution, evaluation_run_id=run_id, filename="visual-resolution.json"
+        )
+        return StageExecutionResult(
+            status=_visual_gate_status(resolution.status),
+            report_path=path.relative_to(settings.workspace_root).as_posix(),
+            reason=resolution.not_run_reason
+            or ("分辨率对照存在失败 case" if resolution.status == "FAIL" else None),
         )
     raise ValueError("未知验收子命令")
 
@@ -193,6 +300,12 @@ def _print_result(status: str, report_path: str, reason: str | None) -> None:
     print(f"报告: {report_path}")
     if reason is not None:
         print(f"原因: {reason}")
+
+
+def _visual_gate_status(status: str) -> GateStatus:
+    if status == "SUCCEEDED":
+        return GateStatus.PASS
+    return GateStatus(status)
 
 
 def _check_result(check: GateCheck) -> StageExecutionResult:
