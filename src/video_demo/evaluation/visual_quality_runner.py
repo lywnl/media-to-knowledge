@@ -40,6 +40,7 @@ from video_demo.evaluation.visual_quality import (
     visual_quality_case_id,
 )
 from video_demo.integrations.qwen_vl import QwenVisionCallFailure, QwenVisionClient
+from video_demo.storage.artifacts import AtomicArtifactStore
 
 
 class VisualQualityRunner:
@@ -354,12 +355,14 @@ class VisualQualityRunner:
     ) -> Any:
         assert self._settings.runtime_root is not None
         path = self._settings.runtime_root / "eval" / "reports" / evaluation_run_id / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                report.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, indent=2
-            ),
-            encoding="utf-8",
+        payload = json.dumps(
+            report.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, indent=2
+        ).encode("utf-8")
+        AtomicArtifactStore(self._settings.runtime_root).write_bytes(
+            path.relative_to(self._settings.runtime_root),
+            payload,
+            max_bytes=self._settings.max_result_bundle_bytes,
+            file_mode=0o600,
         )
         return path
 
