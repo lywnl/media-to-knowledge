@@ -76,3 +76,12 @@ def test_vision_prompt_does_not_include_local_paths_or_secrets(tmp_path: Path) -
     assert "visual/candidates" not in rendered
     assert "sha256" not in rendered
     assert "Bearer" not in rendered
+
+
+def test_vision_prompt_limits_selected_frames_and_allows_empty_observations(
+    tmp_path: Path,
+) -> None:
+    _version, instruction, _data = prompt_for_vision(_request(tmp_path, "画面文字"))
+    assert "每个 observation 最多选择 2 张图片" in instruction
+    assert "整份响应最多使用 2 张不同图片" in instruction
+    assert "返回 observations=[]" in instruction

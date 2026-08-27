@@ -46,10 +46,9 @@ _MAX_CHAPTER_DURATION_MS = 300_000
 _MAX_TARGET_ANCHOR_SPAN_MS = 30_000
 _DEFAULT_MAX_PLANNING_BATCHES = 64
 _DEFAULT_PLANNING_CONCURRENCY = 2
-# 思考模式会把推理 token 计入输出预算；批次过大时模型容易生成超出数组
-# 范围的章节索引并触发一次昂贵修复。20 个片段仍能覆盖约 10 分钟时间轴，
-# 在保持少量请求的同时让结构化输出稳定落在单次响应预算内。
-_MAX_PLANNING_SEGMENTS_PER_BATCH = 20
+# 紧凑规划请求只携带片段的事实投影；48 个片段仍能落在单次输入预算内，
+# 可减少长视频被拆成过多批次后产生的额外模型调用与修复开销。
+_MAX_PLANNING_SEGMENTS_PER_BATCH = 48
 _GRANULARITY_TARGET_DURATION_MS = {
     "fine": 120_000,
     "standard": 180_000,

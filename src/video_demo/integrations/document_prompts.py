@@ -153,7 +153,12 @@ def prompt_for_plan_repair(request: ChapterPlanRepairRequest) -> tuple[str, str,
 def prompt_for_vision(request: ChapterVisionRequest) -> tuple[str, str, str]:
     return _prompt(
         request.prompt_version,
-        "你只能比较输入的本地图片，并且只能返回输入中的 frame_id、target_id 和 evidence_id。",
+        (
+            "你只能比较输入的本地图片，并且只能返回输入中的 frame_id、target_id 和 "
+            "evidence_id。每个 observation 最多选择 2 张图片；整份响应最多使用 2 张不同图片。"
+            "如果图片无法确认目标，返回 observations=[]，不要猜测或选择额外图片。"
+            "selected_frame_ids 必须是实际最能支持该 observation 的最少图片。"
+        ),
         _vision_context(request),
     )
 
@@ -163,7 +168,11 @@ def prompt_for_vision_repair(request: ChapterVisionRepairRequest) -> tuple[str, 
     context["request"] = _vision_context(request.request)
     return _prompt(
         request.prompt_version,
-        "只修复结构和引用；图片顺序和原始取证问题不得改变，不得添加新事实。",
+        (
+            "只修复结构和引用；图片顺序和原始取证问题不得改变，不得添加新事实。"
+            "每个 observation 最多选择 2 张图片，整份响应最多使用 2 张不同图片；"
+            "无法确认时返回 observations=[]。"
+        ),
         context,
     )
 
