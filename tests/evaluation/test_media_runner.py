@@ -3160,7 +3160,6 @@ def test_task4_source_enforces_configured_size_limit_and_cleans_part(
 @pytest.mark.parametrize(
     "changed_path",
     (
-        Path("src/video_demo/application/production_visual.py"),
         Path("src/video_demo/config.py"),
         Path("src/video_demo/evaluation/real_media_execution.py"),
         Path("src/video_demo/evaluation/real_media_source.py"),

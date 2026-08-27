@@ -56,18 +56,11 @@ ArtifactRole = Literal[
     "COMMAND_STDOUT",
     "COMMAND_STDERR",
 ]
-# 旧值仅供迁移期读取历史报告，不属于活动执行集合。
 ActiveLiveCheckId = Literal[
     "chapter_vlm_live",
     "five_language_models",
 ]
-# 兼容读取 11B 前的历史报告；活动入口应使用 ActiveLiveCheckId。
-LiveCheckId = Literal[
-    "baidu_ocr_live",
-    "qwen_live",
-    "chapter_vlm_live",
-    "five_language_models",
-]
+LiveCheckId = ActiveLiveCheckId
 OfflineCheckId = Literal[
     "no_indexing",
     "ruff",
@@ -93,17 +86,8 @@ _LIVE_EXECUTED_CHECKS = frozenset(
         "five_language_models",
     }
 )
-# 已执行的活动 live 检查都必须经过 authority journal 重验；历史检查只允许
-# 由迁移期离线读取路径显式处理，不能绕过当前活动闭包。
 _LIVE_AUTHORITY_CHECKS = _LIVE_EXECUTED_CHECKS
-# 11B 之前仍允许读取和重验旧 live 报告，但这些检查不属于活动门禁。
-_HISTORICAL_LIVE_CHECKS = frozenset(
-    {
-        "baidu_ocr_live",
-        "qwen_live",
-    }
-)
-_ALL_LIVE_CHECKS = _LIVE_AUTHORITY_CHECKS | _HISTORICAL_LIVE_CHECKS
+_ALL_LIVE_CHECKS = _LIVE_AUTHORITY_CHECKS
 _MEDIA_ROLES = frozenset({"INPUT_MEDIA", "OUTPUT_MEDIA"})
 _TEXT_MACHINE_ROLES = frozenset(
     {
@@ -176,9 +160,6 @@ class PreflightReasonCode(StrEnum):
     SECRET_SCAN_INPUT_UNAVAILABLE = "SECRET_SCAN_INPUT_UNAVAILABLE"
     AUTHORIZED_DATASET_UNAVAILABLE = "AUTHORIZED_DATASET_UNAVAILABLE"
     REAL_MEDIA_CHAIN_UNAVAILABLE = "REAL_MEDIA_CHAIN_UNAVAILABLE"
-    # 旧 live 原因保留到 11B 物理删除，但不再映射到活动检查。
-    BAIDU_OCR_CREDENTIALS_UNAVAILABLE = "BAIDU_OCR_CREDENTIALS_UNAVAILABLE"
-    QWEN_CREDENTIALS_UNAVAILABLE = "QWEN_CREDENTIALS_UNAVAILABLE"
     CHAPTER_VLM_INPUT_UNAVAILABLE = "CHAPTER_VLM_INPUT_UNAVAILABLE"
     FIVE_LANGUAGE_MODELS_UNAVAILABLE = "FIVE_LANGUAGE_MODELS_UNAVAILABLE"
     M1_DURABILITY_INPUT_UNAVAILABLE = "M1_DURABILITY_INPUT_UNAVAILABLE"
@@ -193,8 +174,6 @@ _PREFLIGHT_REASON_CHECK: dict[PreflightReasonCode, str] = {
     PreflightReasonCode.SECRET_SCAN_INPUT_UNAVAILABLE: "secret_scan",
     PreflightReasonCode.AUTHORIZED_DATASET_UNAVAILABLE: "authorized_dataset",
     PreflightReasonCode.REAL_MEDIA_CHAIN_UNAVAILABLE: "real_media_chain",
-    PreflightReasonCode.BAIDU_OCR_CREDENTIALS_UNAVAILABLE: "baidu_ocr_live",
-    PreflightReasonCode.QWEN_CREDENTIALS_UNAVAILABLE: "qwen_live",
     PreflightReasonCode.CHAPTER_VLM_INPUT_UNAVAILABLE: "chapter_vlm_live",
     PreflightReasonCode.FIVE_LANGUAGE_MODELS_UNAVAILABLE: "five_language_models",
     PreflightReasonCode.M1_DURABILITY_INPUT_UNAVAILABLE: "m1_durability",
@@ -422,14 +401,6 @@ class _LiveCheckDetails(FrozenModel):
     authorization_sha256: Sha256
 
 
-class BaiduLiveDetails(_LiveCheckDetails):
-    type: Literal["BAIDU_LIVE"]
-
-
-class QwenLiveDetails(_LiveCheckDetails):
-    type: Literal["QWEN_LIVE"]
-
-
 class ChapterVlmLiveDetails(_LiveCheckDetails):
     """章节多图 VLM live 报告的最小权威摘要。"""
 
@@ -585,8 +556,6 @@ MachineEvidenceDetails = Annotated[
     | StaticAuditDetails
     | OfflineEvidenceDetails
     | LiveServiceDetails
-    | BaiduLiveDetails
-    | QwenLiveDetails
     | ChapterVlmLiveDetails
     | FiveLanguageModelsDetails
     | RealMediaDetails
@@ -674,17 +643,6 @@ _LIVE_PREFLIGHT_CODES: dict[str, tuple[ErrorCode, ...]] = {
         ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT,
         ErrorCode.LIVE_AUTHORIZED_CHAPTER_FRAMES_UNAVAILABLE,
     ),
-    "baidu_ocr_live": (
-        ErrorCode.BAIDU_API_KEY_UNAVAILABLE,
-        ErrorCode.BAIDU_SECRET_KEY_UNAVAILABLE,
-        ErrorCode.LIVE_AUTHORIZED_KEYFRAME_UNAVAILABLE,
-    ),
-    "qwen_live": (
-        ErrorCode.QWEN_ENDPOINT_UNAVAILABLE,
-        ErrorCode.QWEN_API_KEY_UNAVAILABLE,
-        ErrorCode.QWEN_MODEL_ID_UNAVAILABLE,
-        ErrorCode.LIVE_AUTHORIZED_CLIP_UNAVAILABLE,
-    ),
     "five_language_models": (
         ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE,
         ErrorCode.SILERO_MODEL_UNAVAILABLE,
@@ -742,24 +700,17 @@ LiveInputKind = Literal[
     "CHAPTER_FRAME",
 ]
 LiveComponent = Literal[
-    "baidu_ocr",
-    "qwen",
     "chapter_vlm",
     "silero_vad",
     "cloud_whisper",
 ]
 LiveFailureComponent = Literal[
-    "baidu_ocr",
-    "qwen",
     "chapter_vlm",
     "silero_vad",
     "cloud_whisper",
     "components_close",
 ]
 LiveOperation = Literal[
-    "recognize",
-    "capability_probe",
-    "understand_segment",
     "analyze_chapter",
     "vad",
     "transcribe",
@@ -795,17 +746,11 @@ class LiveSample(FrozenModel):
     source_media_sha256: Sha256
     audio_relative_path: str = Field(min_length=1, max_length=1024)
     audio_sha256: Sha256
-    keyframe_relative_path: str = Field(min_length=1, max_length=1024)
-    keyframe_sha256: Sha256
-    clip_relative_path: str = Field(min_length=1, max_length=1024)
-    clip_sha256: Sha256
     annotation_sha256: Sha256
 
     @field_validator(
         "source_media_relative_path",
         "audio_relative_path",
-        "keyframe_relative_path",
-        "clip_relative_path",
     )
     @classmethod
     def validate_runtime_paths(cls, value: str) -> str:
@@ -818,8 +763,6 @@ class LiveSample(FrozenModel):
         paths = (
             self.source_media_relative_path,
             self.audio_relative_path,
-            self.keyframe_relative_path,
-            self.clip_relative_path,
         )
         if len(paths) != len(set(paths)):
             raise ValueError("live 样本源媒体和派生产物路径不得重复")
@@ -827,25 +770,21 @@ class LiveSample(FrozenModel):
 
 
 _COMPONENT_OPERATION: dict[str, tuple[str, ...]] = {
-    "baidu_ocr": ("recognize",),
-    "qwen": ("capability_probe", "understand_segment"),
+    "chapter_vlm": ("analyze_chapter",),
     "silero_vad": ("vad",),
     "cloud_whisper": ("transcribe",),
 }
 _COMPONENT_INPUT_KIND: dict[str, str] = {
-    "baidu_ocr": "KEYFRAME",
-    "qwen": "CLIP",
+    "chapter_vlm": "CHAPTER_FRAME",
     "silero_vad": "AUDIO",
     "cloud_whisper": "AUDIO",
 }
 _COMPONENT_PROVIDER: dict[str, str] = {
-    "baidu_ocr": "baidu_ocr",
-    "qwen": "qwen",
+    "chapter_vlm": "qwen",
     "silero_vad": "local",
     "cloud_whisper": "openai_compatible",
 }
 _FIXED_MODEL_IDS: dict[str, str] = {
-    "baidu_ocr": "accurate_basic",
     "silero_vad": "silero-vad",
 }
 _QWEN_MODEL_ID_PATTERN = re.compile(
@@ -875,7 +814,7 @@ class ModelExecutionFact(FrozenModel):
 
     @model_validator(mode="after")
     def bind_component_facts(self) -> ModelExecutionFact:
-        service_component = self.component in {"baidu_ocr", "qwen"}
+        service_component = self.component in {"chapter_vlm", "cloud_whisper"}
         if (
             self.model.component != self.component
             or self.operation not in _COMPONENT_OPERATION[self.component]
@@ -891,16 +830,8 @@ class ModelExecutionFact(FrozenModel):
         self._validate_model_identity()
         if self.component == "cloud_whisper" and self.language is None:
             raise ValueError("五语模型执行事实必须声明语言")
-        if self.component != "qwen" and self.capabilities:
-            raise ValueError("仅 Qwen 能力探测可声明能力事实")
-        if self.component == "qwen" and self.operation != "capability_probe" and self.capabilities:
-            raise ValueError("仅 Qwen 能力探测可声明能力事实")
-        if (
-            self.component == "qwen"
-            and self.operation == "capability_probe"
-            and set(self.capabilities) != {"video_input", "strict_json_schema"}
-        ):
-            raise ValueError("Qwen 能力探测事实必须完整证明视频输入与严格 Schema")
+        if self.capabilities:
+            raise ValueError("活动 live 执行事实不得声明已退役的能力探测")
         if len(self.capabilities) != len(set(self.capabilities)):
             raise ValueError("模型能力事实不得重复")
         _validate_persisted_value(self.model_dump(mode="python"))
@@ -917,11 +848,13 @@ class ModelExecutionFact(FrozenModel):
             valid_model = self.model.model_id == _FIXED_MODEL_IDS[self.component]
         elif self.component == "cloud_whisper":
             valid_model = bool(self.model.model_id.strip())
-        else:
+        elif self.component == "chapter_vlm":
             valid_model = bool(_QWEN_MODEL_ID_PATTERN.fullmatch(self.model.model_id))
+        else:
+            valid_model = False
         if not valid_model:
             raise ValueError("模型 ID 与 live 组件不匹配")
-        if self.component in {"baidu_ocr", "qwen", "cloud_whisper"}:
+        if self.component in {"chapter_vlm", "cloud_whisper"}:
             if self.model.device is not None or self.model.revision is not None:
                 raise ValueError("远程服务模型身份不得声明本地设备或推测 revision")
         elif self.model.device not in {"cpu", "mps"}:
@@ -1014,9 +947,9 @@ class _LiveRawReport(FrozenModel):
         return self
 
     def _validate_sample_inputs(self, samples: tuple[LiveSample, ...]) -> None:
-        expected_count = len(samples) * 4
+        expected_count = len(samples) * 2
         if len(self.inputs) != expected_count:
-            raise ValueError("live raw 必须为每个样本绑定四类精确输入")
+            raise ValueError("live raw 必须为每个样本绑定源媒体和音频输入")
         expected_by_identity = {
             (sample.sample_id, kind): expected
             for sample in samples
@@ -1050,103 +983,11 @@ def _expected_live_inputs(sample: LiveSample) -> dict[LiveInputKind, tuple[str, 
             sample.source_media_sha256,
         ),
         "AUDIO": (sample.audio_relative_path, sample.audio_sha256),
-        "KEYFRAME": (sample.keyframe_relative_path, sample.keyframe_sha256),
-        "CLIP": (sample.clip_relative_path, sample.clip_sha256),
     }
     return {
         kind: (relative_path, sha256, sample.source_media_sha256)
         for kind, (relative_path, sha256) in values.items()
     }
-
-
-class BaiduLiveRawReport(_LiveRawReport):
-    check_id: Literal["baidu_ocr_live"]
-    sample: LiveSample
-
-    @model_validator(mode="after")
-    def validate_baidu_execution(self) -> BaiduLiveRawReport:
-        self._validate_sample_inputs((self.sample,))
-        if self.status == GateStatus.FAIL:
-            if self.failure_component == "components_close":
-                if len(self.executions) != 1:
-                    raise ValueError("百度组件关闭失败前执行事实不完整")
-            elif self.failure_component != "baidu_ocr":
-                raise ValueError("百度真实失败组件身份不匹配")
-        if any(
-            fact.component != "baidu_ocr"
-            or fact.sample_id != self.sample.sample_id
-            or fact.language != self.sample.language
-            or fact.input_sha256 != self.sample.keyframe_sha256
-            for fact in self.executions
-        ):
-            raise ValueError("百度执行事实与当前授权样本不匹配")
-        if self.status == GateStatus.PASS and (
-            len(self.executions) != 1
-            or (fact := self.executions[0]).component != "baidu_ocr"
-            or fact.operation != "recognize"
-            or fact.sample_id != self.sample.sample_id
-            or fact.language != self.sample.language
-            or fact.input_sha256 != self.sample.keyframe_sha256
-            or fact.http_status is None
-            or not 200 <= fact.http_status < 300
-        ):
-            raise ValueError("百度真实执行事实不完整")
-        return self
-
-
-class QwenLiveRawReport(_LiveRawReport):
-    check_id: Literal["qwen_live"]
-    sample: LiveSample
-
-    @model_validator(mode="after")
-    def validate_qwen_execution(self) -> QwenLiveRawReport:
-        self._validate_sample_inputs((self.sample,))
-        operations = tuple(fact.operation for fact in self.executions)
-        expected_operations = ("capability_probe", "understand_segment")
-        if self.status == GateStatus.FAIL:
-            if self.failure_component == "components_close":
-                if operations != expected_operations:
-                    raise ValueError("Qwen 组件关闭失败前执行事实不完整")
-            elif self.failure_component != "qwen":
-                raise ValueError("Qwen 真实失败组件身份不匹配")
-        if operations != expected_operations[: len(operations)] or any(
-            fact.component != "qwen"
-            or fact.sample_id != self.sample.sample_id
-            or fact.language != self.sample.language
-            or fact.input_sha256 != self.sample.clip_sha256
-            for fact in self.executions
-        ):
-            raise ValueError("Qwen 执行事实与当前授权 clip 或阶段顺序不匹配")
-        if any(
-            fact.http_status is None or not 200 <= fact.http_status < 300
-            for fact in self.executions
-        ):
-            raise ValueError("Qwen 阶段事实必须绑定 2xx 成功 HTTP 状态")
-        if self.executions and (
-            set(self.executions[0].capabilities) != {"video_input", "strict_json_schema"}
-        ):
-            raise ValueError("Qwen 能力探测事实必须完整证明视频输入与严格 Schema")
-        if self.status == GateStatus.PASS:
-            if operations != expected_operations:
-                raise ValueError("Qwen 必须先能力探测再执行 segment Schema")
-            if any(
-                fact.component != "qwen"
-                or fact.sample_id != self.sample.sample_id
-                or fact.language != self.sample.language
-                or fact.input_sha256 != self.sample.clip_sha256
-                or fact.http_status is None
-                or not 200 <= fact.http_status < 300
-                for fact in self.executions
-            ):
-                raise ValueError("Qwen 真实执行事实与授权 clip 不匹配")
-            probe, segment = self.executions
-            if segment.capabilities or probe.model != segment.model:
-                raise ValueError("Qwen 能力探测与 segment 事实不匹配")
-        elif len(self.executions) == 2:
-            probe, segment = self.executions
-            if segment.capabilities or probe.model != segment.model:
-                raise ValueError("Qwen FAIL 的 segment 前必须已有完整能力探测事实")
-        return self
 
 
 class ChapterVlmLiveRawReport(FrozenModel):
@@ -2604,8 +2445,6 @@ def _require_live_check_id(check_id: str) -> LiveCheckId:
 def _live_raw_type(check_id: str) -> type[Any]:
     raw_types: dict[str, type[Any]] = {
         "chapter_vlm_live": ChapterVlmLiveRawReport,
-        "baidu_ocr_live": BaiduLiveRawReport,
-        "qwen_live": QwenLiveRawReport,
         "five_language_models": FiveLanguageModelsRawReport,
     }
     try:

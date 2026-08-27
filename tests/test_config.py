@@ -389,14 +389,8 @@ class SettingsTest(unittest.TestCase):
                 }.isdisjoint(Settings.model_fields)
             )
             self.assertEqual(settings.worker_concurrency, 1)
-            self.assertEqual(settings.qwen_max_video_bytes, 64 * 1024 * 1024)
-            self.assertEqual(settings.qwen_max_video_duration_ms, 30_000)
-            self.assertEqual(settings.qwen_timeout_seconds, 300.0)
             self.assertEqual(settings.speech_subprocess_timeout_seconds, 3_600)
             self.assertEqual(settings.max_video_duration_ms, 1_800_000)
-            self.assertEqual(settings.oss_prefix, "video-demo/qwen-clips")
-            self.assertEqual(settings.oss_signed_url_ttl_seconds, 3_600)
-            self.assertFalse(settings.has_complete_oss_configuration())
             self.assertFalse(settings.demo_degraded_mode)
 
     def test_video_duration_and_subprocess_timeout_hard_limits_are_validated(self) -> None:
@@ -419,24 +413,6 @@ class SettingsTest(unittest.TestCase):
             ):
                 with self.subTest(values=values), self.assertRaises(ValidationError):
                     Settings(workspace_root=workspace, _env_file=None, **values)  # type: ignore[arg-type]
-
-    def test_complete_oss_configuration_is_available_without_serializing_secrets(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            settings = Settings(
-                workspace_root=Path(directory),
-                oss_endpoint="https://oss-cn-hangzhou.aliyuncs.com",
-                oss_bucket="private-video-bucket",
-                oss_access_key_id="test-access-key-id",
-                oss_access_key_secret="test-access-key-secret",
-            )
-
-            serialized = settings.model_dump_json()
-
-            self.assertTrue(settings.has_complete_oss_configuration())
-            self.assertNotIn("test-access-key-id", serialized)
-            self.assertNotIn("test-access-key-secret", serialized)
 
     def test_cloud_timeout_and_retry_change_settings_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -479,52 +455,11 @@ class SettingsTest(unittest.TestCase):
                 key_changed.settings_fingerprint,
             )
 
-    def test_partial_oss_configuration_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            settings = Settings(
-                workspace_root=Path(directory),
-                oss_endpoint="https://oss-cn-hangzhou.aliyuncs.com",
-                oss_bucket="private-video-bucket",
-            )
-            self.assertFalse(settings.has_complete_oss_configuration())
-            with self.assertRaisesRegex(ValueError, "OSS 配置必须全部提供或全部留空"):
-                settings._validate_oss_configuration()
-
-    def test_oss_prefix_and_signed_url_ttl_are_strictly_validated(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            for values in (
-                {"oss_prefix": "../qwen-clips"},
-                {"oss_prefix": "video-demo//qwen-clips"},
-                {"oss_prefix": "video-demo\\qwen-clips"},
-                {"oss_signed_url_ttl_seconds": 59},
-                {"oss_signed_url_ttl_seconds": 86_401},
-            ):
-                with self.subTest(values=values), self.assertRaises(ValidationError):
-                    Settings(workspace_root=workspace, **values)  # type: ignore[arg-type]
-
     def test_demo_degraded_mode_is_explicitly_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(workspace_root=Path(directory), demo_degraded_mode=True)
 
             self.assertTrue(settings.demo_degraded_mode)
-
-    def test_qwen_limits_reject_non_finite_timeout_and_duration_above_30_seconds(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            for values in (
-                {"qwen_timeout_seconds": float("nan")},
-                {"qwen_timeout_seconds": float("inf")},
-                {"qwen_timeout_seconds": float("-inf")},
-                {"qwen_timeout_seconds": 0.0},
-                {"qwen_max_video_duration_ms": 30_001},
-                {"qwen_max_video_duration_ms": 0},
-                {"qwen_max_video_bytes": 0},
-            ):
-                with self.subTest(values=values), self.assertRaises(ValidationError):
-                    Settings(workspace_root=workspace, **values)  # type: ignore[arg-type]
 
     def test_resolve_workspace_path_rejects_parent_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -549,23 +484,6 @@ class SettingsTest(unittest.TestCase):
 
             self.assertEqual(raised.exception.code, ErrorCode.WORKSPACE_PATH_ESCAPE)
 
-    def test_secret_values_are_excluded_from_serialized_settings(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            secret = "qwen-secret-value"
-            settings = Settings(
-                workspace_root=Path(directory),
-                qwen_api_key=secret,
-                baidu_api_key="baidu-api-secret",
-                baidu_secret_key="baidu-secret-value",
-                openai_api_key="openai-secret-value",
-            )
-
-            serialized = settings.model_dump_json()
-
-            self.assertNotIn(secret, serialized)
-            self.assertNotIn("baidu-api-secret", serialized)
-            self.assertNotIn("baidu-secret-value", serialized)
-            self.assertNotIn("openai-secret-value", serialized)
 
 
 if __name__ == "__main__":

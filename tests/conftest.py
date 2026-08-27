@@ -18,15 +18,6 @@ def pytest_configure() -> None:
         "VIDEO_DEMO_WHISPER_COMPUTE_TYPE",
         "VIDEO_DEMO_INFERENCE_DEVICE",
         "VIDEO_DEMO_SPEECH_ENRICHMENT_TIMEOUT_SECONDS",
-        "VIDEO_DEMO_BAIDU_API_KEY",
-        "VIDEO_DEMO_BAIDU_SECRET_KEY",
-        "VIDEO_DEMO_QWEN_API_KEY",
-        "VIDEO_DEMO_QWEN_BASE_URL",
-        "VIDEO_DEMO_QWEN_MODEL_ID",
-        "VIDEO_DEMO_OSS_ENDPOINT",
-        "VIDEO_DEMO_OSS_BUCKET",
-        "VIDEO_DEMO_OSS_ACCESS_KEY_ID",
-        "VIDEO_DEMO_OSS_ACCESS_KEY_SECRET",
     ):
         os.environ[name] = ""
     for name in (
@@ -37,9 +28,6 @@ def pytest_configure() -> None:
         "OPENAI_ASR_MAX_ATTEMPTS",
     ):
         os.environ.pop(name, None)
-    os.environ["VIDEO_DEMO_BAIDU_OCR_ENDPOINT"] = (
-        "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"
-    )
 
 
 @pytest.fixture

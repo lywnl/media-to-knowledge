@@ -16,13 +16,8 @@ from video_demo.application.composition import (
     build_production_model_identity_report,
     production_tool_path,
 )
-from video_demo.application.legacy_composition import (
-    ProductionModelIdentityReport as LegacyProductionModelIdentityReport,
-)
 from video_demo.config import Settings
-from video_demo.domain.base import stable_identifier
-from video_demo.domain.evidence import SceneBoundary
-from video_demo.domain.run import ModelIdentity, TimeRange
+from video_demo.domain.run import ModelIdentity
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.evaluation.annotations import (
     ValidatedEvaluationPackage,
@@ -42,8 +37,6 @@ from video_demo.evaluation.dataset import ValidationLanguage
 from video_demo.evaluation.evidence import (
     _LIVE_PREFLIGHT_CODES,
     ArtifactRole,
-    BaiduLiveDetails,
-    BaiduLiveRawReport,
     ChapterVlmLiveDetails,
     ChapterVlmLiveRawReport,
     CommandTrace,
@@ -55,7 +48,6 @@ from video_demo.evaluation.evidence import (
     FiveLanguageModelsRawReport,
     LiveCheckId,
     LiveExecutionSummary,
-    LiveFailureComponent,
     LiveInputArtifact,
     LiveReportRunConflict,
     LiveReportRunWriter,
@@ -65,8 +57,6 @@ from video_demo.evaluation.evidence import (
     PreflightDetails,
     PreflightIssue,
     PreflightRawReport,
-    QwenLiveDetails,
-    QwenLiveRawReport,
     TraceArtifact,
     _assert_snapshot_current,
     _read_file_snapshot,
@@ -80,12 +70,9 @@ from video_demo.evaluation.gate import (
     _current_live_implementation_sha256,
 )
 from video_demo.evaluation.report import GateStatus
-from video_demo.fusion.timeline import build_timeline
 from video_demo.integrations.qwen_vl import QwenVisionCallFailure, QwenVisionClient
-from video_demo.integrations.video_port import SegmentUnderstandingRequest, VideoClipInput
 from video_demo.speech.runtime import ProductionSpeechModels, build_diagnostic_speech_models
 from video_demo.storage.workspace import validate_path_component
-from video_demo.visual.ocr import is_supported_ocr_image
 
 _VALIDATION_LANGUAGES: tuple[ValidationLanguage, ...] = ("zh", "en", "ja", "ko", "es")
 
@@ -100,22 +87,6 @@ def _has_eligible_chapter_frame_cluster(frames: object) -> bool:
     except (TypeError, ValueError, AttributeError):
         return False
     return len(timestamps) >= 2 and timestamps[-1] - timestamps[0] <= 300_000
-
-
-def _normalized_qwen_model_id(
-    value: str | None,
-    *,
-    allow_unrecognized: bool = False,
-) -> str | None:
-    normalized = value.strip() if value is not None else ""
-    if not normalized:
-        return None
-    if not allow_unrecognized and not normalized.startswith("qwen"):
-        raise ValueError("Qwen 模型 ID 非法")
-    return normalized
-
-
-ProductionDiagnosticComponents = Any
 
 
 def _package_media_path(
@@ -187,33 +158,10 @@ def build_live_components(settings: Settings) -> _LiveComponents:
         raise
 
 
-def _build_legacy_live_components(settings: Settings) -> object:
-    """迁移期仅供旧报告/旧入口重验的组件构造器。"""
-    return build_production_diagnostic_components(settings)
-
-
-def build_production_diagnostic_components(settings: Settings) -> object:
-    """兼容迁移期旧 live fixture 的惰性组合根入口。"""
-
-    from video_demo.application.legacy_composition import (
-        build_production_diagnostic_components as build_legacy_components,
-    )
-
-    return build_legacy_components(settings)
-
-
 _CHECK_REASON: dict[str, tuple[str, str]] = {
     "chapter_vlm_live": (
         "CHAPTER_VLM_INPUT_UNAVAILABLE",
         "缺少章节多图 Qwen3-VL 凭据或真实联调结果",
-    ),
-    "baidu_ocr_live": (
-        "BAIDU_OCR_CREDENTIALS_UNAVAILABLE",
-        "缺少百度 OCR 凭据或真实联调结果",
-    ),
-    "qwen_live": (
-        "QWEN_CREDENTIALS_UNAVAILABLE",
-        "缺少 Qwen 凭据或真实联调结果",
     ),
     "five_language_models": (
         "FIVE_LANGUAGE_MODELS_UNAVAILABLE",
@@ -222,8 +170,7 @@ _CHECK_REASON: dict[str, tuple[str, str]] = {
 }
 
 _MODEL_IDENTITY_FAILURE_CODES: dict[str, ErrorCode] = {
-    "baidu_ocr": ErrorCode.OCR_RESPONSE_INVALID,
-    "qwen": ErrorCode.QWEN_RESPONSE_INVALID,
+    "chapter_vlm": ErrorCode.QWEN_RESPONSE_INVALID,
     "silero_vad": ErrorCode.SPEECH_MODEL_UNAVAILABLE,
     "cloud_whisper": ErrorCode.SPEECH_MODEL_UNAVAILABLE,
 }
@@ -362,24 +309,10 @@ class LiveValidationRunner:
     ) -> None:
         self._settings = settings
         self._store = evidence_store
-        self._components_factory = components_factory or _build_legacy_live_components
+        self._components_factory = components_factory or build_live_components
         self._chapter_components_factory = components_factory or build_live_components
         self._execution_port = execution_port or self._task5_execution_port
         self._allows_live_pass = components_factory is None and execution_port is None
-
-    def run_baidu(
-        self,
-        evaluation_run_id: str,
-        package: ValidatedEvaluationPackage,
-    ) -> GateCheck:
-        return self._run("baidu_ocr_live", evaluation_run_id, package)
-
-    def run_qwen(
-        self,
-        evaluation_run_id: str,
-        package: ValidatedEvaluationPackage,
-    ) -> GateCheck:
-        return self._run("qwen_live", evaluation_run_id, package)
 
     def run_local_model_stack(
         self,
@@ -401,20 +334,6 @@ class LiveValidationRunner:
         if package is None:
             return self._run_chapter_vlm(evaluation_run_id, None)
         return self._run_chapter_vlm(evaluation_run_id, package)
-
-    def run_workspace_baidu(self, evaluation_run_id: str) -> GateCheck:
-        return self._run(
-            "baidu_ocr_live",
-            evaluation_run_id,
-            self._load_workspace_package(),
-        )
-
-    def run_workspace_qwen(self, evaluation_run_id: str) -> GateCheck:
-        return self._run(
-            "qwen_live",
-            evaluation_run_id,
-            self._load_workspace_package(),
-        )
 
     def run_workspace_local_model_stack(self, evaluation_run_id: str) -> GateCheck:
         return self._run(
@@ -472,7 +391,7 @@ class LiveValidationRunner:
             issues = (
                 self._preflight_without_package(check_id)
                 if verified_package is None
-                else self._preflight(check_id, evaluation_run_id, verified_package)
+                else self._preflight_local_stack(evaluation_run_id, verified_package)
             )
             if issues:
                 result = self._write_not_run(
@@ -781,7 +700,7 @@ class LiveValidationRunner:
         package: ValidatedEvaluationPackage,
         receipt: object | None,
         score: object | None,
-        identity: ProductionModelIdentityReport | LegacyProductionModelIdentityReport,
+        identity: ProductionModelIdentityReport,
         *,
         status: Literal[GateStatus.PASS, GateStatus.FAIL],
         failure_code: ErrorCode | None = None,
@@ -1029,17 +948,8 @@ class LiveValidationRunner:
         prepared: _PreparedLiveRun,
     ) -> GateCheck:
         self._assert_inputs_current(package, prepared)
-        identity: ProductionModelIdentityReport | LegacyProductionModelIdentityReport
-        if check_id in {"baidu_ocr_live", "qwen_live", "five_language_models"}:
-            # 11B 前旧诊断报告仍需使用旧模型身份；允许缺失新文本/VLM
-            # 配置，章节 VLM 仍使用 3.0 生产身份。
-            from video_demo.application.legacy_composition import (
-                build_production_model_identity_report as build_legacy_identity,
-            )
-
-            identity = build_legacy_identity(self._settings)
-        else:
-            identity = build_production_model_identity_report(self._settings)
+        identity: ProductionModelIdentityReport
+        identity = build_production_model_identity_report(self._settings)
         journal = _LiveExecutionJournal(
             check_id=check_id,
             evaluation_run_id=evaluation_run_id,
@@ -1114,141 +1024,9 @@ class LiveValidationRunner:
         components: object,
         journal: _LiveExecutionJournal,
     ) -> None:
-        # 旧 live 入口在 11B 前仍由 legacy_composition 提供组件；这里只按
-        # 检查 ID 分派，避免新章节组件类型检查误伤历史诊断链。
-        if check_id == "baidu_ocr_live":
-            self._execute_baidu(samples[0], components, journal)
-        elif check_id == "qwen_live":
-            self._execute_qwen(samples[0], components, journal)
-        elif check_id == "five_language_models":
-            self._execute_local_model_stack(samples, components, journal)
-        else:
+        if check_id != "five_language_models":
             raise VideoDemoError(ErrorCode.SYSTEM_FAILURE, "章节 VLM 必须使用专用执行路径")
-
-    def _execute_baidu(
-        self,
-        sample: LiveSample,
-        components: ProductionDiagnosticComponents,
-        journal: _LiveExecutionJournal,
-    ) -> None:
-        image = self._read_live_input_bytes(
-            sample.keyframe_relative_path,
-            sample.keyframe_sha256,
-            max_bytes=self._settings.max_video_bytes,
-        )
-        if not is_supported_ocr_image(image):
-            raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "live OCR 关键帧格式非法")
-        response = components.baidu_ocr_client.recognize(image, sample.language)
-        journal.record_success(
-            LiveExecutionSummary(
-                schema_version="1.0.0",
-                component="baidu_ocr",
-                operation="recognize",
-                evaluation_run_id=journal.evaluation_run_id,
-                model=self._production_model(components, "baidu_ocr"),
-                sample_id=sample.sample_id,
-                language=sample.language,
-                input_kind="KEYFRAME",
-                input_sha256=sample.keyframe_sha256,
-                request_id_sha256=_identifier_sha256(response.request_id),
-                http_status=response.http_status,
-                output_item_count=len(response.lines),
-            )
-        )
-
-    def _execute_qwen(
-        self,
-        sample: LiveSample,
-        components: ProductionDiagnosticComponents,
-        journal: _LiveExecutionJournal,
-    ) -> None:
-        clip_path = self._verified_live_input_path(
-            sample.clip_relative_path,
-            sample.clip_sha256,
-            max_bytes=self._settings.qwen_max_video_bytes,
-        )
-        duration_ms = min(
-            sample.duration_ms,
-            self._settings.qwen_max_video_duration_ms,
-        )
-        clip = VideoClipInput(
-            clip_id=stable_identifier(
-                "live_clip",
-                {
-                    "sample_id": sample.sample_id,
-                    "clip_sha256": sample.clip_sha256,
-                },
-            ),
-            start_ms=0,
-            end_ms=duration_ms,
-            path=clip_path,
-            mime_type="video/mp4",
-            sha256=sample.clip_sha256,
-        )
-        model = self._production_model(components, "qwen")
-        capabilities, probe_receipt = components.qwen_client.probe_capabilities_with_receipt(clip)
-        if (
-            capabilities.model_id != model.model_id
-            or capabilities.video_input != "data_url"
-            or capabilities.json_schema is not True
-        ):
-            raise VideoDemoError(
-                ErrorCode.QWEN_CAPABILITY_UNAVAILABLE,
-                "Qwen 能力或模型身份与生产配置不一致",
-            )
-        journal.record_success(
-            LiveExecutionSummary(
-                schema_version="1.0.0",
-                component="qwen",
-                operation="capability_probe",
-                evaluation_run_id=journal.evaluation_run_id,
-                model=model,
-                sample_id=sample.sample_id,
-                language=sample.language,
-                input_kind="CLIP",
-                input_sha256=sample.clip_sha256,
-                request_id_sha256=_identifier_sha256(probe_receipt.response_id),
-                http_status=probe_receipt.http_status,
-                capabilities=("video_input", "strict_json_schema"),
-                output_item_count=1,
-            )
-        )
-        scene = SceneBoundary(
-            evidence_id=stable_identifier(
-                "live_scene",
-                {
-                    "sample_id": sample.sample_id,
-                    "clip_sha256": sample.clip_sha256,
-                },
-            ),
-            start_ms=0,
-            end_ms=duration_ms,
-            transition="candidate",
-            score=1.0,
-        )
-        request = SegmentUnderstandingRequest(
-            clip=clip,
-            window=TimeRange(start_ms=0, end_ms=duration_ms),
-            timeline=build_timeline((scene,)),
-            evidence=(scene,),
-        )
-        result, segment_receipt = components.qwen_client.understand_segment_with_receipt(request)
-        journal.record_success(
-            LiveExecutionSummary(
-                schema_version="1.0.0",
-                component="qwen",
-                operation="understand_segment",
-                evaluation_run_id=journal.evaluation_run_id,
-                model=model,
-                sample_id=sample.sample_id,
-                language=sample.language,
-                input_kind="CLIP",
-                input_sha256=sample.clip_sha256,
-                request_id_sha256=_identifier_sha256(segment_receipt.response_id),
-                http_status=segment_receipt.http_status,
-                output_item_count=len(result.evidence_refs),
-            )
-        )
+        self._execute_local_model_stack(samples, components, journal)
 
     def _execute_local_model_stack(
         self,
@@ -1406,11 +1184,7 @@ class LiveValidationRunner:
                 evaluation_run_id,
             )
         else:
-            filename = {
-                "baidu_ocr_live": "keyframe.jpg",
-                "qwen_live": "clip.mp4",
-            }[check_id]
-            samples = (self._select_single_sample(package, evaluation_run_id, filename),)
+            raise VideoDemoError(ErrorCode.SYSTEM_FAILURE, "章节 VLM 使用专用执行路径")
         inputs = tuple(
             input_artifact
             for sample, _snapshots in samples
@@ -1423,31 +1197,6 @@ class LiveValidationRunner:
                 snapshot for _sample, sample_snapshots in samples for snapshot in sample_snapshots
             ),
         )
-
-    def _select_single_sample(
-        self,
-        package: ValidatedEvaluationPackage,
-        evaluation_run_id: str,
-        required_filename: str,
-    ) -> tuple[LiveSample, tuple[FileSnapshot, ...]]:
-        for index, dataset_sample in enumerate(package.dataset.samples):
-            required_path = self._derived_path(
-                evaluation_run_id,
-                dataset_sample.sample_id,
-                required_filename,
-            )
-            if not _snapshot_available(
-                required_path,
-                max_bytes=self._input_limit(required_filename),
-            ):
-                continue
-            prepared = self._snapshot_sample(package, evaluation_run_id, index)
-            if prepared is not None:
-                return prepared
-        raise VideoDemoError(
-            ErrorCode.EVALUATION_ARTIFACT_INVALID,
-            "授权 live 样本派生输入不完整",
-        ) from None
 
     def _select_five_language_samples(
         self,
@@ -1494,15 +1243,9 @@ class LiveValidationRunner:
         paths = (
             source,
             self._derived_path(evaluation_run_id, dataset_sample.sample_id, "audio.wav"),
-            self._derived_path(evaluation_run_id, dataset_sample.sample_id, "keyframe.jpg"),
-            self._derived_path(evaluation_run_id, dataset_sample.sample_id, "clip.mp4"),
+
         )
-        limits = (
-            self._settings.max_video_bytes,
-            self._settings.max_video_bytes,
-            self._settings.max_video_bytes,
-            self._settings.qwen_max_video_bytes,
-        )
+        limits = (self._settings.max_video_bytes, self._settings.max_video_bytes)
         try:
             snapshots = tuple(
                 _read_file_snapshot(
@@ -1514,7 +1257,7 @@ class LiveValidationRunner:
             )
         except (OSError, ValueError):
             return None
-        source_snapshot, audio_snapshot, keyframe_snapshot, clip_snapshot = snapshots
+        source_snapshot, audio_snapshot = snapshots
         if source_snapshot.sha256 != dataset_sample.media_sha256:
             return None
         workspace = self._settings.workspace_root
@@ -1527,18 +1270,12 @@ class LiveValidationRunner:
                 source_media_sha256=source_snapshot.sha256,
                 audio_relative_path=paths[1].relative_to(workspace).as_posix(),
                 audio_sha256=audio_snapshot.sha256,
-                keyframe_relative_path=paths[2].relative_to(workspace).as_posix(),
-                keyframe_sha256=keyframe_snapshot.sha256,
-                clip_relative_path=paths[3].relative_to(workspace).as_posix(),
-                clip_sha256=clip_snapshot.sha256,
                 annotation_sha256=annotation.sha256,
             ),
             snapshots,
         )
 
     def _input_limit(self, filename: str) -> int:
-        if filename == "clip.mp4":
-            return self._settings.qwen_max_video_bytes
         return self._settings.max_video_bytes
 
     def _assert_inputs_current(
@@ -1556,78 +1293,30 @@ class LiveValidationRunner:
                 "live 授权输入在执行边界发生变化",
             ) from None
 
-    def _preflight(
-        self,
-        check_id: str,
-        evaluation_run_id: str,
-        package: ValidatedEvaluationPackage,
-    ) -> tuple[ErrorCode, ...]:
-        issues: list[ErrorCode] = []
-        if check_id == "baidu_ocr_live":
-            self._collect_baidu_issues(issues, evaluation_run_id, package)
-        elif check_id == "qwen_live":
-            self._collect_qwen_issues(issues, evaluation_run_id, package)
-        else:
-            self._collect_local_stack_issues(issues, evaluation_run_id, package)
-        ordered = _LIVE_PREFLIGHT_CODES[check_id]
-        return tuple(code for code in ordered if code in set(issues))
-
     def _preflight_without_package(self, check_id: str) -> tuple[ErrorCode, ...]:
         issues: list[ErrorCode] = []
-        if check_id == "baidu_ocr_live":
-            self._collect_baidu_environment_issues(issues)
-            issues.append(ErrorCode.LIVE_AUTHORIZED_KEYFRAME_UNAVAILABLE)
-        elif check_id == "qwen_live":
-            self._collect_qwen_environment_issues(issues)
-            issues.append(ErrorCode.LIVE_AUTHORIZED_CLIP_UNAVAILABLE)
-        else:
+        if check_id == "chapter_vlm_live":
+            self._collect_chapter_vlm_environment_issues(issues)
+            issues.append(ErrorCode.LIVE_AUTHORIZED_CHAPTER_FRAMES_UNAVAILABLE)
+        elif check_id == "five_language_models":
             self._collect_local_stack_environment_issues(issues)
             issues.append(ErrorCode.LIVE_FIVE_LANGUAGE_AUDIO_UNAVAILABLE)
+        else:
+            raise VideoDemoError(ErrorCode.SYSTEM_FAILURE, "未知活动 live 检查")
         ordered = _LIVE_PREFLIGHT_CODES[check_id]
         issue_set = set(issues)
         return tuple(code for code in ordered if code in issue_set)
 
-    def _collect_baidu_issues(
+    def _preflight_local_stack(
         self,
-        issues: list[ErrorCode],
         evaluation_run_id: str,
         package: ValidatedEvaluationPackage,
-    ) -> None:
-        self._collect_baidu_environment_issues(issues)
-        if not self._has_single_live_input(package, evaluation_run_id, "keyframe.jpg"):
-            issues.append(ErrorCode.LIVE_AUTHORIZED_KEYFRAME_UNAVAILABLE)
-
-    def _collect_baidu_environment_issues(self, issues: list[ErrorCode]) -> None:
-        if not _has_secret(self._settings.baidu_api_key):
-            issues.append(ErrorCode.BAIDU_API_KEY_UNAVAILABLE)
-        if not _has_secret(self._settings.baidu_secret_key):
-            issues.append(ErrorCode.BAIDU_SECRET_KEY_UNAVAILABLE)
-
-    def _collect_qwen_issues(
-        self,
-        issues: list[ErrorCode],
-        evaluation_run_id: str,
-        package: ValidatedEvaluationPackage,
-    ) -> None:
-        self._collect_qwen_environment_issues(issues)
-        if not self._has_single_live_input(
-            package,
-            evaluation_run_id,
-            "clip.mp4",
-            max_bytes=self._settings.qwen_max_video_bytes,
-        ):
-            issues.append(ErrorCode.LIVE_AUTHORIZED_CLIP_UNAVAILABLE)
-
-    def _collect_qwen_environment_issues(self, issues: list[ErrorCode]) -> None:
-        if not _has_text(self._settings.qwen_base_url):
-            issues.append(ErrorCode.QWEN_ENDPOINT_UNAVAILABLE)
-        if not _has_secret(self._settings.qwen_api_key):
-            issues.append(ErrorCode.QWEN_API_KEY_UNAVAILABLE)
-        if not _has_valid_qwen_model_id(
-            self._settings.qwen_model_id,
-            allow_unrecognized=self._settings.demo_degraded_mode,
-        ):
-            issues.append(ErrorCode.QWEN_MODEL_ID_UNAVAILABLE)
+    ) -> tuple[ErrorCode, ...]:
+        issues: list[ErrorCode] = []
+        self._collect_local_stack_issues(issues, evaluation_run_id, package)
+        ordered = _LIVE_PREFLIGHT_CODES["five_language_models"]
+        issue_set = set(issues)
+        return tuple(code for code in ordered if code in issue_set)
 
     def _collect_local_stack_issues(
         self,
@@ -1785,7 +1474,7 @@ class LiveValidationRunner:
         package: ValidatedEvaluationPackage,
         prepared: _PreparedLiveRun,
         journal: _LiveExecutionJournal,
-        identity: ProductionModelIdentityReport | LegacyProductionModelIdentityReport,
+        identity: ProductionModelIdentityReport,
     ) -> GateCheck:
         return self._write_execution_result(
             writer,
@@ -1810,7 +1499,7 @@ class LiveValidationRunner:
         journal: _LiveExecutionJournal,
         failure_code: ErrorCode,
         failure_component: str,
-        identity: ProductionModelIdentityReport | LegacyProductionModelIdentityReport,
+        identity: ProductionModelIdentityReport,
     ) -> GateCheck:
         return self._write_execution_result(
             writer,
@@ -1822,7 +1511,7 @@ class LiveValidationRunner:
             identity,
             status=GateStatus.FAIL,
             failure_code=failure_code,
-            failure_component=cast(LiveFailureComponent, failure_component),
+            failure_component=failure_component,
         )
 
     def _write_execution_result(
@@ -1833,11 +1522,11 @@ class LiveValidationRunner:
         package: ValidatedEvaluationPackage,
         prepared: _PreparedLiveRun,
         journal: _LiveExecutionJournal,
-        identity: ProductionModelIdentityReport | LegacyProductionModelIdentityReport,
+        identity: ProductionModelIdentityReport,
         *,
         status: Literal[GateStatus.PASS, GateStatus.FAIL],
         failure_code: ErrorCode | None,
-        failure_component: LiveFailureComponent | None,
+        failure_component: str | None,
     ) -> GateCheck:
         implementation = _current_live_implementation_sha256(self._settings.workspace_root)
         raw_kwargs = {
@@ -1855,31 +1544,9 @@ class LiveValidationRunner:
             "failure_code": failure_code,
             "failure_component": failure_component,
         }
-        raw: (
-            BaiduLiveRawReport
-            | QwenLiveRawReport
-            | FiveLanguageModelsRawReport
-        )
-        details_type: (
-            type[BaiduLiveDetails] | type[QwenLiveDetails] | type[FiveLanguageModelsDetails]
-        )
-        detail_name: Literal[
-            "BAIDU_LIVE",
-            "QWEN_LIVE",
-            "FIVE_LANGUAGE_MODELS",
-        ]
-        if check_id == "baidu_ocr_live":
-            raw = BaiduLiveRawReport(sample=prepared.samples[0], **raw_kwargs)
-            details_type = BaiduLiveDetails
-            detail_name = "BAIDU_LIVE"
-        elif check_id == "qwen_live":
-            raw = QwenLiveRawReport(sample=prepared.samples[0], **raw_kwargs)
-            details_type = QwenLiveDetails
-            detail_name = "QWEN_LIVE"
-        else:
-            raw = FiveLanguageModelsRawReport(samples=prepared.samples, **raw_kwargs)
-            details_type = FiveLanguageModelsDetails
-            detail_name = "FIVE_LANGUAGE_MODELS"
+        raw = FiveLanguageModelsRawReport(samples=prepared.samples, **raw_kwargs)
+        details_type = FiveLanguageModelsDetails
+        detail_name = "FIVE_LANGUAGE_MODELS"
         raw_artifact = writer.write_artifact(
             "raw.json",
             "AUDIT_REPORT",
@@ -2023,23 +1690,6 @@ def _has_text(value: str | None) -> bool:
     return value is not None and bool(value.strip())
 
 
-def _has_valid_qwen_model_id(
-    value: str | None,
-    *,
-    allow_unrecognized: bool = False,
-) -> bool:
-    try:
-        return (
-            _normalized_qwen_model_id(
-                value,
-                allow_unrecognized=allow_unrecognized,
-            )
-            is not None
-        )
-    except ValueError:
-        return False
-
-
 def _has_secret(value: object | None) -> bool:
     if value is None:
         return False
@@ -2051,7 +1701,7 @@ def _live_inputs(
     sample: LiveSample,
     snapshots: tuple[FileSnapshot, ...],
 ) -> tuple[LiveInputArtifact, ...]:
-    source, audio, keyframe, clip = snapshots
+    source, audio = snapshots
     return (
         LiveInputArtifact(
             kind="SOURCE_MEDIA",
@@ -2069,36 +1719,12 @@ def _live_inputs(
             source_media_sha256=sample.source_media_sha256,
             size_bytes=audio.identity.size,
         ),
-        LiveInputArtifact(
-            kind="KEYFRAME",
-            sample_id=sample.sample_id,
-            relative_path=sample.keyframe_relative_path,
-            sha256=sample.keyframe_sha256,
-            source_media_sha256=sample.source_media_sha256,
-            size_bytes=keyframe.identity.size,
-        ),
-        LiveInputArtifact(
-            kind="CLIP",
-            sample_id=sample.sample_id,
-            relative_path=sample.clip_relative_path,
-            sha256=sample.clip_sha256,
-            source_media_sha256=sample.source_media_sha256,
-            size_bytes=clip.identity.size,
-        ),
     )
-
 
 def _execution_stages(
     check_id: LiveCheckId,
     samples: tuple[LiveSample, ...],
 ) -> tuple[tuple[str, str, LiveSample], ...]:
-    if check_id == "baidu_ocr_live":
-        return (("baidu_ocr", "recognize", samples[0]),)
-    if check_id == "qwen_live":
-        return (
-            ("qwen", "capability_probe", samples[0]),
-            ("qwen", "understand_segment", samples[0]),
-        )
     by_language = {sample.language: sample for sample in samples}
     ordered = tuple(
         by_language[language] for language in _VALIDATION_LANGUAGES if language in by_language
@@ -2112,10 +1738,6 @@ def _execution_stages(
 
 
 def _component_input(sample: LiveSample, component: str) -> tuple[str, str]:
-    if component == "baidu_ocr":
-        return "KEYFRAME", sample.keyframe_sha256
-    if component == "qwen":
-        return "CLIP", sample.clip_sha256
     return "AUDIO", sample.audio_sha256
 
 

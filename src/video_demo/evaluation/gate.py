@@ -39,8 +39,6 @@ from video_demo.evaluation.evidence import (
     _CHUNK_BYTES,
     ArtifactRole,
     AuthorizedDatasetDetails,
-    BaiduLiveDetails,
-    BaiduLiveRawReport,
     ChapterVlmLiveDetails,
     ChapterVlmLiveRawReport,
     CommandEvidenceDetails,
@@ -64,8 +62,6 @@ from video_demo.evaluation.evidence import (
     PerformanceSampleRawReport,
     PreflightDetails,
     PreflightRawReport,
-    QwenLiveDetails,
-    QwenLiveRawReport,
     RealMediaDetails,
     RealMediaFile,
     RealMediaRawReport,
@@ -95,14 +91,6 @@ REQUIRED_FAILURE_SCENARIOS: tuple[str, ...] = (
     "no_speech",
     "black_frames",
     "five_language_switch",
-    "ocr_401",
-    "ocr_429",
-    "ocr_5xx",
-    "ocr_timeout",
-    "qwen_401",
-    "qwen_429",
-    "qwen_5xx",
-    "qwen_timeout",
     "malformed_json",
     "cancellation",
     "retry",
@@ -179,33 +167,8 @@ FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     "five_language_switch": (
         "tests/speech/test_language.py::test_language_identifier_tracks_all_five_validation_languages",
     ),
-    "ocr_401": (
-        "tests/integrations/test_baidu_ocr.py::test_http_errors_are_classified_without_secret_leak[401-OCR_AUTHENTICATION_FAILED]",
-    ),
-    "ocr_429": (
-        "tests/integrations/test_baidu_ocr.py::test_http_errors_are_classified_without_secret_leak[429-DEPENDENCY_TEMPORARY_FAILURE]",
-    ),
-    "ocr_5xx": (
-        "tests/integrations/test_baidu_ocr.py::test_http_errors_are_classified_without_secret_leak[500-DEPENDENCY_TEMPORARY_FAILURE]",
-    ),
-    "ocr_timeout": (
-        "tests/integrations/test_baidu_ocr.py::test_ocr_timeout_stops_after_finite_attempts_and_is_classified",
-    ),
-    "qwen_401": (
-        "tests/integrations/test_qwen.py::test_authentication_error_does_not_leak_secret[401]",
-    ),
-    "qwen_429": (
-        "tests/integrations/test_qwen.py::test_transient_network_failures_use_finite_exponential_backoff",
-    ),
-    "qwen_5xx": (
-        "tests/integrations/test_qwen.py::test_qwen_5xx_stops_after_finite_attempts_and_is_retryable",
-    ),
-    "qwen_timeout": (
-        "tests/integrations/test_qwen.py::test_qwen_timeout_stops_after_finite_attempts_and_is_retryable",
-    ),
     "malformed_json": (
-        "tests/integrations/test_qwen.py::test_qwen_malformed_json_fails_closed_after_one_schema_repair",
-        "tests/integrations/test_baidu_ocr.py::test_malformed_provider_json_fails_closed",
+        "tests/integrations/test_qwen_vl.py::test_qwen_request_rejection_is_not_response_content_invalid",
     ),
     "cancellation": (
         "tests/worker/test_runtime.py::test_cancellation_after_handler_prevents_successful_completion",
@@ -225,8 +188,7 @@ FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     ),
     "redaction": (
         "tests/api/test_runs.py::test_run_status_does_not_expose_internal_paths_or_secret_fields",
-        "tests/integrations/test_qwen.py::test_authentication_error_does_not_leak_secret[401]",
-        "tests/integrations/test_baidu_ocr.py::test_http_errors_are_classified_without_secret_leak[401-OCR_AUTHENTICATION_FAILED]",
+        "tests/integrations/test_qwen_vl.py::test_qwen_authentication_status_is_not_masked_by_oversized_body",
     ),
     "prompt_injection": (
         "tests/integrations/test_prompt_isolation.py::test_untrusted_asr_text_never_enters_trusted_system_instruction",
@@ -267,11 +229,8 @@ _LIVE_GATE_CHECKS = frozenset(
 )
 # 11B 前保留旧报告的离线重验能力；这些 ID 不会出现在 FINAL_GATE_CHECKS、CLI
 # 或新的活动汇总中。
-_HISTORICAL_LIVE_GATE_CHECKS = frozenset(
-    {"baidu_ocr_live", "qwen_live"}
-)
 _LIVE_AUTHORITY_CHECKS = _LIVE_GATE_CHECKS
-_LIVE_IMPLEMENTATION_CHECKS = _LIVE_AUTHORITY_CHECKS | _HISTORICAL_LIVE_GATE_CHECKS
+_LIVE_IMPLEMENTATION_CHECKS = _LIVE_AUTHORITY_CHECKS
 
 _LOCAL_MODEL_FAILURE_CODES = frozenset(
     {
@@ -286,9 +245,6 @@ _LOCAL_MODEL_FAILURE_CODES = frozenset(
 _LIVE_COMPONENT_FAILURE_CODES: dict[str, frozenset[ErrorCode]] = {
     "chapter_vlm": frozenset(
         {
-            ErrorCode.QWEN_ENDPOINT_UNAVAILABLE,
-            ErrorCode.QWEN_API_KEY_UNAVAILABLE,
-            ErrorCode.QWEN_MODEL_ID_UNAVAILABLE,
             ErrorCode.QWEN_CAPABILITY_UNAVAILABLE,
             ErrorCode.QWEN_AUTHENTICATION_FAILED,
             ErrorCode.QWEN_REQUEST_REJECTED,
@@ -302,31 +258,6 @@ _LIVE_COMPONENT_FAILURE_CODES: dict[str, frozenset[ErrorCode]] = {
             ErrorCode.WORKSPACE_PATH_ESCAPE,
             ErrorCode.IDEMPOTENCY_CONFLICT,
             ErrorCode.JOB_CANCELLED,
-            ErrorCode.SYSTEM_FAILURE,
-        }
-    ),
-    "baidu_ocr": frozenset(
-        {
-            ErrorCode.OCR_LANGUAGE_UNSUPPORTED,
-            ErrorCode.OCR_AUTHENTICATION_FAILED,
-            ErrorCode.OCR_RESPONSE_INVALID,
-            ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
-            ErrorCode.VIDEO_INPUT_INVALID,
-            ErrorCode.VIDEO_DIGEST_MISMATCH,
-            ErrorCode.WORKSPACE_PATH_ESCAPE,
-            ErrorCode.SYSTEM_FAILURE,
-        }
-    ),
-    "qwen": frozenset(
-        {
-            ErrorCode.QWEN_CAPABILITY_UNAVAILABLE,
-            ErrorCode.QWEN_AUTHENTICATION_FAILED,
-            ErrorCode.QWEN_RESPONSE_INVALID,
-            ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
-            ErrorCode.VIDEO_INPUT_INVALID,
-            ErrorCode.VIDEO_DIGEST_MISMATCH,
-            ErrorCode.UNKNOWN_EVIDENCE_REFERENCE,
-            ErrorCode.WORKSPACE_PATH_ESCAPE,
             ErrorCode.SYSTEM_FAILURE,
         }
     ),
@@ -349,10 +280,6 @@ _MISSING_CHECK_REASONS: dict[str, str] = {
     "chapter_vlm_live": "缺少章节多图 Qwen3-VL 凭据或真实联调结果",
     "five_language_models": "缺少五语授权素材、模型或真实预测",
     "m1_durability": "未提供 M1 耐久机器证据",
-    # 旧 live 报告在 11B 物理删除前仍需要可重验的稳定原因；这些 ID
-    # 不会进入 FINAL_GATE_CHECKS，也不会被新 CLI 执行。
-    "baidu_ocr_live": "缺少百度 OCR 凭据或真实联调结果",
-    "qwen_live": "缺少 Qwen 凭据或真实联调结果",
 }
 
 _DURABILITY_ISSUE_REASONS: dict[ErrorCode, str] = {
@@ -671,8 +598,6 @@ _MINIMUM_EVIDENCE_LEVEL: dict[str, EvidenceLevel] = {
     "secret_scan": EvidenceLevel.STATIC,
     "authorized_dataset": EvidenceLevel.REAL_MEDIA,
     "real_media_chain": EvidenceLevel.REAL_MEDIA,
-    "baidu_ocr_live": EvidenceLevel.REAL_SERVICE,
-    "qwen_live": EvidenceLevel.REAL_SERVICE,
     "chapter_vlm_live": EvidenceLevel.REAL_SERVICE,
     "five_language_models": EvidenceLevel.REAL_SERVICE,
     "m1_durability": EvidenceLevel.PERFORMANCE,
@@ -691,8 +616,6 @@ _ALLOWED_EVIDENCE_KINDS: dict[str, frozenset[EvidenceKind]] = {
     "secret_scan": frozenset({EvidenceKind.STATIC_AUDIT}),
     "authorized_dataset": frozenset({EvidenceKind.COMMAND_REPORT}),
     "real_media_chain": frozenset({EvidenceKind.COMMAND_REPORT}),
-    "baidu_ocr_live": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
-    "qwen_live": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
     "chapter_vlm_live": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
     "five_language_models": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
     "m1_durability": frozenset({EvidenceKind.PERFORMANCE_REPORT}),
@@ -784,8 +707,6 @@ def _derive_machine_gate_status(
         "openapi_contract": (CommandEvidenceDetails, OfflineEvidenceDetails),
         "authorized_dataset": AuthorizedDatasetDetails,
         "real_media_chain": RealMediaDetails,
-        "baidu_ocr_live": BaiduLiveDetails,
-        "qwen_live": QwenLiveDetails,
         "chapter_vlm_live": ChapterVlmLiveDetails,
         "five_language_models": FiveLanguageModelsDetails,
         "m1_durability": PerformanceDetails,
@@ -808,10 +729,6 @@ def _derive_machine_gate_status(
             artifacts,
             workspace_root,
         )
-    elif isinstance(details, BaiduLiveDetails):
-        passed = _verify_baidu_live(details, report, artifacts, workspace_root, settings=settings)
-    elif isinstance(details, QwenLiveDetails):
-        passed = _verify_qwen_live(details, report, artifacts, workspace_root, settings=settings)
     elif isinstance(details, ChapterVlmLiveDetails):
         passed = _verify_chapter_vlm_live(
             details, report, artifacts, workspace_root, settings=settings
@@ -825,11 +742,7 @@ def _derive_machine_gate_status(
             settings=settings,
         )
     elif isinstance(details, LiveServiceDetails):
-        expected_service = {
-            "baidu_ocr_live": "BAIDU_OCR",
-            "qwen_live": "QWEN",
-            "five_language_models": "FIVE_LANGUAGE_MODELS",
-        }[check_id]
+        expected_service = "FIVE_LANGUAGE_MODELS"
         if details.service != expected_service:
             raise ValueError(f"{check_id} 的真实服务身份不匹配")
         _require_artifact_digest(artifacts, "INPUT_MEDIA", details.input_sha256)
@@ -880,8 +793,6 @@ def _derive_machine_gate_status(
         not in {
             "authorized_dataset",
             "real_media_chain",
-            "baidu_ocr_live",
-            "qwen_live",
             "chapter_vlm_live",
             "five_language_models",
             "m1_durability",
@@ -1178,61 +1089,6 @@ def _nonempty_secret_literal(name: str, value: object | None) -> bool:
         return False
     literal = value.value.strip()
     return bool(literal) and literal != name and literal != name.upper()
-
-
-def _verify_baidu_live(
-    details: BaiduLiveDetails,
-    report: MachineEvidenceReport,
-    artifacts: dict[ArtifactRole, tuple[VerifiedArtifact, ...]],
-    workspace_root: Path,
-    *,
-    settings: Settings | None,
-) -> bool:
-    settings_report = _require_live_settings(settings, workspace_root, check_id="baidu_ocr_live")
-    raw, _package = _verify_live_common(
-        details,
-        report,
-        artifacts,
-        workspace_root,
-        raw_type=BaiduLiveRawReport,
-    )
-    _verify_settings_fingerprint(raw, settings_report)
-    _verify_canonical_live_models(raw, settings_report)
-    if raw.status == GateStatus.PASS and len(raw.executions) != 1:
-        raise ValueError("百度必须恰好执行一次授权关键帧调用")
-    return raw.status == GateStatus.PASS
-
-
-def _verify_qwen_live(
-    details: QwenLiveDetails,
-    report: MachineEvidenceReport,
-    artifacts: dict[ArtifactRole, tuple[VerifiedArtifact, ...]],
-    workspace_root: Path,
-    *,
-    settings: Settings | None,
-) -> bool:
-    settings_report = _require_live_settings(settings, workspace_root, check_id="qwen_live")
-    raw, _package = _verify_live_common(
-        details,
-        report,
-        artifacts,
-        workspace_root,
-        raw_type=QwenLiveRawReport,
-    )
-    _verify_settings_fingerprint(raw, settings_report)
-    _verify_canonical_live_models(raw, settings_report)
-    if raw.status == GateStatus.PASS:
-        if tuple(fact.operation for fact in raw.executions) != (
-            "capability_probe",
-            "understand_segment",
-        ):
-            raise ValueError("Qwen 必须按能力探测、segment 顺序执行")
-        probe, segment = raw.executions
-        if set(probe.capabilities) != {"video_input", "strict_json_schema"}:
-            raise ValueError("Qwen 能力探测未证明视频和严格 Schema")
-        if probe.model != segment.model or segment.capabilities:
-            raise ValueError("Qwen 两阶段模型或能力事实不一致")
-    return raw.status == GateStatus.PASS
 
 
 def _verify_chapter_vlm_live(
@@ -1575,19 +1431,6 @@ def _verify_five_language_models(
         raw_type=FiveLanguageModelsRawReport,
     )
     reports = [settings_report]
-    # 11B 前旧五语报告仍可能由 legacy 组合根生成；允许其在迁移期重验，
-    # 但活动新报告优先使用当前 3.0 组合根身份。
-    try:
-        from video_demo.application.legacy_composition import (
-            build_production_model_identity_report as build_legacy_model_identity_report,
-        )
-
-        assert settings is not None
-        legacy_report = build_legacy_model_identity_report(settings)
-        if legacy_report.settings_fingerprint != settings_report.settings_fingerprint:
-            reports.append(legacy_report)
-    except (ImportError, OSError, ValueError):
-        pass
     matched = next(
         (report for report in reports if raw.settings_fingerprint == report.settings_fingerprint),
         None,
@@ -1612,12 +1455,6 @@ def _require_live_settings(
         raise ValueError("settings.workspace_root 必须精确匹配 verifier 工作区")
     if settings.runtime_root != expected_runtime:
         raise ValueError("live verifier 只接受工作区固定 runtime root")
-    if check_id in {"baidu_ocr_live", "qwen_live", "five_language_models"}:
-        from video_demo.application.legacy_composition import (
-            build_production_model_identity_report as build_legacy_model_identity_report,
-        )
-
-        return build_legacy_model_identity_report(settings)
     assert settings is not None
     return build_production_model_identity_report(settings)
 
@@ -1636,11 +1473,7 @@ def _verify_canonical_live_models(
 ) -> None:
     canonical_components = {model.component for model in report.models}
     required_components: set[str]
-    if isinstance(raw, BaiduLiveRawReport):
-        required_components = {"baidu_ocr"}
-    elif isinstance(raw, QwenLiveRawReport):
-        required_components = {"qwen"}
-    elif isinstance(raw, ChapterVlmLiveRawReport):
+    if isinstance(raw, ChapterVlmLiveRawReport):
         required_components = {"chapter_vlm"}
     elif isinstance(raw, FiveLanguageModelsRawReport):
         required_components = {"silero_vad", "cloud_whisper"}
@@ -1834,8 +1667,8 @@ def _load_live_package(
 
 
 def _live_samples(raw: _LiveRawReport) -> tuple[LiveSample, ...]:
-    if isinstance(raw, (BaiduLiveRawReport, QwenLiveRawReport)):
-        return (raw.sample,)
+    if isinstance(raw, ChapterVlmLiveRawReport):
+        return ()
     if isinstance(raw, FiveLanguageModelsRawReport):
         return raw.samples
     raise ValueError("未知 live raw 类型")
@@ -1898,11 +1731,7 @@ def _verify_derived_paths(sample: LiveSample, evaluation_run_id: str) -> None:
     expected_parent = (
         PurePosixPath(".codex/video-rag-demo/eval/live") / evaluation_run_id / sample.sample_id
     )
-    expected = {
-        "AUDIO": (sample.audio_relative_path, "audio.wav"),
-        "KEYFRAME": (sample.keyframe_relative_path, "keyframe.jpg"),
-        "CLIP": (sample.clip_relative_path, "clip.mp4"),
-    }
+    expected = {"AUDIO": (sample.audio_relative_path, "audio.wav")}
     for relative_path, filename in expected.values():
         path = PurePosixPath(relative_path)
         if path.parent != expected_parent or path.name != filename:
@@ -1959,7 +1788,7 @@ def _verify_live_execution_sequence(raw: _LiveRawReport) -> None:
     for index, fact in enumerate(raw.executions):
         if index >= len(stages) or not _fact_matches_stage(fact, stages[index]):
             raise ValueError("live raw 只允许合法执行前缀")
-        if fact.component in {"baidu_ocr", "qwen"} and (
+        if fact.component in {"chapter_vlm", "cloud_whisper"} and (
             fact.http_status is None or not 200 <= fact.http_status < 300
         ):
             raise ValueError("远程 live 阶段必须以 2xx 成功事实表示")
@@ -1986,13 +1815,6 @@ def _verify_live_execution_sequence(raw: _LiveRawReport) -> None:
 def _live_execution_stages(
     raw: _LiveRawReport,
 ) -> tuple[tuple[str, str, str | None], ...]:
-    if isinstance(raw, BaiduLiveRawReport):
-        return (("baidu_ocr", "recognize", None),)
-    if isinstance(raw, QwenLiveRawReport):
-        return (
-            ("qwen", "capability_probe", None),
-            ("qwen", "understand_segment", None),
-        )
     if isinstance(raw, FiveLanguageModelsRawReport):
         languages = ("zh", "en", "ja", "ko", "es")
         return (

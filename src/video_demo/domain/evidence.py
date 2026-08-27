@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Self, TypeAlias
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, model_validator
 
 from video_demo.domain.base import FrozenModel, LanguageCode, Probability, StableId
 from video_demo.domain.run import TimeRange
@@ -53,7 +53,7 @@ class KeyframeEvidence(TimedEvidence):
     keyframe_id: StableId
     timestamp_ms: int = Field(ge=0)
     relative_path: str = Field(min_length=1, max_length=1024)
-    mime_type: Literal["image/jpeg", "image/png"]
+    mime_type: Literal["image/jpeg"]
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     perceptual_hash: str = Field(min_length=8, max_length=128)
     size_bytes: int = Field(ge=1)
@@ -62,34 +62,6 @@ class KeyframeEvidence(TimedEvidence):
     def validate_timestamp_inside_range(self) -> Self:
         if not self.start_ms <= self.timestamp_ms < self.end_ms:
             raise ValueError("timestamp_ms 必须位于关键帧证据区间内")
-        return self
-
-
-class BoundingBox(FrozenModel):
-    x: int = Field(ge=0)
-    y: int = Field(ge=0)
-    width: int = Field(gt=0)
-    height: int = Field(gt=0)
-
-
-class OcrLine(FrozenModel):
-    text: str = Field(min_length=1)
-    bounding_box: BoundingBox
-    confidence: Probability
-
-
-class OcrEvidence(TimedEvidence):
-    evidence_type: Literal["OCR"] = "OCR"
-    keyframe_id: StableId
-    timestamp_ms: int = Field(ge=0)
-    language: LanguageCode
-    lines: tuple[OcrLine, ...]
-    provider_request_id: str = Field(min_length=1, max_length=256)
-
-    @model_validator(mode="after")
-    def validate_timestamp_inside_range(self) -> Self:
-        if not self.start_ms <= self.timestamp_ms < self.end_ms:
-            raise ValueError("timestamp_ms 必须位于 OCR 证据区间内")
         return self
 
 
@@ -383,26 +355,6 @@ def _reject_duplicate_ids(values: tuple[str, ...], field_name: str) -> None:
     if len(values) != len(set(values)):
         raise ValueError(f"{field_name} 不得重复")
 
-
-class TimelineEvidence(TimeRange):
-    timeline_id: StableId
-    evidence_refs: tuple[StableId, ...] = Field(min_length=1)
-
-    @field_validator("evidence_refs")
-    @classmethod
-    def reject_duplicate_refs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(value) != len(set(value)):
-            raise ValueError("evidence_refs 不得重复")
-        return value
-
-
-LegacyEvidenceItem: TypeAlias = (
-    SpeechSegment
-    | SubtitleCue
-    | SceneBoundary
-    | KeyframeEvidence
-    | OcrEvidence
-)
 
 DocumentEvidenceItem: TypeAlias = Annotated[
     SpeechSegment | SubtitleCue | KeyframeEvidence | VisualObservationEvidence,

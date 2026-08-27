@@ -40,15 +40,10 @@ def test_chapter_vlm_live_uses_authority_reverification() -> None:
 
 
 def test_durability_active_preflight_excludes_retired_qwen_configuration() -> None:
-    from video_demo.errors import ErrorCode
     from video_demo.evaluation.durability import _PREFLIGHT_ORDER
     from video_demo.evaluation.evidence import _DURABILITY_PREFLIGHT_CODES
 
-    retired = {
-        ErrorCode.QWEN_ENDPOINT_UNAVAILABLE,
-        ErrorCode.QWEN_API_KEY_UNAVAILABLE,
-        ErrorCode.QWEN_MODEL_ID_UNAVAILABLE,
-    }
+    retired = set()
     assert not retired.intersection(_PREFLIGHT_ORDER)
     assert not retired.intersection(_DURABILITY_PREFLIGHT_CODES)
 

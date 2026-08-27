@@ -231,21 +231,6 @@ class Settings(BaseSettings):
     model_cache_max_run_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
     min_free_disk_reserve_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
 
-    qwen_base_url: str | None = None
-    qwen_model_id: str | None = None
-    qwen_api_key: SecretStr | None = Field(default=None, exclude=True)
-    qwen_max_video_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
-    qwen_max_video_duration_ms: int = Field(default=30_000, ge=1, le=30_000)
-    qwen_timeout_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
-    oss_endpoint: str | None = None
-    oss_bucket: str | None = None
-    oss_access_key_id: SecretStr | None = Field(default=None, exclude=True)
-    oss_access_key_secret: SecretStr | None = Field(default=None, exclude=True)
-    oss_prefix: str = "video-demo/qwen-clips"
-    oss_signed_url_ttl_seconds: int = Field(default=3_600, ge=60, le=86_400)
-    baidu_ocr_endpoint: str = "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"
-    baidu_api_key: SecretStr | None = Field(default=None, exclude=True)
-    baidu_secret_key: SecretStr | None = Field(default=None, exclude=True)
     openai_base_url: str | None = Field(
         default=None,
         validation_alias=AliasChoices("OPENAI_BASE_URL", "openai_base_url"),
@@ -306,20 +291,6 @@ class Settings(BaseSettings):
             return SecretStr(normalized) if normalized else None
         return value
 
-    @field_validator("oss_prefix")
-    @classmethod
-    def validate_oss_prefix(cls, value: str) -> str:
-        normalized = value.strip("/")
-        parts = normalized.split("/")
-        if (
-            not normalized
-            or "\\" in normalized
-            or any(not part or part in {".", ".."} for part in parts)
-            or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
-        ):
-            raise ValueError("OSS 对象前缀非法")
-        return normalized
-
     @model_validator(mode="after")
     def normalize_workspace_paths(self) -> Self:
         workspace = self.workspace_root.expanduser().resolve(strict=False)
@@ -346,9 +317,6 @@ class Settings(BaseSettings):
             raise ValueError("视觉模型在途字节预算不足以覆盖最大并发请求")
         _validate_first_release_budgets(self)
         return self
-
-    def has_complete_oss_configuration(self) -> bool:
-        return all(self._oss_configuration_presence())
 
     def to_api_runtime_config(self) -> ApiRuntimeConfig:
         assert self.runtime_root is not None
@@ -441,13 +409,6 @@ class Settings(BaseSettings):
             overlap_ms=_CLOUD_ASR_OVERLAP_MS,
         )
 
-    def _validate_oss_configuration(self) -> None:
-        """只供 Task 11 前的 legacy 诊断构造器显式调用。"""
-
-        presence = self._oss_configuration_presence()
-        if any(presence) and not all(presence):
-            raise ValueError("OSS 配置必须全部提供或全部留空")
-
     def _validate_document_model_configuration_presence(self) -> None:
         text_presence = (
             bool(self.text_llm_base_url and self.text_llm_base_url.strip()),
@@ -482,20 +443,6 @@ class Settings(BaseSettings):
                 )
             except VideoDemoError as error:
                 raise ValueError("视觉模型端点配置非法") from error
-
-    def _oss_configuration_presence(self) -> tuple[bool, bool, bool, bool]:
-        return (
-            bool(self.oss_endpoint and self.oss_endpoint.strip()),
-            bool(self.oss_bucket and self.oss_bucket.strip()),
-            bool(
-                self.oss_access_key_id
-                and self.oss_access_key_id.get_secret_value().strip()
-            ),
-            bool(
-                self.oss_access_key_secret
-                and self.oss_access_key_secret.get_secret_value().strip()
-            ),
-        )
 
 
 def _validate_first_release_budgets(settings: Settings) -> None:

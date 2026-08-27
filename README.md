@@ -2,7 +2,7 @@
 
 这是一个独立的 Python 3.11 + FastAPI 视频理解 Demo。目标是对独立视频执行音频、画面和多模态理解，输出带证据引用的 `VIDEO_SEGMENT`、`VIDEO_SUMMARY`、`retrieval_text` 和 `retrieval_hash`。
 
-当前状态：Demo 主链已完成。上传、可靠 Worker、ffprobe/FFmpeg、字幕优先、Silero VAD、串行云端 Whisper、镜头/关键帧、百度 OCR、确定性融合、结构化结果、`retrieval_text`、证据分页和关键帧查询均已接通。生产 Qwen 链路使用私有 OSS 完整视频签名 URL：完整代理视频只上传一次，`qwen3-vl-flash` 只发起一次全片请求；模型返回按时间排序的粗粒度视觉语义和全片摘要，程序再映射到本地冻结的精确窗口和证据。实施账本见[计划](./.codex/plans/2026-08-17-video-understanding-retrieval-text-implementation.md)。
+当前状态：Demo 主链已完成。上传、可靠 Worker、ffprobe/FFmpeg、字幕优先、Silero VAD、云端 Whisper、镜头/关键帧、章节多图 VLM、结构化知识文档、证据分页和关键帧查询均已接通。生产链只使用云 ASR、文本 LLM 和章节视觉模型三套配置，结果 Schema 为 3.0。
 
 提交时必须准确区分两类结论：
 
@@ -29,24 +29,10 @@ ASR 阶段仍在受监督的一次性子进程中执行，以隔离 FFmpeg、VAD
 
 质量评测会单独生成提示效果伴随报告，只比较同一授权媒体的 `NONE/CORRECT` 成对 ASR 结果，并报告术语召回率及 CER/WER 差值。它不进入现有发布硬门槛；失败预测、空术语、任一端不是 ASR 或没有合格配对时均为 `NOT_RUN`。字幕命中不能证明热词或核心上下文有效。
 
-## Qwen 的私有 OSS 全片中转
+## 知识文档生产流程
 
-生产 Worker 现在支持同一条产品链完成“本地解析 + 单次全片视觉理解”：源视频仍由现有上传接口进入本地对象存储；Worker 在本地执行 FFmpeg、ASR、关键帧、场景检测和百度 OCR，并生成连续且每段不超过 30 秒的冻结理解窗口；完整 MP4 代理视频只上传到私有阿里云 OSS 一次，Qwen 只接收这一条全片的一小时签名 URL，并在一个结构化逻辑请求中返回按时间排序的粗粒度语义数组和全片摘要。程序按模型实际返回的组数等分全片，将粗语义映射回全部本地细窗口；精确时间和 ASR/OCR/关键帧/场景引用始终由本地程序绑定，再生成 `retrieval_text`。公共上传、创建 Run 和结果查询接口没有变化。
+Worker 在本地完成媒体探测、音频转写、镜头与关键帧提取；章节视觉模型接收授权章节的多张 JPEG，文本模型根据转写与视觉观察生成带证据引用的知识文档。生产结果只写入 Schema 3.0；读取旧 Run 时返回 `RESULT_SCHEMA_UNSUPPORTED`，需要重新创建 Run。
 
-Worker 需要以下环境变量：
-
-```bash
-VIDEO_DEMO_OSS_ENDPOINT=https://oss-cn-hangzhou.aliyuncs.com
-VIDEO_DEMO_OSS_BUCKET=your-private-bucket
-VIDEO_DEMO_OSS_ACCESS_KEY_ID=your-rotated-access-key-id
-VIDEO_DEMO_OSS_ACCESS_KEY_SECRET=your-rotated-access-key-secret
-VIDEO_DEMO_OSS_PREFIX=video-demo/qwen-clips
-VIDEO_DEMO_OSS_SIGNED_URL_TTL_SECONDS=3600
-```
-
-部署前必须在 Bucket 上完成两项设置：Bucket 禁止公共读；为 `video-demo/qwen-clips/` 前缀配置对象创建后一天自动删除的生命周期规则。Qwen 调用成功或失败后，应用会按本次发布返回的精确对象键立即发送 DELETE；Worker 崩溃、断电或 DELETE 失败时由生命周期规则兜底。AccessKey、Secret 和签名 URL 不写入结果、证据或报告；建议使用仅具备目标前缀读写权限的 RAM 子账号，并定期轮换凭据。
-
-配置 Qwen 时必须同时完整配置 OSS；严格生产模式拒绝使用本地 Base64/Data URI 发送视频。Qwen 收到的是 FFmpeg 生成的完整 MP4 代理视频，而且生产 Run 不执行能力探测、逐窗口 `understand_segment()` 或第二次摘要请求。窗口时间只来自本地冻结边界，不依赖“完整视频 URL + `start_ms/end_ms`”让供应商自动 seek；Qwen 响应不是合法 JSON、顶层结构不符、粗语义为空或数量超过本地窗口数时，整次理解失败，不发布部分模型结果。Qwen 不生成时间和证据 ID，因此无法把模型引用误绑定到窗口外。显式 Demo 降级只能使用本地证据生成确定性语义，并产生 `DEMO_DEGRADED_QWEN`。
 
 ## 基础开发环境
 
