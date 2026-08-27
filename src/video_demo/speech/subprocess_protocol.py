@@ -5,7 +5,7 @@ from typing import Literal, Self
 
 from pydantic import Field, SecretStr, model_validator
 
-from video_demo.application.pipeline import PipelineRunConfig
+from video_demo.application.pipeline_contracts import PipelineRunConfig
 from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.domain.run import ModelIdentity
 from video_demo.errors import ErrorCode

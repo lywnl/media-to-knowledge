@@ -1,27 +1,86 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
 
 from video_demo.api.app import create_app
 from video_demo.config import Settings
 from video_demo.errors import ErrorCode, VideoDemoError
 
 
-def test_api_rejects_missing_cloud_asr_configuration_before_writing_runtime(
+def test_api_starts_without_model_configuration(
     tmp_path: Path,
 ) -> None:
+    shutil.copytree(Path.cwd() / "migrations", tmp_path / "migrations")
     settings = Settings(workspace_root=tmp_path, _env_file=None)
     assert settings.runtime_root is not None
 
-    with pytest.raises(VideoDemoError) as raised:
-        create_app(settings)
+    app = create_app(settings)
 
-    assert raised.value.code == ErrorCode.INVALID_CONFIGURATION
-    assert not settings.runtime_root.exists()
+    assert app.state.container.runtime_root == settings.runtime_root
+    assert not hasattr(app.state.container, "settings")
+    assert settings.runtime_root.exists()
+
+
+def test_create_app_runs_migration_before_database_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import video_demo.api.app as app_module
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://ai-proxy.example.test/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "openai/whisper")
+    events: list[str] = []
+
+    def migrate(*_args: object) -> None:
+        events.append("迁移")
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "停止于迁移")
+
+    class ForbiddenDatabase:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            events.append("数据库")
+
+    monkeypatch.setattr(app_module, "upgrade_runtime_database", migrate)
+    monkeypatch.setattr(app_module, "Database", ForbiddenDatabase)
+
+    with pytest.raises(VideoDemoError, match="停止于迁移"):
+        app_module.create_app(Settings(workspace_root=tmp_path))
+    assert events == ["迁移"]
+
+
+def test_create_app_upgrades_real_unversioned_0001_database(
+    tmp_path: Path,
+    cloud_asr_environment: None,
+) -> None:
+    settings = Settings(workspace_root=tmp_path)
+    assert settings.runtime_root is not None
+    settings.runtime_root.mkdir(parents=True)
+    database_url = f"sqlite+pysqlite:///{settings.runtime_root / 'video-demo.db'}"
+    config = Config()
+    config.attributes["configure_logging"] = False
+    config.set_main_option("script_location", str(tmp_path / "migrations"))
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "0001_video_demo")
+    with create_engine(database_url).begin() as connection:
+        connection.execute(text("DROP TABLE alembic_version"))
+
+    app = create_app(settings)
+
+    with create_engine(database_url).connect() as connection:
+        assert (
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+            == "0002_document_artifact"
+        )
+    assert app.state.container.database is not None
+
 
 def test_frontend_page_exposes_local_video_file_workflow(client: TestClient) -> None:
     response = client.get("/")
@@ -98,3 +157,31 @@ def test_frontend_script_renders_untrusted_result_as_text(client: TestClient) ->
     assert ".textContent" in script
     assert ".innerHTML" not in script
     assert 'behavior: "smooth"' not in script
+
+
+def test_frontend_script_exposes_structured_document_reading_contract(
+    client: TestClient,
+) -> None:
+    html = client.get("/").text
+    script = client.get("/static/app.js").text
+
+    assert 'id="document-overview"' in html
+    assert 'id="document-key-points"' in html
+    assert 'id="document-toc"' in html
+    assert 'id="download-status"' in html
+    assert "fetchEvidence" in script
+    assert "visual_content_refs" in script
+    assert "source_keyframe_refs" in script
+    assert "new Set(chapter.selected_keyframe_refs)" in script
+    assert "AbortController" in script
+    assert "URL.revokeObjectURL" in script
+    assert "下载 Markdown失败" in script
+
+
+def test_frontend_styles_include_document_reading_states(client: TestClient) -> None:
+    stylesheet = client.get("/static/styles.css").text
+
+    assert ".document-reader" in stylesheet
+    assert ".document-toc" in stylesheet
+    assert ".chapter-body--quote" in stylesheet
+    assert ".chapter-keyframe.is-failed" in stylesheet

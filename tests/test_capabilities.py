@@ -136,6 +136,54 @@ class RuntimeCapabilitiesTest(unittest.TestCase):
         self.assertNotIn("test-openai-key", serialized)
         self.assertNotIn("inference_device", serialized)
         self.assertNotIn("whisper_compute_type", serialized)
+        self.assertFalse(report.text_llm_configured)
+        self.assertFalse(report.vlm_configured)
+
+    @patch("video_demo.capabilities._read_binary_version", return_value="7.1")
+    def test_document_model_capabilities_are_reported_without_exposing_secrets(
+        self,
+        _version: object,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            tools = workspace / ".codex" / "video-rag-demo" / "tools"
+            tools.mkdir(parents=True)
+            for name in ("ffmpeg", "ffprobe"):
+                binary = tools / name
+                binary.write_bytes(b"binary")
+                binary.chmod(0o755)
+            settings = Settings(
+                workspace_root=workspace,
+                openai_base_url="https://ai-proxy.example.test/v1",
+                openai_api_key="test-openai-key",
+                openai_model="openai/whisper",
+                text_llm_base_url="https://text.example.test/v1",
+                text_llm_api_key="text-secret",
+                text_llm_model_id="text-model",
+                vlm_base_url="https://vision.example.test/v1",
+                vlm_api_key="vision-secret",
+                _env_file=None,
+            )
+
+            report = probe_runtime_capabilities(settings)
+
+        self.assertTrue(report.text_llm_configured)
+        self.assertEqual(report.text_llm_model, "text-model")
+        self.assertTrue(report.vlm_configured)
+        self.assertEqual(report.vlm_model, "qwen3-vl-flash")
+        self.assertNotIn("text-secret", report.model_dump_json())
+        self.assertNotIn("vision-secret", report.model_dump_json())
+
+    def test_partial_document_model_configuration_is_reported_as_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _settings(Path(directory)).model_copy(
+                update={"text_llm_base_url": "https://text.example.test/v1"},
+            )
+
+            report = probe_runtime_capabilities(settings)
+
+        self.assertIn(ErrorCode.INVALID_CONFIGURATION, {issue.code for issue in report.issues})
+        self.assertFalse(report.text_llm_configured)
 
     @patch(
         "video_demo.capabilities._read_binary_version",

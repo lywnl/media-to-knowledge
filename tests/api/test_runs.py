@@ -151,7 +151,51 @@ def test_create_run_persists_only_current_speech_configuration(
             "language_hints": ["zh", "en", "ja", "ko", "es"],
             "hotwords": [],
             "core_context": None,
+            "document_config": {
+                "document_title": None,
+                "detail_level": "standard",
+                "chapter_granularity": "standard",
+                "include_verbatim_quotes": True,
+                "max_visuals_per_chapter": 2,
+                "uncertainty_policy": "explicit",
+            },
+            "result_schema_version": "3.0.0",
         }
+
+
+def test_create_run_sanitizes_document_title_and_includes_it_in_idempotency(
+    client: TestClient,
+    scope_headers: dict[str, str],
+    mp4_content: bytes,
+) -> None:
+    object_ref = _upload(client, scope_headers, mp4_content)
+    runs_url = "/api/kb/knowledge-bases/kb-a/video-understanding-runs"
+    first = {
+        **_create_payload(object_ref),
+        "document_config": {"document_title": "  教程/第一课\u0000  "},
+        "result_schema_version": "3.0.0",
+    }
+
+    created = client.post(runs_url, headers=scope_headers, json=first)
+    assert created.status_code == 202
+    with client.app.state.container.database.session() as session:
+        run = VideoRunRepository(session).get(
+            Scope("tenant-a", "app-a", "kb-a"), created.json()["run_id"]
+        )
+        assert run is not None
+        assert run.config_snapshot["document_config"]["document_title"] == "教程 第一课"
+
+    conflict = client.post(
+        runs_url,
+        headers=scope_headers,
+        json={
+            **_create_payload(object_ref),
+            "document_config": {"document_title": "另一课"},
+            "result_schema_version": "3.0.0",
+        },
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
 
 
 @pytest.mark.parametrize(

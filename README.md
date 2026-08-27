@@ -1,23 +1,20 @@
-# 视频理解到 retrieval_text Demo
+# 视频知识文档 Demo
 
-这是一个独立的 Python 3.11 + FastAPI 视频理解 Demo。目标是对独立视频执行音频、画面和多模态理解，输出带证据引用的 `VIDEO_SEGMENT`、`VIDEO_SUMMARY`、`retrieval_text` 和 `retrieval_hash`。
+这是一个独立的 Python 3.11 + FastAPI 视频理解 Demo。目标是对独立视频执行音频、场景和多模态理解，输出 Schema `3.0.0` 结构化知识文档、可定位证据和确定性 Markdown。
 
-当前状态：Demo 主链已完成。上传、可靠 Worker、ffprobe/FFmpeg、字幕优先、Silero VAD、串行云端 Whisper、镜头/关键帧、百度 OCR、确定性融合、结构化结果、`retrieval_text`、证据分页和关键帧查询均已接通。生产 Qwen 链路使用私有 OSS 完整视频签名 URL：完整代理视频只上传一次，`qwen3-vl-flash` 只发起一次全片请求；模型返回按时间排序的粗粒度视觉语义和全片摘要，程序再映射到本地冻结的精确窗口和证据。实施账本见[计划](./.codex/plans/2026-08-17-video-understanding-retrieval-text-implementation.md)。
+当前状态：Demo 主链已完成。上传、可靠 Worker、ffprobe/FFmpeg、字幕优先、Silero VAD、云端 Whisper、镜头/关键帧、章节多图 VLM、结构化知识文档、证据分页和关键帧查询均已接通。生产链只使用云 ASR、文本 LLM 和章节视觉模型三套配置，结果 Schema 为 3.0.0。
 
-提交时必须准确区分两类结论：
+提交或验收时必须准确区分两类结论：
 
-- Demo 产品链与机器一致性 smoke：已通过。详见[双视频产品链报告](./.codex/reports/two-video-demo-chain-20260821.md)和[双视频质量 smoke](./.codex/reports/two-video-quality-smoke-20260821.md)。
-- 正式五语云端 ASR 质量和 M1 两段耐久：仍为 `NOT_RUN` 或外部前置条件不足，不能用中文 Demo 代替。Qwen 公网完整视频视觉理解已真实通过；同一个完整公网 URL 不保证按 `start_ms/end_ms` 截取片段，因此不能冒充精确片段输入。综合验证见[报告](./.codex/reports/qwen-visual-understanding-20260821.md)，公网 URL 对账见[对账报告](./.codex/reports/qwen-remote-url-reconciliation-20260821.md)。
+- Demo 产品链与机器一致性 smoke：已通过。正式五语云端 ASR、代表性视觉质量、人工文档 rubric 和 M1 两段耐久是否通过，必须以对应授权素材和评测报告为准；缺少真实前置条件时明确报告 `NOT_RUN/INCONCLUSIVE`，不能用 Demo 样本或配置单测替代。
 
-历史实现记录：`示例视频.mp4` 的 921,484 毫秒全片曾完成一次本地 ASR 与增强链验收，产生 601 条 ASR、5,743 条对齐词、329 个关键帧、329 条 OCR 和 128 个场景证据。该数据只描述迁移前实现，当前产品不再生成对齐词，也不能用于证明云端 ASR 已通过。后续严格 Qwen 与融合验收复用了该次运行的代理和已落库证据；报告见[全片严格验收](./.codex/reports/qwen-production-full-video-validation-20260821.json)。
-
-Qwen 的视觉职责与证据边界：完整视频视觉报告可识别人物、场景、账号页、软件界面、关键事件和画面文字；模型观察可能误读账号名、数字或字幕。原始可定位画面文字仍以百度 OCR 证据为权威，语音以字幕或云端 ASR 的 `SpeechSegment` 为权威。需要精确片段视觉理解时，必须传实际派生短片（本地 clip/Data URI 或该短片自己的公网 URL），不得只给完整视频 URL 再依赖时间字段让供应商自动 seek。
+章节视觉模型只对授权章节的本地 JPEG 做观察，结果可能误读画面文字、数字或界面状态；画面文字质量由独立的代表性视觉评测量化，不能把模型返回文本或 Schema 合法性当作准确率。语音以字幕或云端 ASR 的 `SpeechSegment` 为准，视觉观察通过证据 ID 与章节正文绑定。
 
 ## 视频转文本策略
 
 视频文本解析按“内嵌文本字幕优先、云端 ASR 兜底”执行：`ffprobe` 先发现容器内字幕流，系统只把 `subrip`、`ass`、`ssa`、`webvtt` 和 `mov_text` 当作可解析文本字幕。候选字幕经 UTF-8 解析、大小和 cue 数量限制、时间轴及启发式完整性检查后，以独立的 `SUBTITLE_CUE` 证据输出；命中时不生成 `audio.wav`，也不启动 VAD 或调用云端 ASR。
 
-PGS、DVD Subtitle 等位图字幕和直接烧录在画面里的字幕当前不做 OCR，存在音轨时自动提取 WAV 并进入 ASR，不能把“探测到字幕轨”误解为“字幕文本已识别”。字幕完整性门槛只用于决定是否启用 ASR，是工程启发式，不是字幕准确率或完整性的认证；字幕不合格、解码失败或缺失时会自动兜底，不需要重新创建 Run。
+PGS、DVD Subtitle 等位图字幕和直接烧录在画面里的字幕当前不作为文本字幕解析；存在音轨时自动提取 WAV 并进入 ASR，不能把“探测到字幕轨”误解为“字幕文本已识别”。字幕完整性门槛只用于决定是否启用 ASR，是工程启发式，不是字幕准确率或完整性的认证；字幕不合格、解码失败或缺失时会自动兜底，不需要重新创建 Run。
 
 ASR 是自动语音识别，即把音频中的语音转成文本，不是人声分离，也不负责区分谁在说话。无合格字幕时，Worker 提取单声道 16kHz PCM WAV，在一次性 ASR 子进程内执行 Silero VAD，然后通过 OpenAI 兼容接口严格串行上传本地派生 WAV。普通 VAD 区间各自成为独立窗口；只有单个连续语音区间超过 10 分钟时，才按 1 秒重叠均衡拆分。当前只输出段级 `SpeechSegment`，不提供词级对齐、说话人分析或音频事件。
 
@@ -25,28 +22,30 @@ ASR 是自动语音识别，即把音频中的语音转成文本，不是人声�
 
 ASR 阶段仍在受监督的一次性子进程中执行，以隔离 FFmpeg、VAD 和网络调用故障。每个成功窗口会立即发布独立 JSON 缓存；同一 Run 重试时只补传失败窗口，全部成功后再发布整段 ASR 快照。云端最终失败会使整个 ASR 阶段失败，不会发布空转写或部分成功结果。上传 WAV 是可再生临时产物，窗口完成、失败、超时或取消后都会清理。
 
-云端 ASR 只接受本地文件的 `multipart/form-data` 上传，当前实现不接受 OSS 音频 URL。一个 ASR 阶段内窗口请求严格串行；单 Worker 部署下不会并发上传窗口，多 Worker 部署则不提供跨进程全局限流。
+云端 ASR 只接受本地文件的 `multipart/form-data` 上传，不接受远程对象 URL。一个 ASR 阶段内窗口请求严格串行；单 Worker 部署下不会并发上传窗口，多 Worker 部署则不提供跨进程全局限流。
 
 质量评测会单独生成提示效果伴随报告，只比较同一授权媒体的 `NONE/CORRECT` 成对 ASR 结果，并报告术语召回率及 CER/WER 差值。它不进入现有发布硬门槛；失败预测、空术语、任一端不是 ASR 或没有合格配对时均为 `NOT_RUN`。字幕命中不能证明热词或核心上下文有效。
 
-## Qwen 的私有 OSS 全片中转
+## 知识文档生产流程
 
-生产 Worker 现在支持同一条产品链完成“本地解析 + 单次全片视觉理解”：源视频仍由现有上传接口进入本地对象存储；Worker 在本地执行 FFmpeg、ASR、关键帧、场景检测和百度 OCR，并生成连续且每段不超过 30 秒的冻结理解窗口；完整 MP4 代理视频只上传到私有阿里云 OSS 一次，Qwen 只接收这一条全片的一小时签名 URL，并在一个结构化逻辑请求中返回按时间排序的粗粒度语义数组和全片摘要。程序按模型实际返回的组数等分全片，将粗语义映射回全部本地细窗口；精确时间和 ASR/OCR/关键帧/场景引用始终由本地程序绑定，再生成 `retrieval_text`。公共上传、创建 Run 和结果查询接口没有变化。
+Worker 在本地完成媒体探测、音频转写、镜头与关键帧提取；章节视觉模型接收授权章节的多张 JPEG，文本模型根据转写与视觉观察生成带证据引用的知识文档。生产结果只写入 Schema 3.0；读取旧 Run 时返回 `RESULT_SCHEMA_UNSUPPORTED`，需要重新创建 Run。
 
-Worker 需要以下环境变量：
+正式生产使用三套相互独立的模型配置：云端 ASR（`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL`）、文本 LLM（`VIDEO_DEMO_TEXT_LLM_*`）和章节视觉 VLM（`VIDEO_DEMO_VLM_*`）。章节 VLM 只接收本地授权章节的 2～4 张图片，最终结果、证据和文档均为 Schema `3.0.0`。用户可通过 `/document` 获取结构化知识文档视图，`/result`、`/evidence` 与关键帧内容接口使用同一 Run 作用域。
+
+质量评测通过统一 CLI 执行：
 
 ```bash
-VIDEO_DEMO_OSS_ENDPOINT=https://oss-cn-hangzhou.aliyuncs.com
-VIDEO_DEMO_OSS_BUCKET=your-private-bucket
-VIDEO_DEMO_OSS_ACCESS_KEY_ID=your-rotated-access-key-id
-VIDEO_DEMO_OSS_ACCESS_KEY_SECRET=your-rotated-access-key-secret
-VIDEO_DEMO_OSS_PREFIX=video-demo/qwen-clips
-VIDEO_DEMO_OSS_SIGNED_URL_TTL_SECONDS=3600
+.venv/bin/python -m video_demo.evaluation.cli quality visual --evaluation-run-id "$EVALUATION_RUN_ID"
+.venv/bin/python -m video_demo.evaluation.cli quality visual-resolution --evaluation-run-id "$EVALUATION_RUN_ID"
+.venv/bin/python -m video_demo.evaluation.cli quality score --evaluation-run-id "$EVALUATION_RUN_ID"
 ```
 
-部署前必须在 Bucket 上完成两项设置：Bucket 禁止公共读；为 `video-demo/qwen-clips/` 前缀配置对象创建后一天自动删除的生命周期规则。Qwen 调用成功或失败后，应用会按本次发布返回的精确对象键立即发送 DELETE；Worker 崩溃、断电或 DELETE 失败时由生命周期规则兜底。AccessKey、Secret 和签名 URL 不写入结果、证据或报告；建议使用仅具备目标前缀读写权限的 RAM 子账号，并定期轮换凭据。
+`quality visual` 生成代表性视觉文字事实，`quality visual-resolution` 只给出 1280/1920 的证据对照建议；两者不会自动修改生产默认分辨率。质量报告同时区分视觉文字准确率、关键字段召回率，以及文档自动指标 `chapter_time_coverage`、`claim_evidence_rate`、`markdown_json_consistency`。标题/摘要相关性、视觉观察是否补充转写、重复和冲突判断必须来自绑定样本与制品摘要的人工 rubric；没有完整人工判断时显示 `NOT_RUN`，不会用 LLM 自评或 Schema 合法性冒充通过。视觉集缺少授权样本、视觉质量报告或参考分母为零时同样保留 `NOT_RUN/INCONCLUSIVE`，真实调用失败则保留 `FAIL`。
 
-配置 Qwen 时必须同时完整配置 OSS；严格生产模式拒绝使用本地 Base64/Data URI 发送视频。Qwen 收到的是 FFmpeg 生成的完整 MP4 代理视频，而且生产 Run 不执行能力探测、逐窗口 `understand_segment()` 或第二次摘要请求。窗口时间只来自本地冻结边界，不依赖“完整视频 URL + `start_ms/end_ms`”让供应商自动 seek；Qwen 响应不是合法 JSON、顶层结构不符、粗语义为空或数量超过本地窗口数时，整次理解失败，不发布部分模型结果。Qwen 不生成时间和证据 ID，因此无法把模型引用误绑定到窗口外。显式 Demo 降级只能使用本地证据生成确定性语义，并产生 `DEMO_DEGRADED_QWEN`。
+耐久门禁默认验证已授权的两段 30 分钟、至少 1920×1080 的真实素材；配置允许的最大视频时长为 `7_200_000ms`（恰好两小时），超过该值在执行前拒绝。没有真实授权两小时素材时，系统只报告 `NOT_RUN`，不会循环短视频、mock 或把配置单测写成 PASS。
+
+Task 11B 已移除历史对象存储、传统文字识别、全片视频推理和 2.0 生产隔离链。升级后旧 Run 不兼容，必须重新执行 `quality predict`、视觉质量和文档质量评测；未实际运行的代表性视觉集、人工 rubric 和两小时耐久均不得写成 PASS。
+
 
 ## 基础开发环境
 
@@ -74,6 +73,10 @@ API 和 Worker 必须同时运行；API 只创建持久任务，Worker 才负责
 .venv/bin/uvicorn video_demo.main:app --host 127.0.0.1 --port 8000
 .venv/bin/video-demo-worker
 ```
+
+启动时 API 与 Worker 会使用 `.database-migration.lock` 串行升级运行时 SQLite。该机制仅支持
+macOS/Linux 的本地文件系统；运行目录和数据库不得放在 NFS 等网络文件系统上，也不要依赖
+网络文件锁提供等价安全性。
 
 两个进程启动后，浏览器访问 `http://127.0.0.1:8000/`，选择一个本地视频并点击
 “开始处理”。页面会自动完成上传、创建任务、查询处理状态和展示结果，内部固定使用

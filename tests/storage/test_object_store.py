@@ -134,6 +134,31 @@ def test_materialize_isolates_same_run_id_by_scope(
     assert second_path.read_bytes() == second_content
 
 
+def test_materialize_rejects_insufficient_disk_before_copy(
+    tmp_path: Path,
+    scope: Scope,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    initial = LocalVideoObjectStore(runtime_root, max_video_bytes=1024)
+    mime, content = VIDEO_SAMPLES["lesson.mp4"]
+    record = initial.ingest(io.BytesIO(content), "lesson.mp4", mime, scope)
+    checked_paths: list[Path] = []
+    store = LocalVideoObjectStore(
+        runtime_root,
+        max_video_bytes=1024,
+        min_free_disk_reserve_bytes=512,
+        available_bytes=lambda path: checked_paths.append(path) or len(content) + 511,
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        store.materialize(scope, record, "run_001", record.sha256)
+
+    run_input = runtime_root / "runs" / store.scope_key(scope) / "run_001/input"
+    assert raised.value.code == ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT
+    assert checked_paths == [run_input]
+    assert list(run_input.iterdir()) == []
+
+
 def test_materialize_rejects_symlink_source_escape(
     store: LocalVideoObjectStore,
     scope: Scope,

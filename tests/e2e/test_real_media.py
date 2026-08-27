@@ -37,8 +37,7 @@ def test_absent_real_media_models_credentials_and_durability_stay_not_run(
     for check_id in (
         "authorized_dataset",
         "real_media_chain",
-        "baidu_ocr_live",
-        "qwen_live",
+        "chapter_vlm_live",
         "five_language_models",
         "m1_durability",
     ):

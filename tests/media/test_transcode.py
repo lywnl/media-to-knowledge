@@ -15,12 +15,14 @@ from video_demo.media.transcode import (
     NoAudioArtifact,
     SubtitleLimits,
     TranscodeLimits,
+    duration_aware_timeout_seconds,
 )
 
 
 class WritingRunner:
     def __init__(self, *, returncode: int = 0, output: bytes = b"media") -> None:
         self.calls: list[list[str]] = []
+        self.timeouts: list[int] = []
         self.returncode = returncode
         self.output = output
 
@@ -32,9 +34,10 @@ class WritingRunner:
         pass_fds: tuple[int, ...] = (),
         output_paths: tuple[Path, ...] = (),
     ) -> ProcessResult:
-        del timeout_seconds, pass_fds
+        del pass_fds
         command = list(args)
         self.calls.append(command)
+        self.timeouts.append(timeout_seconds)
         if self.returncode == 0:
             target = output_paths[0] if output_paths else Path(command[-1])
             target.write_bytes(self.output)
@@ -56,6 +59,8 @@ def _transcoder(
     available_bytes: int = 1024 * 1024,
     max_output_bytes: int = 1024,
     subtitle_max_output_bytes: int = 256,
+    proxy_max_edge: int = 1280,
+    timeout_seconds: int = 1_800,
 ) -> FFmpegTranscoder:
     runtime = tmp_path / "runtime"
     return FFmpegTranscoder(
@@ -65,9 +70,11 @@ def _transcoder(
         limits=TranscodeLimits(
             max_output_bytes=max_output_bytes,
             required_free_bytes=128,
+            timeout_seconds=timeout_seconds,
         ),
         subtitle_limits=SubtitleLimits(max_output_bytes=subtitle_max_output_bytes),
         available_bytes=lambda _path: available_bytes,
+        proxy_max_edge=proxy_max_edge,
     )
 
 
@@ -237,6 +244,63 @@ def test_create_proxy_limits_long_edge_and_normalizes_pts(
     assert artifact.relative_path == "runs/run_001/media/proxy.mp4"
     assert artifact.max_edge == 1280
     assert artifact.normalized_start_ms == 0
+
+
+def test_create_proxy_uses_configured_edge_in_filter_and_artifact(
+    tmp_path: Path,
+    source: Path,
+) -> None:
+    runner = WritingRunner(output=b"proxy")
+
+    artifact = _transcoder(tmp_path, runner, proxy_max_edge=1920).create_proxy(
+        source,
+        Path("runs/run_001"),
+    )
+
+    video_filter = runner.calls[0][runner.calls[0].index("-vf") + 1]
+    assert "min(1920,iw)" in video_filter
+    assert "min(1920,ih)" in video_filter
+    assert artifact.max_edge == 1920
+
+
+@pytest.mark.parametrize("proxy_max_edge", [1279, 2561])
+def test_transcoder_rejects_proxy_edge_outside_supported_range(
+    tmp_path: Path,
+    proxy_max_edge: int,
+) -> None:
+    with pytest.raises(ValueError, match="代理视频最大边"):
+        _transcoder(tmp_path, WritingRunner(), proxy_max_edge=proxy_max_edge)
+
+
+def test_duration_aware_timeout_uses_base_duration_and_hard_cap() -> None:
+    assert duration_aware_timeout_seconds(3_600, 10_000) == 3_600
+    assert duration_aware_timeout_seconds(1, 1_001) == 302
+    assert duration_aware_timeout_seconds(600, 7_200_000) == 11_100
+    assert duration_aware_timeout_seconds(600, 86_400_000) == 14_400
+    with pytest.raises(ValueError, match="基础超时"):
+        duration_aware_timeout_seconds(14_401, 1_000)
+
+
+def test_full_length_ffmpeg_operations_receive_duration_aware_timeout(
+    tmp_path: Path,
+    source: Path,
+) -> None:
+    runner = WritingRunner(output=b"media")
+    transcoder = _transcoder(tmp_path, runner, timeout_seconds=600)
+
+    transcoder.create_proxy(
+        source,
+        Path("runs/run_001"),
+        duration_ms=7_200_000,
+    )
+    transcoder.extract_audio(
+        source,
+        Path("runs/run_001"),
+        has_audio=True,
+        duration_ms=7_200_000,
+    )
+
+    assert runner.timeouts == [11_100, 11_100]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fd 输出契约仅适用于 POSIX")

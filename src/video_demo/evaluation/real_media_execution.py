@@ -13,7 +13,7 @@ from video_demo.application.pipeline import (
     ProbedAsset,
     RegisteredAsset,
 )
-from video_demo.application.production_visual import frame_tolerance_ms_for_rate
+from video_demo.application.production_scene import frame_tolerance_ms_for_rate
 from video_demo.config import Settings
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError

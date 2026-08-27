@@ -82,7 +82,7 @@ def _imported_video_demo_modules(
 ) -> tuple[str, ...]:
     current_module = _module_name(relative)
     modules: set[str] = set()
-    for node in ast.walk(tree):
+    for node in _runtime_import_nodes(tree):
         if isinstance(node, ast.Import):
             modules.update(
                 alias.name
@@ -102,6 +102,95 @@ def _imported_video_demo_modules(
             if alias.name != "*":
                 modules.add(f"{imported_from}.{alias.name}")
     return tuple(sorted(modules))
+
+
+def _runtime_import_nodes(tree: ast.AST) -> tuple[ast.Import | ast.ImportFrom, ...]:
+    """收集运行时导入，不把 ``TYPE_CHECKING`` 分支计入执行闭包。"""
+
+    imports: list[ast.Import | ast.ImportFrom] = []
+    shadowed_names = _shadowed_type_checking_names(tree)
+
+    class RuntimeImportVisitor(ast.NodeVisitor):
+        def visit_Import(self, node: ast.Import) -> None:
+            imports.append(node)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            imports.append(node)
+
+        def visit_If(self, node: ast.If) -> None:
+            if _is_type_checking_guard(node.test, shadowed_names):
+                for child in node.orelse:
+                    self.visit(child)
+                return
+            self.generic_visit(node)
+
+    RuntimeImportVisitor().visit(tree)
+    return tuple(imports)
+
+
+def _shadowed_type_checking_names(tree: ast.AST) -> frozenset[str]:
+    """保守识别被运行时代码重绑定的标准 typing 名称。"""
+
+    shadowed: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            if node.id in {"TYPE_CHECKING", "typing"}:
+                shadowed.add(node.id)
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in {"TYPE_CHECKING", "typing"}:
+                shadowed.add(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                argument_names = {
+                    argument.arg
+                    for argument in (
+                        *node.args.posonlyargs,
+                        *node.args.args,
+                        *node.args.kwonlyargs,
+                    )
+                }
+                if node.args.vararg is not None:
+                    argument_names.add(node.args.vararg.arg)
+                if node.args.kwarg is not None:
+                    argument_names.add(node.args.kwarg.arg)
+                shadowed.update(argument_names & {"TYPE_CHECKING", "typing"})
+            continue
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                if local_name == "typing" and alias.name != "typing":
+                    shadowed.add(local_name)
+            continue
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                local_name = alias.asname or alias.name
+                if local_name == "TYPE_CHECKING" and not (
+                    node.level == 0
+                    and node.module == "typing"
+                    and alias.name == "TYPE_CHECKING"
+                ):
+                    shadowed.add(local_name)
+    return frozenset(shadowed)
+
+
+def _is_type_checking_guard(
+    node: ast.expr,
+    shadowed_names: frozenset[str],
+) -> bool:
+    return (
+        (
+            isinstance(node, ast.Name)
+            and node.id == "TYPE_CHECKING"
+            and "TYPE_CHECKING" not in shadowed_names
+        )
+        or (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "typing"
+            and node.attr == "TYPE_CHECKING"
+            and "typing" not in shadowed_names
+        )
+    )
 
 
 def _absolute_import_from(

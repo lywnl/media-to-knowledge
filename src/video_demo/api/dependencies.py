@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path as FilePath
 from typing import Annotated
 
 from fastapi import Header, Path, Request
@@ -8,7 +9,6 @@ from fastapi import Header, Path, Request
 from video_demo.application.queries import ResultQueryService
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
-from video_demo.config import Settings
 from video_demo.persistence.database import Database
 from video_demo.persistence.repositories import Scope
 from video_demo.storage.object_store import LocalVideoObjectStore
@@ -16,7 +16,7 @@ from video_demo.storage.object_store import LocalVideoObjectStore
 
 @dataclass(frozen=True, slots=True)
 class AppContainer:
-    settings: Settings
+    runtime_root: FilePath
     database: Database
     object_store: LocalVideoObjectStore
     upload_service: UploadService

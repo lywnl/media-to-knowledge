@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from pydantic import ValidationError
 
@@ -10,6 +11,7 @@ from video_demo.application.pipeline import (
     PipelineRunConfig,
     pipeline_run_config_from_snapshot,
 )
+from video_demo.domain.document import DocumentGenerationConfig
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.models import (
@@ -74,11 +76,15 @@ class RunService:
         language_hints: tuple[str, ...],
         hotwords: tuple[str, ...] = (),
         core_context: str | None = None,
+        document_config: DocumentGenerationConfig | None = None,
+        result_schema_version: Literal["3.0.0"] = "3.0.0",
     ) -> RunView:
         config = PipelineRunConfig(
             language_hints=language_hints,
             hotwords=hotwords,
             core_context=core_context,
+            document_config=document_config or DocumentGenerationConfig(),
+            result_schema_version=result_schema_version,
         )
         config_snapshot = config.model_dump(mode="json")
         with self._database.session() as session:
@@ -128,7 +134,7 @@ class RunService:
     def _same_config(snapshot: dict[str, object], expected: PipelineRunConfig) -> bool:
         try:
             existing = pipeline_run_config_from_snapshot(snapshot)
-        except ValidationError:
+        except (ValidationError, VideoDemoError):
             return False
         return existing == expected
 

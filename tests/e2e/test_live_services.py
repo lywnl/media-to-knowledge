@@ -31,17 +31,17 @@ def test_missing_workspace_package_writes_not_run_instead_of_skipping(
         components_factory=lambda _settings: pytest.fail("缺授权输入不得构造组件"),
     )
 
-    check = runner.run_workspace_baidu("workspace-baidu-missing")
+    check = runner.run_workspace_chapter_vlm("workspace-chapter-missing")
 
     assert check.status == GateStatus.NOT_RUN
     raw = PreflightRawReport.model_validate_json(
         (
             settings.runtime_root
-            / "eval/reports/workspace-baidu-missing/preflight.json"
+            / "eval/reports/workspace-chapter-missing/preflight.json"
         ).read_bytes()
     )
     assert raw.execution_started is False
-    assert "LIVE_AUTHORIZED_KEYFRAME_UNAVAILABLE" in {
+    assert "LIVE_AUTHORIZED_CHAPTER_FRAMES_UNAVAILABLE" in {
         issue.code.value for issue in raw.issues
     }
 
@@ -58,16 +58,14 @@ def test_workspace_live_services_emit_authoritative_results() -> None:
     )
     suffix = uuid4().hex
     checks = {
-        "baidu_ocr_live": runner.run_workspace_baidu(f"workspace-baidu-{suffix}"),
-        "qwen_live": runner.run_workspace_qwen(f"workspace-qwen-{suffix}"),
+        "chapter_vlm_live": runner.run_workspace_chapter_vlm(f"workspace-chapter-{suffix}"),
         "five_language_models": runner.run_workspace_local_model_stack(
             f"workspace-local-{suffix}"
         ),
     }
 
     assert set(checks) == {
-        "baidu_ocr_live",
-        "qwen_live",
+        "chapter_vlm_live",
         "five_language_models",
     }
     for check_id, check in checks.items():

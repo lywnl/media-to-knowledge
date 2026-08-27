@@ -14,6 +14,7 @@ from video_demo.config import Settings
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.evaluation import gate as gate_module
 from video_demo.evaluation.durability import (
+    MAX_DURABILITY_DURATION_MS,
     DurabilityProbe,
     DurabilityRunner,
     DurabilitySample,
@@ -33,6 +34,11 @@ def _cloud_settings(tmp_path: Path) -> Settings:
         openai_base_url="https://asr.example/v1",
         openai_api_key="test-key",
         openai_model="openai/whisper",
+        text_llm_base_url="https://text.example/v1",
+        text_llm_api_key="text-key",
+        text_llm_model_id="text-model",
+        vlm_base_url="https://vlm.example/v1",
+        vlm_api_key="vlm-key",
     )
 
 
@@ -172,6 +178,41 @@ def test_manifest_with_fewer_than_two_samples_is_not_run_before_execution(
     assert "两段" in (check.not_run_reason or "")
     assert "psutil" not in (check.not_run_reason or "").lower()
     assert not (settings.runtime_root / "runs").exists()
+
+
+def test_durability_accepts_two_hour_boundary_but_rejects_longer_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 该用例只验证时长契约；资源采样依赖由其他用例单独覆盖。
+    monkeypatch.setattr("video_demo.evaluation.durability.psutil", object())
+    boundary = _write_manifest(
+        tmp_path / "boundary",
+        [
+            _row("a", duration_ms=MAX_DURABILITY_DURATION_MS),
+            _row("b", duration_ms=MAX_DURABILITY_DURATION_MS),
+        ],
+    )
+    settings = _cloud_settings(tmp_path / "boundary")
+    runner = DurabilityRunner(
+        settings,
+        EvidenceStore(settings.workspace_root, settings.runtime_root),
+        probe_media=_matching_probe,
+        execute_sample=lambda _sample: _successful_metric_sample(),
+    )
+    assert runner._preflight(boundary)[-1] == ()
+
+    too_long = _write_manifest(
+        tmp_path / "too-long",
+        [_row("a", duration_ms=MAX_DURABILITY_DURATION_MS + 1), _row("b")],
+    )
+    settings_long = _cloud_settings(tmp_path / "too-long")
+    runner_long = DurabilityRunner(
+        settings_long,
+        EvidenceStore(settings_long.workspace_root, settings_long.runtime_root),
+        probe_media=_matching_probe,
+    )
+    assert ErrorCode.M1_DURATION_TOO_LONG in runner_long._preflight(too_long)[-1]
 
 
 def test_duplicate_media_digest_is_not_run_before_execution(tmp_path: Path) -> None:
@@ -552,6 +593,7 @@ def test_production_query_chain_checks_job_evidence_page_and_keyframe_content(
                     "mime_type": "image/jpeg",
                     "sha256": keyframe_sha256,
                     "perceptual_hash": "0" * 16,
+                    "size_bytes": len(keyframe_bytes),
                 }
             ],
             "next_cursor": None,
@@ -595,12 +637,12 @@ def test_production_query_chain_checks_job_evidence_page_and_keyframe_content(
         durability_module,
         "_read_published_manifest",
         lambda *_args, **_kwargs: (
-            b"manifest",
             SimpleNamespace(
                 result=result,
                 evidence=manifest_evidence,
                 status="SUCCEEDED",
             ),
+            b"document",
         ),
     )
     monkeypatch.setattr(

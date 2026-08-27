@@ -56,10 +56,16 @@ class LocalVideoObjectStore:
         *,
         max_video_bytes: int,
         mime_detector: Callable[[bytes], str | None] = detect_video_mime,
+        min_free_disk_reserve_bytes: int = 0,
+        available_bytes: Callable[[Path], int] | None = None,
     ) -> None:
         self.runtime_root = runtime_root.expanduser().resolve(strict=False)
         self.max_video_bytes = max_video_bytes
         self._mime_detector = mime_detector
+        if min_free_disk_reserve_bytes < 0:
+            raise ValueError("最小磁盘保留空间不能为负数")
+        self._min_free_disk_reserve_bytes = min_free_disk_reserve_bytes
+        self._available_bytes = available_bytes or self._disk_free_bytes
 
     @staticmethod
     def scope_key(scope: Scope) -> str:
@@ -126,6 +132,8 @@ class LocalVideoObjectStore:
                 raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "视频对象符号链接越界")
             raise VideoDemoError(ErrorCode.VIDEO_OBJECT_NOT_FOUND, "视频对象不存在")
         source = resolve_workspace_path(self.runtime_root, source)
+        if source.stat().st_size != record.size_bytes:
+            raise VideoDemoError(ErrorCode.VIDEO_DIGEST_MISMATCH, "视频对象大小校验失败")
         actual_sha256 = _sha256_file(source)
         if actual_sha256 != expected_sha256 or actual_sha256 != record.sha256:
             raise VideoDemoError(ErrorCode.VIDEO_DIGEST_MISMATCH, "视频对象摘要校验失败")
@@ -137,6 +145,12 @@ class LocalVideoObjectStore:
         )
         temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
         destination.parent.mkdir(parents=True, exist_ok=True)
+        required_free_bytes = record.size_bytes + self._min_free_disk_reserve_bytes
+        if self._available_bytes(destination.parent) < required_free_bytes:
+            raise VideoDemoError(
+                ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT,
+                "可用磁盘空间不足",
+            )
         try:
             with source.open("rb") as source_stream, temporary.open("xb") as output:
                 shutil.copyfileobj(source_stream, output, length=_CHUNK_SIZE)
@@ -184,6 +198,10 @@ class LocalVideoObjectStore:
         if size_bytes == 0:
             raise VideoDemoError(ErrorCode.VIDEO_FILE_EMPTY, "视频文件不能为空")
         return size_bytes, digest.hexdigest(), bytes(header)
+
+    @staticmethod
+    def _disk_free_bytes(path: Path) -> int:
+        return shutil.disk_usage(path).free
 
 
 def _sha256_file(path: Path) -> str:

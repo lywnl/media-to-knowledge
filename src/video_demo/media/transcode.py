@@ -20,6 +20,27 @@ from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.process import ProcessResult, SafeProcessRunner
 from video_demo.storage.workspace import atomic_replace, safe_runtime_path, validate_path_component
 
+MAX_DURATION_AWARE_TIMEOUT_SECONDS = 14_400
+_MIN_PROXY_MAX_EDGE = 1_280
+_MAX_PROXY_MAX_EDGE = 2_560
+
+
+def duration_aware_timeout_seconds(base_timeout_seconds: int, duration_ms: int) -> int:
+    """按已验证媒体时长放大单次长任务超时，并受统一硬上限约束。"""
+
+    if (
+        type(base_timeout_seconds) is not int
+        or not 1 <= base_timeout_seconds <= MAX_DURATION_AWARE_TIMEOUT_SECONDS
+    ):
+        raise ValueError("基础超时必须位于 1~14400 秒")
+    if type(duration_ms) is not int or duration_ms < 1:
+        raise ValueError("媒体时长必须是正整数毫秒")
+    duration_budget = (duration_ms * 3 + 1_999) // 2_000 + 300
+    return min(
+        MAX_DURATION_AWARE_TIMEOUT_SECONDS,
+        max(base_timeout_seconds, duration_budget),
+    )
+
 
 class ProcessRunner(Protocol):
     def run(
@@ -37,6 +58,12 @@ class TranscodeLimits:
     max_output_bytes: int = 4 * 1024 * 1024 * 1024
     required_free_bytes: int = 512 * 1024 * 1024
     timeout_seconds: int = 1_800
+
+    def __post_init__(self) -> None:
+        if self.max_output_bytes < 1 or self.required_free_bytes < 0:
+            raise ValueError("转码字节预算非法")
+        if not 1 <= self.timeout_seconds <= MAX_DURATION_AWARE_TIMEOUT_SECONDS:
+            raise ValueError("转码基础超时必须位于 1~14400 秒")
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +140,7 @@ class FFmpegTranscoder:
         limits: TranscodeLimits | None = None,
         subtitle_limits: SubtitleLimits | None = None,
         available_bytes: Callable[[Path], int] | None = None,
+        proxy_max_edge: int = 1_280,
     ) -> None:
         self._executable = executable
         self._runner = runner
@@ -120,6 +148,12 @@ class FFmpegTranscoder:
         self._limits = limits or TranscodeLimits()
         self._subtitle_limits = subtitle_limits or SubtitleLimits()
         self._available_bytes = available_bytes or self._disk_free_bytes
+        if (
+            type(proxy_max_edge) is not int
+            or not _MIN_PROXY_MAX_EDGE <= proxy_max_edge <= _MAX_PROXY_MAX_EDGE
+        ):
+            raise ValueError("代理视频最大边必须位于 1280~2560 像素")
+        self._proxy_max_edge = proxy_max_edge
 
     @classmethod
     def from_path(
@@ -129,6 +163,8 @@ class FFmpegTranscoder:
         *,
         workspace_root: Path,
         is_cancel_requested: Callable[[], bool] = lambda: False,
+        limits: TranscodeLimits | None = None,
+        proxy_max_edge: int = 1_280,
     ) -> FFmpegTranscoder:
         executable = resolve_workspace_binary(
             executable,
@@ -143,13 +179,21 @@ class FFmpegTranscoder:
         version = runner.run([str(executable), "-version"], timeout_seconds=10)
         if version.returncode != 0:
             raise VideoDemoError(ErrorCode.VIDEO_BINARY_PROBE_FAILED, "ffmpeg 版本探测失败")
-        return cls(executable=executable, runner=runner, runtime_root=runtime_root)
+        return cls(
+            executable=executable,
+            runner=runner,
+            runtime_root=runtime_root,
+            limits=limits,
+            proxy_max_edge=proxy_max_edge,
+        )
 
     def extract_subtitle(
         self,
         source: Path,
         run_relative_root: Path,
         stream: SubtitleStream,
+        *,
+        duration_ms: int | None = None,
     ) -> SubtitleArtifact:
         source = self._validate_source(source)
         relative_path = (
@@ -171,6 +215,7 @@ class FFmpegTranscoder:
             args,
             final_path,
             max_output_bytes=self._subtitle_limits.max_output_bytes,
+            timeout_seconds=self._timeout_for(duration_ms),
         )
         return SubtitleArtifact(
             relative_path=relative_path.as_posix(),
@@ -222,6 +267,7 @@ class FFmpegTranscoder:
                 output_descriptor,
                 "wav",
                 (input_descriptor, output_descriptor),
+                timeout_seconds=self._timeout_for(duration_ms),
             )
             return AudioArtifact(
                 relative_path=relative_path.as_posix(),
@@ -248,7 +294,11 @@ class FFmpegTranscoder:
             "-af",
             "asetpts=PTS-STARTPTS",
         ]
-        size_bytes, sha256 = self._produce(args, final_path)
+        size_bytes, sha256 = self._produce(
+            args,
+            final_path,
+            timeout_seconds=self._timeout_for(duration_ms),
+        )
         return AudioArtifact(
             relative_path=relative_path.as_posix(),
             sha256=sha256,
@@ -263,6 +313,7 @@ class FFmpegTranscoder:
         source: Path,
         run_relative_root: Path,
         *,
+        duration_ms: int | None = None,
         input_fd: int | None = None,
         output_fd: int | None = None,
     ) -> ProxyVideoArtifact:
@@ -276,8 +327,8 @@ class FFmpegTranscoder:
             else "+faststart"
         )
         video_filter = (
-            "scale=w='if(gte(iw,ih),min(1280,iw),-2)':"
-            "h='if(gte(iw,ih),-2,min(1280,ih))':flags=lanczos,"
+            f"scale=w='if(gte(iw,ih),min({self._proxy_max_edge},iw),-2)':"
+            f"h='if(gte(iw,ih),-2,min({self._proxy_max_edge},ih))':flags=lanczos,"
             "setpts=PTS-STARTPTS"
         )
         args = [
@@ -310,15 +361,20 @@ class FFmpegTranscoder:
                 output_descriptor,
                 "mp4",
                 (input_descriptor, output_descriptor),
+                timeout_seconds=self._timeout_for(duration_ms),
             )
         else:
             final_path = self._destination_path(relative_path)
-            size_bytes, sha256 = self._produce(args, final_path)
+            size_bytes, sha256 = self._produce(
+                args,
+                final_path,
+                timeout_seconds=self._timeout_for(duration_ms),
+            )
         return ProxyVideoArtifact(
             relative_path=relative_path.as_posix(),
             sha256=sha256,
             size_bytes=size_bytes,
-            max_edge=1280,
+            max_edge=self._proxy_max_edge,
             normalized_start_ms=0,
         )
 
@@ -442,6 +498,7 @@ class FFmpegTranscoder:
         final_path: Path,
         *,
         max_output_bytes: int | None = None,
+        timeout_seconds: int | None = None,
     ) -> tuple[int, str]:
         output_limit = (
             self._limits.max_output_bytes
@@ -464,7 +521,11 @@ class FFmpegTranscoder:
                     str(output_limit),
                     str(temporary),
                 ],
-                timeout_seconds=self._limits.timeout_seconds,
+                timeout_seconds=(
+                    self._limits.timeout_seconds
+                    if timeout_seconds is None
+                    else timeout_seconds
+                ),
                 output_paths=(temporary,),
             )
             if result.returncode != 0:
@@ -488,6 +549,8 @@ class FFmpegTranscoder:
         output_fd: int,
         format_name: str,
         pass_fds: tuple[int, ...],
+        *,
+        timeout_seconds: int | None = None,
     ) -> tuple[int, str]:
         result = self._runner.run(
             [
@@ -499,7 +562,11 @@ class FFmpegTranscoder:
                 format_name,
                 f"/dev/fd/{output_fd}",
             ],
-            timeout_seconds=self._limits.timeout_seconds,
+            timeout_seconds=(
+                self._limits.timeout_seconds
+                if timeout_seconds is None
+                else timeout_seconds
+            ),
             pass_fds=pass_fds,
         )
         if result.returncode != 0:
@@ -570,6 +637,11 @@ class FFmpegTranscoder:
         destination_parent.mkdir(parents=True, exist_ok=True)
         if self._available_bytes(destination_parent) < self._limits.required_free_bytes:
             raise VideoDemoError(ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT, "可用磁盘空间不足")
+
+    def _timeout_for(self, duration_ms: int | None) -> int:
+        if duration_ms is None:
+            return self._limits.timeout_seconds
+        return duration_aware_timeout_seconds(self._limits.timeout_seconds, duration_ms)
 
     @staticmethod
     def _disk_free_bytes(path: Path) -> int:

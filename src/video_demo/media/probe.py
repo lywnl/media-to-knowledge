@@ -41,6 +41,29 @@ class ProbeLimits:
     max_audio_streams: int = 16
     max_subtitle_streams: int = 32
 
+    def __post_init__(self) -> None:
+        if (
+            type(self.max_duration_ms) is not int
+            or not 1 <= self.max_duration_ms <= 7_200_000
+        ):
+            raise ValueError("视频时长上限必须位于 1~7200000 毫秒")
+        positive_integer_limits = (
+            self.max_width,
+            self.max_height,
+            self.max_video_streams,
+            self.max_audio_streams,
+            self.max_subtitle_streams,
+        )
+        if any(type(value) is not int or value < 1 for value in positive_integer_limits):
+            raise ValueError("Probe 数值上限必须是正整数")
+        if (
+            isinstance(self.max_frame_rate, bool)
+            or not isinstance(self.max_frame_rate, (int, float))
+            or not math.isfinite(self.max_frame_rate)
+            or self.max_frame_rate <= 0
+        ):
+            raise ValueError("Probe 帧率上限必须是有限正数")
+
 
 @dataclass(frozen=True, slots=True)
 class ProbeResult:

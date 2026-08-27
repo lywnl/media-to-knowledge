@@ -28,8 +28,13 @@ from pydantic import (
 from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.domain.run import ModelIdentity
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.evaluation.chapter_vlm_live import (
+    ChapterVlmCallReceipt,
+    VisualTextScoreFact,
+)
 from video_demo.evaluation.dataset import ValidationLanguage
 from video_demo.evaluation.report import GateStatus
+from video_demo.integrations.qwen_vl import QwenVisionProviderFailureReceipt
 
 if TYPE_CHECKING:
     from video_demo.config import Settings
@@ -51,11 +56,11 @@ ArtifactRole = Literal[
     "COMMAND_STDOUT",
     "COMMAND_STDERR",
 ]
-LiveCheckId = Literal[
-    "baidu_ocr_live",
-    "qwen_live",
+ActiveLiveCheckId = Literal[
+    "chapter_vlm_live",
     "five_language_models",
 ]
+LiveCheckId = ActiveLiveCheckId
 OfflineCheckId = Literal[
     "no_indexing",
     "ruff",
@@ -72,18 +77,17 @@ _MAX_JSON_NESTING = 64
 _MAX_COMMAND_JSON_FRAMES = _MAX_JSON_NESTING
 _RUNTIME_RELATIVE_ROOT = PurePosixPath(".codex/video-rag-demo")
 _REAL_MEDIA_INCOMPLETE_MARKER = ".real-media.incomplete"
-_ARTIFACT_DIR_FD_FUNCTIONS = frozenset(
-    (os.open, os.mkdir, os.stat, os.rename, os.unlink)
-)
+_ARTIFACT_DIR_FD_FUNCTIONS = frozenset((os.open, os.mkdir, os.stat, os.rename, os.unlink))
 _REAL_MEDIA_COMMIT_RECORD = ".real-media.commit.json"
 _LIVE_AUTHORITY_RELATIVE_ROOT = Path("eval/live-authority")
 _LIVE_EXECUTED_CHECKS = frozenset(
     {
-        "baidu_ocr_live",
-        "qwen_live",
+        "chapter_vlm_live",
         "five_language_models",
     }
 )
+_LIVE_AUTHORITY_CHECKS = _LIVE_EXECUTED_CHECKS
+_ALL_LIVE_CHECKS = _LIVE_AUTHORITY_CHECKS
 _MEDIA_ROLES = frozenset({"INPUT_MEDIA", "OUTPUT_MEDIA"})
 _TEXT_MACHINE_ROLES = frozenset(
     {
@@ -122,20 +126,12 @@ _SECRET_PATTERN = re.compile(
     r"[\"']?\s*[:=]\s*[\"']?\S+)"
 )
 _DATA_URL_PATTERN = re.compile(r"(?i)(?<![a-z0-9_])data:[^,\s]*,")
-_POSIX_ABSOLUTE_PATTERN = re.compile(
-    r"(?:^|(?<=[\s\"'=:(]))/(?!/)[^\s\"']+"
-)
-_WINDOWS_ABSOLUTE_PATTERN = re.compile(
-    r"(?i)(?:^|(?<=[\s\"'=:(]))[a-z]:[\\/]"
-)
-_UNC_ABSOLUTE_PATTERN = re.compile(
-    r"(?:^|(?<=[\s\"'=:(]))\\{2,}[^\\\s]+\\+[^\\\s]+"
-)
+_POSIX_ABSOLUTE_PATTERN = re.compile(r"(?:^|(?<=[\s\"'=:(]))/(?!/)[^\s\"']+")
+_WINDOWS_ABSOLUTE_PATTERN = re.compile(r"(?i)(?:^|(?<=[\s\"'=:(]))[a-z]:[\\/]")
+_UNC_ABSOLUTE_PATTERN = re.compile(r"(?:^|(?<=[\s\"'=:(]))\\{2,}[^\\\s]+\\+[^\\\s]+")
 _FILE_URI_PATTERN = re.compile(r"(?i)file://")
 _MYPY_DEV_NULL_ARGUMENT = "--cache-dir=/dev/null"
-_JSON_NUMBER_PATTERN = re.compile(
-    r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
-)
+_JSON_NUMBER_PATTERN = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 
 
 class EvidenceKind(StrEnum):
@@ -164,8 +160,7 @@ class PreflightReasonCode(StrEnum):
     SECRET_SCAN_INPUT_UNAVAILABLE = "SECRET_SCAN_INPUT_UNAVAILABLE"
     AUTHORIZED_DATASET_UNAVAILABLE = "AUTHORIZED_DATASET_UNAVAILABLE"
     REAL_MEDIA_CHAIN_UNAVAILABLE = "REAL_MEDIA_CHAIN_UNAVAILABLE"
-    BAIDU_OCR_CREDENTIALS_UNAVAILABLE = "BAIDU_OCR_CREDENTIALS_UNAVAILABLE"
-    QWEN_CREDENTIALS_UNAVAILABLE = "QWEN_CREDENTIALS_UNAVAILABLE"
+    CHAPTER_VLM_INPUT_UNAVAILABLE = "CHAPTER_VLM_INPUT_UNAVAILABLE"
     FIVE_LANGUAGE_MODELS_UNAVAILABLE = "FIVE_LANGUAGE_MODELS_UNAVAILABLE"
     M1_DURABILITY_INPUT_UNAVAILABLE = "M1_DURABILITY_INPUT_UNAVAILABLE"
 
@@ -179,8 +174,7 @@ _PREFLIGHT_REASON_CHECK: dict[PreflightReasonCode, str] = {
     PreflightReasonCode.SECRET_SCAN_INPUT_UNAVAILABLE: "secret_scan",
     PreflightReasonCode.AUTHORIZED_DATASET_UNAVAILABLE: "authorized_dataset",
     PreflightReasonCode.REAL_MEDIA_CHAIN_UNAVAILABLE: "real_media_chain",
-    PreflightReasonCode.BAIDU_OCR_CREDENTIALS_UNAVAILABLE: "baidu_ocr_live",
-    PreflightReasonCode.QWEN_CREDENTIALS_UNAVAILABLE: "qwen_live",
+    PreflightReasonCode.CHAPTER_VLM_INPUT_UNAVAILABLE: "chapter_vlm_live",
     PreflightReasonCode.FIVE_LANGUAGE_MODELS_UNAVAILABLE: "five_language_models",
     PreflightReasonCode.M1_DURABILITY_INPUT_UNAVAILABLE: "m1_durability",
 }
@@ -407,12 +401,21 @@ class _LiveCheckDetails(FrozenModel):
     authorization_sha256: Sha256
 
 
-class BaiduLiveDetails(_LiveCheckDetails):
-    type: Literal["BAIDU_LIVE"]
+class ChapterVlmLiveDetails(_LiveCheckDetails):
+    """章节多图 VLM live 报告的最小权威摘要。"""
 
-
-class QwenLiveDetails(_LiveCheckDetails):
-    type: Literal["QWEN_LIVE"]
+    type: Literal["CHAPTER_VLM"] = "CHAPTER_VLM"
+    status: Literal[GateStatus.PASS, GateStatus.FAIL]
+    parent_evaluation_run_id: StableId
+    evaluation_run_id: StableId
+    sample_id: StableId
+    manifest_sha256: Sha256 | None = None
+    model: ModelIdentity
+    operation: Literal["analyze_chapter"]
+    response_sha256: Sha256 | None = None
+    visual_text_score_fact_sha256: Sha256 | None = None
+    failure_code: ErrorCode | None = None
+    failure_receipt: QwenVisionProviderFailureReceipt | None = None
 
 
 class FiveLanguageModelsDetails(_LiveCheckDetails):
@@ -553,8 +556,7 @@ MachineEvidenceDetails = Annotated[
     | StaticAuditDetails
     | OfflineEvidenceDetails
     | LiveServiceDetails
-    | BaiduLiveDetails
-    | QwenLiveDetails
+    | ChapterVlmLiveDetails
     | FiveLanguageModelsDetails
     | RealMediaDetails
     | AuthorizedDatasetDetails
@@ -633,16 +635,13 @@ _REAL_MEDIA_PREFLIGHT_CODES: tuple[ErrorCode, ...] = (
     ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE,
 )
 _LIVE_PREFLIGHT_CODES: dict[str, tuple[ErrorCode, ...]] = {
-    "baidu_ocr_live": (
-        ErrorCode.BAIDU_API_KEY_UNAVAILABLE,
-        ErrorCode.BAIDU_SECRET_KEY_UNAVAILABLE,
-        ErrorCode.LIVE_AUTHORIZED_KEYFRAME_UNAVAILABLE,
-    ),
-    "qwen_live": (
-        ErrorCode.QWEN_ENDPOINT_UNAVAILABLE,
-        ErrorCode.QWEN_API_KEY_UNAVAILABLE,
-        ErrorCode.QWEN_MODEL_ID_UNAVAILABLE,
-        ErrorCode.LIVE_AUTHORIZED_CLIP_UNAVAILABLE,
+    "chapter_vlm_live": (
+        ErrorCode.INVALID_CONFIGURATION,
+        ErrorCode.VIDEO_FFMPEG_UNAVAILABLE,
+        ErrorCode.VIDEO_FFPROBE_UNAVAILABLE,
+        ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE,
+        ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT,
+        ErrorCode.LIVE_AUTHORIZED_CHAPTER_FRAMES_UNAVAILABLE,
     ),
     "five_language_models": (
         ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE,
@@ -666,11 +665,7 @@ _DURABILITY_PREFLIGHT_CODES: tuple[ErrorCode, ...] = (
     ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE,
     ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE,
     ErrorCode.SILERO_MODEL_UNAVAILABLE,
-    ErrorCode.QWEN_ENDPOINT_UNAVAILABLE,
-    ErrorCode.QWEN_API_KEY_UNAVAILABLE,
-    ErrorCode.QWEN_MODEL_ID_UNAVAILABLE,
-    ErrorCode.BAIDU_API_KEY_UNAVAILABLE,
-    ErrorCode.BAIDU_SECRET_KEY_UNAVAILABLE,
+    ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT,
 )
 _REAL_MEDIA_PHASES: tuple[str, ...] = (
     "generate",
@@ -696,24 +691,27 @@ class PreflightIssue(FrozenModel):
     code: ErrorCode
 
 
-LiveInputKind = Literal["SOURCE_MEDIA", "AUDIO", "KEYFRAME", "CLIP"]
+LiveInputKind = Literal[
+    "SOURCE_MEDIA",
+    "AUDIO",
+    "KEYFRAME",
+    "CLIP",
+    "FRAME_MANIFEST",
+    "CHAPTER_FRAME",
+]
 LiveComponent = Literal[
-    "baidu_ocr",
-    "qwen",
+    "chapter_vlm",
     "silero_vad",
     "cloud_whisper",
 ]
 LiveFailureComponent = Literal[
-    "baidu_ocr",
-    "qwen",
+    "chapter_vlm",
     "silero_vad",
     "cloud_whisper",
     "components_close",
 ]
 LiveOperation = Literal[
-    "recognize",
-    "capability_probe",
-    "understand_segment",
+    "analyze_chapter",
     "vad",
     "transcribe",
 ]
@@ -748,17 +746,11 @@ class LiveSample(FrozenModel):
     source_media_sha256: Sha256
     audio_relative_path: str = Field(min_length=1, max_length=1024)
     audio_sha256: Sha256
-    keyframe_relative_path: str = Field(min_length=1, max_length=1024)
-    keyframe_sha256: Sha256
-    clip_relative_path: str = Field(min_length=1, max_length=1024)
-    clip_sha256: Sha256
     annotation_sha256: Sha256
 
     @field_validator(
         "source_media_relative_path",
         "audio_relative_path",
-        "keyframe_relative_path",
-        "clip_relative_path",
     )
     @classmethod
     def validate_runtime_paths(cls, value: str) -> str:
@@ -771,8 +763,6 @@ class LiveSample(FrozenModel):
         paths = (
             self.source_media_relative_path,
             self.audio_relative_path,
-            self.keyframe_relative_path,
-            self.clip_relative_path,
         )
         if len(paths) != len(set(paths)):
             raise ValueError("live 样本源媒体和派生产物路径不得重复")
@@ -780,25 +770,21 @@ class LiveSample(FrozenModel):
 
 
 _COMPONENT_OPERATION: dict[str, tuple[str, ...]] = {
-    "baidu_ocr": ("recognize",),
-    "qwen": ("capability_probe", "understand_segment"),
+    "chapter_vlm": ("analyze_chapter",),
     "silero_vad": ("vad",),
     "cloud_whisper": ("transcribe",),
 }
 _COMPONENT_INPUT_KIND: dict[str, str] = {
-    "baidu_ocr": "KEYFRAME",
-    "qwen": "CLIP",
+    "chapter_vlm": "CHAPTER_FRAME",
     "silero_vad": "AUDIO",
     "cloud_whisper": "AUDIO",
 }
 _COMPONENT_PROVIDER: dict[str, str] = {
-    "baidu_ocr": "baidu_ocr",
-    "qwen": "qwen",
+    "chapter_vlm": "qwen",
     "silero_vad": "local",
     "cloud_whisper": "openai_compatible",
 }
 _FIXED_MODEL_IDS: dict[str, str] = {
-    "baidu_ocr": "accurate_basic",
     "silero_vad": "silero-vad",
 }
 _QWEN_MODEL_ID_PATTERN = re.compile(
@@ -806,8 +792,10 @@ _QWEN_MODEL_ID_PATTERN = re.compile(
     r"(?:-[0-9]{4}-[0-9]{2}-[0-9]{2})?\Z",
 )
 _MODEL_REVISION_PATTERN = re.compile(
-    r"(?:[0-9a-f]{7,64}|v?[0-9]+(?:\.[0-9]+){1,3})\Z",
+    r"(?:[0-9a-f]{7,64}|v?[0-9]+(?:\.[0-9]+){1,3}|NOT_INSTALLED)\Z",
 )
+
+
 class ModelExecutionFact(FrozenModel):
     model_config = ConfigDict(revalidate_instances="always")
 
@@ -826,7 +814,7 @@ class ModelExecutionFact(FrozenModel):
 
     @model_validator(mode="after")
     def bind_component_facts(self) -> ModelExecutionFact:
-        service_component = self.component in {"baidu_ocr", "qwen"}
+        service_component = self.component in {"chapter_vlm", "cloud_whisper"}
         if (
             self.model.component != self.component
             or self.operation not in _COMPONENT_OPERATION[self.component]
@@ -837,21 +825,13 @@ class ModelExecutionFact(FrozenModel):
             raise ValueError("远程服务执行事实必须绑定 request ID 摘要")
         if service_component != (self.http_status is not None):
             raise ValueError("远程服务执行事实必须绑定 HTTP 状态")
-        if service_component and (
-            self.http_status is None or not 200 <= self.http_status < 300
-        ):
+        if service_component and (self.http_status is None or not 200 <= self.http_status < 300):
             raise ValueError("远程服务执行事实只能表示成功的 2xx 阶段")
         self._validate_model_identity()
         if self.component == "cloud_whisper" and self.language is None:
             raise ValueError("五语模型执行事实必须声明语言")
-        if self.component != "qwen" and self.capabilities:
-            raise ValueError("仅 Qwen 能力探测可声明能力事实")
-        if self.component == "qwen" and self.operation != "capability_probe" and self.capabilities:
-            raise ValueError("仅 Qwen 能力探测可声明能力事实")
-        if self.component == "qwen" and self.operation == "capability_probe" and set(
-            self.capabilities
-        ) != {"video_input", "strict_json_schema"}:
-            raise ValueError("Qwen 能力探测事实必须完整证明视频输入与严格 Schema")
+        if self.capabilities:
+            raise ValueError("活动 live 执行事实不得声明已退役的能力探测")
         if len(self.capabilities) != len(set(self.capabilities)):
             raise ValueError("模型能力事实不得重复")
         _validate_persisted_value(self.model_dump(mode="python"))
@@ -868,11 +848,13 @@ class ModelExecutionFact(FrozenModel):
             valid_model = self.model.model_id == _FIXED_MODEL_IDS[self.component]
         elif self.component == "cloud_whisper":
             valid_model = bool(self.model.model_id.strip())
-        else:
+        elif self.component == "chapter_vlm":
             valid_model = bool(_QWEN_MODEL_ID_PATTERN.fullmatch(self.model.model_id))
+        else:
+            valid_model = False
         if not valid_model:
             raise ValueError("模型 ID 与 live 组件不匹配")
-        if self.component in {"baidu_ocr", "qwen", "cloud_whisper"}:
+        if self.component in {"chapter_vlm", "cloud_whisper"}:
             if self.model.device is not None or self.model.revision is not None:
                 raise ValueError("远程服务模型身份不得声明本地设备或推测 revision")
         elif self.model.device not in {"cpu", "mps"}:
@@ -959,26 +941,21 @@ class _LiveRawReport(FrozenModel):
         )
         if len(identities) != len(set(identities)):
             raise ValueError("真实服务执行事实不得重复")
-        if any(
-            fact.evaluation_run_id != self.evaluation_run_id
-            for fact in self.executions
-        ):
+        if any(fact.evaluation_run_id != self.evaluation_run_id for fact in self.executions):
             raise ValueError("真实服务执行事实必须绑定当前评测 run")
         _validate_persisted_value(self.model_dump(mode="python"))
         return self
 
     def _validate_sample_inputs(self, samples: tuple[LiveSample, ...]) -> None:
-        expected_count = len(samples) * 4
+        expected_count = len(samples) * 2
         if len(self.inputs) != expected_count:
-            raise ValueError("live raw 必须为每个样本绑定四类精确输入")
+            raise ValueError("live raw 必须为每个样本绑定源媒体和音频输入")
         expected_by_identity = {
             (sample.sample_id, kind): expected
             for sample in samples
             for kind, expected in _expected_live_inputs(sample).items()
         }
-        actual_by_identity = {
-            (item.sample_id, item.kind): item for item in self.inputs
-        }
+        actual_by_identity = {(item.sample_id, item.kind): item for item in self.inputs}
         if (
             len(actual_by_identity) != expected_count
             or set(actual_by_identity) != set(expected_by_identity)
@@ -995,9 +972,7 @@ class _LiveRawReport(FrozenModel):
             raise ValueError("live 输入未与样本路径、摘要和源媒体摘要精确绑定")
         input_paths = tuple(item.relative_path for item in self.inputs)
         kind_digests = tuple((item.kind, item.sha256) for item in self.inputs)
-        if len(input_paths) != len(set(input_paths)) or len(kind_digests) != len(
-            set(kind_digests)
-        ):
+        if len(input_paths) != len(set(input_paths)) or len(kind_digests) != len(set(kind_digests)):
             raise ValueError("同一 live 输入不得跨样本复用")
 
 
@@ -1008,8 +983,6 @@ def _expected_live_inputs(sample: LiveSample) -> dict[LiveInputKind, tuple[str, 
             sample.source_media_sha256,
         ),
         "AUDIO": (sample.audio_relative_path, sample.audio_sha256),
-        "KEYFRAME": (sample.keyframe_relative_path, sample.keyframe_sha256),
-        "CLIP": (sample.clip_relative_path, sample.clip_sha256),
     }
     return {
         kind: (relative_path, sha256, sample.source_media_sha256)
@@ -1017,100 +990,179 @@ def _expected_live_inputs(sample: LiveSample) -> dict[LiveInputKind, tuple[str, 
     }
 
 
-class BaiduLiveRawReport(_LiveRawReport):
-    check_id: Literal["baidu_ocr_live"]
-    sample: LiveSample
+class ChapterVlmLiveRawReport(FrozenModel):
+    """章节多图 VLM 的活动 live 报告。"""
+
+    schema_version: Literal["1.0.0"]
+    check_id: Literal["chapter_vlm_live"]
+    status: Literal[GateStatus.PASS, GateStatus.FAIL]
+    execution_started: StrictBool
+    parent_evaluation_run_id: StableId
+    evaluation_run_id: StableId
+    sample_id: StableId
+    annotation_sha256: Sha256
+    source_media_input: LiveInputArtifact
+    frame_manifest_input: LiveInputArtifact | None = None
+    chapter_frames: tuple[LiveInputArtifact, ...] = Field(default=(), max_length=4)
+    model: ModelIdentity
+    operation: Literal["analyze_chapter"]
+    settings_fingerprint: Sha256
+    implementation_sha256: Sha256
+    call_receipt: ChapterVlmCallReceipt | None = None
+    response_sha256: Sha256 | None = None
+    visual_text_score_fact: VisualTextScoreFact | None = None
+    failure_receipt: QwenVisionProviderFailureReceipt | None = None
+    failure_code: ErrorCode | None = None
+    failure_component: Literal["chapter_vlm", "components_close"] | None = None
 
     @model_validator(mode="after")
-    def validate_baidu_execution(self) -> BaiduLiveRawReport:
-        self._validate_sample_inputs((self.sample,))
-        if self.status == GateStatus.FAIL:
-            if self.failure_component == "components_close":
-                if len(self.executions) != 1:
-                    raise ValueError("百度组件关闭失败前执行事实不完整")
-            elif self.failure_component != "baidu_ocr":
-                raise ValueError("百度真实失败组件身份不匹配")
-        if any(
-            fact.component != "baidu_ocr"
-            or fact.sample_id != self.sample.sample_id
-            or fact.language != self.sample.language
-            or fact.input_sha256 != self.sample.keyframe_sha256
-            for fact in self.executions
-        ):
-            raise ValueError("百度执行事实与当前授权样本不匹配")
-        if self.status == GateStatus.PASS and (
-            len(self.executions) != 1
-            or (fact := self.executions[0]).component != "baidu_ocr"
-            or fact.operation != "recognize"
-            or fact.sample_id != self.sample.sample_id
-            or fact.language != self.sample.language
-            or fact.input_sha256 != self.sample.keyframe_sha256
-            or fact.http_status is None
-            or not 200 <= fact.http_status < 300
-        ):
-            raise ValueError("百度真实执行事实不完整")
-        return self
-
-
-class QwenLiveRawReport(_LiveRawReport):
-    check_id: Literal["qwen_live"]
-    sample: LiveSample
-
-    @model_validator(mode="after")
-    def validate_qwen_execution(self) -> QwenLiveRawReport:
-        self._validate_sample_inputs((self.sample,))
-        operations = tuple(fact.operation for fact in self.executions)
-        expected_operations = ("capability_probe", "understand_segment")
-        if self.status == GateStatus.FAIL:
-            if self.failure_component == "components_close":
-                if operations != expected_operations:
-                    raise ValueError("Qwen 组件关闭失败前执行事实不完整")
-            elif self.failure_component != "qwen":
-                raise ValueError("Qwen 真实失败组件身份不匹配")
+    def validate_chapter_execution(self) -> ChapterVlmLiveRawReport:
+        if not self.execution_started:
+            raise ValueError("章节 VLM raw 只能在执行开始后形成")
+        if self.model.component != "chapter_vlm":
+            raise ValueError("章节 VLM live 模型身份必须是 chapter_vlm")
+        if self.source_media_input.kind != "SOURCE_MEDIA":
+            raise ValueError("章节 VLM live 必须绑定 SOURCE_MEDIA")
+        if self.source_media_input.sample_id != self.sample_id:
+            raise ValueError("章节 VLM 源媒体样本绑定不一致")
+        if self.source_media_input.sha256 != self.source_media_input.source_media_sha256:
+            raise ValueError("章节 VLM SOURCE_MEDIA 摘要绑定不一致")
         if (
-            operations != expected_operations[: len(operations)]
-            or any(
-                fact.component != "qwen"
-                or fact.sample_id != self.sample.sample_id
-                or fact.language != self.sample.language
-                or fact.input_sha256 != self.sample.clip_sha256
-                for fact in self.executions
-            )
+            self.frame_manifest_input is not None
+            and self.frame_manifest_input.kind != "FRAME_MANIFEST"
         ):
-            raise ValueError("Qwen 执行事实与当前授权 clip 或阶段顺序不匹配")
+            raise ValueError("章节 VLM Manifest 输入类型非法")
         if any(
-            fact.http_status is None or not 200 <= fact.http_status < 300
-            for fact in self.executions
+            frame.kind != "CHAPTER_FRAME"
+            or frame.sample_id != self.sample_id
+            or frame.source_media_sha256 != self.source_media_input.sha256
+            for frame in self.chapter_frames
         ):
-            raise ValueError("Qwen 阶段事实必须绑定 2xx 成功 HTTP 状态")
-        if self.executions and (
-            set(self.executions[0].capabilities)
-            != {"video_input", "strict_json_schema"}
+            raise ValueError("章节 VLM 帧输入类型或样本绑定非法")
+        if self.frame_manifest_input is not None and (
+            self.frame_manifest_input.sample_id != self.sample_id
+            or self.frame_manifest_input.source_media_sha256
+            != self.source_media_input.sha256
         ):
-            raise ValueError("Qwen 能力探测事实必须完整证明视频输入与严格 Schema")
-        if self.status == GateStatus.PASS:
-            if operations != expected_operations:
-                raise ValueError("Qwen 必须先能力探测再执行 segment Schema")
-            if any(
-                fact.component != "qwen"
-                or fact.sample_id != self.sample.sample_id
-                or fact.language != self.sample.language
-                or fact.input_sha256 != self.sample.clip_sha256
-                or fact.http_status is None
-                or not 200 <= fact.http_status < 300
-                for fact in self.executions
-            ):
-                raise ValueError("Qwen 真实执行事实与授权 clip 不匹配")
-            probe, segment = self.executions
-            if segment.capabilities or probe.model != segment.model:
-                raise ValueError("Qwen 能力探测与 segment 事实不匹配")
-        elif len(self.executions) == 2:
-            probe, segment = self.executions
+            raise ValueError("章节 VLM Manifest 样本或源媒体绑定非法")
+        if len({frame.relative_path for frame in self.chapter_frames}) != len(self.chapter_frames):
+            raise ValueError("章节 VLM 帧路径不得重复")
+        if len({frame.sha256 for frame in self.chapter_frames}) != len(self.chapter_frames):
+            raise ValueError("章节 VLM 帧摘要不得重复")
+        if self.frame_manifest_input is None:
+            # Manifest 尚未形成时，执行尚未进入正式多图调用边界；只能保留
+            # 已确认的源媒体摘要和失败信息，不能伪造任何响应或评分事实。
             if (
-                segment.capabilities or probe.model != segment.model
+                self.chapter_frames
+                or self.call_receipt is not None
+                or self.response_sha256 is not None
+                or self.visual_text_score_fact is not None
+                or self.failure_receipt is not None
             ):
-                raise ValueError("Qwen FAIL 的 segment 前必须已有完整能力探测事实")
+                raise ValueError("没有章节 Manifest 时不得保存响应、回执或评分事实")
+        elif len(self.chapter_frames) not in {2, 3, 4}:
+            raise ValueError("已有章节 Manifest 时必须绑定 2~4 张 CHAPTER_FRAME")
+        if self.call_receipt is None and self.response_sha256 is not None:
+            raise ValueError("响应摘要必须绑定章节调用回执")
+        if self.call_receipt is not None:
+            if self.response_sha256 is None:
+                raise ValueError("章节调用回执必须绑定响应摘要")
+            if self.frame_manifest_input is None:
+                raise ValueError("章节调用回执必须绑定已形成的 Manifest")
+            if (
+                self.call_receipt.parent_evaluation_run_id != self.parent_evaluation_run_id
+                or self.call_receipt.evaluation_run_id != self.evaluation_run_id
+                or self.call_receipt.sample_id != self.sample_id
+                or self.call_receipt.manifest_sha256 != self.frame_manifest_input.sha256
+                or self.call_receipt.response_sha256 != self.response_sha256
+            ):
+                raise ValueError("章节调用回执与 raw 输入闭包不一致")
+        if self.visual_text_score_fact is not None:
+            if self.call_receipt is None or self.response_sha256 is None:
+                raise ValueError("评分事实必须绑定成功的章节响应")
+            if self.frame_manifest_input is None:
+                raise ValueError("评分事实必须绑定已形成的 Manifest")
+            score = self.visual_text_score_fact
+            if (
+                score.parent_evaluation_run_id != self.parent_evaluation_run_id
+                or score.evaluation_run_id != self.evaluation_run_id
+                or score.sample_id != self.sample_id
+                or score.manifest_sha256 != self.frame_manifest_input.sha256
+                or score.response_sha256 != self.response_sha256
+            ):
+                raise ValueError("评分事实与章节响应闭包不一致")
+        if self.failure_receipt is not None and (
+            self.call_receipt is not None
+            or self.response_sha256 is not None
+            or self.visual_text_score_fact is not None
+        ):
+            raise ValueError("供应商失败回执不得与成功领域响应同时存在")
+        if self.status == GateStatus.PASS:
+            if (
+                self.frame_manifest_input is None
+                or len(self.chapter_frames) not in {2, 3, 4}
+                or self.call_receipt is None
+                or self.response_sha256 is None
+                or self.visual_text_score_fact is None
+                or self.failure_receipt is not None
+                or self.failure_code is not None
+                or self.failure_component is not None
+            ):
+                raise ValueError("章节 VLM PASS 必须绑定完整多图调用和评分事实")
+            if (
+                self.call_receipt is None
+                or _object_field(self.call_receipt, "logical_analysis_count") != 1
+            ):
+                raise ValueError("章节 VLM PASS 必须恰好执行一次多图逻辑调用")
+            assert self.call_receipt is not None
+            assert self.frame_manifest_input is not None
+            assert self.visual_text_score_fact is not None
+            if (
+                self.call_receipt.parent_evaluation_run_id
+                != self.parent_evaluation_run_id
+                or self.call_receipt.evaluation_run_id != self.evaluation_run_id
+                or self.call_receipt.sample_id != self.sample_id
+                or self.call_receipt.manifest_sha256
+                != self.frame_manifest_input.sha256
+                or self.call_receipt.response_sha256 != self.response_sha256
+            ):
+                raise ValueError("章节 VLM 调用回执未与输入闭包精确绑定")
+            score = self.visual_text_score_fact
+            if (
+                score.parent_evaluation_run_id != self.parent_evaluation_run_id
+                or score.evaluation_run_id != self.evaluation_run_id
+                or score.sample_id != self.sample_id
+                or score.manifest_sha256 != self.frame_manifest_input.sha256
+                or score.response_sha256 != self.response_sha256
+            ):
+                raise ValueError("章节 VLM 评分事实未与调用响应精确绑定")
+        else:
+            if self.failure_code is None or self.failure_component not in {
+                "chapter_vlm",
+                "components_close",
+            }:
+                raise ValueError("章节 VLM FAIL 必须声明稳定失败组件和错误码")
+            if (
+                self.failure_component == "components_close"
+                and self.failure_code != ErrorCode.SYSTEM_FAILURE
+            ):
+                raise ValueError("章节 VLM 组件关闭失败只能使用 SYSTEM_FAILURE")
+            if (
+                self.failure_component == "chapter_vlm"
+                and self.failure_code
+                in {
+                    ErrorCode.QWEN_RESPONSE_INVALID,
+                    ErrorCode.VISUAL_RESULT_INVALID,
+                }
+                and self.response_sha256 is None
+            ):
+                raise ValueError("已形成视觉响应的失败必须绑定响应摘要")
         return self
+
+def _object_field(value: object, name: str) -> object | None:
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
 
 
 class FiveLanguageModelsRawReport(_LiveRawReport):
@@ -1135,9 +1187,7 @@ class FiveLanguageModelsRawReport(_LiveRawReport):
         ):
             raise ValueError("语音模型执行事实未绑定完整五语授权音频")
         cloud_languages = {
-            fact.language
-            for fact in self.executions
-            if fact.component == "cloud_whisper"
+            fact.language for fact in self.executions if fact.component == "cloud_whisper"
         }
         complete_execution = (
             len(self.executions) == 6
@@ -1307,18 +1357,21 @@ class RealMediaSample(FrozenModel):
         if self.execution_status == "NOT_STARTED":
             if self.failure_code is not None or self.files or self.commands:
                 raise ValueError("未启动媒体样本不得携带执行产物或失败码")
-            if any(
-                value is not None
-                for value in (
-                    self.duration_ms,
-                    self.has_audio,
-                    self.rotation_degrees,
-                    self.is_variable_frame_rate,
-                    self.opencv_decoded_frame_count,
-                    self.scene_count,
-                    self.selected_keyframe_count,
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        self.duration_ms,
+                        self.has_audio,
+                        self.rotation_degrees,
+                        self.is_variable_frame_rate,
+                        self.opencv_decoded_frame_count,
+                        self.scene_count,
+                        self.selected_keyframe_count,
+                    )
                 )
-            ) or self.warnings:
+                or self.warnings
+            ):
                 raise ValueError("未启动媒体样本不得携带 probe 或视觉事实")
         return self
 
@@ -1383,8 +1436,7 @@ class RealMediaRawReport(FrozenModel):
             and commands[-1].exit_code != 0
         )
         sample_finalization_failure = bool(
-            phases == _REAL_MEDIA_PHASES
-            and all(command.exit_code == 0 for command in commands)
+            phases == _REAL_MEDIA_PHASES and all(command.exit_code == 0 for command in commands)
         )
         if not phase_failure and not sample_finalization_failure:
             raise ValueError("失败媒体样本命令必须表达阶段失败或完整样本汇总失败")
@@ -1416,10 +1468,9 @@ class RealMediaRawReport(FrozenModel):
             raise ValueError("版本探测失败必须以固定 setup 前缀结束于非零退出")
         self._validate_setup_output_paths()
         successful_phases = phases[:-1]
-        if (
-            ("ffmpeg_version" in successful_phases) != (self.ffmpeg_version is not None)
-            or ("ffprobe_version" in successful_phases) != (self.ffprobe_version is not None)
-        ):
+        if ("ffmpeg_version" in successful_phases) != (self.ffmpeg_version is not None) or (
+            "ffprobe_version" in successful_phases
+        ) != (self.ffprobe_version is not None):
             raise ValueError("版本探测失败的版本字段必须精确表达已成功阶段")
 
     def _validate_setup_output_paths(self) -> None:
@@ -1434,13 +1485,8 @@ class RealMediaRawReport(FrozenModel):
         if len(paths) != len(set(paths)):
             raise ValueError("版本探测命令输出不得跨命令复用")
 
-    def _validate_sample_files(
-        self, sample: RealMediaSample, seen_paths: set[str]
-    ) -> None:
-        prefix = (
-            f".codex/video-rag-demo/eval/generated/{self.evaluation_run_id}/"
-            f"{sample.case_id}/"
-        )
+    def _validate_sample_files(self, sample: RealMediaSample, seen_paths: set[str]) -> None:
+        prefix = f".codex/video-rag-demo/eval/generated/{self.evaluation_run_id}/{sample.case_id}/"
         for media_file in sample.files:
             if not media_file.relative_path.startswith(prefix):
                 raise ValueError("真实媒体文件必须绑定当前评测运行与 case 目录")
@@ -1450,12 +1496,9 @@ class RealMediaRawReport(FrozenModel):
         for command in sample.commands:
             if _REAL_MEDIA_PHASE_EXECUTABLES.get(command.phase) != command.executable:
                 raise ValueError("真实媒体阶段与执行器不匹配")
-            explicit_paths = set(command.input_relative_paths) | set(
-                command.output_relative_paths
-            )
+            explicit_paths = set(command.input_relative_paths) | set(command.output_relative_paths)
             if any(
-                f"{_RUNTIME_RELATIVE_ROOT}/" in argument
-                and argument not in explicit_paths
+                f"{_RUNTIME_RELATIVE_ROOT}/" in argument and argument not in explicit_paths
                 for argument in command.arguments
             ):
                 raise ValueError("真实媒体路径参数必须显式声明输入或输出归属")
@@ -1469,9 +1512,7 @@ class RealMediaRawReport(FrozenModel):
                     media_file.relative_path for media_file in sample.files
                 }:
                     raise ValueError("成功媒体命令路径必须精确绑定样本文件")
-            report_prefix = (
-                f".codex/video-rag-demo/eval/reports/{self.evaluation_run_id}/"
-            )
+            report_prefix = f".codex/video-rag-demo/eval/reports/{self.evaluation_run_id}/"
             if not (
                 command.stdout_relative_path.startswith(report_prefix)
                 and command.stderr_relative_path.startswith(report_prefix)
@@ -1482,8 +1523,7 @@ class RealMediaRawReport(FrozenModel):
     def _validate_successful_sample(sample: RealMediaSample) -> None:
         if (
             not sample.files
-            or tuple(command.phase for command in sample.commands)
-            != _REAL_MEDIA_PHASES
+            or tuple(command.phase for command in sample.commands) != _REAL_MEDIA_PHASES
             or any(command.exit_code != 0 for command in sample.commands)
         ):
             raise ValueError("成功媒体样本必须包含成功文件与命令事实")
@@ -1510,9 +1550,11 @@ class RealMediaRawReport(FrozenModel):
         expected_roles = {"SOURCE", "PROXY", "KEYFRAME"}
         if sample.case_id != "no_audio":
             expected_roles.add("AUDIO")
-        if set(files_by_role) != expected_roles or any(
-            len(files_by_role[role]) != 1 for role in expected_roles if role != "KEYFRAME"
-        ) or len(files_by_role["KEYFRAME"]) != sample.selected_keyframe_count:
+        if (
+            set(files_by_role) != expected_roles
+            or any(len(files_by_role[role]) != 1 for role in expected_roles if role != "KEYFRAME")
+            or len(files_by_role["KEYFRAME"]) != sample.selected_keyframe_count
+        ):
             raise ValueError("成功媒体样本文件角色与数量不符合 case 语义")
         expected_formats = {"SOURCE": "MP4", "PROXY": "MP4", "KEYFRAME": "JPEG"}
         if "AUDIO" in expected_roles:
@@ -1759,10 +1801,9 @@ class ReportRunWriter:
             if not isinstance(payload, bytes):
                 raise ValueError("机器证据产物必须是 bytes")
             effective_limit = _artifact_limit(role, max_bytes)
-            if (
-                (not payload and role not in {"COMMAND_STDOUT", "COMMAND_STDERR"})
-                or len(payload) > effective_limit
-            ):
+            if (not payload and role not in {"COMMAND_STDOUT", "COMMAND_STDERR"}) or len(
+                payload
+            ) > effective_limit:
                 raise ValueError("机器证据产物超过大小上限或为空")
             _validate_artifact_content(role, payload)
             _write_run_payload(descriptor, filename, payload)
@@ -1925,10 +1966,9 @@ class LiveReportRunWriter:
             if not isinstance(payload, bytes):
                 raise ValueError("机器证据产物必须是 bytes")
             effective_limit = _artifact_limit(role, max_bytes)
-            if (
-                (not payload and role not in {"COMMAND_STDOUT", "COMMAND_STDERR"})
-                or len(payload) > effective_limit
-            ):
+            if (not payload and role not in {"COMMAND_STDOUT", "COMMAND_STDERR"}) or len(
+                payload
+            ) > effective_limit:
                 raise ValueError("机器证据产物超过大小上限或为空")
             _validate_artifact_content(role, payload)
             _write_exclusive_payload(descriptor, filename, payload)
@@ -2065,16 +2105,12 @@ class LiveReportRunWriter:
             schema_version="1.0.0",
             check_id=_require_live_check_id(report.check_id),
             evaluation_run_id=self.evaluation_run_id,
-            machine_report_path=report_snapshot.path.relative_to(
-                self.workspace_root
-            ).as_posix(),
+            machine_report_path=report_snapshot.path.relative_to(self.workspace_root).as_posix(),
             machine_report_sha256=report_snapshot.sha256,
             raw_report_sha256=details.raw_report_sha256,
             settings_fingerprint=details.settings_fingerprint,
             implementation_sha256=details.implementation_sha256,
-            machine_report_identity_sha256=_identity_sha256(
-                report_snapshot.identity
-            ),
+            machine_report_identity_sha256=_identity_sha256(report_snapshot.identity),
             report_run_directory_identity_sha256=_identity_sha256(
                 _identity(os.fstat(self._require_open()))
             ),
@@ -2088,15 +2124,11 @@ class LiveReportRunWriter:
 class EvidenceStore:
     def __init__(self, workspace_root: Path, runtime_root: Path) -> None:
         try:
-            self.workspace_root, self.runtime_root = _trusted_roots(
-                workspace_root, runtime_root
-            )
+            self.workspace_root, self.runtime_root = _trusted_roots(workspace_root, runtime_root)
         except (OSError, ValueError):
             raise ValueError("机器证据可信根非法") from None
 
-    def write_json(
-        self, relative_path: Path, model: FrozenModel
-    ) -> EvidenceReference:
+    def write_json(self, relative_path: Path, model: FrozenModel) -> EvidenceReference:
         try:
             if not isinstance(model, MachineEvidenceReport):
                 raise ValueError("仅机器报告可生成权威证据引用")
@@ -2178,9 +2210,7 @@ class EvidenceStore:
             raw_report_sha256=details.raw_report_sha256,
             settings_fingerprint=details.settings_fingerprint,
             implementation_sha256=details.implementation_sha256,
-            machine_report_identity_sha256=_identity_sha256(
-                report_snapshot.identity
-            ),
+            machine_report_identity_sha256=_identity_sha256(report_snapshot.identity),
             report_run_directory_identity_sha256=_identity_sha256(run_identity),
             artifact_manifest_sha256=_artifact_manifest_sha256(report.artifacts),
         )
@@ -2318,10 +2348,9 @@ class EvidenceStore:
             if not isinstance(payload, bytes):
                 raise ValueError("机器证据产物必须是 bytes")
             effective_limit = _artifact_limit(role, max_bytes)
-            if (
-                (not payload and role not in {"COMMAND_STDOUT", "COMMAND_STDERR"})
-                or len(payload) > effective_limit
-            ):
+            if (not payload and role not in {"COMMAND_STDOUT", "COMMAND_STDERR"}) or len(
+                payload
+            ) > effective_limit:
                 raise ValueError("机器证据产物超过大小上限或为空")
             _validate_artifact_content(role, payload)
             published = _write_bound_artifact_payload(
@@ -2379,9 +2408,8 @@ class EvidenceStore:
 
 
 def _is_executed_live_machine_report(report: MachineEvidenceReport) -> bool:
-    return (
-        report.check_id in _LIVE_EXECUTED_CHECKS
-        and isinstance(report.details, _LiveCheckDetails)
+    return report.check_id in _ALL_LIVE_CHECKS and isinstance(
+        report.details, _LiveCheckDetails
     )
 
 
@@ -2409,15 +2437,14 @@ def _encode_machine_report(
 
 
 def _require_live_check_id(check_id: str) -> LiveCheckId:
-    if check_id not in _LIVE_EXECUTED_CHECKS:
+    if check_id not in _ALL_LIVE_CHECKS:
         raise ValueError("未知 live 检查")
     return cast(LiveCheckId, check_id)
 
 
-def _live_raw_type(check_id: str) -> type[_LiveRawReport]:
-    raw_types: dict[str, type[_LiveRawReport]] = {
-        "baidu_ocr_live": BaiduLiveRawReport,
-        "qwen_live": QwenLiveRawReport,
+def _live_raw_type(check_id: str) -> type[Any]:
+    raw_types: dict[str, type[Any]] = {
+        "chapter_vlm_live": ChapterVlmLiveRawReport,
         "five_language_models": FiveLanguageModelsRawReport,
     }
     try:
@@ -2446,8 +2473,7 @@ def _validate_live_publication_context(
     raw_references = tuple(
         artifact
         for artifact in report.artifacts
-        if artifact.role == "AUDIT_REPORT"
-        and artifact.sha256 == details.raw_report_sha256
+        if artifact.role == "AUDIT_REPORT" and artifact.sha256 == details.raw_report_sha256
     )
     if len(raw_references) != 1:
         raise ValueError("live authority 必须唯一绑定 raw report")
@@ -2491,15 +2517,14 @@ def _validate_live_publication_context_at(
     target: Path,
     workspace_root: Path,
     run_descriptor: int,
-) -> _LiveRawReport:
+) -> Any:
     details = report.details
     if not isinstance(details, _LiveCheckDetails):
         raise ValueError("live authority 缺少已执行 detail")
     report_relative = target.relative_to(workspace_root)
     if (
         len(report_relative.parts) != 6
-        or report_relative.parts[:4]
-        != (".codex", "video-rag-demo", "eval", "reports")
+        or report_relative.parts[:4] != (".codex", "video-rag-demo", "eval", "reports")
         or report_relative.name != f"{report.check_id}.json"
     ):
         raise ValueError("live machine report 必须位于固定 run 报告路径")
@@ -2507,8 +2532,7 @@ def _validate_live_publication_context_at(
     raw_references = tuple(
         artifact
         for artifact in report.artifacts
-        if artifact.role == "AUDIT_REPORT"
-        and artifact.sha256 == details.raw_report_sha256
+        if artifact.role == "AUDIT_REPORT" and artifact.sha256 == details.raw_report_sha256
     )
     if len(raw_references) != 1:
         raise ValueError("live authority 必须唯一绑定 raw report")
@@ -2695,6 +2719,8 @@ def build_verified_gate_check(
     workspace_root: Path,
     settings: Settings | None = None,
 ) -> GateCheck:
+    # 旧 live 报告在 11B 前仍需可离线重验；它们不会因为不在
+    # FINAL_GATE_CHECKS 而进入活动门禁，最终汇总会单独拒绝未知检查。
     return _build_verified_gate_check(
         check_id,
         report_path,
@@ -2750,11 +2776,7 @@ def _build_verified_gate_check(
         artifacts = verify_machine_artifacts(report, workspace_root=workspace_root)
         if check_id == "real_media_chain":
             _verify_real_media_report_boundary(report_snapshot.path, artifacts, workspace_root)
-        if check_id in {
-            "baidu_ocr_live",
-            "qwen_live",
-            "five_language_models",
-        }:
+        if check_id in _LIVE_AUTHORITY_CHECKS:
             _verify_live_report_boundary(report_snapshot.path, artifacts)
             if isinstance(report.details, _LiveCheckDetails):
                 live_authority = _load_live_authority_state(
@@ -2886,13 +2908,7 @@ def _load_live_authority_state(
     run_descriptor = _open_directory_descriptor(report_snapshot.path.parent)
     try:
         run_identity = _identity(os.fstat(run_descriptor))
-        journal_path = (
-            runtime
-            / "eval"
-            / "live-authority"
-            / run_id
-            / f"{report.check_id}.json"
-        )
+        journal_path = runtime / "eval" / "live-authority" / run_id / f"{report.check_id}.json"
         trusted_journal = _workspace_runtime_file(
             journal_path,
             workspace,
@@ -2915,12 +2931,9 @@ def _load_live_authority_state(
             or record.raw_report_sha256 != details.raw_report_sha256
             or record.settings_fingerprint != details.settings_fingerprint
             or record.implementation_sha256 != details.implementation_sha256
-            or record.machine_report_identity_sha256
-            != _identity_sha256(report_snapshot.identity)
-            or record.report_run_directory_identity_sha256
-            != _identity_sha256(run_identity)
-            or record.artifact_manifest_sha256
-            != _artifact_manifest_sha256(report.artifacts)
+            or record.machine_report_identity_sha256 != _identity_sha256(report_snapshot.identity)
+            or record.report_run_directory_identity_sha256 != _identity_sha256(run_identity)
+            or record.artifact_manifest_sha256 != _artifact_manifest_sha256(report.artifacts)
         ):
             raise ValueError("live authority journal 与报告发布事实不匹配")
         return _LiveAuthorityState(
@@ -2946,10 +2959,7 @@ def _assert_live_authority_current(
         current_identity = _identity(os.fstat(current_descriptor))
     finally:
         os.close(current_descriptor)
-    if (
-        held_identity != authority.run_identity
-        or current_identity != authority.run_identity
-    ):
+    if held_identity != authority.run_identity or current_identity != authority.run_identity:
         raise ValueError("live authority 验收期间报告 run 身份发生变化")
 
 
@@ -2959,9 +2969,7 @@ def _assert_staged_real_media_run(
 ) -> None:
     if (
         not _same_directory(staged.directory_identity, _identity(os.fstat(staged.descriptor)))
-        or _identity(
-            os.stat(_REAL_MEDIA_INCOMPLETE_MARKER, dir_fd=staged.descriptor)
-        )
+        or _identity(os.stat(_REAL_MEDIA_INCOMPLETE_MARKER, dir_fd=staged.descriptor))
         != staged.marker_identity
     ):
         raise ValueError("真实媒体 staged run 身份发生变化")
@@ -3034,9 +3042,7 @@ def verify_machine_artifacts(
     workspace_root: Path,
 ) -> dict[ArtifactRole, tuple[VerifiedArtifact, ...]]:
     try:
-        workspace, runtime = _trusted_roots(
-            workspace_root, workspace_root / _RUNTIME_RELATIVE_ROOT
-        )
+        workspace, runtime = _trusted_roots(workspace_root, workspace_root / _RUNTIME_RELATIVE_ROOT)
         grouped: dict[ArtifactRole, list[VerifiedArtifact]] = {}
         media_limit = (
             report.details.max_video_bytes
@@ -3044,12 +3050,8 @@ def verify_machine_artifacts(
             else _DEFAULT_MEDIA_BYTES
         )
         for artifact in report.artifacts:
-            path = _workspace_runtime_file(
-                Path(artifact.relative_path), workspace, runtime
-            )
-            default_limit = (
-                media_limit if artifact.role in _MEDIA_ROLES else _MAX_MACHINE_BYTES
-            )
+            path = _workspace_runtime_file(Path(artifact.relative_path), workspace, runtime)
+            default_limit = media_limit if artifact.role in _MEDIA_ROLES else _MAX_MACHINE_BYTES
             limit = artifact.max_bytes if artifact.max_bytes is not None else default_limit
             _artifact_limit(artifact.role, limit)
             snapshot = _read_file_snapshot(
@@ -3135,9 +3137,7 @@ def _prepare_runtime_target(runtime: Path, relative_path: Path) -> Path:
 
 def _reject_public_live_authority_write(relative_path: Path) -> None:
     relative_parts = tuple(part.casefold() for part in relative_path.parts)
-    reserved_parts = tuple(
-        part.casefold() for part in _LIVE_AUTHORITY_RELATIVE_ROOT.parts
-    )
+    reserved_parts = tuple(part.casefold() for part in _LIVE_AUTHORITY_RELATIVE_ROOT.parts)
     if relative_parts[: len(reserved_parts)] == reserved_parts:
         raise ValueError("live authority 只能通过独占发布器写入")
 
@@ -3255,9 +3255,7 @@ def _validate_workspace_relative(value: str) -> None:
 
 def _require_runtime_relative(value: str) -> None:
     path = PurePosixPath(value)
-    if path == _RUNTIME_RELATIVE_ROOT or not path.is_relative_to(
-        _RUNTIME_RELATIVE_ROOT
-    ):
+    if path == _RUNTIME_RELATIVE_ROOT or not path.is_relative_to(_RUNTIME_RELATIVE_ROOT):
         raise ValueError("机器证据必须位于固定运行根")
 
 
@@ -3746,16 +3744,14 @@ def _scan_command_candidate_branch(
         for lane_index, lane in enumerate(lanes):
             if not lane.active:
                 continue
-            matched, scalar_ends[lane_index], opened = (
-                _advance_candidate_lane_character(
-                    value,
-                    lane,
-                    decoder=decoder,
-                    character=character,
-                    index=index,
-                    end=end,
-                    scalar_end=scalar_ends[lane_index],
-                )
+            matched, scalar_ends[lane_index], opened = _advance_candidate_lane_character(
+                value,
+                lane,
+                decoder=decoder,
+                character=character,
+                index=index,
+                end=end,
+                scalar_end=scalar_ends[lane_index],
             )
             if matched:
                 return True
@@ -3843,13 +3839,9 @@ def _open_candidate_frame(
         lane.frames,
         depth=len(lane.expected_closers),
     )
-    accepted_by_parent = bool(
-        parent and _consume_candidate_container(parent)
-    )
+    accepted_by_parent = bool(parent and _consume_candidate_container(parent))
     lane.expected_closers.append(ord("]" if character == "[" else "}"))
-    kind: Literal["array", "object"] = (
-        "array" if character == "[" else "object"
-    )
+    kind: Literal["array", "object"] = "array" if character == "[" else "object"
     state = "value_or_end" if kind == "array" else "key_or_end"
     depth = len(lane.expected_closers)
     slot_index = (depth - 1) % _MAX_COMMAND_JSON_FRAMES
@@ -4127,8 +4119,7 @@ def _validate_persisted_value(value: Any) -> None:
 
 def _validate_persisted_string(value: str) -> None:
     if any(
-        unicodedata.category(character) == "Cc" and character not in "\t\n\r"
-        for character in value
+        unicodedata.category(character) == "Cc" and character not in "\t\n\r" for character in value
     ):
         raise ValueError("机器证据字符串包含非法控制字符")
     if _SECRET_PATTERN.search(value):

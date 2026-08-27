@@ -86,7 +86,25 @@
             <p>后端返回的摘要与分段理解内容。</p>
           </div>
         </div>
-        <div id="result-content"></div>
+        <div id="result-content" class="document-reader">
+          <div id="document-overview"></div>
+          <div id="document-key-points"></div>
+          <nav id="document-toc" aria-label="文档目录"></nav>
+          <p id="download-status" class="download-status" role="status"></p>
+          <div id="document-chapters"></div>
+        </div>
+      </section>
+
+      <section id="history-panel" class="panel" aria-labelledby="history-title">
+        <div class="section-heading">
+          <span class="step-number" aria-hidden="true">04</span>
+          <div>
+            <h2 id="history-title">历史记录</h2>
+            <p id="history-status" role="status">正在读取历史记录</p>
+          </div>
+          <button id="refresh-history" type="button">刷新</button>
+        </div>
+        <div id="history-list"></div>
       </section>
     </main>
     <script src="/static/app.js" defer></script>

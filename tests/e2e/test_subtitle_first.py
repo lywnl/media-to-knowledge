@@ -335,7 +335,14 @@ class _RecordingTranscoder:
         self.extract_subtitle_calls: list[int] = []
         self.extract_audio_calls: list[tuple[bool, int]] = []
 
-    def create_proxy(self, _source: Path, root: Path) -> ProxyVideoArtifact:
+    def create_proxy(
+        self,
+        _source: Path,
+        root: Path,
+        *,
+        duration_ms: int | None = None,
+    ) -> ProxyVideoArtifact:
+        assert duration_ms is not None
         relative = root / "media/proxy.mp4"
         output = self.runtime_root / relative
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -353,7 +360,10 @@ class _RecordingTranscoder:
         _source: Path,
         root: Path,
         stream: SubtitleStream,
+        *,
+        duration_ms: int | None = None,
     ) -> SubtitleArtifact:
+        assert duration_ms is not None
         self.extract_subtitle_calls.append(stream.index)
         payload = self.subtitle_payloads[stream.index].encode("utf-8")
         relative = root / "media/subtitles" / f"{stream.index}.vtt"

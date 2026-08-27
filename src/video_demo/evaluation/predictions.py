@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Self
 
 from pydantic import Field, TypeAdapter, ValidationError, field_validator, model_validator
 
+from video_demo.application.document_rendering import render_markdown
 from video_demo.domain.base import FrozenModel, Sha256, StableId, stable_identifier
-from video_demo.domain.evidence import EvidenceItem
+from video_demo.domain.evidence import DocumentEvidenceItem, KeyframeEvidence
 from video_demo.domain.result import VideoUnderstandingResult, validate_evidence_references
 from video_demo.domain.result_artifact import (
-    ARTIFACT_ENVELOPE_SCHEMA_VERSION,
-    ResultArtifactPayload,
+    DocumentArtifactPayload,
     TranscriptSource,
 )
 from video_demo.domain.run import ModelIdentity
@@ -25,8 +26,9 @@ from video_demo.evaluation.dataset import (
     _safe_root,
     _safe_runtime_root,
 )
+from video_demo.storage.artifacts import RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION
 
-_EVIDENCE_ADAPTER = TypeAdapter(tuple[EvidenceItem, ...])
+_EVIDENCE_ADAPTER = TypeAdapter(tuple[DocumentEvidenceItem, ...])
 _TERMINAL_SUCCESS = ("SUCCEEDED", "PARTIAL_SUCCEEDED")
 _TERMINAL_FAILURE = ("FAILED", "CANCELLED")
 
@@ -50,7 +52,7 @@ class PredictionRunSnapshot(FrozenModel):
 
 
 class EvaluationPrediction(FrozenModel):
-    schema_version: Literal["1.1.0"]
+    schema_version: Literal["1.2.0"]
     evaluation_run_id: StableId
     sample_id: StableId
     media_sha256: Sha256
@@ -63,6 +65,9 @@ class EvaluationPrediction(FrozenModel):
     result_sha256: Sha256 | None = None
     evidence_relative_path: str | None = Field(default=None, max_length=1024)
     evidence_sha256: Sha256 | None = None
+    document_relative_path: str | None = Field(default=None, max_length=1024)
+    document_sha256: Sha256 | None = None
+    document_size_bytes: int | None = Field(default=None, gt=0, le=16 * 1024 * 1024)
     artifact_manifest_relative_path: str | None = Field(default=None, max_length=1024)
     artifact_manifest_sha256: Sha256 | None = None
     failure_code: str | None = Field(default=None, min_length=3, max_length=128)
@@ -74,6 +79,7 @@ class EvaluationPrediction(FrozenModel):
         "run_relative_path",
         "result_relative_path",
         "evidence_relative_path",
+        "document_relative_path",
         "artifact_manifest_relative_path",
     )
     @classmethod
@@ -96,6 +102,9 @@ class EvaluationPrediction(FrozenModel):
             self.result_sha256,
             self.evidence_relative_path,
             self.evidence_sha256,
+            self.document_relative_path,
+            self.document_sha256,
+            self.document_size_bytes,
             self.artifact_manifest_relative_path,
             self.artifact_manifest_sha256,
         )
@@ -117,9 +126,11 @@ class EvaluationPrediction(FrozenModel):
 
 class PredictionClaim(FrozenModel):
     claim_id: StableId
-    source_kind: Literal["SEGMENT_SUMMARY", "VIDEO_SUMMARY"]
+    source_kind: Literal["CHAPTER_CLAIM"] = "CHAPTER_CLAIM"
     source_id: StableId
     text: str = Field(min_length=1)
+    evidence_refs: tuple[StableId, ...] = Field(min_length=1, max_length=32)
+    certainty: float = Field(ge=0, le=1)
 
 
 class VerifiedPrediction(FrozenModel):
@@ -127,7 +138,7 @@ class VerifiedPrediction(FrozenModel):
     index_sha256: Sha256
     run: PredictionRunSnapshot
     result: VideoUnderstandingResult | None
-    evidence: tuple[EvidenceItem, ...]
+    evidence: tuple[DocumentEvidenceItem, ...]
     claims: tuple[PredictionClaim, ...]
     artifact_manifest_sha256: Sha256 | None
     eval_root: Path = Field(exclude=True)
@@ -187,6 +198,8 @@ def load_verified_prediction(
             )
         assert index.result_relative_path is not None and index.result_sha256 is not None
         assert index.evidence_relative_path is not None and index.evidence_sha256 is not None
+        assert index.document_relative_path is not None and index.document_sha256 is not None
+        assert index.document_size_bytes is not None
         assert index.artifact_manifest_relative_path is not None
         assert index.artifact_manifest_sha256 is not None
         result_file = _safe_relative_file(
@@ -204,13 +217,34 @@ def load_verified_prediction(
         _require_digest(evidence_bytes, index.evidence_sha256)
         evidence = _parse_evidence_jsonl(evidence_bytes)
         validate_evidence_references(result, evidence)
+        document_file = _safe_relative_file(
+            safe_eval_root,
+            index.document_relative_path,
+            safe_runtime_root,
+        )
+        document_bytes = _read_json_file(document_file)
+        _require_digest(document_bytes, index.document_sha256)
+        if len(document_bytes) != index.document_size_bytes:
+            raise ValueError("Markdown 大小与预测索引不一致")
+        rendered = render_markdown(result, evidence)
+        if rendered.content != document_bytes:
+            raise ValueError("Markdown 不是结构化结果的确定性渲染")
         _validate_manifest(
             safe_eval_root,
             safe_runtime_root,
             index,
             result=result,
             evidence=evidence,
+            document_bytes=document_bytes,
             run=run,
+        )
+        _validate_keyframe_closure(
+            _safe_relative_file(
+                safe_eval_root,
+                index.artifact_manifest_relative_path,
+                safe_runtime_root,
+            ).parent,
+            evidence,
         )
         return VerifiedPrediction(
             index=index,
@@ -299,7 +333,7 @@ def _require_digest(content: bytes, expected: str) -> None:
         raise ValueError("产物摘要不匹配")
 
 
-def _parse_evidence_jsonl(content: bytes) -> tuple[EvidenceItem, ...]:
+def _parse_evidence_jsonl(content: bytes) -> tuple[DocumentEvidenceItem, ...]:
     values = [json.loads(line) for line in content.decode("utf-8").splitlines() if line.strip()]
     if not values:
         raise ValueError("证据 JSONL 不能为空")
@@ -312,7 +346,8 @@ def _validate_manifest(
     index: EvaluationPrediction,
     *,
     result: VideoUnderstandingResult,
-    evidence: tuple[EvidenceItem, ...],
+    evidence: tuple[DocumentEvidenceItem, ...],
+    document_bytes: bytes,
     run: PredictionRunSnapshot,
 ) -> None:
     assert index.artifact_manifest_relative_path is not None
@@ -329,15 +364,20 @@ def _validate_manifest(
     }:
         raise ValueError("生产产物 Manifest envelope 非法")
     if (
-        envelope["schema_version"] != ARTIFACT_ENVELOPE_SCHEMA_VERSION
+        envelope["schema_version"] != RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION
         or envelope["upstream_sha256"] != index.media_sha256
     ):
         raise ValueError("生产产物 Manifest 上游绑定不匹配")
-    payload = ResultArtifactPayload.model_validate(envelope["payload"])
+    payload = DocumentArtifactPayload.model_validate(envelope["payload"])
     if payload.status != index.terminal_status:
         raise ValueError("生产产物 Manifest 状态不匹配")
     if payload.result != result or payload.evidence != evidence:
         raise ValueError("生产产物 Manifest 内容与导出产物不一致")
+    if (
+        payload.document_sha256 != hashlib.sha256(document_bytes).hexdigest()
+        or payload.document_size_bytes != len(document_bytes)
+    ):
+        raise ValueError("生产产物 Manifest 的 Markdown 绑定不匹配")
     if payload.warnings != run.warning_codes:
         raise ValueError("生产产物 Manifest 警告与运行快照不匹配")
     if payload.transcript_source != index.transcript_source:
@@ -345,23 +385,66 @@ def _validate_manifest(
 
 
 def _extract_claims(result: VideoUnderstandingResult) -> tuple[PredictionClaim, ...]:
-    claims: list[PredictionClaim] = []
-    for segment in result.segments:
-        claims.append(_claim("SEGMENT_SUMMARY", segment.segment_id, segment.summary_zh))
-    claims.append(_claim("VIDEO_SUMMARY", result.run_id, result.summary.summary_zh))
-    return tuple(claims)
+    return tuple(
+        _claim(chapter.chapter_id, index, claim)
+        for chapter in result.chapters
+        for index, claim in enumerate(chapter.claims)
+    )
 
 
 def _claim(
-    source_kind: Literal["SEGMENT_SUMMARY", "VIDEO_SUMMARY"],
-    source_id: str,
-    text: str,
+    chapter_id: str,
+    chapter_claim_index: int,
+    claim: object,
 ) -> PredictionClaim:
+    from video_demo.domain.document import GroundedClaim
+
+    if not isinstance(claim, GroundedClaim):
+        raise TypeError("章节 claim 类型非法")
+    identity = {
+        "source_kind": "CHAPTER_CLAIM",
+        "source_id": chapter_id,
+        "chapter_claim_index": chapter_claim_index,
+        "claim": claim.model_dump(mode="json"),
+    }
     return PredictionClaim(
-        claim_id=stable_identifier(
-            "claim", {"source_kind": source_kind, "source_id": source_id, "text": text}
-        ),
-        source_kind=source_kind,
-        source_id=source_id,
-        text=text,
+        claim_id=stable_identifier("claim", identity),
+        source_id=chapter_id,
+        text=claim.text,
+        evidence_refs=claim.evidence_refs,
+        certainty=claim.certainty,
     )
+
+
+def _validate_keyframe_closure(
+    sample_root: Path,
+    evidence: tuple[DocumentEvidenceItem, ...],
+) -> None:
+    keyframes = tuple(item for item in evidence if isinstance(item, KeyframeEvidence))
+    expected_names = {f"{item.sha256}.jpg" for item in keyframes}
+    keyframe_root = sample_root / "visual" / "keyframes"
+    if not keyframe_root.exists():
+        if keyframes:
+            raise ValueError("评测关键帧目录缺失")
+        return
+    if keyframe_root.is_symlink() or not keyframe_root.is_dir():
+        raise ValueError("评测关键帧目录非法")
+    actual_names = {entry.name for entry in keyframe_root.iterdir()}
+    if actual_names != expected_names:
+        raise ValueError("评测关键帧副本闭包不精确")
+    for item in keyframes:
+        path = keyframe_root / f"{item.sha256}.jpg"
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size != item.size_bytes
+        ):
+            raise ValueError("评测关键帧副本类型、链接数或大小非法")
+        content = path.read_bytes()
+        if (
+            not content.startswith(b"\xff\xd8\xff")
+            or not content.endswith(b"\xff\xd9")
+            or hashlib.sha256(content).hexdigest() != item.sha256
+        ):
+            raise ValueError("评测关键帧副本不是声明的 JPEG 内容")

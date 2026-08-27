@@ -22,17 +22,57 @@ from video_demo.evaluation.dataset import (
 _DEFAULT_MAX_VIDEO_BYTES = 4 * 1024 * 1024 * 1024
 
 
-class ReferenceOcrFrame(FrozenModel):
+class ReferenceVisualFrame(FrozenModel):
     frame_id: StableId
     timestamp_ms: int = Field(ge=0)
-    text_lines: tuple[str, ...] = Field(min_length=1)
+    text_lines: tuple[str, ...] = ()
+    quality_categories: tuple[
+        Literal["GENERAL_TEXT", "CODE", "TABLE", "FORMULA", "DIAGRAM", "UI_SMALL_TEXT"],
+        ...,
+    ] = Field(default=("GENERAL_TEXT",), min_length=1)
+    key_fields: tuple[str, ...] = ()
 
     @field_validator("text_lines")
     @classmethod
     def reject_blank_lines(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if any(not line for line in value):
-            raise ValueError("OCR 行不得为空")
+        if any(not line.strip() for line in value):
+            raise ValueError("视觉文字行不得为空")
         return value
+
+    @model_validator(mode="after")
+    def require_text_or_key_fields(self) -> Self:
+        if not self.text_lines and not self.key_fields:
+            raise ValueError("视觉帧必须包含文字或关键字段")
+        return self
+
+    @field_validator("quality_categories")
+    @classmethod
+    def reject_duplicate_quality_categories(
+        cls,
+        value: tuple[
+            Literal["GENERAL_TEXT", "CODE", "TABLE", "FORMULA", "DIAGRAM", "UI_SMALL_TEXT"],
+            ...,
+        ],
+    ) -> tuple[
+        Literal["GENERAL_TEXT", "CODE", "TABLE", "FORMULA", "DIAGRAM", "UI_SMALL_TEXT"],
+        ...,
+    ]:
+        if len(value) != len(set(value)):
+            raise ValueError("视觉质量分类不得重复")
+        return value
+
+    @field_validator("key_fields")
+    @classmethod
+    def normalize_key_fields(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(item.strip() for item in value)
+        comparison_keys = tuple(
+            unicodedata.normalize("NFKC", item).casefold() for item in normalized
+        )
+        if any(not item for item in normalized) or len(comparison_keys) != len(
+            set(comparison_keys)
+        ):
+            raise ValueError("视觉关键字段不得为空或重复")
+        return normalized
 
 
 class SupportedFact(FrozenModel):
@@ -100,13 +140,13 @@ class AuthorizationFile(FrozenModel):
 
 
 class EvaluationAnnotation(FrozenModel):
-    schema_version: Literal["1.0.0"]
+    schema_version: Literal["2.0.0"]
     sample_id: StableId
     media_sha256: Sha256
     duration_ms: int = Field(gt=0)
     language: Literal["zh", "en", "ja", "ko", "es"]
     reference_text: str = Field(min_length=1)
-    ocr_frames: tuple[ReferenceOcrFrame, ...] = Field(min_length=1)
+    visual_frames: tuple[ReferenceVisualFrame, ...] = Field(min_length=1)
     scene_boundaries_ms: tuple[int, ...] = Field(min_length=1)
     semantic_boundaries_ms: tuple[int, ...] = Field(min_length=1)
     supported_facts: tuple[SupportedFact, ...] = Field(min_length=1)
@@ -130,8 +170,8 @@ class EvaluationAnnotation(FrozenModel):
     @model_validator(mode="after")
     def validate_annotation_references(self) -> Self:
         self._validate_unique_ids()
-        if any(timestamp >= self.duration_ms for timestamp in self.ocr_timestamps):
-            raise ValueError("OCR 帧时间不得超过媒体时长")
+        if any(timestamp >= self.duration_ms for timestamp in self.visual_timestamps):
+            raise ValueError("视觉帧时间不得超过媒体时长")
         self._validate_boundaries(self.scene_boundaries_ms)
         self._validate_boundaries(self.semantic_boundaries_ms)
         fact_ids = {fact.fact_id for fact in self.supported_facts}
@@ -142,12 +182,12 @@ class EvaluationAnnotation(FrozenModel):
         return self
 
     @property
-    def ocr_timestamps(self) -> tuple[int, ...]:
-        return tuple(frame.timestamp_ms for frame in self.ocr_frames)
+    def visual_timestamps(self) -> tuple[int, ...]:
+        return tuple(frame.timestamp_ms for frame in self.visual_frames)
 
     def _validate_unique_ids(self) -> None:
         collections = (
-            tuple(frame.frame_id for frame in self.ocr_frames),
+            tuple(frame.frame_id for frame in self.visual_frames),
             tuple(fact.fact_id for fact in self.supported_facts),
             tuple(person.person_id for person in self.known_people),
         )
@@ -159,6 +199,44 @@ class EvaluationAnnotation(FrozenModel):
             raise ValueError("边界时间不得超过媒体时长")
         if tuple(sorted(boundaries)) != boundaries or len(boundaries) != len(set(boundaries)):
             raise ValueError("边界时间必须严格递增且不重复")
+
+
+def select_reference_visual_frames(
+    annotation: EvaluationAnnotation,
+    *,
+    max_span_ms: int = 300_000,
+    max_frames: int = 4,
+) -> tuple[ReferenceVisualFrame, ...]:
+    """选择最早的最大合法章节帧簇，并以首尾等距规则限制帧数。"""
+
+    if type(max_span_ms) is not int or max_span_ms < 0:
+        raise ValueError("视觉帧簇跨度必须是非负整数")
+    if type(max_frames) is not int or max_frames < 2:
+        raise ValueError("视觉帧簇至少允许两帧")
+    by_timestamp: dict[int, ReferenceVisualFrame] = {}
+    for frame in sorted(
+        annotation.visual_frames,
+        key=lambda item: (item.timestamp_ms, item.frame_id),
+    ):
+        by_timestamp.setdefault(frame.timestamp_ms, frame)
+    frames = tuple(by_timestamp.values())
+    left = 0
+    best: tuple[ReferenceVisualFrame, ...] = ()
+    for right, frame in enumerate(frames):
+        while frame.timestamp_ms - frames[left].timestamp_ms > max_span_ms:
+            left += 1
+        candidate = frames[left : right + 1]
+        if len(candidate) > len(best):
+            best = candidate
+    if len(best) <= max_frames:
+        return best
+    last_index = len(best) - 1
+    denominator = max_frames - 1
+    indexes = tuple(
+        (last_index * position + denominator // 2) // denominator
+        for position in range(max_frames)
+    )
+    return tuple(best[index] for index in indexes)
 
 
 class ClaimJudgment(FrozenModel):

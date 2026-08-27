@@ -8,12 +8,133 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from video_demo.application.composition import build_production_model_identity_report
+from video_demo.application.composition import (
+    build_production_model_identity_report,
+    resolution_comparison_settings_fingerprint,
+)
 from video_demo.config import Settings, resolve_workspace_path
 from video_demo.errors import ErrorCode, VideoDemoError
 
 
 class SettingsTest(unittest.TestCase):
+    def test_candidate_artifact_limits_have_safe_defaults_and_reject_invalid_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            settings = Settings(workspace_root=workspace, _env_file=None)
+
+            self.assertEqual(settings.max_candidate_frame_files_per_run, 20_000)
+            self.assertEqual(settings.candidate_directory_lock_timeout_seconds, 300.0)
+            self.assertEqual(settings.max_published_keyframe_files_per_run, 20_000)
+            for field, value in (
+                ("max_candidate_frame_files_per_run", 0),
+                ("max_published_keyframe_files_per_run", 0),
+                ("candidate_directory_lock_timeout_seconds", 0),
+                ("candidate_directory_lock_timeout_seconds", float("inf")),
+            ):
+                with self.subTest(field=field, value=value), self.assertRaises(ValidationError):
+                    Settings(
+                        workspace_root=workspace,
+                        _env_file=None,
+                        **{field: value},
+                    )
+
+    def test_text_llm_and_vlm_configuration_are_independent_and_vlm_has_default_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                workspace_root=Path(directory),
+                text_llm_base_url="https://text.example.test/v1",
+                text_llm_api_key="text-secret",
+                text_llm_model_id="text-model",
+                vlm_base_url="https://vision.example.test/v1",
+                vlm_api_key="vision-secret",
+                _env_file=None,
+            )
+
+            text = settings.require_text_llm_configuration()
+            vision = settings.require_vlm_configuration()
+
+            self.assertEqual(text.base_url, "https://text.example.test/v1")
+            self.assertEqual(text.model_id, "text-model")
+            self.assertEqual(vision.base_url, "https://vision.example.test/v1")
+            self.assertEqual(vision.model_id, "qwen3-vl-flash")
+
+    def test_model_configuration_rejects_partial_values_and_unsafe_http(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            for values, method in (
+                (
+                    {
+                        "text_llm_base_url": "https://text.example.test/v1",
+                        "text_llm_api_key": "secret",
+                    },
+                    "require_text_llm_configuration",
+                ),
+                (
+                    {
+                        "vlm_base_url": "http://vision.example.test/v1",
+                        "vlm_api_key": "secret",
+                    },
+                    "require_vlm_configuration",
+                ),
+            ):
+                with self.subTest(values=values), self.assertRaises(VideoDemoError):
+                    settings = Settings(workspace_root=workspace, _env_file=None, **values)
+                    getattr(settings, method)()
+
+    def test_explicit_vlm_model_without_endpoint_or_key_is_partial_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(VideoDemoError):
+            Settings(
+                workspace_root=Path(directory),
+                vlm_model_id="qwen3-vl-plus",
+                _env_file=None,
+            ).require_vlm_configuration()
+
+    def test_local_http_model_endpoint_requires_explicit_localhost_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                workspace_root=Path(directory),
+                vlm_base_url="http://127.0.0.1:8080/v1",
+                vlm_api_key="vision-secret",
+                allow_insecure_local_model_endpoint=True,
+                _env_file=None,
+            )
+            self.assertEqual(settings.require_vlm_configuration().base_url, "http://127.0.0.1:8080/v1")
+
+    def test_model_secrets_are_hidden_from_serialized_settings_and_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            secret = "new-model-secret"
+            settings = Settings(
+                workspace_root=Path(directory),
+                text_llm_base_url="https://text.example.test/v1",
+                text_llm_api_key=secret,
+                text_llm_model_id="text-model",
+                vlm_base_url="https://vision.example.test/v1",
+                vlm_api_key="vision-secret",
+                _env_file=None,
+            )
+            serialized = (repr(settings), repr(settings.model_dump()), settings.model_dump_json())
+            self.assertTrue(all(secret not in value for value in serialized))
+
+    def test_document_model_internal_concurrency_is_capped_at_two(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for field in ("vlm_concurrency", "chapter_writer_concurrency"):
+                with self.subTest(field=field), self.assertRaises(ValidationError):
+                    Settings(
+                        workspace_root=Path(directory),
+                        _env_file=None,
+                        **{field: 3},
+                    )
+
+    def test_vlm_inflight_budget_must_cover_all_concurrent_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValidationError):
+            Settings(
+                workspace_root=Path(directory),
+                vlm_concurrency=2,
+                vlm_max_encoded_request_bytes=36 * 1024 * 1024,
+                vlm_max_inflight_encoded_bytes=64 * 1024 * 1024,
+                _env_file=None,
+            )
+
     def test_retired_local_model_dotenv_keys_are_ignored_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -202,6 +323,11 @@ class SettingsTest(unittest.TestCase):
                 openai_base_url="https://ai-proxy.example.test/v1",
                 openai_api_key=secret,
                 openai_model="openai/whisper",
+                text_llm_base_url="https://text.example.test/v1",
+                text_llm_api_key="text-key",
+                text_llm_model_id="text-model",
+                vlm_base_url="https://vlm.example.test/v1",
+                vlm_api_key="vlm-key",
                 _env_file=None,
             )
             configuration = settings.require_cloud_asr_configuration()
@@ -210,6 +336,11 @@ class SettingsTest(unittest.TestCase):
                 openai_base_url="https://ai-proxy.example.test/v1",
                 openai_api_key="different-cloud-asr-key",
                 openai_model="openai/whisper",
+                text_llm_base_url="https://text.example.test/v1",
+                text_llm_api_key="text-key",
+                text_llm_model_id="text-model",
+                vlm_base_url="https://vlm.example.test/v1",
+                vlm_api_key="vlm-key",
                 _env_file=None,
             )
             invalid_settings = Settings(
@@ -263,32 +394,30 @@ class SettingsTest(unittest.TestCase):
                 }.isdisjoint(Settings.model_fields)
             )
             self.assertEqual(settings.worker_concurrency, 1)
-            self.assertEqual(settings.qwen_max_video_bytes, 64 * 1024 * 1024)
-            self.assertEqual(settings.qwen_max_video_duration_ms, 30_000)
-            self.assertEqual(settings.qwen_timeout_seconds, 300.0)
             self.assertEqual(settings.speech_subprocess_timeout_seconds, 3_600)
-            self.assertEqual(settings.oss_prefix, "video-demo/qwen-clips")
-            self.assertEqual(settings.oss_signed_url_ttl_seconds, 3_600)
-            self.assertFalse(settings.has_complete_oss_configuration())
+            self.assertEqual(settings.max_video_duration_ms, 1_800_000)
             self.assertFalse(settings.demo_degraded_mode)
 
-    def test_complete_oss_configuration_is_available_without_serializing_secrets(
-        self,
-    ) -> None:
+    def test_video_duration_and_subprocess_timeout_hard_limits_are_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
             settings = Settings(
-                workspace_root=Path(directory),
-                oss_endpoint="https://oss-cn-hangzhou.aliyuncs.com",
-                oss_bucket="private-video-bucket",
-                oss_access_key_id="test-access-key-id",
-                oss_access_key_secret="test-access-key-secret",
+                workspace_root=workspace,
+                max_video_duration_ms=7_200_000,
+                process_timeout_seconds=14_400,
+                speech_subprocess_timeout_seconds=14_400,
+                _env_file=None,
             )
 
-            serialized = settings.model_dump_json()
-
-            self.assertTrue(settings.has_complete_oss_configuration())
-            self.assertNotIn("test-access-key-id", serialized)
-            self.assertNotIn("test-access-key-secret", serialized)
+            self.assertEqual(settings.max_video_duration_ms, 7_200_000)
+            for values in (
+                {"max_video_duration_ms": 7_200_001},
+                {"process_timeout_seconds": 14_401},
+                {"speech_subprocess_timeout_seconds": 14_401},
+            ):
+                with self.subTest(values=values), self.assertRaises(ValidationError):
+                    Settings(workspace_root=workspace, _env_file=None, **values)  # type: ignore[arg-type]
 
     def test_cloud_timeout_and_retry_change_settings_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -298,6 +427,11 @@ class SettingsTest(unittest.TestCase):
                 "openai_base_url": "https://ai-proxy.example.test/v1",
                 "openai_api_key": "test-openai-key",
                 "openai_model": "openai/whisper",
+                "text_llm_base_url": "https://text.example.test/v1",
+                "text_llm_api_key": "text-key",
+                "text_llm_model_id": "text-model",
+                "vlm_base_url": "https://vlm.example.test/v1",
+                "vlm_api_key": "vlm-key",
                 "_env_file": None,
             }
             baseline = build_production_model_identity_report(
@@ -326,52 +460,39 @@ class SettingsTest(unittest.TestCase):
                 key_changed.settings_fingerprint,
             )
 
-    def test_partial_oss_configuration_is_rejected(self) -> None:
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            self.assertRaisesRegex(ValidationError, "OSS 配置必须全部提供或全部留空"),
-        ):
-            Settings(
-                workspace_root=Path(directory),
-                oss_endpoint="https://oss-cn-hangzhou.aliyuncs.com",
-                oss_bucket="private-video-bucket",
-            )
-
-    def test_oss_prefix_and_signed_url_ttl_are_strictly_validated(self) -> None:
+    def test_resolution_comparison_fingerprint_ignores_only_proxy_edge(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
-            for values in (
-                {"oss_prefix": "../qwen-clips"},
-                {"oss_prefix": "video-demo//qwen-clips"},
-                {"oss_prefix": "video-demo\\qwen-clips"},
-                {"oss_signed_url_ttl_seconds": 59},
-                {"oss_signed_url_ttl_seconds": 86_401},
-            ):
-                with self.subTest(values=values), self.assertRaises(ValidationError):
-                    Settings(workspace_root=workspace, **values)  # type: ignore[arg-type]
+            common = {
+                "workspace_root": workspace,
+                "openai_base_url": "https://ai-proxy.example.test/v1",
+                "openai_api_key": "test-openai-key",
+                "openai_model": "openai/whisper",
+                "text_llm_base_url": "https://text.example.test/v1",
+                "text_llm_api_key": "text-key",
+                "text_llm_model_id": "text-model",
+                "vlm_base_url": "https://vlm.example.test/v1",
+                "vlm_api_key": "vlm-key",
+                "_env_file": None,
+            }
+            settings_1280 = Settings(**common, visual_proxy_max_edge=1_280)
+            settings_1920 = Settings(**common, visual_proxy_max_edge=1_920)
+            jpeg_changed = Settings(**common, visual_proxy_max_edge=1_920, keyframe_jpeg_quality=91)
+
+            self.assertEqual(
+                resolution_comparison_settings_fingerprint(settings_1280),
+                resolution_comparison_settings_fingerprint(settings_1920),
+            )
+            self.assertNotEqual(
+                resolution_comparison_settings_fingerprint(settings_1920),
+                resolution_comparison_settings_fingerprint(jpeg_changed),
+            )
 
     def test_demo_degraded_mode_is_explicitly_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(workspace_root=Path(directory), demo_degraded_mode=True)
 
             self.assertTrue(settings.demo_degraded_mode)
-
-    def test_qwen_limits_reject_non_finite_timeout_and_duration_above_30_seconds(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            for values in (
-                {"qwen_timeout_seconds": float("nan")},
-                {"qwen_timeout_seconds": float("inf")},
-                {"qwen_timeout_seconds": float("-inf")},
-                {"qwen_timeout_seconds": 0.0},
-                {"qwen_max_video_duration_ms": 30_001},
-                {"qwen_max_video_duration_ms": 0},
-                {"qwen_max_video_bytes": 0},
-            ):
-                with self.subTest(values=values), self.assertRaises(ValidationError):
-                    Settings(workspace_root=workspace, **values)  # type: ignore[arg-type]
 
     def test_resolve_workspace_path_rejects_parent_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -396,23 +517,6 @@ class SettingsTest(unittest.TestCase):
 
             self.assertEqual(raised.exception.code, ErrorCode.WORKSPACE_PATH_ESCAPE)
 
-    def test_secret_values_are_excluded_from_serialized_settings(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            secret = "qwen-secret-value"
-            settings = Settings(
-                workspace_root=Path(directory),
-                qwen_api_key=secret,
-                baidu_api_key="baidu-api-secret",
-                baidu_secret_key="baidu-secret-value",
-                openai_api_key="openai-secret-value",
-            )
-
-            serialized = settings.model_dump_json()
-
-            self.assertNotIn(secret, serialized)
-            self.assertNotIn("baidu-api-secret", serialized)
-            self.assertNotIn("baidu-secret-value", serialized)
-            self.assertNotIn("openai-secret-value", serialized)
 
 
 if __name__ == "__main__":

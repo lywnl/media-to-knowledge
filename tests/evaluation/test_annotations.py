@@ -35,13 +35,15 @@ def _loader_kwargs(tmp_path: Path) -> dict[str, Path]:
 
 def _annotation(media_sha256: str, *, duration_ms: int = 1_000) -> dict[str, object]:
     return {
-        "schema_version": "1.0.0",
+        "schema_version": "2.0.0",
         "sample_id": "sample_001",
         "media_sha256": media_sha256,
         "duration_ms": duration_ms,
         "language": "zh",
         "reference_text": "你好",
-        "ocr_frames": [{"frame_id": "frame_001", "timestamp_ms": 100, "text_lines": ["你好"]}],
+        "visual_frames": [
+            {"frame_id": "frame_001", "timestamp_ms": 100, "text_lines": ["你好"]}
+        ],
         "scene_boundaries_ms": [500],
         "semantic_boundaries_ms": [500],
         "supported_facts": [{"fact_id": "fact_001", "canonical_text": "有人问好"}],
@@ -100,20 +102,62 @@ def _write_package(tmp_path: Path) -> tuple[Path, Path, str]:
 
 def test_annotation_contract_rejects_time_overrun() -> None:
     payload = _annotation("a" * 64)
-    payload["ocr_frames"][0]["timestamp_ms"] = 1_001
+    payload["visual_frames"][0]["timestamp_ms"] = 1_001
 
-    with pytest.raises(ValueError, match="OCR 帧时间"):
+    with pytest.raises(ValueError, match="视觉帧时间"):
         EvaluationAnnotation.model_validate(payload)
 
 
 def test_annotation_contract_rejects_duplicate_id() -> None:
     payload = _annotation("a" * 64)
-    payload["ocr_frames"] = [
+    payload["visual_frames"] = [
         {"frame_id": "frame_001", "timestamp_ms": 100, "text_lines": ["你好"]},
         {"frame_id": "frame_001", "timestamp_ms": 200, "text_lines": ["世界"]},
     ]
 
     with pytest.raises(ValueError, match="稳定 ID"):
+        EvaluationAnnotation.model_validate(payload)
+
+
+def test_visual_frame_allows_key_fields_without_text_lines() -> None:
+    payload = _annotation("a" * 64)
+    payload["visual_frames"] = [
+        {
+            "frame_id": "frame_001",
+            "timestamp_ms": 100,
+            "text_lines": [],
+            "key_fields": ["Latency"],
+            "quality_categories": ["UI_SMALL_TEXT"],
+        }
+    ]
+
+    annotation = EvaluationAnnotation.model_validate(payload)
+
+    assert annotation.visual_frames[0].text_lines == ()
+    assert annotation.visual_frames[0].key_fields == ("Latency",)
+
+
+def test_visual_frame_requires_at_least_one_quality_category() -> None:
+    payload = _annotation("a" * 64)
+    payload["visual_frames"] = [
+        {
+            "frame_id": "frame_001",
+            "timestamp_ms": 100,
+            "text_lines": ["你好"],
+            "quality_categories": [],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="quality_categories"):
+        EvaluationAnnotation.model_validate(payload)
+
+
+def test_annotation_contract_rejects_retired_ocr_schema() -> None:
+    payload = _annotation("a" * 64)
+    payload["schema_version"] = "1.0.0"
+    payload["ocr_frames"] = payload.pop("visual_frames")
+
+    with pytest.raises(ValueError):
         EvaluationAnnotation.model_validate(payload)
 
 
@@ -364,7 +408,7 @@ def _prediction_for_judgment(eval_root: Path) -> VerifiedPrediction:
 
     return VerifiedPrediction(
         index=EvaluationPrediction(
-            schema_version="1.1.0",
+                schema_version="1.2.0",
             evaluation_run_id="eval_001",
             sample_id="sample_001",
             media_sha256="a" * 64,
@@ -392,9 +436,11 @@ def _prediction_for_judgment(eval_root: Path) -> VerifiedPrediction:
         claims=(
             PredictionClaim(
                 claim_id="claim_001",
-                source_kind="VIDEO_SUMMARY",
-                source_id="run_001",
-                text="摘要",
+                    source_kind="CHAPTER_CLAIM",
+                    source_id="chapter_001",
+                    text="摘要",
+                    evidence_refs=("asr_001",),
+                    certainty=0.9,
             ),
         ),
         artifact_manifest_sha256=None,

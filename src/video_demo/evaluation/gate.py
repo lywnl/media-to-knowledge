@@ -15,24 +15,33 @@ from xml.etree import ElementTree
 from pydantic import Field, ValidationError, ValidationInfo, model_validator
 
 from video_demo.application.composition import (
-    ProductionModelIdentityReport,
     build_production_model_identity_report,
+    production_tool_path,
 )
 from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel
-from video_demo.domain.result_artifact import ResultArtifactPayload
+from video_demo.domain.document_artifact import DocumentArtifactPayload
 from video_demo.errors import ErrorCode
 from video_demo.evaluation.annotations import (
     AuthorizationFile,
     ValidatedEvaluationPackage,
     load_evaluation_package,
 )
+from video_demo.evaluation.chapter_vlm_input import (
+    ChapterVlmInputManifest,
+    ValidatedChapterVlmInputContext,
+    _source_display_size,
+    chapter_vlm_input_manifest_sha256,
+    validate_chapter_vlm_input_manifest,
+)
+from video_demo.evaluation.chapter_vlm_live import VisualTextScoreFact
+from video_demo.evaluation.document_judgments import DocumentQualityReport
 from video_demo.evaluation.evidence import (
     _CHUNK_BYTES,
     ArtifactRole,
     AuthorizedDatasetDetails,
-    BaiduLiveDetails,
-    BaiduLiveRawReport,
+    ChapterVlmLiveDetails,
+    ChapterVlmLiveRawReport,
     CommandEvidenceDetails,
     EvidenceKind,
     EvidenceLevel,
@@ -54,8 +63,6 @@ from video_demo.evaluation.evidence import (
     PerformanceSampleRawReport,
     PreflightDetails,
     PreflightRawReport,
-    QwenLiveDetails,
-    QwenLiveRawReport,
     RealMediaDetails,
     RealMediaFile,
     RealMediaRawReport,
@@ -74,6 +81,7 @@ from video_demo.evaluation.evidence import (
 from video_demo.evaluation.evidence import CommandTrace as CommandTrace
 from video_demo.evaluation.report import GateStatus, QualityReport
 from video_demo.implementation import implementation_import_closure
+from video_demo.media.probe import FFprobeClient, ProbeLimits, SupportedMime
 
 REQUIRED_FAILURE_SCENARIOS: tuple[str, ...] = (
     "corrupted_media",
@@ -84,14 +92,6 @@ REQUIRED_FAILURE_SCENARIOS: tuple[str, ...] = (
     "no_speech",
     "black_frames",
     "five_language_switch",
-    "ocr_401",
-    "ocr_429",
-    "ocr_5xx",
-    "ocr_timeout",
-    "qwen_401",
-    "qwen_429",
-    "qwen_5xx",
-    "qwen_timeout",
     "malformed_json",
     "cancellation",
     "retry",
@@ -107,14 +107,11 @@ _GATE_VERIFIER_LEAF = frozenset({Path("src/video_demo/evaluation/gate.py")})
 _REAL_MEDIA_IMPLEMENTATION_FILES: tuple[Path, ...] = implementation_import_closure(
     _IMPLEMENTATION_REFERENCE_ROOT,
     (
-    Path("src/video_demo/evaluation/media_runner.py"),
-    Path("src/video_demo/evaluation/real_media_execution.py"),
-    Path("src/video_demo/evaluation/real_media_source.py"),
+        Path("src/video_demo/evaluation/media_runner.py"),
+        Path("src/video_demo/evaluation/real_media_execution.py"),
+        Path("src/video_demo/evaluation/real_media_source.py"),
     ),
-    leaf_files=_GATE_VERIFIER_LEAF
-    | frozenset(
-        {Path("src/video_demo/application/pipeline.py")}
-    ),
+    leaf_files=_GATE_VERIFIER_LEAF | frozenset({Path("src/video_demo/application/pipeline.py")}),
 )
 
 _LIVE_ONLY_PRODUCTION_ISOLATION_FILES = frozenset(
@@ -160,10 +157,10 @@ FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     "rotation": ("tests/media/test_probe.py::test_parse_rotation_vfr_and_no_audio_warning",),
     "no_audio": (
         "tests/media/test_transcode.py::test_extract_audio_without_track_returns_explicit_no_audio",
-        "tests/application/test_pipeline.py::test_no_audio_or_no_speech_keeps_visual_pipeline_running[False-True-NO_AUDIO_STREAM]",
+        "tests/application/test_document_pipeline.py::test_no_audio_or_no_speech_keeps_visual_pipeline_running[NONE-NO_AUDIO_TRACK]",
     ),
     "no_speech": (
-        "tests/application/test_pipeline.py::test_no_audio_or_no_speech_keeps_visual_pipeline_running[True-False-NO_SPEECH_DETECTED]",
+        "tests/application/test_document_pipeline.py::test_no_audio_or_no_speech_keeps_visual_pipeline_running[ASR-NO_SPEECH_DETECTED]",
     ),
     "black_frames": (
         "tests/visual/test_keyframes.py::test_all_black_candidates_produce_no_keyframe",
@@ -171,41 +168,14 @@ FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     "five_language_switch": (
         "tests/speech/test_language.py::test_language_identifier_tracks_all_five_validation_languages",
     ),
-    "ocr_401": (
-        "tests/integrations/test_baidu_ocr.py::test_http_errors_are_classified_without_secret_leak[401-OCR_AUTHENTICATION_FAILED]",
-    ),
-    "ocr_429": (
-        "tests/integrations/test_baidu_ocr.py::test_http_errors_are_classified_without_secret_leak[429-DEPENDENCY_TEMPORARY_FAILURE]",
-    ),
-    "ocr_5xx": (
-        "tests/integrations/test_baidu_ocr.py::test_http_errors_are_classified_without_secret_leak[500-DEPENDENCY_TEMPORARY_FAILURE]",
-    ),
-    "ocr_timeout": (
-        "tests/integrations/test_baidu_ocr.py::test_ocr_timeout_stops_after_finite_attempts_and_is_classified",
-    ),
-    "qwen_401": (
-        "tests/integrations/test_qwen.py::test_authentication_error_does_not_leak_secret[401]",
-    ),
-    "qwen_429": (
-        "tests/integrations/test_qwen.py::test_transient_network_failures_use_finite_exponential_backoff",
-    ),
-    "qwen_5xx": (
-        "tests/integrations/test_qwen.py::test_qwen_5xx_stops_after_finite_attempts_and_is_retryable",
-    ),
-    "qwen_timeout": (
-        "tests/integrations/test_qwen.py::test_qwen_timeout_stops_after_finite_attempts_and_is_retryable",
-    ),
     "malformed_json": (
-        "tests/integrations/test_qwen.py::test_qwen_malformed_json_fails_closed_after_one_schema_repair",
-        "tests/integrations/test_baidu_ocr.py::test_malformed_provider_json_fails_closed",
+        "tests/integrations/test_qwen_vl.py::test_qwen_request_rejection_is_not_response_content_invalid",
     ),
     "cancellation": (
         "tests/worker/test_runtime.py::test_cancellation_after_handler_prevents_successful_completion",
         "tests/worker/test_runtime.py::test_cancellation_during_handler_marks_job_cancelled",
     ),
-    "retry": (
-        "tests/worker/test_runtime.py::test_retryable_failure_stops_after_max_attempts",
-    ),
+    "retry": ("tests/worker/test_runtime.py::test_retryable_failure_stops_after_max_attempts",),
     "restart_resume": (
         "tests/worker/test_resume.py::test_new_stage_runner_reuses_verified_artifact_after_restart",
         "tests/worker/test_resume.py::test_new_stage_runner_recomputes_corrupted_artifact_after_restart",
@@ -214,13 +184,12 @@ FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
         "tests/media/test_transcode.py::test_transcode_rejects_insufficient_disk_before_starting",
     ),
     "cross_tenant": (
-        "tests/api/test_results.py::test_success_result_is_hidden_from_other_tenant",
+        "tests/api/test_results.py::test_result_routes_are_scope_isolated",
         "tests/worker/test_runtime.py::test_worker_completion_does_not_touch_same_job_id_in_another_scope",
     ),
     "redaction": (
-        "tests/api/test_results.py::test_error_response_does_not_expose_internal_paths",
-        "tests/integrations/test_qwen.py::test_authentication_error_does_not_leak_secret[401]",
-        "tests/integrations/test_baidu_ocr.py::test_http_errors_are_classified_without_secret_leak[401-OCR_AUTHENTICATION_FAILED]",
+        "tests/api/test_runs.py::test_run_status_does_not_expose_internal_paths_or_secret_fields",
+        "tests/integrations/test_qwen_vl.py::test_qwen_authentication_status_is_not_masked_by_oversized_body",
     ),
     "prompt_injection": (
         "tests/integrations/test_prompt_isolation.py::test_untrusted_asr_text_never_enters_trusted_system_instruction",
@@ -248,19 +217,21 @@ FINAL_GATE_CHECKS: tuple[str, ...] = (
     "secret_scan",
     "authorized_dataset",
     "real_media_chain",
-    "baidu_ocr_live",
-    "qwen_live",
+    "chapter_vlm_live",
     "five_language_models",
     "m1_durability",
 )
 
 _LIVE_GATE_CHECKS = frozenset(
     {
-        "baidu_ocr_live",
-        "qwen_live",
+        "chapter_vlm_live",
         "five_language_models",
     }
 )
+# 11B 前保留旧报告的离线重验能力；这些 ID 不会出现在 FINAL_GATE_CHECKS、CLI
+# 或新的活动汇总中。
+_LIVE_AUTHORITY_CHECKS = _LIVE_GATE_CHECKS
+_LIVE_IMPLEMENTATION_CHECKS = _LIVE_AUTHORITY_CHECKS
 
 _LOCAL_MODEL_FAILURE_CODES = frozenset(
     {
@@ -273,28 +244,21 @@ _LOCAL_MODEL_FAILURE_CODES = frozenset(
     }
 )
 _LIVE_COMPONENT_FAILURE_CODES: dict[str, frozenset[ErrorCode]] = {
-    "baidu_ocr": frozenset(
-        {
-            ErrorCode.OCR_LANGUAGE_UNSUPPORTED,
-            ErrorCode.OCR_AUTHENTICATION_FAILED,
-            ErrorCode.OCR_RESPONSE_INVALID,
-            ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
-            ErrorCode.VIDEO_INPUT_INVALID,
-            ErrorCode.VIDEO_DIGEST_MISMATCH,
-            ErrorCode.WORKSPACE_PATH_ESCAPE,
-            ErrorCode.SYSTEM_FAILURE,
-        }
-    ),
-    "qwen": frozenset(
+    "chapter_vlm": frozenset(
         {
             ErrorCode.QWEN_CAPABILITY_UNAVAILABLE,
             ErrorCode.QWEN_AUTHENTICATION_FAILED,
+            ErrorCode.QWEN_REQUEST_REJECTED,
             ErrorCode.QWEN_RESPONSE_INVALID,
             ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
-            ErrorCode.VIDEO_INPUT_INVALID,
+            ErrorCode.ARTIFACT_SCHEMA_INVALID,
+            ErrorCode.INPUT_BUDGET_EXCEEDED,
+            ErrorCode.VISUAL_RESULT_INVALID,
+            ErrorCode.VISUAL_MEDIA_INVALID,
             ErrorCode.VIDEO_DIGEST_MISMATCH,
-            ErrorCode.UNKNOWN_EVIDENCE_REFERENCE,
             ErrorCode.WORKSPACE_PATH_ESCAPE,
+            ErrorCode.IDEMPOTENCY_CONFLICT,
+            ErrorCode.JOB_CANCELLED,
             ErrorCode.SYSTEM_FAILURE,
         }
     ),
@@ -314,8 +278,7 @@ _MISSING_CHECK_REASONS: dict[str, str] = {
     "secret_scan": "未提供敏感字段审计证据",
     "authorized_dataset": "缺少授权五语评测集",
     "real_media_chain": "缺少工作区 FFmpeg/ffprobe 与真实媒体运行结果",
-    "baidu_ocr_live": "缺少百度 OCR 凭据或真实联调结果",
-    "qwen_live": "缺少 Qwen 凭据或真实联调结果",
+    "chapter_vlm_live": "缺少章节多图 Qwen3-VL 凭据或真实联调结果",
     "five_language_models": "缺少五语授权素材、模型或真实预测",
     "m1_durability": "未提供 M1 耐久机器证据",
 }
@@ -323,6 +286,7 @@ _MISSING_CHECK_REASONS: dict[str, str] = {
 _DURABILITY_ISSUE_REASONS: dict[ErrorCode, str] = {
     ErrorCode.M1_SAMPLE_COUNT_INVALID: "耐久样本必须恰好两段",
     ErrorCode.M1_DURATION_TOO_SHORT: "耐久样本时长不足 30 分钟",
+    ErrorCode.M1_DURATION_TOO_LONG: "耐久样本时长超过 2 小时上限",
     ErrorCode.M1_RESOLUTION_TOO_SMALL: "耐久样本分辨率低于 1920×1080",
     ErrorCode.M1_AUTHORIZATION_UNAVAILABLE: "耐久素材授权记录不可用",
     ErrorCode.M1_MEDIA_INVALID: "耐久媒体或 Manifest 不可用",
@@ -335,11 +299,7 @@ _DURABILITY_ISSUE_REASONS: dict[ErrorCode, str] = {
     ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE: "视觉依赖不可用",
     ErrorCode.SILERO_DEPENDENCY_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
     ErrorCode.SILERO_MODEL_UNAVAILABLE: "本地音频模型、依赖或授权不可用",
-    ErrorCode.QWEN_ENDPOINT_UNAVAILABLE: "Qwen 配置不可用",
-    ErrorCode.QWEN_API_KEY_UNAVAILABLE: "Qwen 配置不可用",
-    ErrorCode.QWEN_MODEL_ID_UNAVAILABLE: "Qwen 配置不可用",
-    ErrorCode.BAIDU_API_KEY_UNAVAILABLE: "百度 OCR 配置不可用",
-    ErrorCode.BAIDU_SECRET_KEY_UNAVAILABLE: "百度 OCR 配置不可用",
+    ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT: "可用磁盘空间不足",
 }
 
 
@@ -349,8 +309,7 @@ def build_durability_not_run_reason(issues: Sequence[ErrorCode]) -> str:
     order = tuple(_DURABILITY_ISSUE_REASONS)
     reasons = tuple(
         dict.fromkeys(
-            _DURABILITY_ISSUE_REASONS[issue]
-            for issue in sorted(set(issues), key=order.index)
+            _DURABILITY_ISSUE_REASONS[issue] for issue in sorted(set(issues), key=order.index)
         )
     )
     return f"M1 耐久前置条件不足: {'；'.join(reasons)}"
@@ -378,6 +337,7 @@ _FINAL_GATE_BUILD_TOKEN = object()
 class FinalGateReport(FrozenModel):
     status: GateStatus
     quality: QualityReport
+    document_quality: DocumentQualityReport | None = None
     checks: tuple[GateCheck, ...] = Field(min_length=len(FINAL_GATE_CHECKS))
 
     @model_validator(mode="after")
@@ -385,7 +345,7 @@ class FinalGateReport(FrozenModel):
         check_ids = tuple(check.check_id for check in self.checks)
         if len(check_ids) != len(set(check_ids)) or set(check_ids) != set(FINAL_GATE_CHECKS):
             raise ValueError("最终门禁必须且只能包含全部权威检查")
-        if self.status != _aggregate_status(self.quality, self.checks):
+        if self.status != _aggregate_status(self.quality, self.checks, self.document_quality):
             raise ValueError("最终状态必须与质量和权威检查一致")
         workspace_root = info.context.get("workspace_root") if info.context else None
         if not isinstance(workspace_root, Path):
@@ -506,9 +466,7 @@ def _build_automated_tests_check(
     missing_identities = set(collected_identities) - executed_identities
     unexpected_identities = executed_identities - set(collected_identities)
     missing = tuple(sorted(collected_identities[identity] for identity in missing_identities))
-    unexpected = tuple(
-        sorted(f"{classname}::{name}" for classname, name in unexpected_identities)
-    )
+    unexpected = tuple(sorted(f"{classname}::{name}" for classname, name in unexpected_identities))
     source_missing = tuple(sorted(authoritative - collected))
     source_unexpected = tuple(sorted(collected - authoritative))
     statuses = tuple(
@@ -563,6 +521,7 @@ def build_final_gate_report(
     checks: Sequence[GateCheck],
     workspace_root: Path,
     settings: Settings | None = None,
+    document_quality: DocumentQualityReport | None = None,
 ) -> FinalGateReport:
     failure_message: str | None = None
     try:
@@ -571,6 +530,7 @@ def build_final_gate_report(
             checks=checks,
             workspace_root=workspace_root,
             settings=settings,
+            document_quality=document_quality,
         )
     except ValidationError:
         failure_message = "最终门禁报告非法或不可信"
@@ -587,6 +547,7 @@ def _build_final_gate_report(
     checks: Sequence[GateCheck],
     workspace_root: Path,
     settings: Settings | None,
+    document_quality: DocumentQualityReport | None,
 ) -> FinalGateReport:
     supplied = {check.check_id: check for check in checks}
     if len(supplied) != len(checks):
@@ -611,8 +572,9 @@ def _build_final_gate_report(
         _verify_gate_check(check, workspace_root, settings=settings)
     return FinalGateReport.model_validate(
         {
-            "status": _aggregate_status(quality, completed),
+            "status": _aggregate_status(quality, completed, document_quality),
             "quality": quality,
+            "document_quality": document_quality,
             "checks": completed,
         },
         context={
@@ -623,8 +585,14 @@ def _build_final_gate_report(
     )
 
 
-def _aggregate_status(quality: QualityReport, checks: Sequence[GateCheck]) -> GateStatus:
-    statuses = (quality.status, *(check.status for check in checks))
+def _aggregate_status(
+    quality: QualityReport,
+    checks: Sequence[GateCheck],
+    document_quality: DocumentQualityReport | None = None,
+) -> GateStatus:
+    statuses = [quality.status, *(check.status for check in checks)]
+    if document_quality is not None:
+        statuses.append(GateStatus(document_quality.status))
     if GateStatus.FAIL in statuses:
         return GateStatus.FAIL
     if GateStatus.NOT_RUN in statuses:
@@ -643,8 +611,7 @@ _MINIMUM_EVIDENCE_LEVEL: dict[str, EvidenceLevel] = {
     "secret_scan": EvidenceLevel.STATIC,
     "authorized_dataset": EvidenceLevel.REAL_MEDIA,
     "real_media_chain": EvidenceLevel.REAL_MEDIA,
-    "baidu_ocr_live": EvidenceLevel.REAL_SERVICE,
-    "qwen_live": EvidenceLevel.REAL_SERVICE,
+    "chapter_vlm_live": EvidenceLevel.REAL_SERVICE,
     "five_language_models": EvidenceLevel.REAL_SERVICE,
     "m1_durability": EvidenceLevel.PERFORMANCE,
 }
@@ -662,8 +629,7 @@ _ALLOWED_EVIDENCE_KINDS: dict[str, frozenset[EvidenceKind]] = {
     "secret_scan": frozenset({EvidenceKind.STATIC_AUDIT}),
     "authorized_dataset": frozenset({EvidenceKind.COMMAND_REPORT}),
     "real_media_chain": frozenset({EvidenceKind.COMMAND_REPORT}),
-    "baidu_ocr_live": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
-    "qwen_live": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
+    "chapter_vlm_live": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
     "five_language_models": frozenset({EvidenceKind.LIVE_SERVICE_REPORT}),
     "m1_durability": frozenset({EvidenceKind.PERFORMANCE_REPORT}),
 }
@@ -754,8 +720,7 @@ def _derive_machine_gate_status(
         "openapi_contract": (CommandEvidenceDetails, OfflineEvidenceDetails),
         "authorized_dataset": AuthorizedDatasetDetails,
         "real_media_chain": RealMediaDetails,
-        "baidu_ocr_live": BaiduLiveDetails,
-        "qwen_live": QwenLiveDetails,
+        "chapter_vlm_live": ChapterVlmLiveDetails,
         "five_language_models": FiveLanguageModelsDetails,
         "m1_durability": PerformanceDetails,
     }
@@ -765,9 +730,7 @@ def _derive_machine_gate_status(
         raise ValueError(f"{check_id} 的机器证据级别不符合门禁要求")
     details = report.details
     if isinstance(details, PreflightDetails):
-        return _derive_preflight_status(
-            check_id, report, details, artifacts, workspace_root
-        )
+        return _derive_preflight_status(check_id, report, details, artifacts, workspace_root)
     required = expected_type.get(check_id)
     if required is None or not isinstance(details, required):
         raise ValueError(f"{check_id} 的机器证据明细类型不符合门禁要求")
@@ -779,12 +742,8 @@ def _derive_machine_gate_status(
             artifacts,
             workspace_root,
         )
-    elif isinstance(details, BaiduLiveDetails):
-        passed = _verify_baidu_live(
-            details, report, artifacts, workspace_root, settings=settings
-        )
-    elif isinstance(details, QwenLiveDetails):
-        passed = _verify_qwen_live(
+    elif isinstance(details, ChapterVlmLiveDetails):
+        passed = _verify_chapter_vlm_live(
             details, report, artifacts, workspace_root, settings=settings
         )
     elif isinstance(details, FiveLanguageModelsDetails):
@@ -796,11 +755,7 @@ def _derive_machine_gate_status(
             settings=settings,
         )
     elif isinstance(details, LiveServiceDetails):
-        expected_service = {
-            "baidu_ocr_live": "BAIDU_OCR",
-            "qwen_live": "QWEN",
-            "five_language_models": "FIVE_LANGUAGE_MODELS",
-        }[check_id]
+        expected_service = "FIVE_LANGUAGE_MODELS"
         if details.service != expected_service:
             raise ValueError(f"{check_id} 的真实服务身份不匹配")
         _require_artifact_digest(artifacts, "INPUT_MEDIA", details.input_sha256)
@@ -844,14 +799,18 @@ def _derive_machine_gate_status(
         "openapi_contract",
         "secret_scan",
     }
-    if passed and not strict_offline_pass and check_id not in {
-        "authorized_dataset",
-        "real_media_chain",
-        "baidu_ocr_live",
-        "qwen_live",
-        "five_language_models",
-        "m1_durability",
-    }:
+    if (
+        passed
+        and not strict_offline_pass
+        and check_id
+        not in {
+            "authorized_dataset",
+            "real_media_chain",
+            "chapter_vlm_live",
+            "five_language_models",
+            "m1_durability",
+        }
+    ):
         raise ValueError(f"{check_id} 尚未交付严格 raw verifier，不能形成 PASS")
     return (GateStatus.PASS if passed else GateStatus.FAIL), None
 
@@ -1010,8 +969,9 @@ def _alembic_roundtrip_observations(workspace_root: Path) -> tuple[str, ...]:
         config.set_main_option("sqlalchemy.url", database_url)
         engine = None
         try:
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
-                io.StringIO()
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
             ):
                 command.upgrade(config, "head")
                 engine = create_engine(database_url)
@@ -1144,59 +1104,323 @@ def _nonempty_secret_literal(name: str, value: object | None) -> bool:
     return bool(literal) and literal != name and literal != name.upper()
 
 
-def _verify_baidu_live(
-    details: BaiduLiveDetails,
+def _verify_chapter_vlm_live(
+    details: ChapterVlmLiveDetails,
     report: MachineEvidenceReport,
     artifacts: dict[ArtifactRole, tuple[VerifiedArtifact, ...]],
     workspace_root: Path,
     *,
     settings: Settings | None,
 ) -> bool:
-    settings_report = _require_live_settings(settings, workspace_root)
-    raw, _package = _verify_live_common(
-        details,
-        report,
-        artifacts,
-        workspace_root,
-        raw_type=BaiduLiveRawReport,
+    if settings is None:
+        raise ValueError("章节 VLM live 必须提供可信 settings")
+    settings_report = _require_live_settings(settings, workspace_root, check_id="chapter_vlm_live")
+    _verify_live_report_shape(details, report, artifacts)
+    raw_artifact = _require_unique_artifact(
+        artifacts, "AUDIT_REPORT", details.raw_report_sha256, "章节 VLM 原始报告"
     )
-    _verify_settings_fingerprint(raw, settings_report)
-    _verify_canonical_live_models(raw, settings_report)
-    if raw.status == GateStatus.PASS and len(raw.executions) != 1:
-        raise ValueError("百度必须恰好执行一次授权关键帧调用")
-    return raw.status == GateStatus.PASS
-
-
-def _verify_qwen_live(
-    details: QwenLiveDetails,
-    report: MachineEvidenceReport,
-    artifacts: dict[ArtifactRole, tuple[VerifiedArtifact, ...]],
-    workspace_root: Path,
-    *,
-    settings: Settings | None,
-) -> bool:
-    settings_report = _require_live_settings(settings, workspace_root)
-    raw, _package = _verify_live_common(
-        details,
-        report,
-        artifacts,
-        workspace_root,
-        raw_type=QwenLiveRawReport,
+    raw = ChapterVlmLiveRawReport.model_validate_json(_artifact_content(raw_artifact))
+    if (
+        raw.check_id != report.check_id
+        or raw.status != report.status
+        or raw.evaluation_run_id != raw_artifact.path.parent.name
+        or raw.implementation_sha256 != details.implementation_sha256
+        or raw.settings_fingerprint != details.settings_fingerprint
+        or raw.parent_evaluation_run_id != details.parent_evaluation_run_id
+        or raw.sample_id != details.sample_id
+    ):
+        raise ValueError("章节 VLM raw、detail 与 machine report 绑定不一致")
+    if raw.implementation_sha256 != _current_live_implementation_sha256(workspace_root):
+        raise ValueError("章节 VLM 实现摘要不是当前实现")
+    _verify_chapter_vlm_inputs(raw, details, artifacts, workspace_root, settings=settings)
+    if not isinstance(raw, ChapterVlmLiveRawReport):
+        raise ValueError("章节 VLM raw 类型不匹配")
+    if raw.model != details.model or raw.model.component != "chapter_vlm":
+        raise ValueError("章节 VLM 模型身份与 detail 不一致")
+    if raw.settings_fingerprint != settings_report.settings_fingerprint:
+        raise ValueError("章节 VLM settings fingerprint 不是当前生产配置")
+    canonical = {
+        (model.component, model.provider, model.model_id, model.device, model.revision)
+        for model in settings_report.models
+    }
+    identity = (
+        raw.model.component,
+        raw.model.provider,
+        raw.model.model_id,
+        raw.model.device,
+        raw.model.revision,
     )
-    _verify_settings_fingerprint(raw, settings_report)
-    _verify_canonical_live_models(raw, settings_report)
+    if identity not in canonical:
+        raise ValueError("章节 VLM 执行模型身份不是当前生产组合")
+    if details.status != raw.status or details.operation != raw.operation:
+        raise ValueError("章节 VLM detail 的状态或操作与 raw 不一致")
+    if details.manifest_sha256 != (
+        raw.frame_manifest_input.sha256 if raw.frame_manifest_input is not None else None
+    ):
+        raise ValueError("章节 VLM Manifest 摘要与 detail 不一致")
+    if details.response_sha256 != raw.response_sha256:
+        raise ValueError("章节 VLM 响应摘要与 detail 不一致")
     if raw.status == GateStatus.PASS:
-        if tuple(fact.operation for fact in raw.executions) != (
-            "capability_probe",
-            "understand_segment",
-        ):
-            raise ValueError("Qwen 必须按能力探测、segment 顺序执行")
-        probe, segment = raw.executions
-        if set(probe.capabilities) != {"video_input", "strict_json_schema"}:
-            raise ValueError("Qwen 能力探测未证明视频和严格 Schema")
-        if probe.model != segment.model or segment.capabilities:
-            raise ValueError("Qwen 两阶段模型或能力事实不一致")
+        if len(raw.chapter_frames) not in {2, 3, 4} or raw.call_receipt is None:
+            raise ValueError("章节 VLM PASS 必须绑定 2~4 张帧和调用回执")
+        if _field(raw.call_receipt, "logical_analysis_count") != 1:
+            raise ValueError("章节 VLM 必须恰好执行一次逻辑调用")
+        if raw.response_sha256 is None or raw.visual_text_score_fact is None:
+            raise ValueError("章节 VLM PASS 缺少响应或评分事实")
+    score_artifacts = artifacts.get("QUALITY_DETAIL", ())
+    if raw.visual_text_score_fact is None:
+        if details.visual_text_score_fact_sha256 is not None or score_artifacts:
+            raise ValueError("章节 VLM 无评分事实时不得绑定 QUALITY_DETAIL")
+    else:
+        if details.visual_text_score_fact_sha256 is None:
+            raise ValueError("章节 VLM 评分事实缺少 detail 摘要")
+        score_artifact = _require_unique_artifact(
+            artifacts,
+            "QUALITY_DETAIL",
+            details.visual_text_score_fact_sha256,
+            "章节 VLM 评分事实",
+        )
+        encoded = score_artifact.snapshot.content
+        if encoded is None:
+            raise ValueError("章节 VLM 评分事实缺少正文")
+        score = VisualTextScoreFact.model_validate_json(encoded)
+        if score != raw.visual_text_score_fact:
+            raise ValueError("章节 VLM 评分事实与 raw 不一致")
+        if raw.response_sha256 != score.response_sha256:
+            raise ValueError("章节 VLM 评分事实响应摘要不一致")
     return raw.status == GateStatus.PASS
+
+
+def _field(value: object, name: str) -> object | None:
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _verify_chapter_vlm_inputs(
+    raw: ChapterVlmLiveRawReport,
+    details: ChapterVlmLiveDetails,
+    artifacts: dict[ArtifactRole, tuple[VerifiedArtifact, ...]],
+    workspace_root: Path,
+    *,
+    settings: Settings,
+) -> None:
+    """验证章节 VLM 的源媒体、Manifest 和 2~4 张 JPEG 闭包。"""
+
+    package = _load_live_package(
+        _require_unique_artifact(
+            artifacts, "DATASET_MANIFEST", details.dataset_sha256, "章节 VLM 授权 Manifest"
+        ),
+        _require_unique_artifact(
+            artifacts,
+            "AUTHORIZATION_RECORD",
+            details.authorization_sha256,
+            "章节 VLM 授权记录",
+        ),
+        workspace_root,
+    )
+    if package.dataset_sha256 != details.dataset_sha256:
+        raise ValueError("章节 VLM 数据集摘要与当前授权包不一致")
+    if package.authorization_sha256 != details.authorization_sha256:
+        raise ValueError("章节 VLM 授权摘要与当前授权包不一致")
+    sample = next(
+        (item for item in package.dataset.samples if item.sample_id == raw.sample_id),
+        None,
+    )
+    verified_annotation = next(
+        (item for item in package.annotations if item.annotation.sample_id == raw.sample_id),
+        None,
+    )
+    if sample is None or verified_annotation is None:
+        raise ValueError("章节 VLM 样本或标注不在当前授权包")
+    if raw.annotation_sha256 != verified_annotation.sha256:
+        raise ValueError("章节 VLM 标注摘要与当前授权标注不一致")
+    if raw.source_media_input.source_media_sha256 != sample.media_sha256:
+        raise ValueError("章节 VLM 源媒体摘要与当前授权样本不一致")
+    source_path = package.dataset.eval_root / sample.media_relative_path
+    source_relative = source_path.resolve(strict=True).relative_to(
+        workspace_root.resolve(strict=True)
+    )
+    if raw.source_media_input.relative_path != source_relative.as_posix():
+        raise ValueError("章节 VLM 源媒体路径与当前授权样本不一致")
+    source_snapshot = _read_file_snapshot(
+        source_path,
+        max_bytes=settings.max_video_bytes,
+        capture_content=False,
+    )
+    if (
+        source_snapshot.sha256 != sample.media_sha256
+        or source_snapshot.sha256 != raw.source_media_input.sha256
+        or source_snapshot.identity.size != raw.source_media_input.size_bytes
+    ):
+        raise ValueError("章节 VLM 源媒体内容与授权声明不一致")
+    _require_input_artifact(artifacts, raw.source_media_input)
+
+    if raw.source_media_input.kind != "SOURCE_MEDIA":
+        raise ValueError("章节 VLM 必须绑定 SOURCE_MEDIA")
+    if raw.source_media_input.sample_id != raw.sample_id:
+        raise ValueError("章节 VLM 源媒体样本不一致")
+    if raw.frame_manifest_input is None or raw.frame_manifest_input.kind != "FRAME_MANIFEST":
+        raise ValueError("章节 VLM 必须绑定 FRAME_MANIFEST")
+    manifest_artifact = _require_input_artifact(artifacts, raw.frame_manifest_input)
+    manifest = _load_chapter_vlm_manifest(manifest_artifact)
+    manifest_sha256 = chapter_vlm_input_manifest_sha256(manifest)
+    if manifest_sha256 != raw.frame_manifest_input.sha256:
+        raise ValueError("章节 VLM Manifest 摘要与 raw 不一致")
+    if (
+        manifest.parent_evaluation_run_id != raw.parent_evaluation_run_id
+        or manifest.evaluation_run_id != raw.evaluation_run_id
+        or manifest.sample_id != raw.sample_id
+        or manifest.source_media_sha256 != sample.media_sha256
+        or manifest.annotation_sha256 != raw.annotation_sha256
+    ):
+        raise ValueError("章节 VLM Manifest 与运行、样本或授权标注不一致")
+    run_root = manifest_artifact.path.parent.parent.resolve(strict=True)
+    if run_root.name != raw.evaluation_run_id:
+        raise ValueError("章节 VLM Manifest 不在当前评测 Run")
+    proxy_path = run_root / manifest.proxy_relative_path
+    proxy_snapshot = _read_file_snapshot(
+        proxy_path,
+        max_bytes=settings.max_video_bytes,
+        capture_content=False,
+    )
+    if (
+        proxy_snapshot.sha256 != manifest.proxy_sha256
+        or proxy_snapshot.identity.size != manifest.proxy_size_bytes
+    ):
+        raise ValueError("章节 VLM 代理内容与 Manifest 不一致")
+    ffprobe = FFprobeClient.from_path(
+        production_tool_path(settings, "ffprobe"),
+        workspace_root=workspace_root,
+    )
+    source_probe = ffprobe.probe(
+        source_path,
+        object_ref=sample.sample_id,
+        source_sha256=source_snapshot.sha256,
+        source_size_bytes=source_snapshot.identity.size,
+        source_mime=_chapter_source_mime(source_path),
+        limits=ProbeLimits(max_duration_ms=7_200_000),
+    )
+    proxy_probe = ffprobe.probe(
+        proxy_path,
+        object_ref=sample.sample_id,
+        source_sha256=proxy_snapshot.sha256,
+        source_size_bytes=proxy_snapshot.identity.size,
+        source_mime="video/mp4",
+        limits=ProbeLimits(max_duration_ms=7_200_000),
+    )
+    context = ValidatedChapterVlmInputContext(
+        parent_evaluation_run_id=manifest.parent_evaluation_run_id,
+        evaluation_run_id=manifest.evaluation_run_id,
+        sample_id=manifest.sample_id,
+        source_media_sha256=manifest.source_media_sha256,
+        annotation_sha256=manifest.annotation_sha256,
+        source_duration_ms=source_probe.manifest.duration_ms,
+        source_display_width=_source_display_size(source_probe.manifest)[0],
+        source_display_height=_source_display_size(source_probe.manifest)[1],
+        allowed_run_root=run_root,
+        proxy_relative_path=manifest.proxy_relative_path,
+        proxy_sha256=proxy_snapshot.sha256,
+        proxy_size_bytes=proxy_snapshot.identity.size,
+        proxy_max_edge=manifest.proxy_max_edge,
+        proxy_width=proxy_probe.manifest.video_stream.width,
+        proxy_height=proxy_probe.manifest.video_stream.height,
+        proxy_frame_rate=proxy_probe.manifest.video_stream.average_frame_rate,
+        proxy_is_variable_frame_rate=proxy_probe.manifest.video_stream.is_variable_frame_rate,
+        proxy_duration_ms=proxy_probe.manifest.duration_ms,
+        duration_tolerance_ms=manifest.duration_tolerance_ms,
+        frame_tolerance_ms=manifest.frame_tolerance_ms,
+        jpeg_quality=manifest.jpeg_quality,
+        vlm_max_image_bytes=settings.vlm_max_image_bytes,
+        max_candidate_frame_bytes_per_run=settings.max_candidate_frame_bytes_per_run,
+        max_candidate_frame_files_per_run=settings.max_candidate_frame_files_per_run,
+    )
+    validate_chapter_vlm_input_manifest(manifest, context=context)
+    manifest_frame_inputs = tuple(
+        LiveInputArtifact(
+            kind="CHAPTER_FRAME",
+            sample_id=manifest.sample_id,
+            relative_path=(run_root / frame.relative_path)
+            .relative_to(workspace_root)
+            .as_posix(),
+            sha256=frame.sha256,
+            source_media_sha256=manifest.source_media_sha256,
+            size_bytes=frame.size_bytes,
+        )
+        for frame in manifest.frames
+    )
+    if raw.chapter_frames != manifest_frame_inputs:
+        raise ValueError("章节 VLM raw 帧闭包与 Manifest 不一致")
+    if len(raw.chapter_frames) not in {2, 3, 4}:
+        raise ValueError("章节 VLM 必须绑定 2~4 张 CHAPTER_FRAME")
+    if any(
+        frame.kind != "CHAPTER_FRAME" or frame.sample_id != raw.sample_id
+        for frame in raw.chapter_frames
+    ):
+        raise ValueError("章节 VLM 帧类型或样本绑定非法")
+    if len({frame.relative_path for frame in raw.chapter_frames}) != len(raw.chapter_frames):
+        raise ValueError("章节 VLM 帧路径不得重复")
+    if len({frame.sha256 for frame in raw.chapter_frames}) != len(raw.chapter_frames):
+        raise ValueError("章节 VLM 帧摘要不得重复")
+    expected = (raw.source_media_input, raw.frame_manifest_input, *raw.chapter_frames)
+    for item in expected:
+        _require_input_artifact(artifacts, item)
+        if Path(item.relative_path).is_absolute() or ".." in Path(item.relative_path).parts:
+            raise ValueError("章节 VLM 输入路径非法")
+    if details.manifest_sha256 != raw.frame_manifest_input.sha256:
+        raise ValueError("章节 VLM Manifest 摘要与 detail 不一致")
+    if raw.call_receipt is not None:
+        if raw.call_receipt.ordered_input_frame_ids != tuple(
+            frame.frame_id for frame in manifest.frames
+        ):
+            raise ValueError("章节 VLM 回执输入帧顺序与 Manifest 不一致")
+        if not 200 <= raw.call_receipt.provider.final_http_status < 300:
+            raise ValueError("章节 VLM 回执最终 HTTP 状态必须是 2xx")
+
+
+def _require_input_artifact(
+    artifacts: dict[ArtifactRole, tuple[VerifiedArtifact, ...]],
+    item: LiveInputArtifact,
+) -> VerifiedArtifact:
+    matches = tuple(
+        artifact
+        for artifact in artifacts.get("INPUT_MEDIA", ())
+        if artifact.reference.relative_path == item.relative_path
+        and artifact.reference.sha256 == item.sha256
+    )
+    if len(matches) != 1 or matches[0].snapshot.identity.size != item.size_bytes:
+        raise ValueError("章节 VLM 输入产物未与 raw 精确绑定")
+    return matches[0]
+
+
+def _load_chapter_vlm_manifest(artifact: VerifiedArtifact) -> ChapterVlmInputManifest:
+    encoded = artifact.snapshot.content
+    if encoded is None:
+        raise ValueError("章节 VLM Manifest 缺少正文")
+    try:
+        manifest = ChapterVlmInputManifest.model_validate_json(encoded)
+    except (TypeError, ValueError) as error:
+        raise ValueError("章节 VLM Manifest 非法") from error
+    canonical_sha256 = chapter_vlm_input_manifest_sha256(manifest)
+    if (
+        hashlib.sha256(encoded).hexdigest() != artifact.reference.sha256
+        or canonical_sha256 != artifact.reference.sha256
+    ):
+        raise ValueError("章节 VLM Manifest 摘要与规范正文不一致")
+    return manifest
+
+
+def _chapter_source_mime(path: Path) -> SupportedMime:
+    mapping: dict[str, SupportedMime] = {
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".mkv": "video/x-matroska",
+        ".webm": "video/webm",
+    }
+    try:
+        return mapping[path.suffix.casefold()]
+    except KeyError:
+        raise ValueError("章节 VLM 源媒体格式不受支持") from None
 
 
 def _verify_five_language_models(
@@ -1207,7 +1431,11 @@ def _verify_five_language_models(
     *,
     settings: Settings | None,
 ) -> bool:
-    settings_report = _require_live_settings(settings, workspace_root)
+    settings_report = _require_live_settings(
+        settings,
+        workspace_root,
+        check_id="five_language_models",
+    )
     raw, _package = _verify_live_common(
         details,
         report,
@@ -1215,15 +1443,23 @@ def _verify_five_language_models(
         workspace_root,
         raw_type=FiveLanguageModelsRawReport,
     )
-    _verify_settings_fingerprint(raw, settings_report)
-    _verify_canonical_live_models(raw, settings_report)
+    reports = [settings_report]
+    matched = next(
+        (report for report in reports if raw.settings_fingerprint == report.settings_fingerprint),
+        None,
+    )
+    if matched is None:
+        raise ValueError("live settings fingerprint 不是当前生产配置")
+    _verify_canonical_live_models(raw, matched)
     return raw.status == GateStatus.PASS
 
 
 def _require_live_settings(
     settings: Settings | None,
     workspace_root: Path,
-) -> ProductionModelIdentityReport:
+    *,
+    check_id: str | None = None,
+) -> Any:
     if settings is None:
         raise ValueError("已执行 live 门禁必须提供可信 settings")
     workspace = workspace_root.resolve(strict=True)
@@ -1232,12 +1468,13 @@ def _require_live_settings(
         raise ValueError("settings.workspace_root 必须精确匹配 verifier 工作区")
     if settings.runtime_root != expected_runtime:
         raise ValueError("live verifier 只接受工作区固定 runtime root")
+    assert settings is not None
     return build_production_model_identity_report(settings)
 
 
 def _verify_settings_fingerprint(
     raw: _LiveRawReport,
-    report: ProductionModelIdentityReport,
+    report: Any,
 ) -> None:
     if raw.settings_fingerprint != report.settings_fingerprint:
         raise ValueError("live settings fingerprint 不是当前生产配置")
@@ -1245,14 +1482,12 @@ def _verify_settings_fingerprint(
 
 def _verify_canonical_live_models(
     raw: _LiveRawReport,
-    report: ProductionModelIdentityReport,
+    report: Any,
 ) -> None:
     canonical_components = {model.component for model in report.models}
     required_components: set[str]
-    if isinstance(raw, BaiduLiveRawReport):
-        required_components = {"baidu_ocr"}
-    elif isinstance(raw, QwenLiveRawReport):
-        required_components = {"qwen"}
+    if isinstance(raw, ChapterVlmLiveRawReport):
+        required_components = {"chapter_vlm"}
     elif isinstance(raw, FiveLanguageModelsRawReport):
         required_components = {"silero_vad", "cloud_whisper"}
     else:
@@ -1299,6 +1534,8 @@ def _verify_live_common(
         artifacts,
         workspace_root,
     )
+    if raw.dataset_sha256 is None or raw.authorization_sha256 is None:
+        raise ValueError("旧 live raw 缺少授权摘要")
     manifest = _require_unique_artifact(
         artifacts,
         "DATASET_MANIFEST",
@@ -1347,6 +1584,7 @@ def _verify_live_report_shape(
         "AUTHORIZATION_RECORD",
         "INPUT_MEDIA",
         "PROVIDER_RESPONSE",
+        "QUALITY_DETAIL",
     }
     if set(artifacts) - allowed:
         raise ValueError("live 报告包含未声明产物角色")
@@ -1372,13 +1610,16 @@ def _verify_live_report_shape(
         ("COMMAND_STDERR", trace.stderr_sha256),
     )
     for role, digest in trace_pairs:
-        if len(
-            tuple(
-                artifact
-                for artifact in artifacts.get(role, ())
-                if artifact.reference.sha256 == digest
+        if (
+            len(
+                tuple(
+                    artifact
+                    for artifact in artifacts.get(role, ())
+                    if artifact.reference.sha256 == digest
+                )
             )
-        ) != 1:
+            != 1
+        ):
             raise ValueError("live 顶层 trace 输出必须唯一绑定")
 
 
@@ -1439,8 +1680,8 @@ def _load_live_package(
 
 
 def _live_samples(raw: _LiveRawReport) -> tuple[LiveSample, ...]:
-    if isinstance(raw, (BaiduLiveRawReport, QwenLiveRawReport)):
-        return (raw.sample,)
+    if isinstance(raw, ChapterVlmLiveRawReport):
+        return ()
     if isinstance(raw, FiveLanguageModelsRawReport):
         return raw.samples
     raise ValueError("未知 live raw 类型")
@@ -1468,8 +1709,10 @@ def _verify_live_samples(
     for sample in samples:
         dataset_sample, annotation = package_by_id[sample.sample_id]
         expected_source = (
-            package.dataset.eval_root / dataset_sample.media_relative_path
-        ).relative_to(workspace_root).as_posix()
+            (package.dataset.eval_root / dataset_sample.media_relative_path)
+            .relative_to(workspace_root)
+            .as_posix()
+        )
         if (
             sample.source_media_relative_path != expected_source
             or sample.source_media_sha256 != dataset_sample.media_sha256
@@ -1492,24 +1735,16 @@ def _verify_live_samples(
         if matches[0].snapshot.identity.size != item.size_bytes:
             raise ValueError("live 输入大小与 raw 不一致")
         if item.source_media_sha256 != next(
-            sample.source_media_sha256
-            for sample in samples
-            if sample.sample_id == item.sample_id
+            sample.source_media_sha256 for sample in samples if sample.sample_id == item.sample_id
         ):
             raise ValueError("live 输入未绑定当前样本源媒体摘要")
 
 
 def _verify_derived_paths(sample: LiveSample, evaluation_run_id: str) -> None:
     expected_parent = (
-        PurePosixPath(".codex/video-rag-demo/eval/live")
-        / evaluation_run_id
-        / sample.sample_id
+        PurePosixPath(".codex/video-rag-demo/eval/live") / evaluation_run_id / sample.sample_id
     )
-    expected = {
-        "AUDIO": (sample.audio_relative_path, "audio.wav"),
-        "KEYFRAME": (sample.keyframe_relative_path, "keyframe.jpg"),
-        "CLIP": (sample.clip_relative_path, "clip.mp4"),
-    }
+    expected = {"AUDIO": (sample.audio_relative_path, "audio.wav")}
     for relative_path, filename in expected.values():
         path = PurePosixPath(relative_path)
         if path.parent != expected_parent or path.name != filename:
@@ -1566,7 +1801,7 @@ def _verify_live_execution_sequence(raw: _LiveRawReport) -> None:
     for index, fact in enumerate(raw.executions):
         if index >= len(stages) or not _fact_matches_stage(fact, stages[index]):
             raise ValueError("live raw 只允许合法执行前缀")
-        if fact.component in {"baidu_ocr", "qwen"} and (
+        if fact.component in {"chapter_vlm", "cloud_whisper"} and (
             fact.http_status is None or not 200 <= fact.http_status < 300
         ):
             raise ValueError("远程 live 阶段必须以 2xx 成功事实表示")
@@ -1575,10 +1810,7 @@ def _verify_live_execution_sequence(raw: _LiveRawReport) -> None:
             raise ValueError("live PASS 执行阶段不完整")
         return
     if raw.failure_component == "components_close":
-        if (
-            len(raw.executions) != len(stages)
-            or raw.failure_code != ErrorCode.SYSTEM_FAILURE
-        ):
+        if len(raw.executions) != len(stages) or raw.failure_code != ErrorCode.SYSTEM_FAILURE:
             raise ValueError("live 组件关闭失败必须位于完整执行序列之后")
         return
     if len(raw.executions) >= len(stages):
@@ -1588,8 +1820,7 @@ def _verify_live_execution_sequence(raw: _LiveRawReport) -> None:
     if (
         raw.failure_component is None
         or raw.failure_code is None
-        or raw.failure_code
-        not in _LIVE_COMPONENT_FAILURE_CODES[raw.failure_component]
+        or raw.failure_code not in _LIVE_COMPONENT_FAILURE_CODES[raw.failure_component]
     ):
         raise ValueError("live 失败错误码与实际组件不一致")
 
@@ -1597,13 +1828,6 @@ def _verify_live_execution_sequence(raw: _LiveRawReport) -> None:
 def _live_execution_stages(
     raw: _LiveRawReport,
 ) -> tuple[tuple[str, str, str | None], ...]:
-    if isinstance(raw, BaiduLiveRawReport):
-        return (("baidu_ocr", "recognize", None),)
-    if isinstance(raw, QwenLiveRawReport):
-        return (
-            ("qwen", "capability_probe", None),
-            ("qwen", "understand_segment", None),
-        )
     if isinstance(raw, FiveLanguageModelsRawReport):
         languages = ("zh", "en", "ja", "ko", "es")
         return (
@@ -1655,9 +1879,7 @@ def _verify_real_media(
         raise ValueError("真实媒体 detail 与原始报告不一致")
     if raw.trace_exit_code != details.trace.exit_code:
         raise ValueError("真实媒体顶层 trace 与原始报告不一致")
-    if raw.implementation_sha256 != _current_real_media_implementation_sha256(
-        workspace_root
-    ):
+    if raw.implementation_sha256 != _current_real_media_implementation_sha256(workspace_root):
         raise ValueError("真实媒体实现摘要不是当前实现")
     if raw.status == GateStatus.FAIL and all(
         sample.execution_status == "NOT_STARTED" for sample in raw.samples
@@ -1706,18 +1928,18 @@ def _verify_real_media_setup_outputs(
     )
     for role, digest in trace_pairs:
         matches = tuple(
-            artifact
-            for artifact in artifacts.get(role, ())
-            if artifact.reference.sha256 == digest
+            artifact for artifact in artifacts.get(role, ()) if artifact.reference.sha256 == digest
         )
         if len(matches) != 1:
             raise ValueError("真实媒体顶层 trace 输出必须唯一绑定")
         trace_expected.append((role, matches[0].reference.relative_path, digest))
     if set(expected) & set(trace_expected):
         raise ValueError("版本探测命令输出不得与顶层 trace 复用")
-    if raw.status == GateStatus.FAIL and all(
-        sample.execution_status == "NOT_STARTED" for sample in raw.samples
-    ) and actual != set(expected) | set(trace_expected):
+    if (
+        raw.status == GateStatus.FAIL
+        and all(sample.execution_status == "NOT_STARTED" for sample in raw.samples)
+        and actual != set(expected) | set(trace_expected)
+    ):
         raise ValueError("版本探测命令输出产物必须精确绑定")
     if any(
         not artifact.path.is_relative_to(raw_artifact.path.parent)
@@ -1787,9 +2009,7 @@ def _current_durability_implementation_sha256(workspace_root: Path) -> str:
             max_bytes=_MAX_EVIDENCE_BYTES,
             capture_content=False,
         )
-        entries.append(
-            {"relative_path": relative_path.as_posix(), "sha256": snapshot.sha256}
-        )
+        entries.append({"relative_path": relative_path.as_posix(), "sha256": snapshot.sha256})
     encoded = json.dumps(
         entries,
         ensure_ascii=False,
@@ -1807,9 +2027,7 @@ def _verify_real_media_files(
     expected: dict[tuple[ArtifactRole, str, str], RealMediaFile] = {}
     for sample in raw.samples:
         for media_file in sample.files:
-            role: ArtifactRole = (
-                "INPUT_MEDIA" if media_file.role == "SOURCE" else "OUTPUT_MEDIA"
-            )
+            role: ArtifactRole = "INPUT_MEDIA" if media_file.role == "SOURCE" else "OUTPUT_MEDIA"
             expected_key = (role, media_file.relative_path, media_file.sha256)
             if expected_key in expected:
                 raise ValueError("真实媒体原始报告重复声明文件")
@@ -1936,9 +2154,7 @@ class _WaveChunkWalker:
     def _finish_chunk(self) -> None:
         if self._chunk_id == b"fmt ":
             tag = (
-                int.from_bytes(self._fmt_tag, byteorder="little")
-                if len(self._fmt_tag) == 2
-                else -1
+                int.from_bytes(self._fmt_tag, byteorder="little") if len(self._fmt_tag) == 2 else -1
             )
             minimum = 40 if tag == 0xFFFE else 16
             if self._fmt_size is None or self._fmt_size < minimum:
@@ -2069,8 +2285,7 @@ def _verify_real_media_command_outputs(
         matches = tuple(
             artifact
             for artifact in artifacts.get(role, ())
-            if artifact.reference.relative_path == path
-            and artifact.reference.sha256 == digest
+            if artifact.reference.relative_path == path and artifact.reference.sha256 == digest
         )
         if len(matches) != 1:
             raise ValueError("真实媒体命令输出必须唯一绑定")
@@ -2088,9 +2303,7 @@ def _verify_real_media_command_outputs(
     )
     for role, digest in trace_pairs:
         matches = tuple(
-            artifact
-            for artifact in artifacts.get(role, ())
-            if artifact.reference.sha256 == digest
+            artifact for artifact in artifacts.get(role, ()) if artifact.reference.sha256 == digest
         )
         if len(matches) != 1:
             raise ValueError("真实媒体顶层 trace 输出必须唯一绑定")
@@ -2162,23 +2375,19 @@ def _derive_preflight_status(
     if raw.check_id != check_id:
         raise ValueError("preflight 检查绑定不匹配")
     if check_id == "real_media_chain" and (
-        raw.implementation_sha256
-        != _current_real_media_implementation_sha256(workspace_root)
+        raw.implementation_sha256 != _current_real_media_implementation_sha256(workspace_root)
     ):
         raise ValueError("真实媒体 preflight 实现摘要不是当前实现")
     if check_id == "real_media_chain":
         _verify_real_media_artifact_roles(artifacts, allow_media=False)
         _verify_real_media_preflight_artifacts(raw, report, artifacts, raw_artifact)
-    if check_id in _LIVE_GATE_CHECKS:
-        if raw.implementation_sha256 != _current_live_implementation_sha256(
-            workspace_root
-        ):
+    if check_id in _LIVE_IMPLEMENTATION_CHECKS:
+        if raw.implementation_sha256 != _current_live_implementation_sha256(workspace_root):
             raise ValueError("live preflight 实现摘要不是当前实现")
         _verify_live_preflight_artifacts(raw, report, artifacts, raw_artifact)
     if check_id == "m1_durability":
         if (
-            raw.implementation_sha256
-            != _current_durability_implementation_sha256(workspace_root)
+            raw.implementation_sha256 != _current_durability_implementation_sha256(workspace_root)
             or raw.evaluation_run_id is None
             or raw.evaluation_run_id != raw_artifact.path.parent.name
         ):
@@ -2289,9 +2498,7 @@ def _require_artifact_digest(
     role: ArtifactRole,
     expected_sha256: str,
 ) -> None:
-    if expected_sha256 not in {
-        artifact.reference.sha256 for artifact in artifacts.get(role, ())
-    }:
+    if expected_sha256 not in {artifact.reference.sha256 for artifact in artifacts.get(role, ())}:
         raise ValueError(f"机器证据缺少匹配摘要的 {role} 产物")
 
 
@@ -2405,9 +2612,7 @@ def _verify_performance(
         raise ValueError("旧版 M1 性能 Schema 缺少可信运行绑定")
     if settings is None:
         raise ValueError("M1 性能重验必须提供当前 Settings")
-    if (
-        settings.worker_concurrency != 1
-    ):
+    if settings.worker_concurrency != 1:
         raise ValueError("M1 性能当前设置不是 CPU/int8/单并发")
     raw_reports = artifacts.get("PERFORMANCE_REPORT", ())
     aggregate = tuple(
@@ -2432,9 +2637,7 @@ def _verify_performance(
         or raw.samples != details.samples
     ):
         raise ValueError("M1 detail、汇总 raw 与运行绑定不一致")
-    if raw.implementation_sha256 != _current_durability_implementation_sha256(
-        workspace_root
-    ):
+    if raw.implementation_sha256 != _current_durability_implementation_sha256(workspace_root):
         raise ValueError("M1 性能报告不是当前实现")
     current_identity = build_production_model_identity_report(settings)
     if raw.settings_fingerprint != current_identity.settings_fingerprint:
@@ -2445,9 +2648,9 @@ def _verify_performance(
         for artifact in raw_reports
         if artifact.reference.sha256 in raw.sample_report_sha256s
     )
-    if len(sample_raw) != 2 or {
-        artifact.reference.sha256 for artifact in sample_raw
-    } != set(raw.sample_report_sha256s):
+    if len(sample_raw) != 2 or {artifact.reference.sha256 for artifact in sample_raw} != set(
+        raw.sample_report_sha256s
+    ):
         raise ValueError("M1 两份样本 raw 未精确绑定")
     parsed_samples = tuple(
         PerformanceSampleRawReport.model_validate_json(artifact.snapshot.content).sample
@@ -2492,12 +2695,7 @@ def _verify_performance_sources(
     inputs = artifacts.get("INPUT_MEDIA", ())
     probes = artifacts.get("AUDIT_REPORT", ())
     results = artifacts.get("PRODUCTION_RESULT", ())
-    if (
-        len(manifests) != 1
-        or len(authorizations) != 1
-        or len(inputs) != 2
-        or len(probes) != 2
-    ):
+    if len(manifests) != 1 or len(authorizations) != 1 or len(inputs) != 2 or len(probes) != 2:
         raise ValueError("M1 Manifest、授权、输入或 probe 绑定不完整")
     if (
         manifests[0].reference.sha256 != raw.manifest_sha256
@@ -2557,8 +2755,7 @@ def _verify_performance_sources(
         if sample.result_manifest_relative_path is not None
     }
     actual_results = {
-        (artifact.reference.relative_path, artifact.reference.sha256)
-        for artifact in results
+        (artifact.reference.relative_path, artifact.reference.sha256) for artifact in results
     }
     if actual_results != expected_results:
         raise ValueError("M1 生产结果 Manifest 必须精确闭合")
@@ -2575,9 +2772,7 @@ def _verify_performance_sources(
             / cast(str, sample.production_run_id)
             / "result"
         )
-        if artifact.path.parent != expected_parent or not artifact.path.name.startswith(
-            "bundle-"
-        ):
+        if artifact.path.parent != expected_parent or not artifact.path.name.startswith("bundle-"):
             raise ValueError("M1 生产结果 Manifest 路径非法")
         encoded = artifact.snapshot.content
         if encoded is None:
@@ -2588,7 +2783,7 @@ def _verify_performance_sources(
             or envelope.get("upstream_sha256") != sample.sample_sha256
         ):
             raise ValueError("M1 生产结果 Manifest 上游摘要不匹配")
-        payload = ResultArtifactPayload.model_validate(envelope.get("payload"))
+        payload = DocumentArtifactPayload.model_validate(envelope.get("payload"))
         if (
             payload.result.run_id != sample.production_run_id
             or payload.result.asset_sha256 != sample.sample_sha256
@@ -2679,9 +2874,7 @@ def _verify_automated_tests_check(check: GateCheck, workspace_root: Path) -> Non
         evidence for evidence in check.evidence if evidence.kind == EvidenceKind.PYTEST_JUNIT
     )
     collections = tuple(
-        evidence
-        for evidence in check.evidence
-        if evidence.kind == EvidenceKind.PYTEST_COLLECTION
+        evidence for evidence in check.evidence if evidence.kind == EvidenceKind.PYTEST_COLLECTION
     )
     if len(junit) != 1 or len(collections) != 1 or len(check.evidence) != 2:
         raise ValueError("全量 pytest 门禁必须绑定一份 JUnit 和一份收集清单")
@@ -2702,9 +2895,7 @@ def _parse_pytest_collection(encoded: bytes) -> set[str]:
     except UnicodeDecodeError:
         raise ValueError("pytest 收集清单必须是 UTF-8") from None
     collected = {
-        line.strip()
-        for line in lines
-        if line.strip().startswith("tests/") and "::" in line
+        line.strip() for line in lines if line.strip().startswith("tests/") and "::" in line
     }
     if not collected:
         raise ValueError("pytest 收集清单没有精确 node ID")
