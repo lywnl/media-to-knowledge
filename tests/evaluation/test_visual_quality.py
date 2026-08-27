@@ -6,6 +6,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from video_demo.evaluation.chapter_vlm_live import ChapterVlmCallReceipt, VisualTextScoreFact
 from video_demo.evaluation.visual_quality import (
     VisualQualityCase,
     VisualQualityReport,
@@ -16,6 +17,7 @@ from video_demo.evaluation.visual_quality import (
     build_visual_resolution_report,
     visual_quality_case_id,
 )
+from video_demo.integrations.qwen_vl import QwenVisionProviderReceipt
 
 
 def _sha(value: object) -> str:
@@ -79,6 +81,71 @@ def test_not_run_case_cannot_claim_a_created_run() -> None:
         payload["evaluation_run_id"] = "run_001"
         VisualQualityCase(
             **payload,
+        )
+
+
+def test_failed_case_cannot_retain_a_successful_score_fact() -> None:
+    parent = "eval_parent"
+    sample = "sample_001"
+    refs = ("frame_001", "frame_002")
+    manifest_sha = "c" * 64
+    response_sha = "d" * 64
+    receipt = ChapterVlmCallReceipt(
+        logical_analysis_count=1,
+        parent_evaluation_run_id=parent,
+        evaluation_run_id="run_001",
+        sample_id=sample,
+        manifest_sha256=manifest_sha,
+        provider=QwenVisionProviderReceipt(
+            provider_attempt_count=1,
+            final_http_status=200,
+            provider_response_sha256="e" * 64,
+            request_json_bytes=1,
+            encoded_request_bytes=1,
+            elapsed_ms=1,
+        ),
+        ordered_input_frame_ids=refs,
+        request_json_bytes=1,
+        encoded_request_bytes=1,
+        vlm_elapsed_ms=1,
+        response_sha256=response_sha,
+    )
+    score = VisualTextScoreFact(
+        schema_version="1.0.0",
+        parent_evaluation_run_id=parent,
+        evaluation_run_id="run_001",
+        sample_id=sample,
+        manifest_sha256=manifest_sha,
+        response_sha256=response_sha,
+        reference_sha256="f" * 64,
+        hypothesis_sha256="a" * 64,
+        errors=0,
+        reference_units=1,
+        key_field_matches=0,
+        key_field_reference_units=0,
+        quality_categories=("GENERAL_TEXT",),
+        selected_reference_frame_count=1,
+    )
+    with pytest.raises(ValidationError, match="评分事实"):
+        VisualQualityCase(
+            case_id=visual_quality_case_id(parent, sample, refs, 1920, 90),
+            parent_evaluation_run_id=parent,
+            evaluation_run_id="run_001",
+            sample_id=sample,
+            requested_reference_frame_ids=refs,
+            proxy_max_edge=1920,
+            jpeg_quality=90,
+            case_status="FAIL",
+            error_code="VISUAL_RESULT_INVALID",
+            manifest_sha256=manifest_sha,
+            call_receipt=receipt,
+            response_sha256=response_sha,
+            score_fact=score,
+            implementation_sha256="1" * 64,
+            settings_fingerprint="2" * 64,
+            request_json_bytes=1,
+            encoded_request_bytes=1,
+            vlm_elapsed_ms=1,
         )
 
 

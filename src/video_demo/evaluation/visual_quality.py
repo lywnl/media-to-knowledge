@@ -259,10 +259,27 @@ class VisualQualityCase(FrozenModel):
         elif self.case_status == "FAIL":
             if self.error_code is None:
                 raise ValueError("FAIL case 必须包含稳定错误码")
-            if self.score_fact is not None and self.call_receipt is None:
-                raise ValueError("失败 case 的评分事实必须绑定正式调用回执")
-            if self.score_fact is not None and self.response_sha256 is None:
-                raise ValueError("失败 case 的评分事实必须绑定响应摘要")
+            if self.score_fact is not None:
+                if self.call_receipt is None:
+                    raise ValueError("失败 case 的评分事实必须绑定正式调用回执")
+                if self.response_sha256 is None:
+                    raise ValueError("失败 case 的评分事实必须绑定响应摘要")
+                if self.error_code != ErrorCode.VISUAL_RESULT_INVALID:
+                    raise ValueError(
+                        "失败 case 的评分事实只允许用于视觉结果非法分支"
+                    )
+                if any(
+                    value != 0
+                    for value in (
+                        self.score_fact.key_field_matches,
+                    )
+                ):
+                    raise ValueError("视觉结果非法分支的评分事实必须是零命中")
+                if (
+                    self.score_fact.reference_units > 0
+                    and self.score_fact.errors != self.score_fact.reference_units
+                ):
+                    raise ValueError("视觉结果非法分支的评分事实必须是零命中")
             if self.failure_receipt is not None and self.call_receipt is not None:
                 raise ValueError("同一失败 case 不得同时保存成功调用回执和失败回执")
             for fact in (self.call_receipt, self.score_fact):
