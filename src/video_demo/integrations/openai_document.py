@@ -470,6 +470,14 @@ def _validate_compact_planning_response(
 ) -> None:
     segment_count = len(request.segments)
     transcript_count = len(request.transcript_evidence)
+    segment_transcript_indexes = tuple(
+        tuple(
+            index
+            for index, evidence in enumerate(request.transcript_evidence)
+            if evidence.evidence_id in segment.evidence_refs
+        )
+        for segment in request.segments
+    )
     expected_start = 0
     for draft in response.chapter_drafts:
         if draft.start_segment_index != expected_start:
@@ -489,6 +497,17 @@ def _validate_compact_planning_response(
                 target.anchor_transcript_indexes
             ):
                 raise _ReferenceValidationError("semantic_targets.anchor_indexes:duplicate")
+            chapter_transcript_indexes = {
+                index
+                for indexes in segment_transcript_indexes[
+                    draft.start_segment_index : draft.end_segment_index
+                ]
+                for index in indexes
+            }
+            if not set(target.anchor_transcript_indexes) <= chapter_transcript_indexes:
+                raise _ReferenceValidationError(
+                    "semantic_targets.anchor_indexes:not_in_chapter",
+                )
     if expected_start != segment_count:
         raise _ReferenceValidationError("chapter_drafts.segment_indexes:not_complete")
 

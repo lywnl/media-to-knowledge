@@ -193,6 +193,77 @@ def test_compact_planning_request_maps_indexes_back_to_stable_ids() -> None:
     assert "asr_001" not in json.dumps(sent, ensure_ascii=False)
 
 
+def test_compact_planning_rejects_anchor_from_another_chapter() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _provider_response(
+            request,
+            {
+                "chapter_drafts": [
+                    {
+                        "start_segment_index": 0,
+                        "end_segment_index": 1,
+                        "title_hint": "第一章",
+                        "visual_mode": "SINGLE",
+                        "semantic_targets": [],
+                    },
+                    {
+                        "start_segment_index": 1,
+                        "end_segment_index": 2,
+                        "title_hint": "第二章",
+                        "visual_mode": "SINGLE",
+                        "semantic_targets": [
+                            {
+                                "query_zh": "错误锚点",
+                                "anchor_transcript_indexes": [0],
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+
+    client = OpenAIDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="text-secret",
+        model_id="text-model",
+        compact_planning=True,
+        sleeper=lambda _delay: None,
+    )
+
+    with pytest.raises(ModelResponseValidationError) as raised:
+        client.plan_chapters(_planning_request().model_copy(
+            update={
+                "segments": (
+                    _segment(),
+                    _segment().model_copy(
+                        update={
+                            "segment_id": "segment_002",
+                            "start_ms": 10_000,
+                            "end_ms": 20_000,
+                            "evidence_refs": ("asr_002",),
+                        },
+                    ),
+                ),
+                "transcript_evidence": (
+                    _speech(),
+                    _speech().model_copy(
+                        update={
+                            "evidence_id": "asr_002",
+                            "start_ms": 11_000,
+                            "end_ms": 12_000,
+                        },
+                    ),
+                ),
+                "duration_ms": 20_000,
+            },
+        ))
+
+    assert raised.value.invalid_response.validation_errors == (
+        "semantic_targets.anchor_indexes:not_in_chapter",
+    )
+
+
 def test_plan_request_allows_large_repair_budget_for_provider_validation() -> None:
     payloads: list[dict[str, object]] = []
 
