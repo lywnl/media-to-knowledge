@@ -59,6 +59,7 @@ from video_demo.storage.document_cache import DocumentModelCache, ModelInvocatio
 from video_demo.visual.candidate_artifacts import (
     CandidateDirectoryLease,
     read_verified_candidate_jpeg,
+    validate_candidate_descriptor,
 )
 from video_demo.visual.keyframe_artifacts import KeyframeArtifactSession
 
@@ -249,7 +250,6 @@ class ChapterVisionService:
         max_image_bytes: int,
         max_request_image_bytes: int,
         max_encoded_request_bytes: int,
-        max_candidate_bytes: int,
         max_published_keyframe_bytes: int,
         max_published_keyframe_files: int,
         invocation_wait_timeout_seconds: float,
@@ -260,7 +260,6 @@ class ChapterVisionService:
             max_image_bytes,
             max_request_image_bytes,
             max_encoded_request_bytes,
-            max_candidate_bytes,
             max_published_keyframe_bytes,
             max_published_keyframe_files,
         )
@@ -292,7 +291,6 @@ class ChapterVisionService:
         self._max_image_bytes = max_image_bytes
         self._max_request_image_bytes = max_request_image_bytes
         self._max_encoded_request_bytes = max_encoded_request_bytes
-        self._max_candidate_bytes = max_candidate_bytes
         self._max_published_keyframe_bytes = max_published_keyframe_bytes
         self._max_published_keyframe_files = max_published_keyframe_files
         self._invocation_wait_timeout_seconds = invocation_wait_timeout_seconds
@@ -311,7 +309,13 @@ class ChapterVisionService:
         frame_sets, frame_status = _validate_batch_alignment(chapters, frame_batch)
         if document_config.max_visuals_per_chapter == 0:
             return _disabled_batch(chapters)
-        _validate_frame_batch_semantics(chapters, frame_sets, frame_status)
+        _validate_frame_batch_semantics(
+            chapters,
+            frame_sets,
+            frame_status,
+            asset_sha256=frame_batch.asset_sha256,
+            allowed_run_root=frame_batch.allowed_run_root,
+        )
         transcripts = _validate_transcripts(chapters, transcript_evidence)
         if not any(frame_set.candidates for frame_set in frame_sets.values()):
             return _empty_batch(chapters, frame_status, frame_batch.status)
@@ -326,9 +330,10 @@ class ChapterVisionService:
         lease_transferred = False
         cleanup_handoff = _DeferredCleanupHandoff()
         try:
-            _revalidate_candidate_closure(
+            _verify_candidate_batch_files(
+                frame_sets,
+                frame_batch.asset_sha256,
                 frame_batch.allowed_run_root,
-                frame_sets.values(),
                 max_bytes=self._max_image_bytes,
             )
             cleanup_handoff.start(self._invocation_wait_timeout_seconds)
@@ -711,6 +716,9 @@ def _validate_frame_batch_semantics(
     chapters: tuple[ChapterPlan, ...],
     frame_sets: Mapping[str, ChapterFrameSet],
     frame_status: Mapping[str, ChapterFrameStatus],
+    *,
+    asset_sha256: str,
+    allowed_run_root: Path,
 ) -> None:
     frame_metadata: dict[str, tuple[object, ...]] = {}
     for chapter in chapters:
@@ -731,6 +739,11 @@ def _validate_frame_batch_semantics(
         if len(frame_ids) != len(set(frame_ids)):
             raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "章节候选帧 ID 重复")
         for frame in frame_set.candidates:
+            validate_candidate_descriptor(
+                frame,
+                asset_sha256,
+                allowed_run_root=allowed_run_root,
+            )
             if (
                 not chapter.start_ms <= frame.timestamp_ms < chapter.end_ms
                 or not set(frame.target_ids) <= target_ids
@@ -756,6 +769,33 @@ def _validate_frame_batch_semantics(
             frame_metadata[frame.frame_id] = metadata
 
 
+def _verify_candidate_batch_files(
+    frame_sets: Mapping[str, ChapterFrameSet],
+    asset_sha256: str,
+    allowed_run_root: Path,
+    *,
+    max_bytes: int,
+) -> None:
+    """在候选租约内按唯一 SHA 完成一次文件级完整性复验。"""
+
+    seen: set[str] = set()
+    for frame_set in frame_sets.values():
+        for frame in frame_set.candidates:
+            if frame.sha256 in seen:
+                continue
+            validate_candidate_descriptor(
+                frame,
+                asset_sha256,
+                allowed_run_root=allowed_run_root,
+            )
+            read_verified_candidate_jpeg(
+                allowed_run_root,
+                frame,
+                max_bytes=max_bytes,
+            )
+            seen.add(frame.sha256)
+
+
 def _validate_transcripts(
     chapters: tuple[ChapterPlan, ...],
     transcript_evidence: tuple[TranscriptEvidence, ...],
@@ -777,33 +817,6 @@ def _validate_transcripts(
         )
         for chapter in chapters
     }
-
-
-def _revalidate_candidate_closure(
-    allowed_run_root: Path,
-    frame_sets: Iterable[object],
-    *,
-    max_bytes: int,
-) -> None:
-    metadata: dict[str, tuple[str, int, str]] = {}
-    for frame_set in frame_sets:
-        candidates = getattr(frame_set, "candidates", ())
-        for frame in candidates:
-            current = (frame.relative_path, frame.size_bytes, frame.mime_type)
-            if frame.sha256 in metadata and metadata[frame.sha256] != current:
-                raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "同 SHA 候选帧元数据不一致")
-            if frame.sha256 in metadata:
-                continue
-            try:
-                read_verified_candidate_jpeg(
-                    allowed_run_root,
-                    frame,
-                    max_bytes=max_bytes,
-                )
-            except VideoDemoError as error:
-                if error.code != ErrorCode.INPUT_BUDGET_EXCEEDED:
-                    raise
-            metadata[frame.sha256] = current
 
 
 def _skipped_analysis(

@@ -267,7 +267,6 @@ def build_production_pipeline(
                 max_image_bytes=vision.max_image_bytes,
                 max_request_image_bytes=vision.max_request_image_bytes,
                 max_encoded_request_bytes=vision.max_encoded_request_bytes,
-                max_candidate_bytes=settings.max_candidate_frame_bytes_per_run,
                 max_published_keyframe_bytes=(
                     settings.max_published_keyframe_bytes_per_run
                 ),

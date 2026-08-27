@@ -19,7 +19,7 @@ from video_demo.application.pipeline_contracts import (
     SceneIndex,
     scene_index_sha256,
 )
-from video_demo.domain.base import FrozenModel, StableId, stable_identifier
+from video_demo.domain.base import FrozenModel, Sha256, StableId, stable_identifier
 from video_demo.domain.document import DocumentGenerationConfig
 from video_demo.domain.document_artifact import MAX_METRIC_VALUE
 from video_demo.domain.document_plan import (
@@ -64,6 +64,7 @@ _NO_ARTIFACT_SAMPLE_STATUSES = _FAILED_SAMPLE_STATUSES | {"QUALITY_REJECTED"}
 
 
 class ChapterFrameSearchBatch(FrozenModel):
+    asset_sha256: Sha256
     allowed_run_root: Path
     frame_tolerance_ms: int = Field(ge=0, le=100)
     frame_sets: tuple[ChapterFrameSet, ...] = Field(max_length=240)
@@ -195,7 +196,12 @@ class ChapterFrameSearcher:
     ) -> ChapterFrameSearchBatch:
         allowed_run_root = self._validate_inputs(media, chapters, transcript_by_id, scene_index)
         if document_config.max_visuals_per_chapter == 0:
-            return self._disabled_batch(chapters, allowed_run_root, scene_index.frame_tolerance_ms)
+            return self._disabled_batch(
+                chapters,
+                allowed_run_root,
+                scene_index.frame_tolerance_ms,
+                media.source.asset.source_sha256,
+            )
         samples, bindings = self._build_samples(chapters, transcript_by_id, scene_index)
         artifact_session = CandidateArtifactSession(
             runtime_root=self._runtime_root,
@@ -646,6 +652,7 @@ class ChapterFrameSearcher:
             else "SUCCEEDED"
         )
         return ChapterFrameSearchBatch(
+            asset_sha256=asset_sha256,
             allowed_run_root=allowed_run_root,
             frame_tolerance_ms=frame_tolerance_ms,
             frame_sets=tuple(frame_sets),
@@ -707,7 +714,11 @@ class ChapterFrameSearcher:
     @staticmethod
     def _to_artifact(asset_sha256: str, item: _InternalCandidate) -> FrameCandidateArtifact:
         return FrameCandidateArtifact(
-        frame_id=frame_candidate_id(asset_sha256, item.frame.timestamp_ms, item.sha256),
+            frame_id=frame_candidate_id(
+                asset_sha256,
+                actual_timestamp_ms=item.frame.timestamp_ms,
+                image_sha256=item.sha256,
+            ),
             timestamp_ms=item.frame.timestamp_ms,
             sha256=item.sha256,
             size_bytes=item.size_bytes,
@@ -721,8 +732,10 @@ class ChapterFrameSearcher:
         chapters: tuple[ChapterPlan, ...],
         allowed_run_root: Path,
         frame_tolerance_ms: int,
+        asset_sha256: str,
     ) -> ChapterFrameSearchBatch:
         return ChapterFrameSearchBatch(
+            asset_sha256=asset_sha256,
             allowed_run_root=allowed_run_root,
             frame_tolerance_ms=frame_tolerance_ms,
             frame_sets=tuple(
@@ -978,7 +991,11 @@ def _candidate_rank(
         -item.frame.sharpness,
         -base_hits,
         item.frame.timestamp_ms,
-        frame_candidate_id(asset_sha256, item.frame.timestamp_ms, item.sha256),
+        frame_candidate_id(
+            asset_sha256,
+            actual_timestamp_ms=item.frame.timestamp_ms,
+            image_sha256=item.sha256,
+        ),
     )
 
 

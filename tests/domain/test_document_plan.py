@@ -9,6 +9,7 @@ from video_demo.domain.document_plan import (
     ChapterPlan,
     FrameCandidateArtifact,
     VisualSearchTarget,
+    frame_candidate_id,
 )
 from video_demo.domain.evidence import ChapterVisualObservation
 
@@ -125,9 +126,25 @@ def test_frame_candidate_is_jpeg_only_and_uses_content_addressed_run_path() -> N
         ("mime_type", "image/png"),
         ("relative_path", f"runs/scope/run/visual/candidates/{'a' * 64}.jpg"),
         ("relative_path", "visual/candidates/wrong.jpg"),
+        ("perceptual_hash", "0123456789ABCDEf"),
+        ("perceptual_hash", "0123456789abcde"),
     ):
         with pytest.raises(ValidationError):
             FrameCandidateArtifact.model_validate({**valid, field: invalid})
+
+
+def test_frame_candidate_id_uses_actual_timestamp_but_canonical_timestamp_key() -> None:
+    asset_sha256 = "a" * 64
+    image_sha256 = "b" * 64
+
+    by_keyword = frame_candidate_id(
+        asset_sha256,
+        actual_timestamp_ms=1_234,
+        image_sha256=image_sha256,
+    )
+    by_positional = frame_candidate_id(asset_sha256, 1_234, image_sha256)
+
+    assert by_keyword == by_positional
 
 
 def test_candidate_and_observation_accept_at_most_six_target_ids() -> None:

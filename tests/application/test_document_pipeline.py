@@ -408,6 +408,7 @@ class _PipelineFixture:
             )
         self.frame_finished.set()
         return ChapterFrameSearchBatch(
+            asset_sha256=media.source.asset.source_sha256,
             allowed_run_root=self.runtime_root / media.source.asset.run_relative_root,
             frame_tolerance_ms=scene_index.frame_tolerance_ms,
             frame_sets=(

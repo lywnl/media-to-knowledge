@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import math
 import os
+import re
 import stat
 import threading
 import time
@@ -14,7 +15,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Literal, Self
 
-from video_demo.domain.document_plan import FrameCandidateArtifact
+from video_demo.domain.document_plan import FrameCandidateArtifact, frame_candidate_id
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.storage.workspace import (
     reject_symlink_components,
@@ -28,6 +29,7 @@ CandidateLeaseMode = Literal["SHARED", "EXCLUSIVE"]
 
 _LOCK_POLL_SECONDS = 0.05
 _PROCESS_LOCK_GUARD = threading.Lock()
+_PERCEPTUAL_HASH_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
 @dataclass(slots=True)
@@ -504,6 +506,56 @@ def read_verified_candidate_jpeg(
         expected_size=frame.size_bytes,
         max_bytes=max_bytes,
     )
+
+
+def validate_candidate_descriptor(
+    frame: FrameCandidateArtifact,
+    asset_sha256: str,
+    *,
+    allowed_run_root: Path,
+) -> None:
+    """校验候选帧描述符，不读取文件或执行预算统计。"""
+
+    if not allowed_run_root.expanduser().is_absolute():
+        raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "当前 Run 根必须是绝对路径")
+    if not _is_sha256(asset_sha256):
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "候选帧资产摘要非法")
+    try:
+        relative_path = Path(frame.relative_path)
+        frame_sha256 = frame.sha256
+        timestamp_ms = frame.timestamp_ms
+        frame_id = frame.frame_id
+        mime_type = frame.mime_type
+        perceptual_hash = frame.perceptual_hash
+        target_ids = tuple(frame.target_ids)
+        size_bytes = frame.size_bytes
+    except (AttributeError, TypeError, ValueError) as error:
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "候选帧描述符非法") from error
+    if (
+        relative_path.is_absolute()
+        or ".." in relative_path.parts
+        or not _is_sha256(frame_sha256)
+        or relative_path != Path("visual/candidates") / f"{frame_sha256}.jpg"
+        or mime_type != "image/jpeg"
+        or _PERCEPTUAL_HASH_PATTERN.fullmatch(perceptual_hash) is None
+        or not target_ids
+        or len(target_ids) != len(set(target_ids))
+        or type(timestamp_ms) is not int
+        or timestamp_ms < 0
+        or type(size_bytes) is not int
+        or size_bytes <= 0
+    ):
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "候选帧描述符非法")
+    try:
+        expected_frame_id = frame_candidate_id(
+            asset_sha256,
+            actual_timestamp_ms=timestamp_ms,
+            image_sha256=frame_sha256,
+        )
+    except ValueError as error:
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "候选帧描述符非法") from error
+    if frame_id != expected_frame_id:
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "候选帧 ID 与资产和实际时间不一致")
 
 
 def _read_verified_candidate_at(

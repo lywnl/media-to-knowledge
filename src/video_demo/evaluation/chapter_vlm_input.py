@@ -170,7 +170,9 @@ class ChapterVlmInputManifest(FrozenModel):
             if frame.target_ids != (target_id,):
                 raise ValueError("评测输入帧必须绑定唯一 BASE_COVERAGE 目标")
             if frame.frame_id != frame_candidate_id(
-                self.source_media_sha256, frame.actual_timestamp_ms, frame.sha256
+                self.source_media_sha256,
+                actual_timestamp_ms=frame.actual_timestamp_ms,
+                image_sha256=frame.sha256,
             ):
                 raise ValueError("评测 frame_id 与媒体、时间和图片摘要不匹配")
             if (
@@ -784,8 +786,8 @@ def prepare_chapter_vlm_input(
                         reference_frame_id=reference_id,
                         frame_id=frame_candidate_id(
                             sample.media_sha256,
-                            candidates[reference_id].timestamp_ms,
-                            _candidate_sha(candidates[reference_id]),
+                            actual_timestamp_ms=candidates[reference_id].timestamp_ms,
+                            image_sha256=_candidate_sha(candidates[reference_id]),
                         ),
                         requested_timestamp_ms=references[reference_id].timestamp_ms,
                         actual_timestamp_ms=candidates[reference_id].timestamp_ms,

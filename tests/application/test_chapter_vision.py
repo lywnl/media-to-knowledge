@@ -20,6 +20,7 @@ from video_demo.domain.document_plan import (
     ChapterPlan,
     FrameCandidateArtifact,
     VisualSearchTarget,
+    frame_candidate_id,
 )
 from video_demo.domain.evidence import (
     ChapterVisualObservation,
@@ -37,6 +38,31 @@ from video_demo.integrations.document_port import (
     ModelResponseValidationError,
 )
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
+
+_ASSET_SHA256 = "a" * 64
+_FIXTURE_DIGEST = hashlib.sha256(b"\xff\xd8\xffchapter-vision\xff\xd9").hexdigest()
+
+
+def _frame_id(timestamp_ms: int, image_sha256: str) -> str:
+    return frame_candidate_id(
+        _ASSET_SHA256,
+        actual_timestamp_ms=timestamp_ms,
+        image_sha256=image_sha256,
+    )
+
+
+def _updated_frame(
+    frame: FrameCandidateArtifact,
+    **updates: object,
+) -> FrameCandidateArtifact:
+    values = frame.model_dump(mode="python")
+    values.update(updates)
+    values["frame_id"] = frame_candidate_id(
+        _ASSET_SHA256,
+        actual_timestamp_ms=values["timestamp_ms"],
+        image_sha256=values["sha256"],
+    )
+    return FrameCandidateArtifact.model_validate(values)
 
 
 class _VisionPort:
@@ -122,7 +148,7 @@ def _fixture(
         base_coverage_targets=(),
     )
     frame = FrameCandidateArtifact(
-        frame_id="frame_001",
+        frame_id=_frame_id(1_500, digest),
         timestamp_ms=1_500,
         sha256=digest,
         size_bytes=len(payload),
@@ -131,6 +157,7 @@ def _fixture(
         target_ids=(target.target_id,),
     )
     frame_batch = ChapterFrameSearchBatch(
+        asset_sha256=_ASSET_SHA256,
         allowed_run_root=run_root,
         frame_tolerance_ms=50,
         frame_sets=(ChapterFrameSet(chapter_id=chapter.chapter_id, candidates=(frame,)),),
@@ -145,13 +172,13 @@ def _response() -> ChapterVisionResponse:
         observations=(
             ChapterVisualObservation(
                 target_ids=("target_001",),
-                selected_frame_ids=("frame_001",),
+                selected_frame_ids=(_frame_id(1_500, _FIXTURE_DIGEST),),
                 transcript_evidence_refs=("asr_001",),
                 visual_type="TEXT",
                 caption="配置将并发数设置为 2",
                 content_blocks=(
                     VisualTextContentDraft(
-                        source_frame_ids=("frame_001",),
+                        source_frame_ids=(_frame_id(1_500, _FIXTURE_DIGEST),),
                         text="vlm_concurrency = 2",
                     ),
                 ),
@@ -176,7 +203,6 @@ def _service(
         max_image_bytes=1024,
         max_request_image_bytes=4096,
         max_encoded_request_bytes=64 * 1024,
-        max_candidate_bytes=512 * 1024 * 1024,
         max_published_keyframe_bytes=4096,
         max_published_keyframe_files=10,
         invocation_wait_timeout_seconds=invocation_wait_timeout_seconds,
@@ -207,7 +233,6 @@ def test_chapter_vision_rejects_stale_cache_schema_identity(
             max_image_bytes=1024,
             max_request_image_bytes=4096,
             max_encoded_request_bytes=64 * 1024,
-            max_candidate_bytes=512 * 1024 * 1024,
             max_published_keyframe_bytes=4096,
             max_published_keyframe_files=10,
             invocation_wait_timeout_seconds=2,
@@ -223,6 +248,7 @@ def _replace_frame_batch(
     status: str = "SUCCEEDED",
 ) -> ChapterFrameSearchBatch:
     return ChapterFrameSearchBatch(
+        asset_sha256=frame_batch.asset_sha256,
         allowed_run_root=frame_batch.allowed_run_root,
         frame_tolerance_ms=frame_batch.frame_tolerance_ms,
         frame_sets=(ChapterFrameSet(chapter_id=chapter.chapter_id, candidates=candidates),),
@@ -282,18 +308,18 @@ def test_chapter_vision_generates_stable_unique_content_and_fact_ids(
                 update={
                     "content_blocks": (
                         VisualTextContentDraft(
-                            source_frame_ids=("frame_001",),
+                            source_frame_ids=(frame_batch.frame_sets[0].candidates[0].frame_id,),
                             text="vlm_concurrency = 2",
                         ),
                         VisualTextContentDraft(
-                            source_frame_ids=("frame_001",),
+                            source_frame_ids=(frame_batch.frame_sets[0].candidates[0].frame_id,),
                             text="worker_concurrency = 2",
                         ),
                     ),
                     "visual_facts": (
                         VisualFactDraft(
                             text="界面显示两个并发配置",
-                            source_frame_ids=("frame_001",),
+                            source_frame_ids=(frame_batch.frame_sets[0].candidates[0].frame_id,),
                         ),
                     ),
                 },
@@ -388,7 +414,7 @@ def test_chapter_vision_degrades_only_temporary_failed_chapter(tmp_path: Path) -
     assert result.metrics["vlm_fallback_chapters"] == 1
 
 
-def test_oversized_candidate_with_target_covering_alternative_continues(
+def test_oversized_candidate_is_rejected_during_batch_file_verification(
     tmp_path: Path,
 ) -> None:
     run_root, chapter, frame_batch, speech, payload = _fixture(tmp_path)
@@ -398,14 +424,12 @@ def test_oversized_candidate_with_target_covering_alternative_continues(
     large_path = run_root / f"visual/candidates/{large_digest}.jpg"
     large_path.write_bytes(large_payload)
     large_path.chmod(0o600)
-    oversized = first.model_copy(
-        update={
-            "frame_id": "frame_oversized",
-            "timestamp_ms": 1_400,
-            "sha256": large_digest,
-            "size_bytes": len(large_payload),
-            "relative_path": f"visual/candidates/{large_digest}.jpg",
-        },
+    oversized = _updated_frame(
+        first,
+        timestamp_ms=1_400,
+        sha256=large_digest,
+        size_bytes=len(large_payload),
+        relative_path=f"visual/candidates/{large_digest}.jpg",
     )
     batch = _replace_frame_batch(
         frame_batch,
@@ -414,21 +438,22 @@ def test_oversized_candidate_with_target_covering_alternative_continues(
     )
     port = _VisionPort(_response())
 
-    result = _service(tmp_path, port).analyze_all(
-        (chapter,),
-        batch,
-        (speech,),
-        DocumentGenerationConfig(),
-        cache=_cache(run_root),
-        is_cancel_requested=lambda: False,
-    )
+    with pytest.raises(VideoDemoError) as raised:
+        _service(tmp_path, port).analyze_all(
+            (chapter,),
+            batch,
+            (speech,),
+            DocumentGenerationConfig(),
+            cache=_cache(run_root),
+            is_cancel_requested=lambda: False,
+        )
 
     assert len(large_payload) > 1_024 > len(payload)
-    assert tuple(frame.frame_id for frame in port.requests[0].frames) == (first.frame_id,)
-    assert result.chapter_status == ((chapter.chapter_id, "SUCCEEDED"),)
+    assert raised.value.code == ErrorCode.INPUT_BUDGET_EXCEEDED
+    assert port.requests == []
 
 
-def test_only_target_covering_candidate_over_image_limit_degrades_by_budget(
+def test_only_target_covering_candidate_over_image_limit_fails_batch_verification(
     tmp_path: Path,
 ) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
@@ -438,29 +463,27 @@ def test_only_target_covering_candidate_over_image_limit_degrades_by_budget(
     large_path = run_root / f"visual/candidates/{large_digest}.jpg"
     large_path.write_bytes(large_payload)
     large_path.chmod(0o600)
-    oversized = original.model_copy(
-        update={
-            "sha256": large_digest,
-            "size_bytes": len(large_payload),
-            "relative_path": f"visual/candidates/{large_digest}.jpg",
-        },
+    oversized = _updated_frame(
+        original,
+        sha256=large_digest,
+        size_bytes=len(large_payload),
+        relative_path=f"visual/candidates/{large_digest}.jpg",
     )
     batch = _replace_frame_batch(frame_batch, chapter=chapter, candidates=(oversized,))
     port = _VisionPort(_response())
 
-    result = _service(tmp_path, port).analyze_all(
-        (chapter,),
-        batch,
-        (speech,),
-        DocumentGenerationConfig(),
-        cache=_cache(run_root),
-        is_cancel_requested=lambda: False,
-    )
+    with pytest.raises(VideoDemoError) as raised:
+        _service(tmp_path, port).analyze_all(
+            (chapter,),
+            batch,
+            (speech,),
+            DocumentGenerationConfig(),
+            cache=_cache(run_root),
+            is_cancel_requested=lambda: False,
+        )
 
     assert port.requests == []
-    assert result.chapter_status == ((chapter.chapter_id, "DEGRADED"),)
-    assert result.warnings == (f"CHAPTER_VLM_INPUT_BUDGET_DEGRADED:{chapter.chapter_id}",)
-    assert result.metrics["vlm_fallback_chapters"] == 1
+    assert raised.value.code == ErrorCode.INPUT_BUDGET_EXCEEDED
 
 
 def test_visual_disabled_short_circuits_before_lease_and_candidate_read(tmp_path: Path) -> None:
@@ -500,6 +523,7 @@ def test_degraded_frame_chapter_with_candidates_stays_degraded_without_copying_f
 ) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
     degraded_batch = ChapterFrameSearchBatch(
+        asset_sha256=frame_batch.asset_sha256,
         allowed_run_root=run_root,
         frame_tolerance_ms=frame_batch.frame_tolerance_ms,
         frame_sets=frame_batch.frame_sets,
@@ -597,7 +621,7 @@ def test_same_sha_with_distinct_frame_ids_publishes_one_file_and_two_evidence_it
 ) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
     first = frame_batch.frame_sets[0].candidates[0]
-    second = first.model_copy(update={"frame_id": "frame_002", "timestamp_ms": 1_700})
+    second = _updated_frame(first, timestamp_ms=1_700)
     batch = _replace_frame_batch(
         frame_batch,
         chapter=chapter,
@@ -668,7 +692,7 @@ def test_structure_repair_reuses_original_ordered_frames_once_and_counts_real_at
 ) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
     first = frame_batch.frame_sets[0].candidates[0]
-    second = first.model_copy(update={"frame_id": "frame_002", "timestamp_ms": 1_700})
+    second = _updated_frame(first, timestamp_ms=1_700)
     batch = _replace_frame_batch(
         frame_batch,
         chapter=chapter,
@@ -688,7 +712,10 @@ def test_structure_repair_reuses_original_ordered_frames_once_and_counts_real_at
     assert len(port.repair_requests) == 1
     assert port.repair_requests[0].invalid_response is port.invalid
     assert port.repair_requests[0].request.frames == port.requests[0].frames
-    assert tuple(frame.frame_id for frame in port.requests[0].frames) == ("frame_001", "frame_002")
+    assert tuple(frame.frame_id for frame in port.requests[0].frames) == (
+        first.frame_id,
+        second.frame_id,
+    )
     assert result.metrics["vlm_logical_analyses"] == 1
     assert result.metrics["vlm_provider_attempts"] == 2
     assert result.metrics["vlm_structure_repairs"] == 1
@@ -699,7 +726,7 @@ def test_reverse_time_frame_relation_is_rejected_as_local_invalid_response(
 ) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
     first = frame_batch.frame_sets[0].candidates[0]
-    second = first.model_copy(update={"frame_id": "frame_002", "timestamp_ms": 1_700})
+    second = _updated_frame(first, timestamp_ms=1_700)
     batch = _replace_frame_batch(frame_batch, chapter=chapter, candidates=(first, second))
     response = ChapterVisionResponse(
         observations=(
@@ -863,7 +890,6 @@ def test_published_budget_removes_complete_observation_and_degrades_only_its_cha
         max_image_bytes=1024,
         max_request_image_bytes=4096,
         max_encoded_request_bytes=64 * 1024,
-        max_candidate_bytes=512 * 1024 * 1024,
         max_published_keyframe_bytes=len(payload) - 1,
         max_published_keyframe_files=10,
         invocation_wait_timeout_seconds=2,
@@ -902,7 +928,6 @@ def test_macos_publish_budget_counts_staging_and_formal_clone(
         max_image_bytes=1024,
         max_request_image_bytes=4096,
         max_encoded_request_bytes=64 * 1024,
-        max_candidate_bytes=512 * 1024 * 1024,
         max_published_keyframe_bytes=len(payload),
         max_published_keyframe_files=1,
         invocation_wait_timeout_seconds=2,
@@ -955,14 +980,12 @@ def test_publish_keeps_verified_file_from_current_batch_on_later_failure(
     second_path = run_root / f"visual/candidates/{second_digest}.jpg"
     second_path.write_bytes(second_payload)
     second_path.chmod(0o600)
-    second = first.model_copy(
-        update={
-            "frame_id": "frame_002",
-            "timestamp_ms": 1_700,
-            "sha256": second_digest,
-            "size_bytes": len(second_payload),
-            "relative_path": f"visual/candidates/{second_digest}.jpg",
-        },
+    second = _updated_frame(
+        first,
+        timestamp_ms=1_700,
+        sha256=second_digest,
+        size_bytes=len(second_payload),
+        relative_path=f"visual/candidates/{second_digest}.jpg",
     )
     batch = _replace_frame_batch(frame_batch, chapter=chapter, candidates=(first, second))
     response = ChapterVisionResponse(
@@ -1147,15 +1170,14 @@ def test_bounded_concurrency_preserves_chapter_order(tmp_path: Path) -> None:
     )
     base_frame = frame_batch.frame_sets[0].candidates[0]
     frames = tuple(
-        base_frame.model_copy(
-            update={
-                "frame_id": f"frame_{index:03d}",
-                "timestamp_ms": (index - 1) * 10_000 + 1_500,
-            },
+        _updated_frame(
+            base_frame,
+            timestamp_ms=(index - 1) * 10_000 + 1_500,
         )
         for index in range(1, 4)
     )
     batch = ChapterFrameSearchBatch(
+        asset_sha256=frame_batch.asset_sha256,
         allowed_run_root=run_root,
         frame_tolerance_ms=50,
         frame_sets=tuple(
@@ -1212,15 +1234,14 @@ def test_cancellation_stops_submitting_and_waits_for_inflight_chapters(tmp_path:
     )
     base_frame = frame_batch.frame_sets[0].candidates[0]
     frames = tuple(
-        base_frame.model_copy(
-            update={
-                "frame_id": f"frame_{index:03d}",
-                "timestamp_ms": (index - 1) * 10_000 + 1_500,
-            },
+        _updated_frame(
+            base_frame,
+            timestamp_ms=(index - 1) * 10_000 + 1_500,
         )
         for index in range(1, 4)
     )
     batch = ChapterFrameSearchBatch(
+        asset_sha256=frame_batch.asset_sha256,
         allowed_run_root=run_root,
         frame_tolerance_ms=50,
         frame_sets=tuple(

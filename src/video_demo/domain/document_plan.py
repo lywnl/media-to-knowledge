@@ -12,20 +12,24 @@ from video_demo.domain.run import TimeRange
 _CANDIDATE_PATH_PATTERN = re.compile(r"^visual/candidates/([0-9a-f]{64})\.jpg$")
 
 
-def frame_candidate_id(asset_sha256: str, timestamp_ms: int, image_sha256: str) -> str:
+def frame_candidate_id(
+    asset_sha256: str,
+    actual_timestamp_ms: int,
+    image_sha256: str,
+) -> str:
     """按源媒体、实际帧时间和图片摘要生成唯一稳定候选帧 ID。"""
 
     if not re.fullmatch(r"[0-9a-f]{64}", asset_sha256):
         raise ValueError("asset_sha256 必须是小写 SHA-256")
-    if type(timestamp_ms) is not int or timestamp_ms < 0:
-        raise ValueError("timestamp_ms 必须是非负整数")
+    if type(actual_timestamp_ms) is not int or actual_timestamp_ms < 0:
+        raise ValueError("actual_timestamp_ms 必须是非负整数")
     if not re.fullmatch(r"[0-9a-f]{64}", image_sha256):
         raise ValueError("image_sha256 必须是小写 SHA-256")
     return stable_identifier(
         "keyframe",
         {
             "asset_sha256": asset_sha256,
-            "timestamp_ms": timestamp_ms,
+            "timestamp_ms": actual_timestamp_ms,
             "sha256": image_sha256,
         },
     )
@@ -131,7 +135,7 @@ class FrameCandidateArtifact(FrozenModel):
     size_bytes: int = Field(gt=0)
     relative_path: str = Field(min_length=1, max_length=1024)
     mime_type: Literal["image/jpeg"] = "image/jpeg"
-    perceptual_hash: str = Field(min_length=8, max_length=128)
+    perceptual_hash: str = Field(pattern=r"^[0-9a-f]{16}$")
     target_ids: tuple[StableId, ...] = Field(min_length=1, max_length=6)
 
     @model_validator(mode="after")

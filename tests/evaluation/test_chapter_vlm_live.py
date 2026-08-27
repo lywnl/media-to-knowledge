@@ -103,7 +103,11 @@ def _input_fixture(
         frames.append(
             ChapterVlmInputFrame(
                 reference_frame_id=reference_id,
-                frame_id=frame_candidate_id(source_sha, timestamp_ms, digest),
+                frame_id=frame_candidate_id(
+                    source_sha,
+                    actual_timestamp_ms=timestamp_ms,
+                    image_sha256=digest,
+                ),
                 requested_timestamp_ms=timestamp_ms,
                 actual_timestamp_ms=timestamp_ms,
                 relative_path=f"visual/candidates/{digest}.jpg",

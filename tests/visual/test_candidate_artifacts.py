@@ -10,13 +10,14 @@ from threading import Event, Thread
 
 import pytest
 
-from video_demo.domain.document_plan import FrameCandidateArtifact
+from video_demo.domain.document_plan import FrameCandidateArtifact, frame_candidate_id
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.visual import candidate_artifacts
 from video_demo.visual.candidate_artifacts import (
     CandidateArtifactSession,
     CandidateDirectoryLease,
     read_verified_candidate_jpeg,
+    validate_candidate_descriptor,
 )
 
 
@@ -39,7 +40,11 @@ def _frame(run_root: Path, payload: bytes) -> FrameCandidateArtifact:
     path.write_bytes(payload)
     path.chmod(0o600)
     return FrameCandidateArtifact(
-        frame_id="frame_001",
+        frame_id=frame_candidate_id(
+            "a" * 64,
+            actual_timestamp_ms=1_000,
+            image_sha256=digest,
+        ),
         timestamp_ms=1_000,
         sha256=digest,
         size_bytes=len(payload),
@@ -47,6 +52,21 @@ def _frame(run_root: Path, payload: bytes) -> FrameCandidateArtifact:
         perceptual_hash="0123456789abcdef",
         target_ids=("target_001",),
     )
+
+
+def test_candidate_descriptor_rejects_frame_identity_mismatch(tmp_path: Path) -> None:
+    run_root = tmp_path / "runtime/runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    frame = _frame(run_root, _jpeg("descriptor"))
+
+    with pytest.raises(VideoDemoError) as raised:
+        validate_candidate_descriptor(
+            frame.model_copy(update={"frame_id": "forged-frame"}),
+            "a" * 64,
+            allowed_run_root=run_root,
+        )
+
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
 
 
 def _session(
