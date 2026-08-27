@@ -6,6 +6,8 @@ from video_demo.evaluation.document_judgments import (
     ChapterDocumentJudgment,
     DocumentMetricObservation,
     DocumentQualityJudgment,
+    DocumentQualityReport,
+    document_quality_report_sha256,
 )
 
 
@@ -71,3 +73,32 @@ def test_partial_metric_is_explicit_numeric_observation() -> None:
     metric = DocumentMetricObservation(value=0.5)
     assert metric.value == 0.5
     assert metric.not_run_reason is None
+
+
+def test_succeeded_visual_quality_requires_reason_for_missing_metric() -> None:
+    payload: dict[str, object] = {
+        "schema_version": "1.0.0",
+        "evaluation_run_id": "eval_001",
+        "dataset_sha256": "a" * 64,
+        "authorization_sha256": "b" * 64,
+        "prediction_index_sha256": "c" * 64,
+        "status": "NOT_RUN",
+        "not_run_reason": "尚未提供人工审阅",
+        "failure_code": None,
+        "automatic_metrics": None,
+        "visual_quality_status": "SUCCEEDED",
+        "visual_quality_metrics": {
+            "visual_text_accuracy": None,
+            "visual_key_field_recall": 1.0,
+        },
+        "visual_quality_not_run_reason": None,
+        "visual_quality_failure_code": None,
+        "human_metrics": None,
+        "judgment_sha256": None,
+        "report_sha256": "0" * 64,
+    }
+    provisional = DocumentQualityReport.model_construct(**payload)
+    payload["report_sha256"] = document_quality_report_sha256(provisional)
+
+    with pytest.raises(ValueError, match="视觉质量"):
+        DocumentQualityReport.model_validate(payload)

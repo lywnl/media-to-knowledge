@@ -207,8 +207,19 @@ class DocumentQualityReport(FrozenModel):
                 or self.visual_quality_failure_code is None
             ):
                 raise ValueError("FAIL 视觉质量必须只有失败码")
-        elif self.visual_quality_not_run_reason is not None or self.visual_quality_failure_code:
-            raise ValueError("SUCCEEDED 视觉质量不得包含失败或未运行原因")
+        else:
+            if self.visual_quality_failure_code is not None:
+                raise ValueError("SUCCEEDED 视觉质量不得包含失败码")
+            if (
+                any(value is None for value in values)
+                and self.visual_quality_not_run_reason is None
+            ):
+                raise ValueError("SUCCEEDED 视觉质量缺失指标必须说明未运行原因")
+            if (
+                all(value is not None for value in values)
+                and self.visual_quality_not_run_reason is not None
+            ):
+                raise ValueError("SUCCEEDED 视觉质量完整指标不得携带未运行原因")
 
 def verify_document_quality_judgment(
     judgment: DocumentQualityJudgment,
