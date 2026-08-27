@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from itertools import pairwise
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import cast
 
 import pytest
@@ -100,6 +101,7 @@ def _planner(
     max_chapters: int = 240,
     max_planning_batches: int = 64,
     invocation_wait_timeout_seconds: float = 2,
+    planning_concurrency: int = 2,
 ) -> ChapterPlanner:
     return ChapterPlanner(
         cast(DocumentTextPort, port),
@@ -109,6 +111,7 @@ def _planner(
         max_chapters=max_chapters,
         max_planning_batches=max_planning_batches,
         invocation_wait_timeout_seconds=invocation_wait_timeout_seconds,
+        concurrency=planning_concurrency,
     )
 
 
@@ -470,6 +473,62 @@ def test_chapter_planner_splits_oversized_input_on_segment_boundaries(
     assert tuple(ref for plan in batch.plans for ref in plan.segment_refs) == tuple(
         item.segment_id for item in segments
     )
+    assert batch.metrics["chapter_planner_logical_calls"] == 4
+
+
+def test_chapter_planner_processes_independent_batches_concurrently(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(4, text="长文本" * 200)
+    active = 0
+    maximum_active = 0
+    counter_lock = Lock()
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        nonlocal active, maximum_active
+        with counter_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.03)
+        with counter_lock:
+            active -= 1
+        return ChapterPlanningResponse(
+            chapter_drafts=(
+                ChapterDraft(
+                    segment_refs=tuple(item.segment_id for item in request.segments),
+                    title_hint="并发章节",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                ),
+            ),
+        )
+
+    single_sizes = []
+    for segment, evidence in zip(segments, transcript, strict=True):
+        request = ChapterPlanningRequest(
+            title_hint="测试视频",
+            duration_ms=segments[-1].end_ms,
+            segments=(segment,),
+            transcript_evidence=(evidence,),
+            document_config=DocumentGenerationConfig(),
+            prompt_version="chapter-planner-v1",
+        )
+        single_sizes.append(len(prompt_for_planning(request)[2]))
+
+    port = _PlanningTextPort(response, response)
+    batch = _plan(
+        _planner(
+            port,
+            max_input_chars=max(single_sizes),
+            planning_concurrency=2,
+        ),
+        tmp_path,
+        segments,
+        transcript,
+        scenes,
+    )
+
+    assert maximum_active >= 2
     assert batch.metrics["chapter_planner_logical_calls"] == 4
 
 

@@ -197,6 +197,7 @@ class Settings(BaseSettings):
     text_llm_max_attempts: int = Field(default=3, ge=1, le=5)
     text_llm_max_input_chars: int = Field(default=60_000, ge=1)
     text_llm_max_input_bytes: int = Field(default=1 * 1024 * 1024, ge=1)
+    chapter_planning_concurrency: int = Field(default=2, ge=1, le=2)
     model_max_response_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
 
     vlm_base_url: str | None = None

@@ -4,7 +4,9 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from itertools import pairwise
+from threading import Lock
 from typing import Literal
 
 from pydantic import Field, StrictInt, field_validator
@@ -40,6 +42,7 @@ _MIN_CHAPTER_DURATION_MS = 60_000
 _MAX_CHAPTER_DURATION_MS = 300_000
 _MAX_TARGET_ANCHOR_SPAN_MS = 30_000
 _DEFAULT_MAX_PLANNING_BATCHES = 64
+_DEFAULT_PLANNING_CONCURRENCY = 2
 _GRANULARITY_TARGET_DURATION_MS = {
     "fine": 120_000,
     "standard": 180_000,
@@ -78,6 +81,7 @@ class ChapterPlanningBatch(FrozenModel):
 
 class _PlanningCounters:
     def __init__(self) -> None:
+        self._lock = Lock()
         self.logical_calls = 0
         self.provider_attempts = 0
         self.structure_repairs = 0
@@ -85,16 +89,26 @@ class _PlanningCounters:
         self.fallback_chapters = 0
 
     def provider_attempt(self) -> None:
-        self.provider_attempts += 1
+        with self._lock:
+            self.provider_attempts += 1
+
+    def cache_hit(self) -> None:
+        with self._lock:
+            self.cache_hits += 1
+
+    def structure_repair(self) -> None:
+        with self._lock:
+            self.structure_repairs += 1
 
     def as_metrics(self) -> dict[str, int]:
-        return {
-            "chapter_planner_logical_calls": self.logical_calls,
-            "chapter_planner_provider_attempts": self.provider_attempts,
-            "chapter_planner_structure_repairs": self.structure_repairs,
-            "chapter_planner_cache_hits": self.cache_hits,
-            "chapter_planner_fallback_chapters": self.fallback_chapters,
-        }
+        with self._lock:
+            return {
+                "chapter_planner_logical_calls": self.logical_calls,
+                "chapter_planner_provider_attempts": self.provider_attempts,
+                "chapter_planner_structure_repairs": self.structure_repairs,
+                "chapter_planner_cache_hits": self.cache_hits,
+                "chapter_planner_fallback_chapters": self.fallback_chapters,
+            }
 
 
 class ChapterPlanner:
@@ -110,15 +124,21 @@ class ChapterPlanner:
         max_chapters: int,
         invocation_wait_timeout_seconds: float,
         max_planning_batches: int = _DEFAULT_MAX_PLANNING_BATCHES,
+        concurrency: int = _DEFAULT_PLANNING_CONCURRENCY,
     ) -> None:
         if min(
             max_input_chars,
             max_input_bytes,
             max_chapters,
             max_planning_batches,
+            concurrency,
         ) < 1:
             raise ValueError("章节规划预算必须大于 0")
-        if max_chapters > 240 or max_planning_batches > _DEFAULT_MAX_PLANNING_BATCHES:
+        if (
+            max_chapters > 240
+            or max_planning_batches > _DEFAULT_MAX_PLANNING_BATCHES
+            or concurrency > _DEFAULT_PLANNING_CONCURRENCY
+        ):
             raise ValueError("章节规划预算超过硬契约上限")
         if invocation_wait_timeout_seconds <= 0:
             raise ValueError("模型调用锁等待时间必须大于 0")
@@ -128,6 +148,7 @@ class ChapterPlanner:
         self._max_input_bytes = max_input_bytes
         self._max_chapters = max_chapters
         self._max_planning_batches = max_planning_batches
+        self._concurrency = concurrency
         self._invocation_wait_timeout_seconds = invocation_wait_timeout_seconds
 
     def plan(
@@ -162,36 +183,21 @@ class ChapterPlanner:
                 transcript_evidence,
                 document_config,
             )
-            for batch_index, request in enumerate(requests, start=1):
-                counters.logical_calls += 1
-                started_at = time.monotonic()
-                response = self._logical_call(
-                    cache,
-                    request,
-                    ordered_segments,
-                    counters,
-                    is_cancel_requested,
-                )
-                prompt_data = prompt_for_planning(request)[2]
-                _LOGGER.info(
-                    "章节规划批次完成 batch=%d/%d chars=%d bytes=%d elapsed_ms=%d status=%s",
-                    batch_index,
-                    len(requests),
-                    len(prompt_data),
-                    len(prompt_data.encode("utf-8")),
-                    max(0, round((time.monotonic() - started_at) * 1_000)),
-                    "SUCCEEDED" if response is not None else "FALLBACK",
-                )
+            results = self._plan_batches(
+                requests,
+                cache,
+                ordered_segments,
+                counters,
+                is_cancel_requested,
+            )
+            for request, response in results:
                 if response is None:
-                    fallback = _rule_drafts(
+                    drafts.extend(_rule_drafts(
                         request.segments,
                         request.transcript_evidence,
                         request.document_config,
-                    )
-                    drafts.extend(fallback)
-                    fallback_segment_ids.update(
-                        segment.segment_id for segment in request.segments
-                    )
+                    ))
+                    fallback_segment_ids.update(segment.segment_id for segment in request.segments)
                     used_fallback = True
                 else:
                     drafts.extend(response.chapter_drafts)
@@ -229,6 +235,66 @@ class ChapterPlanner:
             status="PARTIAL_SUCCEEDED" if used_fallback else "SUCCEEDED",
             metrics=counters.as_metrics(),
         )
+
+    def _plan_batches(
+        self,
+        requests: tuple[ChapterPlanningRequest, ...],
+        cache: DocumentModelCache,
+        all_segments: tuple[BaseSegment, ...],
+        counters: _PlanningCounters,
+        is_cancel_requested: Callable[[], bool],
+    ) -> tuple[tuple[ChapterPlanningRequest, ChapterPlanningResponse | None], ...]:
+        results: list[
+            tuple[ChapterPlanningRequest, ChapterPlanningResponse | None] | None
+        ] = [None] * len(requests)
+        executor = ThreadPoolExecutor(
+            max_workers=self._concurrency,
+            thread_name_prefix="chapter-planning",
+        )
+        pending: dict[Future[ChapterPlanningResponse | None], tuple[int, float]] = {}
+        next_index = 0
+        try:
+            while next_index < len(requests) or pending:
+                if is_cancel_requested():
+                    for future in pending:
+                        future.cancel()
+                    raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
+                while next_index < len(requests) and len(pending) < self._concurrency:
+                    counters.logical_calls += 1
+                    future = executor.submit(
+                        self._logical_call,
+                        cache,
+                        requests[next_index],
+                        all_segments,
+                        counters,
+                        is_cancel_requested,
+                    )
+                    pending[future] = (next_index, time.monotonic())
+                    next_index += 1
+                completed, _ = wait(tuple(pending), timeout=0.05, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    index, started_at = pending.pop(future)
+                    response = future.result()
+                    request = requests[index]
+                    data = prompt_for_planning(request)[2]
+                    _LOGGER.info(
+                        "章节规划批次完成 batch=%d/%d chars=%d bytes=%d elapsed_ms=%d status=%s",
+                        index + 1,
+                        len(requests),
+                        len(data),
+                        len(data.encode("utf-8")),
+                        max(0, round((time.monotonic() - started_at) * 1_000)),
+                        "SUCCEEDED" if response is not None else "FALLBACK",
+                    )
+                    results[index] = (request, response)
+        except BaseException:
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+        return tuple(result for result in results if result is not None)
 
     def _planning_requests(
         self,
@@ -319,7 +385,7 @@ class ChapterPlanner:
             validate,
         )
         if cached is not None:
-            counters.cache_hits += 1
+            counters.cache_hit()
             return cached.response
         with cache.invocation_lock(
             self._identity,
@@ -334,7 +400,7 @@ class ChapterPlanner:
                 validate,
             )
             if cached is not None:
-                counters.cache_hits += 1
+                counters.cache_hit()
                 return cached.response
             invalid_response: InvalidModelResponse | None = None
             try:
@@ -385,7 +451,7 @@ class ChapterPlanner:
     ) -> ChapterPlanningResponse:
         if not isinstance(invalid_response, InvalidModelResponse):
             raise TypeError("规划修复上下文类型非法")
-        counters.structure_repairs += 1
+        counters.structure_repair()
         return self._text_port.repair_chapter_plan(
             ChapterPlanRepairRequest(
                 request=request,

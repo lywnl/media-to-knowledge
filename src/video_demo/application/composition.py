@@ -236,6 +236,7 @@ def build_production_pipeline(
                 max_input_bytes=text.max_input_bytes,
                 max_chapters=settings.max_document_chapters,
                 invocation_wait_timeout_seconds=text.timeout_seconds,
+                concurrency=settings.chapter_planning_concurrency,
             ),
             ChapterFrameSearcher(
                 runtime_root,
