@@ -186,7 +186,6 @@ class OpenAIDocumentClient(DocumentTextPort):
         on_provider_attempt: Callable[[], None] | None,
     ) -> ResponseModel:
         version, instruction, data = prompt
-        _validate_input_budget(data, self._max_input_chars, self._max_input_bytes)
         payload = _request_payload(
             model_id=self._model_id,
             version=version,

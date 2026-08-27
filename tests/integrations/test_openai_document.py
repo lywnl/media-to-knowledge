@@ -143,6 +143,27 @@ def test_plan_request_uses_main_schema_prompt_and_temperature_zero() -> None:
     assert "text-secret" not in json.dumps(payloads)
 
 
+def test_plan_request_allows_large_repair_budget_for_provider_validation() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return _provider_response(request, _planning_body())
+
+    oversized = _planning_request().model_copy(
+        update={
+            "transcript_evidence": (
+                _speech().model_copy(update={"text": "长" * 70_000}),
+            ),
+        },
+    )
+
+    result = _client(httpx.MockTransport(handler)).plan_chapters(oversized)
+
+    assert result.chapter_drafts[0].segment_refs == ("segment_001",)
+    assert len(payloads) == 1
+
+
 def test_invalid_model_json_raises_bounded_repair_context_without_leaking_content() -> None:
     raw_message = '{"chapter_drafts":[{"segment_refs":[]}]}'
 
