@@ -68,10 +68,12 @@ def _planning_context(request: ChapterPlanningRequest) -> dict[str, object]:
 
 
 def prompt_for_plan_repair(request: ChapterPlanRepairRequest) -> tuple[str, str, str]:
+    context = request.model_dump(mode="json", exclude={"request"})
+    context["request"] = _planning_context(request.request)
     return _prompt(
         request.prompt_version,
         "只修复结构和引用；必须保留原请求的事实边界，不得添加新事实。",
-        request.model_dump(mode="json"),
+        context,
     )
 
 

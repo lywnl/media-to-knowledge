@@ -38,6 +38,7 @@ from video_demo.integrations.document_prompts import (
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 Prompt = tuple[str, str, str]
+_DEFAULT_MAX_OUTPUT_TOKENS = 8_192
 
 
 class OpenAIDocumentClient(DocumentTextPort):
@@ -55,6 +56,7 @@ class OpenAIDocumentClient(DocumentTextPort):
         max_input_chars: int = 60_000,
         max_input_bytes: int = 1 * 1024 * 1024,
         max_response_bytes: int = 2 * 1024 * 1024,
+        max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self._http_client = http_client
@@ -66,6 +68,9 @@ class OpenAIDocumentClient(DocumentTextPort):
         self._max_input_chars = max_input_chars
         self._max_input_bytes = max_input_bytes
         self._max_response_bytes = max_response_bytes
+        if max_output_tokens < 1:
+            raise ValueError("文本模型输出 token 上限必须大于 0")
+        self._max_output_tokens = max_output_tokens
         self._sleeper = sleeper
 
     def plan_chapters(
@@ -193,6 +198,7 @@ class OpenAIDocumentClient(DocumentTextPort):
             data=data,
             response_type=response_type,
             schema_name=schema_name,
+            max_output_tokens=self._max_output_tokens,
         )
         raw = self._post_with_retry(payload, on_provider_attempt=on_provider_attempt)
         return _parse_and_validate_response(
@@ -249,10 +255,12 @@ def _request_payload(
     data: str,
     response_type: type[BaseModel],
     schema_name: str,
+    max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> dict[str, object]:
     return {
         "model": model_id,
         "temperature": 0,
+        "max_tokens": max_output_tokens,
         "response_format": {
             "type": "json_schema",
             "json_schema": {
