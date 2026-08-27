@@ -473,6 +473,25 @@ def test_chapter_planner_splits_oversized_input_on_segment_boundaries(
     assert batch.metrics["chapter_planner_logical_calls"] == 4
 
 
+def test_chapter_planning_prompt_uses_compact_fact_projection() -> None:
+    segments, transcript, _scenes = _planning_fixture(1, text="紧凑输入")
+    request = ChapterPlanningRequest(
+        title_hint="测试视频",
+        duration_ms=segments[-1].end_ms,
+        segments=segments,
+        transcript_evidence=transcript,
+        document_config=DocumentGenerationConfig(),
+        prompt_version="chapter-planner-v1",
+    )
+
+    data = prompt_for_planning(request)[2]
+
+    assert "language" not in data
+    assert "confidence" not in data
+    assert '"segment_id":"segment_000"' in data
+    assert '"evidence_id":"asr_000"' in data
+
+
 def test_chapter_planner_applies_utf8_byte_budget_independently_of_char_budget(
     tmp_path: Path,
 ) -> None:

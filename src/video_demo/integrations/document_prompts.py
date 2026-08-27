@@ -30,8 +30,41 @@ def prompt_for_planning(request: ChapterPlanningRequest) -> tuple[str, str, str]
             "coarse 120~300 秒；证据不可拆分时允许偏离目标范围，但任何章节不得超过 "
             "300 秒。不得生成时间、章节 ID 或未知引用。"
         ),
-        request.model_dump(mode="json"),
+        _planning_context(request),
     )
+
+
+def _planning_context(request: ChapterPlanningRequest) -> dict[str, object]:
+    """只向章节规划模型发送决策所需字段，完整请求仍由程序保留并校验。
+
+    语言、置信度、场景引用和视觉配置不会改变章节边界，却会随每条转写重复
+    占用上下文。删掉这些冗余字段可以让更多视频在一次规划请求内完成，同时不
+    改变缓存指纹或程序侧的证据闭包校验。
+    """
+
+    return {
+        "title_hint": request.title_hint,
+        "duration_ms": request.duration_ms,
+        "chapter_granularity": request.document_config.chapter_granularity,
+        "segments": tuple(
+            {
+                "segment_id": segment.segment_id,
+                "start_ms": segment.start_ms,
+                "end_ms": segment.end_ms,
+                "evidence_refs": segment.evidence_refs,
+            }
+            for segment in request.segments
+        ),
+        "transcript_evidence": tuple(
+            {
+                "evidence_id": evidence.evidence_id,
+                "start_ms": evidence.start_ms,
+                "end_ms": evidence.end_ms,
+                "text": evidence.text,
+            }
+            for evidence in request.transcript_evidence
+        ),
+    }
 
 
 def prompt_for_plan_repair(request: ChapterPlanRepairRequest) -> tuple[str, str, str]:

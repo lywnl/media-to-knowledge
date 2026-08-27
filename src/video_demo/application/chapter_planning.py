@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from collections.abc import Callable
 from itertools import pairwise
 from typing import Literal
@@ -52,6 +54,7 @@ _CHAPTER_PLANNING_METRIC_NAMES = frozenset(
         "chapter_planner_fallback_chapters",
     },
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class ChapterPlanningBatch(FrozenModel):
@@ -152,22 +155,32 @@ class ChapterPlanner:
         fallback_segment_ids: set[str] = set()
         if transcript_evidence:
             drafts: list[ChapterDraft] = []
-            for request in (
-                self._planning_requests(
-                    title_hint,
-                    duration_ms,
-                    ordered_segments,
-                    transcript_evidence,
-                    document_config,
-                )
-            ):
+            requests = self._planning_requests(
+                title_hint,
+                duration_ms,
+                ordered_segments,
+                transcript_evidence,
+                document_config,
+            )
+            for batch_index, request in enumerate(requests, start=1):
                 counters.logical_calls += 1
+                started_at = time.monotonic()
                 response = self._logical_call(
                     cache,
                     request,
                     ordered_segments,
                     counters,
                     is_cancel_requested,
+                )
+                prompt_data = prompt_for_planning(request)[2]
+                _LOGGER.info(
+                    "章节规划批次完成 batch=%d/%d chars=%d bytes=%d elapsed_ms=%d status=%s",
+                    batch_index,
+                    len(requests),
+                    len(prompt_data),
+                    len(prompt_data.encode("utf-8")),
+                    max(0, round((time.monotonic() - started_at) * 1_000)),
+                    "SUCCEEDED" if response is not None else "FALLBACK",
                 )
                 if response is None:
                     fallback = _rule_drafts(

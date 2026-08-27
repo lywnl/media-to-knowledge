@@ -133,6 +133,26 @@ def _render_chapter(
             lines.append("")
 
     _heading(lines, 4, "关键画面与引用")
+    observations = tuple(
+        item
+        for item in evidence_by_id.values()
+        if isinstance(item, VisualObservationEvidence)
+        and item.chapter_id == chapter.chapter_id
+    )
+    frame_refs = {
+        frame_ref
+        for item in observations
+        for frame_ref in item.keyframe_refs
+    }
+    frame_refs.update(chapter.selected_keyframe_refs)
+    lines.extend(
+        (
+            f"图片处理：章节视觉模型已分析 {len(observations)} 条观察，"
+            f"处理 {len(frame_refs)} 张 JPEG 关键帧。",
+            f"视觉观察类型：{', '.join(item.visual_type for item in observations) or '无'}。",
+            "",
+        ),
+    )
     if chapter.selected_keyframe_refs:
         for evidence_ref in chapter.selected_keyframe_refs:
             keyframe = evidence_by_id[evidence_ref]

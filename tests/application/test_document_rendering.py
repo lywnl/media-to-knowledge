@@ -243,6 +243,8 @@ def test_render_markdown_uses_keyframe_placeholder_without_leaking_storage_path(
     markdown = render_markdown(result, evidence).content.decode("utf-8")
 
     assert "video-demo-keyframe:keyframe_001" in markdown
+    assert "图片处理：章节视觉模型已分析 1 条观察，处理 1 张 JPEG 关键帧。" in markdown
+    assert "视觉观察类型：TEXT" in markdown
     assert f"visual/keyframes/{KEYFRAME_SHA256}.jpg" not in markdown
     assert KEYFRAME_SHA256 not in markdown
 
