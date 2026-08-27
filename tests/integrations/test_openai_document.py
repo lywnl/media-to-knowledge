@@ -144,6 +144,55 @@ def test_plan_request_uses_main_schema_prompt_and_temperature_zero() -> None:
     assert "text-secret" not in json.dumps(payloads)
 
 
+def test_compact_planning_request_maps_indexes_back_to_stable_ids() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return _provider_response(
+            request,
+            {
+                "chapter_drafts": [
+                    {
+                        "start_segment_index": 0,
+                        "end_segment_index": 1,
+                        "title_hint": "设置页面",
+                        "visual_mode": "SINGLE",
+                        "semantic_targets": [
+                            {
+                                "query_zh": "页面设置",
+                                "anchor_transcript_indexes": [0],
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+
+    client = OpenAIDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="text-secret",
+        model_id="text-model",
+        compact_planning=True,
+        sleeper=lambda _delay: None,
+    )
+
+    result = client.plan_chapters(_planning_request())
+
+    assert result.chapter_drafts[0].segment_refs == ("segment_001",)
+    assert result.chapter_drafts[0].semantic_targets[0].anchor_evidence_refs == ("asr_001",)
+    assert payloads[0]["response_format"]["json_schema"]["name"] == (  # type: ignore[index]
+        "chapter_planning_compact_v1"
+    )
+    assert payloads[0]["thinking"] == {"type": "disabled"}
+    sent = json.loads(payloads[0]["messages"][1]["content"].split("\n", 1)[1])  # type: ignore[index]
+    assert sent["segments"][0] == [10_000, [0]]
+    assert sent["transcript_evidence"][0] == [1_000, 2_000, "请打开设置页面"]
+    assert "segment_001" not in json.dumps(sent, ensure_ascii=False)
+    assert "asr_001" not in json.dumps(sent, ensure_ascii=False)
+
+
 def test_plan_request_allows_large_repair_budget_for_provider_validation() -> None:
     payloads: list[dict[str, object]] = []
 

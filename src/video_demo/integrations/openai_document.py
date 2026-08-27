@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 import httpx
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from video_demo.domain.document import VisualBlock
+from video_demo.domain.document_plan import ChapterDraft, VisualTargetDraft
 from video_demo.domain.evidence import VisualObservationEvidence
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.document_port import (
@@ -28,6 +29,8 @@ from video_demo.integrations.document_port import (
     invalid_model_response,
 )
 from video_demo.integrations.document_prompts import (
+    prompt_for_compact_plan_repair,
+    prompt_for_compact_planning,
     prompt_for_global_editing,
     prompt_for_global_repair,
     prompt_for_plan_repair,
@@ -39,6 +42,32 @@ from video_demo.integrations.document_prompts import (
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 Prompt = tuple[str, str, str]
 _DEFAULT_MAX_OUTPUT_TOKENS = 8_192
+# DeepSeek 的思考 token 也计入 max_tokens；索引协议虽显著缩短正文，仍需给
+# 思考阶段留出与普通规划相同的上限，否则大批次会得到空 content/length 截断。
+_COMPACT_PLANNING_MAX_OUTPUT_TOKENS = _DEFAULT_MAX_OUTPUT_TOKENS
+
+
+class _CompactVisualTargetDraft(BaseModel):
+    model_config = {"extra": "forbid", "frozen": True}
+
+    query_zh: str = Field(min_length=1, max_length=500)
+    anchor_transcript_indexes: tuple[int, ...] = Field(min_length=1, max_length=3)
+
+
+class _CompactChapterDraft(BaseModel):
+    model_config = {"extra": "forbid", "frozen": True}
+
+    start_segment_index: int = Field(ge=0)
+    end_segment_index: int = Field(gt=0)
+    title_hint: str = Field(min_length=1, max_length=200)
+    visual_mode: Literal["NONE", "SINGLE", "COMPARISON", "MULTI_STEP"]
+    semantic_targets: tuple[_CompactVisualTargetDraft, ...] = Field(max_length=4)
+
+
+class _CompactChapterPlanningResponse(BaseModel):
+    model_config = {"extra": "forbid", "frozen": True}
+
+    chapter_drafts: tuple[_CompactChapterDraft, ...] = Field(min_length=1, max_length=240)
 
 
 class OpenAIDocumentClient(DocumentTextPort):
@@ -57,6 +86,7 @@ class OpenAIDocumentClient(DocumentTextPort):
         max_input_bytes: int = 1 * 1024 * 1024,
         max_response_bytes: int = 2 * 1024 * 1024,
         max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
+        compact_planning: bool = False,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self._http_client = http_client
@@ -71,6 +101,7 @@ class OpenAIDocumentClient(DocumentTextPort):
         if max_output_tokens < 1:
             raise ValueError("文本模型输出 token 上限必须大于 0")
         self._max_output_tokens = max_output_tokens
+        self._compact_planning = compact_planning
         self._sleeper = sleeper
 
     def plan_chapters(
@@ -79,6 +110,20 @@ class OpenAIDocumentClient(DocumentTextPort):
         *,
         on_provider_attempt: Callable[[], None] | None = None,
     ) -> ChapterPlanningResponse:
+        if self._compact_planning:
+            compact = self._call(
+                prompt_for_compact_planning(request),
+                response_type=_CompactChapterPlanningResponse,
+                schema_name="chapter_planning_compact_v1",
+                max_output_tokens=_COMPACT_PLANNING_MAX_OUTPUT_TOKENS,
+                extra_payload={"thinking": {"type": "disabled"}},
+                validate_response=lambda response: _validate_compact_planning_response(
+                    response,
+                    request,
+                ),
+                on_provider_attempt=on_provider_attempt,
+            )
+            return _expand_compact_planning_response(compact, request)
         return self._call(
             prompt_for_planning(request),
             response_type=ChapterPlanningResponse,
@@ -99,6 +144,20 @@ class OpenAIDocumentClient(DocumentTextPort):
         *,
         on_provider_attempt: Callable[[], None] | None = None,
     ) -> ChapterPlanningResponse:
+        if self._compact_planning:
+            compact = self._call(
+                prompt_for_compact_plan_repair(request),
+                response_type=_CompactChapterPlanningResponse,
+                schema_name="chapter_planning_compact_repair_v1",
+                max_output_tokens=_COMPACT_PLANNING_MAX_OUTPUT_TOKENS,
+                extra_payload={"thinking": {"type": "disabled"}},
+                validate_response=lambda response: _validate_compact_planning_response(
+                    response,
+                    request.request,
+                ),
+                on_provider_attempt=on_provider_attempt,
+            )
+            return _expand_compact_planning_response(compact, request.request)
         return self._call(
             prompt_for_plan_repair(request),
             response_type=ChapterPlanningResponse,
@@ -187,6 +246,8 @@ class OpenAIDocumentClient(DocumentTextPort):
         *,
         response_type: type[ResponseModel],
         schema_name: str,
+        max_output_tokens: int | None = None,
+        extra_payload: dict[str, object] | None = None,
         validate_response: Callable[[ResponseModel], None],
         on_provider_attempt: Callable[[], None] | None,
     ) -> ResponseModel:
@@ -198,8 +259,14 @@ class OpenAIDocumentClient(DocumentTextPort):
             data=data,
             response_type=response_type,
             schema_name=schema_name,
-            max_output_tokens=self._max_output_tokens,
+            max_output_tokens=(
+                self._max_output_tokens
+                if max_output_tokens is None
+                else max_output_tokens
+            ),
         )
+        if extra_payload:
+            payload.update(extra_payload)
         raw = self._post_with_retry(payload, on_provider_attempt=on_provider_attempt)
         return _parse_and_validate_response(
             raw,
@@ -395,6 +462,64 @@ def _validate_planning_response(
                 allowed_transcript_ids,
                 "chapter_drafts.semantic_targets.anchor_evidence_refs",
             )
+
+
+def _validate_compact_planning_response(
+    response: _CompactChapterPlanningResponse,
+    request: ChapterPlanningRequest,
+) -> None:
+    segment_count = len(request.segments)
+    transcript_count = len(request.transcript_evidence)
+    expected_start = 0
+    for draft in response.chapter_drafts:
+        if draft.start_segment_index != expected_start:
+            raise _ReferenceValidationError("chapter_drafts.segment_indexes:not_contiguous")
+        if draft.end_segment_index > segment_count:
+            raise _ReferenceValidationError("chapter_drafts.end_segment_index:out_of_range")
+        if draft.end_segment_index <= draft.start_segment_index:
+            raise _ReferenceValidationError("chapter_drafts.segment_indexes:empty")
+        expected_start = draft.end_segment_index
+        for target in draft.semantic_targets:
+            if any(
+                index < 0 or index >= transcript_count
+                for index in target.anchor_transcript_indexes
+            ):
+                raise _ReferenceValidationError("semantic_targets.anchor_indexes:out_of_range")
+            if len(set(target.anchor_transcript_indexes)) != len(
+                target.anchor_transcript_indexes
+            ):
+                raise _ReferenceValidationError("semantic_targets.anchor_indexes:duplicate")
+    if expected_start != segment_count:
+        raise _ReferenceValidationError("chapter_drafts.segment_indexes:not_complete")
+
+
+def _expand_compact_planning_response(
+    response: _CompactChapterPlanningResponse,
+    request: ChapterPlanningRequest,
+) -> ChapterPlanningResponse:
+    segment_ids = tuple(item.segment_id for item in request.segments)
+    transcript_ids = tuple(item.evidence_id for item in request.transcript_evidence)
+    drafts = tuple(
+        ChapterDraft(
+            segment_refs=segment_ids[
+                draft.start_segment_index : draft.end_segment_index
+            ],
+            title_hint=draft.title_hint,
+            visual_mode=draft.visual_mode,
+            semantic_targets=tuple(
+                VisualTargetDraft(
+                    query_zh=target.query_zh,
+                    anchor_evidence_refs=tuple(
+                        transcript_ids[index]
+                        for index in target.anchor_transcript_indexes
+                    ),
+                )
+                for target in draft.semantic_targets
+            ),
+        )
+        for draft in response.chapter_drafts
+    )
+    return ChapterPlanningResponse(chapter_drafts=drafts)
 
 
 def _validate_writing_response(

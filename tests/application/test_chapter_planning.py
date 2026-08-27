@@ -533,6 +533,31 @@ def test_chapter_planner_processes_independent_batches_concurrently(
     assert batch.metrics["chapter_planner_logical_calls"] == 4
 
 
+def test_chapter_planner_caps_compact_batches_at_thirty_segments(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(31, text="短文本")
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        return ChapterPlanningResponse(
+            chapter_drafts=(
+                ChapterDraft(
+                    segment_refs=tuple(item.segment_id for item in request.segments),
+                    title_hint="三十片段一批",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                ),
+            ),
+        )
+
+    port = _PlanningTextPort(response, response)
+    batch = _plan(_planner(port), tmp_path, segments, transcript, scenes)
+
+    assert len(port.main_requests) == 2
+    assert sorted(len(request.segments) for request in port.main_requests) == [1, 30]
+    assert batch.metrics["chapter_planner_logical_calls"] == 2
+
+
 def test_chapter_planning_prompt_uses_compact_fact_projection() -> None:
     segments, transcript, _scenes = _planning_fixture(1, text="紧凑输入")
     request = ChapterPlanningRequest(

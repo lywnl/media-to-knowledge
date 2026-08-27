@@ -182,6 +182,7 @@ def build_production_pipeline(
             max_input_chars=text.max_input_chars,
             max_input_bytes=text.max_input_bytes,
             max_response_bytes=text.max_response_bytes,
+            compact_planning=True,
         )
         vision_client = QwenVisionClient(
             vision_http,
@@ -227,10 +228,11 @@ def build_production_pipeline(
                     "chapter_planning",
                     text_fingerprint,
                     text.model_id,
-                    "chapter_planning_v1",
+                    "chapter_planning_compact_v1",
                     prompt_versions.chapter_planner,
-                    "chapter_planning_repair_v1",
+                    "chapter_planning_compact_repair_v1",
                     prompt_versions.chapter_planner_repair,
+                    generation_config=(("temperature", "0"), ("thinking", "disabled")),
                 ),
                 max_input_chars=text.max_input_chars,
                 max_input_bytes=text.max_input_bytes,
@@ -406,12 +408,13 @@ def _identity(
     main_prompt: str,
     repair_schema: str,
     repair_prompt: str,
+    generation_config: tuple[tuple[str, str], ...] = (("temperature", "0"),),
 ) -> ModelInvocationIdentity:
     return ModelInvocationIdentity(
         logical_operation=operation,
         provider_config_fingerprint=fingerprint,
         model_id=model_id,
-        generation_config=(("temperature", "0"),),
+        generation_config=generation_config,
         main_response_schema_name=main_schema,
         main_prompt_version=main_prompt,
         repair_response_schema_name=repair_schema,

@@ -36,6 +36,38 @@ def prompt_for_planning(request: ChapterPlanningRequest) -> tuple[str, str, str]
     )
 
 
+def prompt_for_compact_planning(request: ChapterPlanningRequest) -> tuple[str, str, str]:
+    """使用数组索引规划章节，避免模型重复生成长稳定标识。"""
+
+    return _prompt(
+        request.prompt_version,
+        (
+            "你只能根据输入的基础片段和转写证据规划连续章节。使用数组索引返回范围："
+            "start_segment_index 包含、end_segment_index 不包含，所有范围必须按顺序从 0 开始"
+            "完整覆盖 segments (最后一个 end_segment_index 必须等于 segments 长度)。"
+            "语义目标的 anchor_transcript_indexes 必须是当前章节内"
+            "1~3 个按时间排序且不重复的 transcript_evidence 索引，跨度不得超过 30 秒。"
+            "章节粒度优先目标为 fine 60~120 秒、standard 60~180 秒、coarse 120~300 秒；"
+            "任何章节不得超过 300 秒。不得生成时间、ID 或未知索引。segments 每项为"
+            "[duration_ms, transcript_evidence_indexes]；transcript_evidence 每项为"
+            "[start_ms, end_ms, text]。只返回 JSON。"
+        ),
+        _compact_planning_context(request),
+    )
+
+
+def prompt_for_compact_plan_repair(request: ChapterPlanRepairRequest) -> tuple[str, str, str]:
+    context = {
+        "invalid_response": request.invalid_response.model_dump(mode="json"),
+        "request": _compact_planning_context(request.request),
+    }
+    return _prompt(
+        request.prompt_version,
+        "只修复结构和索引；必须保留原请求的事实边界，不得添加新事实。只返回 JSON。",
+        context,
+    )
+
+
 def _planning_context(request: ChapterPlanningRequest) -> dict[str, object]:
     """只向章节规划模型发送决策所需字段，完整请求仍由程序保留并校验。
 
@@ -67,6 +99,29 @@ def _planning_context(request: ChapterPlanningRequest) -> dict[str, object]:
                 evidence.end_ms,
                 evidence.text,
             )
+            for evidence in request.transcript_evidence
+        ),
+    }
+
+
+def _compact_planning_context(request: ChapterPlanningRequest) -> dict[str, object]:
+    evidence_indexes = {
+        evidence.evidence_id: index
+        for index, evidence in enumerate(request.transcript_evidence)
+    }
+    return {
+        "title_hint": request.title_hint,
+        "duration_ms": request.duration_ms,
+        "chapter_granularity": request.document_config.chapter_granularity,
+        "segments": tuple(
+            (
+                segment.duration_ms,
+                tuple(evidence_indexes[ref] for ref in segment.evidence_refs),
+            )
+            for segment in request.segments
+        ),
+        "transcript_evidence": tuple(
+            (evidence.start_ms, evidence.end_ms, evidence.text)
             for evidence in request.transcript_evidence
         ),
     }

@@ -43,6 +43,9 @@ _MAX_CHAPTER_DURATION_MS = 300_000
 _MAX_TARGET_ANCHOR_SPAN_MS = 30_000
 _DEFAULT_MAX_PLANNING_BATCHES = 64
 _DEFAULT_PLANNING_CONCURRENCY = 2
+# 索引协议虽然显著缩短了输出，但大模型在一次返回数百个边界时仍容易截断；
+# 30 个基础片段约对应 15 分钟以内的时间轴，足够保留局部语义上下文并控制单次延迟。
+_MAX_PLANNING_SEGMENTS_PER_BATCH = 30
 _GRANULARITY_TARGET_DURATION_MS = {
     "fine": 120_000,
     "standard": 180_000,
@@ -308,6 +311,22 @@ class ChapterPlanner:
         requests: list[ChapterPlanningRequest] = []
         batch: list[BaseSegment] = []
         for segment in segments:
+            if len(batch) >= _MAX_PLANNING_SEGMENTS_PER_BATCH:
+                if len(requests) >= self._max_planning_batches:
+                    raise VideoDemoError(
+                        ErrorCode.INPUT_BUDGET_EXCEEDED,
+                        "章节规划批次数超过上限",
+                    )
+                requests.append(
+                    _planning_request(
+                        title_hint,
+                        duration_ms,
+                        tuple(batch),
+                        evidence_by_id,
+                        document_config,
+                    ),
+                )
+                batch = []
             candidate = (*batch, segment)
             request = _planning_request(
                 title_hint,
