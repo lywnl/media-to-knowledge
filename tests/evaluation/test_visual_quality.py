@@ -2,17 +2,28 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from video_demo.evaluation.annotations import (
+    AuthorizationFile,
+    AuthorizationRecord,
+    EvaluationAnnotation,
+    ReferenceVisualFrame,
+    ValidatedEvaluationPackage,
+    VerifiedAnnotation,
+)
 from video_demo.evaluation.chapter_vlm_live import ChapterVlmCallReceipt, VisualTextScoreFact
+from video_demo.evaluation.dataset import EvaluationDataset, EvaluationSample
 from video_demo.evaluation.visual_quality import (
     VisualQualityCase,
     VisualQualityReport,
     VisualQualitySample,
     VisualQualitySet,
     build_visual_quality_report,
+    build_visual_quality_set,
     build_visual_resolution_pair,
     build_visual_resolution_report,
     visual_quality_case_id,
@@ -40,6 +51,85 @@ def _not_run_case(edge: int = 1920) -> VisualQualityCase:
         case_status="NOT_RUN",
         implementation_sha256="a" * 64,
         settings_fingerprint="b" * 64,
+    )
+
+
+def _package_with_frames(frames: tuple[ReferenceVisualFrame, ...]) -> ValidatedEvaluationPackage:
+    media_sha = "a" * 64
+    sample = EvaluationSample(
+        sample_id="sample_001",
+        language="zh",
+        authorization_id="auth_001",
+        media_relative_path="media/sample.mp4",
+        media_sha256=media_sha,
+        annotations_relative_path="annotations/sample.json",
+        annotations_sha256="b" * 64,
+    )
+    annotation = EvaluationAnnotation(
+        schema_version="2.0.0",
+        sample_id=sample.sample_id,
+        media_sha256=media_sha,
+        duration_ms=10_000,
+        language="zh",
+        reference_text="参考文本",
+        visual_frames=frames,
+        scene_boundaries_ms=(5_000,),
+        semantic_boundaries_ms=(5_000,),
+        supported_facts=(
+            {"fact_id": "fact_001", "canonical_text": "事实"},
+        ),
+        key_fact_ids=("fact_001",),
+    )
+    dataset = EvaluationDataset(
+        samples=(sample,),
+        eval_root=Path("/tmp/eval"),
+        runtime_root=Path("/tmp/runtime"),
+        workspace_root=Path("/tmp/workspace"),
+    )
+    authorization = AuthorizationFile(
+        schema_version="1.0.0",
+        records=(
+            AuthorizationRecord(
+                schema_version="1.0.0",
+                authorization_id="auth_001",
+                source_category="OWNED",
+                allowed_purposes=("VIDEO_QUALITY_EVALUATION",),
+                confirmed_at="2026-01-01T00:00:00Z",
+                media_sha256=(media_sha,),
+            ),
+        ),
+    )
+    return ValidatedEvaluationPackage(
+        dataset=dataset,
+        authorization=authorization,
+        annotations=(VerifiedAnnotation(annotation=annotation, sha256="c" * 64),),
+        dataset_sha256="d" * 64,
+        authorization_sha256="e" * 64,
+    )
+
+
+def test_quality_set_selects_first_last_and_evenly_spaced_frames() -> None:
+    frames = tuple(
+        ReferenceVisualFrame(
+            frame_id=f"frame_{index:03d}",
+            timestamp_ms=index * 1_000,
+            text_lines=(f"文本 {index}",),
+            quality_categories=(
+                "CODE" if index == 5 else "GENERAL_TEXT",
+            ),
+        )
+        for index in range(6)
+    )
+    quality_set = build_visual_quality_set(
+        _package_with_frames(frames),
+        parent_evaluation_run_id="eval_parent",
+    )
+
+    assert quality_set.samples[0].requested_reference_frame_ids == (
+        "frame_000",
+        "frame_002",
+        "frame_003",
+        "frame_005",
     )
 
 

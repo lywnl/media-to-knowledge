@@ -11,6 +11,7 @@ import httpx
 from video_demo.application.composition import (
     build_production_model_identity_report,
     production_tool_path,
+    resolution_comparison_settings_fingerprint,
 )
 from video_demo.config import Settings
 from video_demo.errors import ErrorCode, VideoDemoError
@@ -168,7 +169,9 @@ class VisualQualityRunner:
             "jpeg_quality": quality_set.jpeg_quality,
             "implementation_sha256": implementation,
             "settings_fingerprint": identity.settings_fingerprint,
-            "resolution_settings_fingerprint": identity.settings_fingerprint,
+            "resolution_settings_fingerprint": resolution_comparison_settings_fingerprint(
+                self._settings
+            ),
         }
         started = time.monotonic_ns()
         assert self._settings.runtime_root is not None

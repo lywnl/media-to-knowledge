@@ -8,7 +8,10 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from video_demo.application.composition import build_production_model_identity_report
+from video_demo.application.composition import (
+    build_production_model_identity_report,
+    resolution_comparison_settings_fingerprint,
+)
 from video_demo.config import Settings, resolve_workspace_path
 from video_demo.errors import ErrorCode, VideoDemoError
 
@@ -453,6 +456,34 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(
                 baseline.settings_fingerprint,
                 key_changed.settings_fingerprint,
+            )
+
+    def test_resolution_comparison_fingerprint_ignores_only_proxy_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            common = {
+                "workspace_root": workspace,
+                "openai_base_url": "https://ai-proxy.example.test/v1",
+                "openai_api_key": "test-openai-key",
+                "openai_model": "openai/whisper",
+                "text_llm_base_url": "https://text.example.test/v1",
+                "text_llm_api_key": "text-key",
+                "text_llm_model_id": "text-model",
+                "vlm_base_url": "https://vlm.example.test/v1",
+                "vlm_api_key": "vlm-key",
+                "_env_file": None,
+            }
+            settings_1280 = Settings(**common, visual_proxy_max_edge=1_280)
+            settings_1920 = Settings(**common, visual_proxy_max_edge=1_920)
+            jpeg_changed = Settings(**common, visual_proxy_max_edge=1_920, keyframe_jpeg_quality=91)
+
+            self.assertEqual(
+                resolution_comparison_settings_fingerprint(settings_1280),
+                resolution_comparison_settings_fingerprint(settings_1920),
+            )
+            self.assertNotEqual(
+                resolution_comparison_settings_fingerprint(settings_1920),
+                resolution_comparison_settings_fingerprint(jpeg_changed),
             )
 
     def test_demo_degraded_mode_is_explicitly_opt_in(self) -> None:

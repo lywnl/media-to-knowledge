@@ -429,11 +429,14 @@ def _component_fingerprint(payload: object) -> str:
 
 
 def _settings_fingerprint(settings: Settings) -> str:
+    return _component_fingerprint(_settings_payload(settings))
+
+
+def _settings_payload(settings: Settings) -> dict[str, object]:
     cloud = settings.require_cloud_asr_configuration()
     text = settings.require_text_llm_configuration()
     vision = settings.require_vlm_configuration()
-    return _component_fingerprint(
-        {
+    return {
             "schema_version": "3.0.0",
             "cloud_asr": {
                 "base_url": cloud.base_url,
@@ -468,7 +471,16 @@ def _settings_fingerprint(settings: Settings) -> str:
             },
             "prompts": _prompt_versions().model_dump(mode="json"),
         }
-    )
+
+
+def resolution_comparison_settings_fingerprint(settings: Settings) -> str:
+    """生成 1280/1920 对照共用的设置指纹，仅忽略代理长边。"""
+
+    payload = _settings_payload(settings)
+    vision = payload["vision"]
+    assert isinstance(vision, dict)
+    vision.pop("proxy_max_edge")
+    return _component_fingerprint(payload)
 
 
 def _local_model_identity(
@@ -537,4 +549,5 @@ __all__ = [
     "build_production_pipeline",
     "build_worker",
     "production_tool_path",
+    "resolution_comparison_settings_fingerprint",
 ]

@@ -86,7 +86,9 @@ def build_visual_quality_set(
         )
         if len(frames) < 2:
             continue
-        selected = tuple(frame.frame_id for frame in frames[:4])
+        selected_indexes = _representative_frame_indexes(len(frames))
+        selected_frames = tuple(frames[index] for index in selected_indexes)
+        selected = tuple(frame.frame_id for frame in selected_frames)
         samples.append(
             VisualQualitySample(
                 sample_id=sample.sample_id,
@@ -95,7 +97,7 @@ def build_visual_quality_set(
         )
         media_ids.add(sample.media_sha256)
         frame_count += len(selected)
-        for frame in frames[:4]:
+        for frame in selected_frames:
             for category in frame.quality_categories:
                 if category in category_counts:
                     category_counts[category] += 1
@@ -129,6 +131,16 @@ def build_visual_quality_set(
         proxy_max_edge=proxy_max_edge,
         jpeg_quality=jpeg_quality,
     )
+
+
+def _representative_frame_indexes(frame_count: int) -> tuple[int, ...]:
+    """稳定保留首尾，并在中间使用等距分位点，避免前段帧垄断质量集。"""
+
+    if frame_count <= 4:
+        return tuple(range(frame_count))
+    last_index = frame_count - 1
+    interior = tuple((last_index * position + 1) // 3 for position in (1, 2))
+    return (0, *interior, last_index)
 
 
 def visual_quality_case_id(
