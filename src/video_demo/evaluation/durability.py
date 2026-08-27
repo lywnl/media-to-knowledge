@@ -73,6 +73,7 @@ except ModuleNotFoundError:  # pragma: no cover - 由 preflight 测试覆盖
 
 _CHECK_ID = "m1_durability"
 _MIN_DURATION_MS = 1_800_000
+MAX_DURABILITY_DURATION_MS = 7_200_000
 _MIN_WIDTH = 1920
 _MIN_HEIGHT = 1080
 _MAX_RTF = 3.0
@@ -135,6 +136,7 @@ def _module_available(name: str) -> bool:
 _PREFLIGHT_ORDER = (
     ErrorCode.M1_SAMPLE_COUNT_INVALID,
     ErrorCode.M1_DURATION_TOO_SHORT,
+    ErrorCode.M1_DURATION_TOO_LONG,
     ErrorCode.M1_RESOLUTION_TOO_SMALL,
     ErrorCode.M1_AUTHORIZATION_UNAVAILABLE,
     ErrorCode.M1_MEDIA_INVALID,
@@ -477,6 +479,8 @@ class DurabilityRunner:
             issues.append(ErrorCode.M1_MEDIA_INVALID)
         if any(sample.duration_ms < _MIN_DURATION_MS for sample in values):
             issues.append(ErrorCode.M1_DURATION_TOO_SHORT)
+        if any(sample.duration_ms > MAX_DURABILITY_DURATION_MS for sample in values):
+            issues.append(ErrorCode.M1_DURATION_TOO_LONG)
         if any(sample.width < _MIN_WIDTH or sample.height < _MIN_HEIGHT for sample in values):
             issues.append(ErrorCode.M1_RESOLUTION_TOO_SMALL)
         media_paths = self._media_paths(manifest, values, issues)

@@ -35,6 +35,7 @@ from video_demo.evaluation.chapter_vlm_input import (
     validate_chapter_vlm_input_manifest,
 )
 from video_demo.evaluation.chapter_vlm_live import VisualTextScoreFact
+from video_demo.evaluation.document_judgments import DocumentQualityReport
 from video_demo.evaluation.evidence import (
     _CHUNK_BYTES,
     ArtifactRole,
@@ -285,6 +286,7 @@ _MISSING_CHECK_REASONS: dict[str, str] = {
 _DURABILITY_ISSUE_REASONS: dict[ErrorCode, str] = {
     ErrorCode.M1_SAMPLE_COUNT_INVALID: "耐久样本必须恰好两段",
     ErrorCode.M1_DURATION_TOO_SHORT: "耐久样本时长不足 30 分钟",
+    ErrorCode.M1_DURATION_TOO_LONG: "耐久样本时长超过 2 小时上限",
     ErrorCode.M1_RESOLUTION_TOO_SMALL: "耐久样本分辨率低于 1920×1080",
     ErrorCode.M1_AUTHORIZATION_UNAVAILABLE: "耐久素材授权记录不可用",
     ErrorCode.M1_MEDIA_INVALID: "耐久媒体或 Manifest 不可用",
@@ -335,6 +337,7 @@ _FINAL_GATE_BUILD_TOKEN = object()
 class FinalGateReport(FrozenModel):
     status: GateStatus
     quality: QualityReport
+    document_quality: DocumentQualityReport | None = None
     checks: tuple[GateCheck, ...] = Field(min_length=len(FINAL_GATE_CHECKS))
 
     @model_validator(mode="after")
@@ -342,7 +345,7 @@ class FinalGateReport(FrozenModel):
         check_ids = tuple(check.check_id for check in self.checks)
         if len(check_ids) != len(set(check_ids)) or set(check_ids) != set(FINAL_GATE_CHECKS):
             raise ValueError("最终门禁必须且只能包含全部权威检查")
-        if self.status != _aggregate_status(self.quality, self.checks):
+        if self.status != _aggregate_status(self.quality, self.checks, self.document_quality):
             raise ValueError("最终状态必须与质量和权威检查一致")
         workspace_root = info.context.get("workspace_root") if info.context else None
         if not isinstance(workspace_root, Path):
@@ -518,6 +521,7 @@ def build_final_gate_report(
     checks: Sequence[GateCheck],
     workspace_root: Path,
     settings: Settings | None = None,
+    document_quality: DocumentQualityReport | None = None,
 ) -> FinalGateReport:
     failure_message: str | None = None
     try:
@@ -526,6 +530,7 @@ def build_final_gate_report(
             checks=checks,
             workspace_root=workspace_root,
             settings=settings,
+            document_quality=document_quality,
         )
     except ValidationError:
         failure_message = "最终门禁报告非法或不可信"
@@ -542,6 +547,7 @@ def _build_final_gate_report(
     checks: Sequence[GateCheck],
     workspace_root: Path,
     settings: Settings | None,
+    document_quality: DocumentQualityReport | None,
 ) -> FinalGateReport:
     supplied = {check.check_id: check for check in checks}
     if len(supplied) != len(checks):
@@ -566,8 +572,9 @@ def _build_final_gate_report(
         _verify_gate_check(check, workspace_root, settings=settings)
     return FinalGateReport.model_validate(
         {
-            "status": _aggregate_status(quality, completed),
+            "status": _aggregate_status(quality, completed, document_quality),
             "quality": quality,
+            "document_quality": document_quality,
             "checks": completed,
         },
         context={
@@ -578,8 +585,14 @@ def _build_final_gate_report(
     )
 
 
-def _aggregate_status(quality: QualityReport, checks: Sequence[GateCheck]) -> GateStatus:
-    statuses = (quality.status, *(check.status for check in checks))
+def _aggregate_status(
+    quality: QualityReport,
+    checks: Sequence[GateCheck],
+    document_quality: DocumentQualityReport | None = None,
+) -> GateStatus:
+    statuses = [quality.status, *(check.status for check in checks)]
+    if document_quality is not None:
+        statuses.append(GateStatus(document_quality.status))
     if GateStatus.FAIL in statuses:
         return GateStatus.FAIL
     if GateStatus.NOT_RUN in statuses:

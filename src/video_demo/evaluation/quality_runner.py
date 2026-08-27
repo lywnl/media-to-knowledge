@@ -26,6 +26,11 @@ from video_demo.evaluation.annotations import (
     reverify_evaluation_package,
 )
 from video_demo.evaluation.dataset import EvaluationSample, ValidationLanguage
+from video_demo.evaluation.document_judgments import (
+    DocumentQualityJudgment,
+    DocumentQualityReport,
+    build_document_quality_report,
+)
 from video_demo.evaluation.metrics import (
     EditCounts,
     MatchCounts,
@@ -149,6 +154,7 @@ class QualityScoreArtifacts(FrozenModel):
     report: BoundQualityReport
     sample_details: tuple[SampleQualityDetail, ...]
     hint_effect_report: HintEffectReport
+    document_quality_report: DocumentQualityReport
 
 
 def score_quality(
@@ -158,6 +164,7 @@ def score_quality(
     *,
     evaluation_run_id: str,
     visual_quality_report: VerifiedVisualQualityReport | None = None,
+    document_judgments: tuple[DocumentQualityJudgment, ...] = (),
 ) -> QualityScoreArtifacts:
     """从受验签来源确定性重建非运行时质量指标及逐样本明细。"""
 
@@ -251,10 +258,20 @@ def score_quality(
         ),
         durability_report_sha256=None,
     )
+    document_quality_report = build_document_quality_report(
+        evaluation_run_id=evaluation_run_id,
+        dataset_sha256=verified_package.dataset_sha256,
+        authorization_sha256=verified_package.authorization_sha256,
+        predictions=ordered_predictions,
+        annotations=ordered_annotations,
+        judgments=document_judgments,
+        visual_quality_report=visual_quality_report,
+    )
     return QualityScoreArtifacts(
         report=report,
         sample_details=details,
         hint_effect_report=hint_effect_report,
+        document_quality_report=document_quality_report,
     )
 
 

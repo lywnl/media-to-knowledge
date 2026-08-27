@@ -23,6 +23,7 @@ from video_demo.capabilities import probe_runtime_capabilities
 from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.evaluation.annotations import load_evaluation_package
+from video_demo.evaluation.document_judgments import DocumentQualityReport
 from video_demo.evaluation.durability import DurabilityRunReport, DurabilitySampleResult
 from video_demo.evaluation.evidence import (
     AuthorizedDatasetDetails,
@@ -322,6 +323,9 @@ class FinalValidationRunner:
             checks.append(authorized_dataset)
         checks.extend(self._load_external_checks(evaluation_run_id))
         quality = self._load_quality(evaluation_run_id)
+        document_quality = self._load_document_quality(evaluation_run_id)
+        if document_quality is not None:
+            self._verify_document_quality_binding(document_quality, quality)
         durability = next(
             (check for check in checks if check.check_id == "m1_durability"),
             None,
@@ -342,6 +346,7 @@ class FinalValidationRunner:
             checks=checks,
             workspace_root=self._settings.workspace_root,
             settings=self._settings,
+            document_quality=document_quality,
         )
         report_root = self._store.runtime_root / "eval/reports" / evaluation_run_id
         final_path = report_root / "final.json"
@@ -572,16 +577,88 @@ class FinalValidationRunner:
             return build_quality_report({}, QUALITY_THRESHOLDS)
         try:
             from video_demo.evaluation.prediction_runner import score_prediction_run
+            visual_quality = None
+            dataset_path = self._store.runtime_root / "eval/dataset.jsonl"
+            authorization_path = self._store.runtime_root / "eval/authorization.json"
+            visual_path = report_root / "visual-quality.json"
+            if visual_path.is_file() and dataset_path.is_file() and authorization_path.is_file():
+                from video_demo.evaluation.visual_quality import (
+                    VisualQualityReport,
+                    build_visual_quality_set,
+                    verify_visual_quality_report,
+                )
+
+                package = load_evaluation_package(
+                    dataset_path,
+                    authorization_path,
+                    workspace_root=self._settings.workspace_root,
+                    runtime_root=self._store.runtime_root,
+                    max_video_bytes=self._settings.max_video_bytes,
+                )
+                visual_report = VisualQualityReport.model_validate_json(visual_path.read_bytes())
+                quality_set = build_visual_quality_set(
+                    package,
+                    parent_evaluation_run_id=evaluation_run_id,
+                    proxy_max_edge=1_920,
+                    jpeg_quality=self._settings.keyframe_jpeg_quality,
+                )
+                visual_quality = verify_visual_quality_report(
+                    visual_report, quality_set, package
+                )
 
             report = score_prediction_run(
                 evaluation_run_id,
                 eval_root=self._store.runtime_root / "eval",
+                visual_quality_report=visual_quality,
             )
         except Exception:
             raise ValueError("质量报告非法或损坏") from None
         if report.evaluation_run_id != evaluation_run_id:
             raise ValueError("质量报告运行 ID 不匹配")
+        document_path = report_root / "document-quality.json"
+        if document_path.is_file():
+            from video_demo.evaluation.document_judgments import DocumentQualityReport
+
+            document_quality = DocumentQualityReport.model_validate_json(document_path.read_bytes())
+            if document_quality.evaluation_run_id != evaluation_run_id:
+                raise ValueError("文档质量报告运行 ID 不匹配")
         return report
+
+    def _load_document_quality(
+        self, evaluation_run_id: str
+    ) -> DocumentQualityReport | None:
+        """读取与当前评测 Run 绑定的独立文档质量报告。"""
+
+        path = (
+            self._store.runtime_root
+            / "eval/reports"
+            / evaluation_run_id
+            / "document-quality.json"
+        )
+        if not path.is_file():
+            return None
+        try:
+            report = DocumentQualityReport.model_validate_json(path.read_bytes())
+        except Exception:
+            raise ValueError("文档质量报告非法或损坏") from None
+        if report.evaluation_run_id != evaluation_run_id:
+            raise ValueError("文档质量报告运行 ID 不匹配")
+        return report
+
+    @staticmethod
+    def _verify_document_quality_binding(
+        document_quality: DocumentQualityReport,
+        quality: QualityReport,
+    ) -> None:
+        if not isinstance(quality, BoundQualityReport):
+            raise ValueError("文档质量报告缺少绑定的预测质量报告")
+        if (
+            document_quality.evaluation_run_id != quality.evaluation_run_id
+            or document_quality.dataset_sha256 != quality.dataset_sha256
+            or document_quality.authorization_sha256 != quality.authorization_sha256
+            or document_quality.prediction_index_sha256 != quality.prediction_index_sha256
+        ):
+            raise ValueError("文档质量报告与预测质量报告闭包不一致")
 
     def _bind_verified_durability(
         self,

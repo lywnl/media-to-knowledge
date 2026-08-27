@@ -311,6 +311,9 @@ def test_quality_uses_chapter_boundaries_and_marks_retired_visual_metrics_not_ru
     assert metrics["semantic_boundary_f1"].value == 1.0
     assert metrics["schema_time_valid_rate"].value == 1.0
     assert artifacts.sample_details[0].metric_inputs["semantic_boundary_f1"] == 1.0
+    assert artifacts.document_quality_report.automatic_metrics is None
+    assert artifacts.document_quality_report.human_metrics is None
+    assert artifacts.document_quality_report.status == "NOT_RUN"
 
 
 def test_quality_report_is_bound_to_prediction_index_and_has_no_runtime_metrics(

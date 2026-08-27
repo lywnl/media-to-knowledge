@@ -37,6 +37,10 @@ from video_demo.evaluation.annotations import (
     reverify_evaluation_package,
 )
 from video_demo.evaluation.dataset import EvaluationSample, _safe_relative_file
+from video_demo.evaluation.document_judgments import (
+    DocumentQualityJudgment,
+    load_document_quality_judgment,
+)
 from video_demo.evaluation.predictions import (
     EvaluationPrediction,
     PredictionRunSnapshot,
@@ -735,6 +739,7 @@ def score_prediction_run(
     *,
     eval_root: Path,
     visual_quality_report: VerifiedVisualQualityReport | None = None,
+    document_quality_judgments: tuple[DocumentQualityJudgment, ...] | None = None,
 ) -> BoundQualityReport:
     """只加载已落盘预测和人工审阅并重建质量，不调用生产模型。"""
 
@@ -787,6 +792,7 @@ def score_prediction_run(
         if current_index_digest != report.prediction_index_sha256:
             raise ValueError("预测索引摘要与当前产物不匹配")
         judgments: list[SemanticJudgment] = []
+        document_judgments: list[DocumentQualityJudgment] = []
         for prediction in predictions:
             path = (
                 safe_eval_root
@@ -808,12 +814,35 @@ def score_prediction_run(
                         prediction=prediction,
                     )
                 )
+            document_path = (
+                safe_eval_root
+                / "document-judgments"
+                / evaluation_run_id
+                / f"{prediction.index.sample_id}.json"
+            )
+            if document_path.is_file():
+                document_judgments.append(
+                    load_document_quality_judgment(
+                        document_path,
+                        annotation=next(
+                            annotation
+                            for annotation in package.annotations
+                            if annotation.annotation.sample_id == prediction.index.sample_id
+                        ),
+                        prediction=prediction,
+                        dataset_sha256=package.dataset_sha256,
+                        authorization_sha256=package.authorization_sha256,
+                    )
+                )
+        if document_quality_judgments is not None:
+            document_judgments = list(document_quality_judgments)
         artifacts = score_quality(
             package,
             predictions,
             tuple(judgments),
             evaluation_run_id=evaluation_run_id,
             visual_quality_report=visual_quality_report,
+            document_judgments=tuple(document_judgments),
         )
         _atomic_write_bytes(
             safe_eval_root / "reports" / evaluation_run_id / "quality.json",
@@ -831,6 +860,10 @@ def score_prediction_run(
         _atomic_write_bytes(
             safe_eval_root / "reports" / evaluation_run_id / "hint-effect.json",
             artifacts.hint_effect_report.model_dump_json(exclude_none=True).encode("utf-8"),
+        )
+        _atomic_write_bytes(
+            safe_eval_root / "reports" / evaluation_run_id / "document-quality.json",
+            artifacts.document_quality_report.model_dump_json(exclude_none=True).encode("utf-8"),
         )
         return artifacts.report
     except (OSError, ValueError, ValidationError, KeyError, StopIteration, VideoDemoError):
