@@ -1203,6 +1203,38 @@ def test_bounded_concurrency_preserves_chapter_order(tmp_path: Path) -> None:
     assert result.chapter_status == tuple((item.chapter_id, "NO_VALUE") for item in chapters)
 
 
+def test_chapter_vision_limits_candidates_to_selected_frame_budget(
+    tmp_path: Path,
+) -> None:
+    run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
+    base_frame = frame_batch.frame_sets[0].candidates[0]
+    candidates = tuple(
+        _updated_frame(base_frame, timestamp_ms=1_500 + index * 1_000)
+        for index in range(3)
+    )
+    batch = frame_batch.model_copy(
+        update={
+            "frame_sets": (
+                ChapterFrameSet(chapter_id=chapter.chapter_id, candidates=candidates),
+            ),
+        },
+    )
+    port = _VisionPort(_response())
+
+    result = _service(tmp_path, port).analyze_all(
+        (chapter,),
+        batch,
+        (speech,),
+        DocumentGenerationConfig(),
+        cache=_cache(run_root),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert len(port.requests) == 1
+    assert len(port.requests[0].frames) == 2
+    assert result.chapter_status == ((chapter.chapter_id, "SUCCEEDED"),)
+
+
 def test_cancellation_stops_submitting_and_waits_for_inflight_chapters(tmp_path: Path) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
     chapter_speeches = tuple(

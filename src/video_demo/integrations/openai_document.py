@@ -116,7 +116,7 @@ class OpenAIDocumentClient(DocumentTextPort):
                 response_type=_CompactChapterPlanningResponse,
                 schema_name="chapter_planning_compact_v1",
                 max_output_tokens=_COMPACT_PLANNING_MAX_OUTPUT_TOKENS,
-                extra_payload={"thinking": {"type": "disabled"}},
+                extra_payload={"thinking": {"type": "enabled"}},
                 validate_response=lambda response: _validate_compact_planning_response(
                     response,
                     request,
@@ -150,7 +150,7 @@ class OpenAIDocumentClient(DocumentTextPort):
                 response_type=_CompactChapterPlanningResponse,
                 schema_name="chapter_planning_compact_repair_v1",
                 max_output_tokens=_COMPACT_PLANNING_MAX_OUTPUT_TOKENS,
-                extra_payload={"thinking": {"type": "disabled"}},
+                extra_payload={"thinking": {"type": "enabled"}},
                 validate_response=lambda response: _validate_compact_planning_response(
                     response,
                     request.request,

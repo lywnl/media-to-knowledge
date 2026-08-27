@@ -103,6 +103,7 @@ def _planner(
     max_planning_batches: int = 64,
     invocation_wait_timeout_seconds: float = 2,
     planning_concurrency: int = 2,
+    compact_planning: bool = False,
 ) -> ChapterPlanner:
     return ChapterPlanner(
         cast(DocumentTextPort, port),
@@ -113,6 +114,7 @@ def _planner(
         max_planning_batches=max_planning_batches,
         invocation_wait_timeout_seconds=invocation_wait_timeout_seconds,
         concurrency=planning_concurrency,
+        compact_planning=compact_planning,
     )
 
 
@@ -533,10 +535,10 @@ def test_chapter_planner_processes_independent_batches_concurrently(
     assert batch.metrics["chapter_planner_logical_calls"] == 4
 
 
-def test_chapter_planner_caps_compact_batches_at_thirty_segments(
+def test_chapter_planner_caps_thinking_batches_at_fifteen_segments(
     tmp_path: Path,
 ) -> None:
-    segments, transcript, scenes = _planning_fixture(31, text="短文本")
+    segments, transcript, scenes = _planning_fixture(16, text="短文本")
 
     def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
         return ChapterPlanningResponse(
@@ -551,10 +553,10 @@ def test_chapter_planner_caps_compact_batches_at_thirty_segments(
         )
 
     port = _PlanningTextPort(response, response)
-    batch = _plan(_planner(port), tmp_path, segments, transcript, scenes)
+    batch = _plan(_planner(port, compact_planning=True), tmp_path, segments, transcript, scenes)
 
     assert len(port.main_requests) == 2
-    assert sorted(len(request.segments) for request in port.main_requests) == [1, 30]
+    assert sorted(len(request.segments) for request in port.main_requests) == [1, 15]
     assert batch.metrics["chapter_planner_logical_calls"] == 2
 
 

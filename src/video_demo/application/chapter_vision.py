@@ -625,10 +625,17 @@ class ChapterVisionService:
     ) -> tuple[FrameCandidateArtifact, ...] | None:
         admitted = tuple(frame for frame in frames if frame.size_bytes <= self._max_image_bytes)
         required_targets = {target.target_id for target in _targets(chapter)}
+        max_selected_frames = min(
+            document_config.max_visuals_per_chapter,
+            3 if chapter.visual_mode in {"COMPARISON", "MULTI_STEP"} else 2,
+        )
+        if max_selected_frames == 0:
+            return None
         while admitted:
             request = _vision_request(chapter, admitted, transcript_evidence, document_config)
             if (
-                sum(frame.size_bytes for frame in admitted) <= self._max_request_image_bytes
+                len(admitted) <= max_selected_frames
+                and sum(frame.size_bytes for frame in admitted) <= self._max_request_image_bytes
                 and self._request_pair_fits(request)
                 and _covers_targets(admitted, required_targets)
             ):

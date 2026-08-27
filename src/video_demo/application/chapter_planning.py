@@ -35,7 +35,10 @@ from video_demo.integrations.document_port import (
     ModelResponseValidationError,
     invalid_model_response,
 )
-from video_demo.integrations.document_prompts import prompt_for_planning
+from video_demo.integrations.document_prompts import (
+    prompt_for_compact_planning,
+    prompt_for_planning,
+)
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
 
 _MIN_CHAPTER_DURATION_MS = 60_000
@@ -43,9 +46,9 @@ _MAX_CHAPTER_DURATION_MS = 300_000
 _MAX_TARGET_ANCHOR_SPAN_MS = 30_000
 _DEFAULT_MAX_PLANNING_BATCHES = 64
 _DEFAULT_PLANNING_CONCURRENCY = 2
-# 索引协议虽然显著缩短了输出，但大模型在一次返回数百个边界时仍容易截断；
-# 30 个基础片段约对应 15 分钟以内的时间轴，足够保留局部语义上下文并控制单次延迟。
-_MAX_PLANNING_SEGMENTS_PER_BATCH = 30
+# 思考模式会把推理 token 计入输出预算；批次过大时供应商容易超时或返回空内容。
+# 15 个基础片段通常覆盖 7.5 分钟以内的时间轴，在保持上下文的同时控制单次延迟。
+_MAX_PLANNING_SEGMENTS_PER_BATCH = 15
 _GRANULARITY_TARGET_DURATION_MS = {
     "fine": 120_000,
     "standard": 180_000,
@@ -128,6 +131,7 @@ class ChapterPlanner:
         invocation_wait_timeout_seconds: float,
         max_planning_batches: int = _DEFAULT_MAX_PLANNING_BATCHES,
         concurrency: int = _DEFAULT_PLANNING_CONCURRENCY,
+        compact_planning: bool = False,
     ) -> None:
         if min(
             max_input_chars,
@@ -152,6 +156,7 @@ class ChapterPlanner:
         self._max_chapters = max_chapters
         self._max_planning_batches = max_planning_batches
         self._concurrency = concurrency
+        self._compact_planning = compact_planning
         self._invocation_wait_timeout_seconds = invocation_wait_timeout_seconds
 
     def plan(
@@ -279,7 +284,7 @@ class ChapterPlanner:
                     index, started_at = pending.pop(future)
                     response = future.result()
                     request = requests[index]
-                    data = prompt_for_planning(request)[2]
+                    data = self._planning_prompt(request)[2]
                     _LOGGER.info(
                         "章节规划批次完成 batch=%d/%d chars=%d bytes=%d elapsed_ms=%d status=%s",
                         index + 1,
@@ -335,7 +340,7 @@ class ChapterPlanner:
                 evidence_by_id,
                 document_config,
             )
-            if _request_fits(request, self._max_input_chars, self._max_input_bytes):
+            if self._request_fits(request):
                 batch.append(segment)
                 continue
             if not batch:
@@ -365,7 +370,7 @@ class ChapterPlanner:
                 evidence_by_id,
                 document_config,
             )
-            if not _request_fits(single, self._max_input_chars, self._max_input_bytes):
+            if not self._request_fits(single):
                 raise VideoDemoError(
                     ErrorCode.INPUT_BUDGET_EXCEEDED,
                     "单个基础片段超过文本模型输入预算",
@@ -386,6 +391,18 @@ class ChapterPlanner:
                 ),
             )
         return tuple(requests)
+
+    def _planning_prompt(self, request: ChapterPlanningRequest) -> tuple[str, str, str]:
+        if self._compact_planning:
+            return prompt_for_compact_planning(request)
+        return prompt_for_planning(request)
+
+    def _request_fits(self, request: ChapterPlanningRequest) -> bool:
+        data = self._planning_prompt(request)[2]
+        return (
+            len(data) <= self._max_input_chars
+            and len(data.encode("utf-8")) <= self._max_input_bytes
+        )
 
     def _logical_call(
         self,
@@ -574,15 +591,6 @@ def _validate_chapter_count_feasibility(
             ErrorCode.INPUT_BUDGET_EXCEEDED,
             "视频时长与安全片段边界无法满足章节数量上限",
         )
-
-
-def _request_fits(
-    request: ChapterPlanningRequest,
-    max_chars: int,
-    max_bytes: int,
-) -> bool:
-    data = prompt_for_planning(request)[2]
-    return len(data) <= max_chars and len(data.encode("utf-8")) <= max_bytes
 
 
 def _validate_planning_response(
