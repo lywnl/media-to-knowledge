@@ -20,7 +20,6 @@ SpeakerId = Literal[
     "SPEAKER_09",
     "SPEAKER_10",
 ]
-VisualUncertainty = Annotated[str, Field(min_length=1)]
 
 
 class TimedEvidence(TimeRange):
@@ -181,8 +180,6 @@ class VisualObservationEvidence(TimedEvidence):
         "CONFLICTING", "INDEPENDENT",
     ]
     certainty: Probability
-    quality_flags: tuple[str, ...] = Field(default=(), max_length=16)
-    uncertainties: tuple[VisualUncertainty, ...] = Field(default=(), max_length=16)
 
     @model_validator(mode="after")
     def validate_local_references(self) -> Self:
@@ -212,8 +209,6 @@ class VisualObservationEvidence(TimedEvidence):
             raise ValueError("INDEPENDENT 观察不得引用转写证据")
         if self.relation_to_transcript != "INDEPENDENT" and not self.transcript_evidence_refs:
             raise ValueError("音画关系需要至少一个转写证据引用")
-        if self.relation_to_transcript == "CONFLICTING" and not self.uncertainties:
-            raise ValueError("CONFLICTING 观察必须说明 uncertainties")
         return self
 
 
@@ -324,8 +319,6 @@ class ChapterVisualObservation(FrozenModel):
         "CONFLICTING", "INDEPENDENT",
     ]
     certainty: Probability
-    quality_flags: tuple[str, ...] = Field(default=(), max_length=16)
-    uncertainties: tuple[VisualUncertainty, ...] = Field(default=(), max_length=16)
 
     @model_validator(mode="after")
     def validate_local_references(self) -> Self:
@@ -346,8 +339,6 @@ class ChapterVisualObservation(FrozenModel):
             raise ValueError("INDEPENDENT 草稿不得引用转写证据")
         if self.relation_to_transcript != "INDEPENDENT" and not self.transcript_evidence_refs:
             raise ValueError("音画关系需要至少一个转写证据引用")
-        if self.relation_to_transcript == "CONFLICTING" and not self.uncertainties:
-            raise ValueError("CONFLICTING 草稿必须说明 uncertainties")
         return self
 
 

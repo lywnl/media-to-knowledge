@@ -1,4 +1,4 @@
-"""唯一正式 3.0 结果 bundle 外观。"""
+"""唯一正式 4.0 结果 bundle 外观。"""
 
 from video_demo.domain.document import TranscriptSource
 from video_demo.domain.document_artifact import (

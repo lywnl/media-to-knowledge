@@ -39,7 +39,7 @@ class PipelineRunner(Protocol):
 
 
 class PipelineJobHandler:
-    """把可靠任务租约转换为 3.0 流水线上下文并原子发布唯一结果。"""
+    """把可靠任务租约转换为 4.0 流水线上下文并原子发布唯一结果。"""
 
     def __init__(
         self,

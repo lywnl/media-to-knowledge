@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class PipelineContext:
-    """3.0 生产流水线一次运行所需的全部显式输入。"""
+    """4.0 生产流水线一次运行所需的全部显式输入。"""
 
     run_id: str
     scope: Scope
@@ -58,7 +58,7 @@ class PipelineContext:
 
 @dataclass(frozen=True, slots=True)
 class PipelineOutcome:
-    """尚未发布的 3.0 结果及发布后清理所需的内部闭包。"""
+    """尚未发布的 4.0 结果及发布后清理所需的内部闭包。"""
 
     status: Literal["SUCCEEDED", "PARTIAL_SUCCEEDED"]
     result: VideoUnderstandingResult
@@ -113,7 +113,7 @@ class PipelineRunConfig(FrozenModel):
     document_config: DocumentGenerationConfig = Field(
         default_factory=DocumentGenerationConfig,
     )
-    result_schema_version: Literal["3.0.0"] = "3.0.0"
+    result_schema_version: Literal["4.0.0"] = "4.0.0"
 
     @model_validator(mode="after")
     def normalize_speech_configuration(self) -> Self:
@@ -134,11 +134,11 @@ def pipeline_run_config_from_snapshot(
 ) -> PipelineRunConfig:
     """只在读取历史数据库快照时丢弃三个已退役语音字段。"""
 
-    if snapshot.get("result_schema_version") != "3.0.0":
+    if snapshot.get("result_schema_version") != "4.0.0":
         raise VideoDemoError(
             ErrorCode.RESULT_SCHEMA_UNSUPPORTED,
-            "运行配置快照不是 3.0",
-            {"supported_schema_version": "3.0.0"},
+            "运行配置快照不是 4.0",
+            {"supported_schema_version": "4.0.0"},
         )
 
     normalized = {

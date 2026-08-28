@@ -166,7 +166,7 @@ class _StageMetrics:
 
 
 class VideoUnderstandingPipeline:
-    """从注册到确定性 Markdown 的唯一 3.0 生产编排。"""
+    """从注册到确定性 Markdown 的唯一 4.0 生产编排。"""
 
     def __init__(
         self,

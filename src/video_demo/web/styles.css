@@ -426,12 +426,6 @@ input {
   font-size: 0.78rem;
 }
 
-.toc-sections {
-  margin: 0 0 12px;
-  color: var(--ink-muted);
-  font-size: 0.88rem;
-}
-
 .download-status {
   min-height: 1.6em;
   margin: 0;
@@ -565,19 +559,6 @@ input {
 
 .chapter-claims li + li {
   margin-top: 5px;
-}
-
-.uncertainty-note {
-  margin-top: 18px;
-  padding: 12px 14px;
-  color: var(--warning);
-  background: #fff8e5;
-  border: 1px solid #ead7a0;
-}
-
-.uncertainty-note ul {
-  margin: 6px 0 0;
-  padding-left: 1.2rem;
 }
 
 .chapter-keyframe {

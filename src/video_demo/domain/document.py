@@ -20,7 +20,7 @@ from video_demo.domain.evidence import (
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 
-RESULT_SCHEMA_VERSION: Literal["3.0.0"] = "3.0.0"
+RESULT_SCHEMA_VERSION: Literal["4.0.0"] = "4.0.0"
 TranscriptSource: TypeAlias = Literal["SUBTITLE", "ASR", "NONE"]
 _TITLE_MAX_LENGTH = 200
 _VISUAL_CAPTION_MAX_LENGTH = 2_000
@@ -59,7 +59,6 @@ class DocumentGenerationConfig(FrozenModel):
     chapter_granularity: Literal["fine", "standard", "coarse"] = "standard"
     include_verbatim_quotes: bool = True
     max_visuals_per_chapter: int = Field(default=2, ge=0, le=3)
-    uncertainty_policy: Literal["explicit", "conservative"] = "explicit"
 
     @field_validator("document_title", mode="before")
     @classmethod
@@ -86,21 +85,6 @@ class VideoDocumentSummary(FrozenModel):
     def validate_retrieval_hash(self) -> VideoDocumentSummary:
         _validate_retrieval_hash(self.retrieval_text, self.retrieval_hash)
         return self
-
-
-class SemanticSection(FrozenModel):
-    section_id: StableId
-    title: str = Field(min_length=1, max_length=200)
-    summary_zh: str = Field(max_length=4_000)
-    chapter_refs: tuple[StableId, ...] = Field(min_length=1, max_length=240)
-
-
-class SectionDraft(FrozenModel):
-    """全局编辑器返回的草稿；最终 section_id 由程序生成。"""
-
-    title: str = Field(min_length=1, max_length=200)
-    summary_zh: str = Field(max_length=4_000)
-    chapter_refs: tuple[StableId, ...] = Field(min_length=1, max_length=240)
 
 
 class GroundedClaim(FrozenModel):
@@ -242,35 +226,6 @@ class SemanticChapter(TimeRange):
         return self
 
 
-def visual_caption_for_policy(
-    observation: VisualObservationEvidence,
-    config: DocumentGenerationConfig,
-) -> str:
-    """把视觉观察投影为最终文档唯一可接受的确定性文案。"""
-
-    if observation.relation_to_transcript != "CONFLICTING":
-        return observation.caption
-    uncertainty = "；".join(observation.uncertainties)
-    if config.uncertainty_policy == "conservative":
-        marker = " (画面与转写存在冲突，未采纳为确定事实："
-    else:
-        marker = " (音画信息存在冲突："
-    suffix = ")"
-    fixed_length = len(marker) + len(suffix)
-    content_budget = _VISUAL_CAPTION_MAX_LENGTH - fixed_length
-    total_content_length = len(observation.caption) + len(uncertainty)
-    if total_content_length <= content_budget:
-        caption = observation.caption
-    else:
-        caption_budget = max(
-            1,
-            content_budget * len(observation.caption) // total_content_length,
-        )
-        caption = observation.caption[:caption_budget]
-    uncertainty_budget = content_budget - len(caption)
-    return f"{caption}{marker}{uncertainty[:uncertainty_budget]}{suffix}"
-
-
 class PromptVersions(FrozenModel):
     chapter_planner: Literal["chapter-planner-v1"]
     chapter_planner_repair: Literal["chapter-planner-repair-v1"]
@@ -290,16 +245,15 @@ class DocumentGenerationMetadata(FrozenModel):
 
 
 class VideoUnderstandingResult(FrozenModel):
-    schema_version: Literal["3.0.0"] = RESULT_SCHEMA_VERSION
+    schema_version: Literal["4.0.0"] = RESULT_SCHEMA_VERSION
     run_id: StableId
     asset_sha256: Sha256
     summary: VideoDocumentSummary
-    sections: tuple[SemanticSection, ...] = Field(min_length=1, max_length=240)
     chapters: tuple[SemanticChapter, ...] = Field(min_length=1, max_length=240)
     generation: DocumentGenerationMetadata
 
     @model_validator(mode="after")
-    def validate_result_timeline_and_sections(self) -> VideoUnderstandingResult:
+    def validate_result_timeline(self) -> VideoUnderstandingResult:
         if self.chapters[0].start_ms != 0:
             raise ValueError("章节时间轴必须从 0 开始")
         if self.chapters[-1].end_ms != self.summary.duration_ms:
@@ -310,18 +264,6 @@ class VideoUnderstandingResult(FrozenModel):
         for previous, current in zip(self.chapters[:-1], self.chapters[1:], strict=True):
             if previous.end_ms != current.start_ms:
                 raise ValueError("章节必须连续且无重叠")
-        chapter_set = set(chapter_ids)
-        section_refs: list[str] = []
-        for section in self.sections:
-            if len(section.chapter_refs) != len(set(section.chapter_refs)):
-                raise ValueError("Section chapter_refs 不得重复")
-            if any(ref not in chapter_set for ref in section.chapter_refs):
-                raise ValueError("Section 引用了不存在的章节")
-            if section.section_id != section_id_for(self.asset_sha256, section.chapter_refs):
-                raise ValueError("Section ID 必须由资产摘要和有序章节引用稳定生成")
-            section_refs.extend(section.chapter_refs)
-        if tuple(section_refs) != chapter_ids:
-            raise ValueError("Section 必须按顺序完整覆盖每个章节一次")
         grounded = {
             chapter.chapter_id
             for chapter in self.chapters
@@ -331,13 +273,6 @@ class VideoUnderstandingResult(FrozenModel):
             if any(ref not in grounded for ref in point.chapter_refs):
                 raise ValueError("SummaryPoint 只能引用已有的 GROUNDED 章节")
         return self
-
-
-def section_id_for(asset_sha256: str, ordered_chapter_refs: tuple[str, ...]) -> str:
-    return stable_identifier(
-        "section",
-        {"asset_sha256": asset_sha256, "chapter_refs": ordered_chapter_refs},
-    )
 
 
 def validate_evidence_references(
@@ -372,14 +307,12 @@ def validate_evidence_references(
             chapter,
             chapter.title_evidence_refs,
             evidence_by_id,
-            result.generation.document_config,
             allow_typed_visual=False,
         )
         _validate_attributed_evidence_refs(
             chapter,
             chapter.summary_evidence_refs,
             evidence_by_id,
-            result.generation.document_config,
             allow_typed_visual=False,
         )
         for evidence_ref in chapter.evidence_refs:
@@ -419,7 +352,6 @@ def validate_evidence_references(
                 chapter,
                 block.evidence_refs,
                 evidence_by_id,
-                result.generation.document_config,
                 allow_typed_visual=isinstance(block, VisualBlock),
             )
             if isinstance(block, VisualBlock):
@@ -452,10 +384,7 @@ def validate_evidence_references(
                 if (
                     observation.relation_to_transcript == "CONFLICTING"
                     and block.caption
-                    != visual_caption_for_policy(
-                        observation,
-                        result.generation.document_config,
-                    )
+                    != observation.caption
                 ):
                     raise VideoDemoError(
                         ErrorCode.EVIDENCE_RELATION_INVALID,
@@ -466,7 +395,6 @@ def validate_evidence_references(
                 chapter,
                 claim.evidence_refs,
                 evidence_by_id,
-                result.generation.document_config,
                 allow_typed_visual=False,
             )
         rebuilt_keyframes = _selected_keyframes_from_body(
@@ -589,7 +517,6 @@ def _validate_attributed_evidence_refs(
     chapter: SemanticChapter,
     evidence_refs: tuple[str, ...],
     evidence_by_id: dict[str, TimedEvidence],
-    config: DocumentGenerationConfig,
     *,
     allow_typed_visual: bool,
 ) -> None:
@@ -618,15 +545,6 @@ def _validate_attributed_evidence_refs(
             raise VideoDemoError(
                 ErrorCode.EVIDENCE_RELATION_INVALID,
                 "CONFLICTING 视觉观察只能通过类型化视觉块表达",
-            )
-        if (
-            config.uncertainty_policy == "conservative"
-            and referenced.certainty < 0.7
-            and relation != "CONFLICTING"
-        ):
-            raise VideoDemoError(
-                ErrorCode.EVIDENCE_RELATION_INVALID,
-                "保守策略下低置信视觉观察只能进入信息边界",
             )
 
 

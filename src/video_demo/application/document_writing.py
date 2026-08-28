@@ -29,17 +29,13 @@ from video_demo.domain.document import (
     ParagraphBlock,
     PromptVersions,
     QuoteBlock,
-    SectionDraft,
     SemanticChapter,
-    SemanticSection,
     SummaryPoint,
     TableBlock,
     VideoDocumentSummary,
     VideoUnderstandingResult,
     VisualBlock,
-    section_id_for,
     validate_evidence_references,
-    visual_caption_for_policy,
 )
 from video_demo.domain.document_artifact import MAX_METRIC_VALUE
 from video_demo.domain.document_plan import ChapterPlan
@@ -55,7 +51,7 @@ from video_demo.integrations.document_port import (
     ChapterWritingRequest,
     ChapterWritingResponse,
     DocumentTextPort,
-    GlobalChapterGroup,
+    GlobalChapterInput,
     GlobalWritingRepairRequest,
     GlobalWritingRequest,
     GlobalWritingResponse,
@@ -90,8 +86,6 @@ _WRITING_METRICS = frozenset(
     },
 )
 _PLACEHOLDER = "本时段未提取到可验证语义内容"
-_MAX_GLOBAL_GROUP_CHAPTERS = 20
-_MAX_GLOBAL_DIGEST_CHARS = 4_000
 _MAX_INPUT_CHARS = 60_000
 _MAX_INPUT_BYTES = 1_048_576
 _LOGGER = logging.getLogger(__name__)
@@ -198,7 +192,7 @@ class _ChapterOutcome:
 
 
 class DocumentWriter:
-    """把有界模型草稿收敛为程序拥有引用、顺序与检索投影的 3.0 结果。"""
+    """把有界模型草稿收敛为程序拥有引用、顺序与检索投影的 4.0 结果。"""
 
     def __init__(
         self,
@@ -883,15 +877,14 @@ def _global_request(
     max_chars: int,
     max_bytes: int,
 ) -> GlobalWritingRequest:
-    groups = list(_global_groups(chapters))
     request = GlobalWritingRequest(
         context=context,
-        groups=tuple(groups),
+        chapters=_global_chapter_inputs(chapters),
         prompt_version=prompt_version,
     )
     if _global_request_fits(request, max_chars, max_bytes):
         return request
-    minimum = _resized_global_request(context, groups, prompt_version, scale=0)
+    minimum = _resized_global_request(context, chapters, prompt_version, scale=0)
     if not _global_request_fits(minimum, max_chars, max_bytes):
         raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "全局编辑最小输入超过预算")
     lower = 0
@@ -899,7 +892,7 @@ def _global_request(
     best = minimum
     while lower <= upper:
         scale = (lower + upper) // 2
-        candidate = _resized_global_request(context, groups, prompt_version, scale=scale)
+        candidate = _resized_global_request(context, chapters, prompt_version, scale=scale)
         if _global_request_fits(candidate, max_chars, max_bytes):
             best = candidate
             lower = scale + 1
@@ -910,80 +903,47 @@ def _global_request(
 
 def _resized_global_request(
     context: DocumentWritingContext,
-    groups: list[GlobalChapterGroup],
+    chapters: tuple[SemanticChapter, ...],
     prompt_version: Literal["global-editor-v1"],
     *,
     scale: int,
 ) -> GlobalWritingRequest:
     resized = tuple(
-        group
-        if not group.grounded_chapter_refs
-        else group.model_copy(
-            update={
-                "digest_zh": group.digest_zh[
-                    : max(1, len(group.digest_zh) * scale // 1_000_000)
-                ],
-            },
+        GlobalChapterInput(
+            chapter_id=chapter.chapter_id,
+            start_ms=chapter.start_ms,
+            end_ms=chapter.end_ms,
+            title=chapter.title,
+            summary_zh=chapter.summary_zh[: max(1, len(chapter.summary_zh) * scale // 1_000_000)],
+            key_conclusions=tuple(
+                claim.text[: max(1, len(claim.text) * scale // 1_000_000)]
+                for claim in chapter.claims
+            ),
+            content_status=chapter.content_status,
         )
-        for group in groups
+        for chapter in chapters
     )
     return GlobalWritingRequest(
         context=context,
-        groups=resized,
+        chapters=resized,
         prompt_version=prompt_version,
     )
 
 
-def _global_groups(chapters: tuple[SemanticChapter, ...]) -> tuple[GlobalChapterGroup, ...]:
-    groups: list[GlobalChapterGroup] = []
-    for start in range(0, len(chapters), _MAX_GLOBAL_GROUP_CHAPTERS):
-        batch = chapters[start : start + _MAX_GLOBAL_GROUP_CHAPTERS]
-        grounded = tuple(
-            chapter for chapter in batch if chapter.content_status == "GROUNDED"
+def _global_chapter_inputs(
+    chapters: tuple[SemanticChapter, ...],
+) -> tuple[GlobalChapterInput, ...]:
+    return tuple(
+        GlobalChapterInput(
+            chapter_id=chapter.chapter_id,
+            start_ms=chapter.start_ms,
+            end_ms=chapter.end_ms,
+            title=chapter.title,
+            summary_zh=chapter.summary_zh,
+            key_conclusions=tuple(claim.text for claim in chapter.claims),
+            content_status=chapter.content_status,
         )
-        digest = _fit_digest_parts(
-            tuple(
-                f"{chapter.title}|{chapter.summary_zh}|{chapter.retrieval_text}"
-                for chapter in grounded
-            ),
-            _MAX_GLOBAL_DIGEST_CHARS,
-        )
-        groups.append(
-            GlobalChapterGroup(
-                start_ms=batch[0].start_ms,
-                end_ms=batch[-1].end_ms,
-                chapter_refs=tuple(chapter.chapter_id for chapter in batch),
-                grounded_chapter_refs=tuple(chapter.chapter_id for chapter in grounded),
-                digest_zh=digest,
-            ),
-        )
-    return tuple(groups)
-
-
-def _fit_digest_parts(parts: tuple[str, ...], maximum: int) -> str:
-    """公平裁剪章节投影，避免长首章吞掉同组后续章节。"""
-
-    joined = "\n".join(parts)
-    if len(joined) <= maximum:
-        return joined
-    content_budget = maximum - max(0, len(parts) - 1)
-    allocations = [0] * len(parts)
-    remaining = content_budget
-    active = list(range(len(parts)))
-    while remaining > 0 and active:
-        share = max(1, remaining // len(active))
-        next_active: list[int] = []
-        for index in active:
-            available = len(parts[index]) - allocations[index]
-            granted = min(available, share, remaining)
-            allocations[index] += granted
-            remaining -= granted
-            if allocations[index] < len(parts[index]):
-                next_active.append(index)
-        active = next_active
-    return "\n".join(
-        part[:allocation]
-        for part, allocation in zip(parts, allocations, strict=True)
+        for chapter in chapters
     )
 
 
@@ -1152,12 +1112,6 @@ def _validate_visual_reference_policy(
         raise ValueError("DUPLICATE 视觉观察不得由普通正文或 Claim 重复表达")
     if relation == "CONFLICTING" and not is_visual_block:
         raise ValueError("CONFLICTING 视觉观察只能通过类型化视觉块表达")
-    if (
-        request.context.document_config.uncertainty_policy == "conservative"
-        and observation.certainty < 0.7
-        and relation != "CONFLICTING"
-    ):
-        raise ValueError("保守策略下低置信视觉观察只能进入信息边界")
 
 
 def _response_body_characters(response: ChapterWritingResponse) -> int:
@@ -1198,15 +1152,6 @@ def _normalize_response_blocks(
         if isinstance(block, VisualBlock):
             observation = observations[block.visual_observation_ref]
             if observation.relation_to_transcript == "DUPLICATE":
-                continue
-            if observation.relation_to_transcript == "CONFLICTING":
-                caption = visual_caption_for_policy(
-                    observation,
-                    request.context.document_config,
-                )
-                blocks.append(
-                    block.model_copy(update={"caption": caption}),
-                )
                 continue
         blocks.append(block)
     blocks = _append_omitted_visual_blocks(tuple(blocks), request)
@@ -1256,10 +1201,7 @@ def _append_omitted_visual_blocks(
         visual = VisualBlock(
             visual_observation_ref=observation.evidence_id,
             visual_content_refs=content_refs,
-            caption=visual_caption_for_policy(
-                observation,
-                request.context.document_config,
-            ),
+            caption=observation.caption,
             evidence_refs=(observation.evidence_id,),
         )
         if body_size + _block_character_count(visual) > body_limit:
@@ -1304,11 +1246,7 @@ def _visual_observation_is_renderable(
     # 把冲突信息误包装成正文；支持/补充观察则可安全确定性展示。
     if observation.relation_to_transcript in {"DUPLICATE", "CONFLICTING"}:
         return False
-    return not (
-        request.context.document_config.uncertainty_policy == "conservative"
-        and observation.certainty < 0.7
-        and observation.relation_to_transcript != "CONFLICTING"
-    )
+    return True
 
 
 def _quote_matches(
@@ -1537,12 +1475,6 @@ def _fallback_chapter_response(request: ChapterWritingRequest) -> ChapterWriting
     for observation in request.visual_observations:
         if observation.relation_to_transcript == "DUPLICATE":
             continue
-        if (
-            request.context.document_config.uncertainty_policy == "conservative"
-            and observation.certainty < 0.7
-            and observation.relation_to_transcript != "CONFLICTING"
-        ):
-            continue
         selection = _fallback_visual_selection(
             observation,
             used_sources=used_sources,
@@ -1554,12 +1486,7 @@ def _fallback_chapter_response(request: ChapterWritingRequest) -> ChapterWriting
         visual = VisualBlock(
             visual_observation_ref=observation.evidence_id,
             visual_content_refs=content_refs,
-            caption=(
-                visual_caption_for_policy(
-                    observation,
-                    request.context.document_config,
-                )
-            ),
+            caption=observation.caption,
             evidence_refs=(observation.evidence_id,),
         )
         remaining = body_limit - sum(_block_character_count(block) for block in blocks)
@@ -1586,11 +1513,6 @@ def _fallback_header_evidence_refs(request: ChapterWritingRequest) -> tuple[str,
         return (request.transcript_evidence[0].evidence_id,)
     for observation in request.visual_observations:
         if observation.relation_to_transcript in {"DUPLICATE", "CONFLICTING"}:
-            continue
-        if (
-            request.context.document_config.uncertainty_policy == "conservative"
-            and observation.certainty < 0.7
-        ):
             continue
         return (observation.evidence_id,)
     return ()
@@ -1636,23 +1558,13 @@ def _validate_global_response(
     request: GlobalWritingRequest,
     chapters: tuple[SemanticChapter, ...],
 ) -> None:
-    expected = allowed_global_chapter_ids(request)
-    actual = tuple(ref for section in response.sections for ref in section.chapter_refs)
-    if actual != expected:
-        raise ValueError("Section 必须按顺序完整覆盖所有章节一次")
+    expected = set(allowed_global_chapter_ids(request))
     grounded = {chapter.chapter_id for chapter in chapters if chapter.content_status == "GROUNDED"}
     if any(ref not in grounded for point in response.key_points for ref in point.chapter_refs):
         raise ValueError("全局关键点只能引用事实章节")
-    placeholder_ids = {
-        chapter.chapter_id
-        for chapter in chapters
-        if chapter.content_status == "NO_SEMANTIC_EVIDENCE"
-    }
-    for section in response.sections:
-        if placeholder_ids.intersection(section.chapter_refs) and "信息不足" not in (
-            section.title + section.summary_zh
-        ):
-            raise ValueError("覆盖占位章的 Section 必须明确该时段信息不足")
+    for point in response.key_points:
+        if not set(point.chapter_refs).issubset(expected):
+            raise ValueError("全局关键点引用了不存在的章节")
 
 
 def _fallback_global_response(chapters: tuple[SemanticChapter, ...]) -> GlobalWritingResponse:
@@ -1667,15 +1579,7 @@ def _fallback_global_response(chapters: tuple[SemanticChapter, ...]) -> GlobalWr
             for chapter in grounded[:64]
             if chapter.summary_zh
         )
-    sections = tuple(
-        SectionDraft(
-            title=chapter.title if chapter.content_status == "GROUNDED" else "信息不足时段",
-            summary_zh=chapter.summary_zh if chapter.content_status == "GROUNDED" else "",
-            chapter_refs=(chapter.chapter_id,),
-        )
-        for chapter in chapters
-    )
-    return GlobalWritingResponse(overview_zh=overview, key_points=points, sections=sections)
+    return GlobalWritingResponse(overview_zh=overview, key_points=points)
 
 
 def _materialize_result(
@@ -1687,15 +1591,6 @@ def _materialize_result(
     vlm_model_id: str,
     prompt_versions: PromptVersions,
 ) -> VideoUnderstandingResult:
-    sections = tuple(
-        SemanticSection(
-            section_id=section_id_for(context.asset_sha256, draft.chapter_refs),
-            title=draft.title,
-            summary_zh=draft.summary_zh,
-            chapter_refs=draft.chapter_refs,
-        )
-        for draft in global_response.sections
-    )
     overview = global_response.overview_zh.strip() or _fallback_global_overview(chapters)
     provisional_summary = VideoDocumentSummary(
         title=context.document_config.document_title or context.title_hint,
@@ -1720,7 +1615,6 @@ def _materialize_result(
         run_id=context.run_id,
         asset_sha256=context.asset_sha256,
         summary=summary,
-        sections=sections,
         chapters=chapters,
         generation=DocumentGenerationMetadata(
             document_config=context.document_config,

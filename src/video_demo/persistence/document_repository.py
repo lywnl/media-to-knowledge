@@ -12,7 +12,6 @@ from sqlalchemy.orm import Session
 from video_demo.domain.document import (
     DocumentGenerationMetadata,
     SemanticChapter,
-    SemanticSection,
     VideoDocumentSummary,
     VideoUnderstandingResult,
 )
@@ -49,7 +48,7 @@ def _reject_sensitive_json(value: object, path: str = "$") -> None:
 
 
 class ResultRepository:
-    """生产 3.0 结果行的唯一映射。"""
+    """生产 4.0 结果行的唯一映射。"""
 
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -70,10 +69,6 @@ class ResultRepository:
         )
         summary_payload = {
             "summary": validated.summary.model_dump(mode="json", exclude_computed_fields=True),
-            "sections": [
-                item.model_dump(mode="json", exclude_computed_fields=True)
-                for item in validated.sections
-            ],
             "generation": validated.generation.model_dump(
                 mode="json", exclude_computed_fields=True
             ),
@@ -91,7 +86,7 @@ class ResultRepository:
                     segment_id=chapter.chapter_id,
                     start_ms=chapter.start_ms,
                     end_ms=chapter.end_ms,
-                    schema_version="3.0.0",
+                    schema_version="4.0.0",
                     payload_json=payload,
                     retrieval_text=chapter.retrieval_text,
                     retrieval_hash=chapter.retrieval_hash,
@@ -103,7 +98,7 @@ class ResultRepository:
                 application_id=scope.application_id,
                 knowledge_base_id=scope.knowledge_base_id,
                 run_id=validated.run_id,
-                schema_version="3.0.0",
+                schema_version="4.0.0",
                 payload_json=summary_payload,
                 retrieval_text=validated.summary.retrieval_text,
                 retrieval_hash=validated.summary.retrieval_hash,
@@ -121,9 +116,6 @@ class ResultRepository:
             if not isinstance(payload, dict):
                 _invalid("Summary payload 必须是对象")
             summary = VideoDocumentSummary.model_validate(payload.get("summary"))
-            sections = tuple(
-                SemanticSection.model_validate(item) for item in payload.get("sections", ())
-            )
             generation = DocumentGenerationMetadata.model_validate(payload.get("generation"))
             chapters = tuple(SemanticChapter.model_validate(item.payload_json) for item in segments)
             _validate_column_projections(summary_row, summary, segments, chapters)
@@ -131,12 +123,11 @@ class ResultRepository:
                 run_id=run_id,
                 asset_sha256=asset_sha256,
                 summary=summary,
-                sections=sections,
                 chapters=chapters,
                 generation=generation,
             )
         except (ValidationError, TypeError, KeyError, AttributeError) as error:
-            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "3.0 结果行内容非法") from error
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "4.0 结果行内容非法") from error
 
     def _delete_existing(self, scope: Scope, run_id: str) -> None:
         for model in (VideoSegmentModel, VideoSummaryModel):
@@ -178,13 +169,16 @@ def _require_supported_rows(
     if not segments and not summaries:
         raise VideoDemoError(ErrorCode.VIDEO_RESULT_NOT_READY, "知识文档结果尚未就绪")
     if not segments or len(summaries) != 1:
-        _invalid("3.0 结果行缺失或重复")
+        _invalid("4.0 结果行缺失或重复")
     versions = {str(item.schema_version) for item in segments} | {
         str(item.schema_version) for item in summaries
     }
-    if len(versions) == 1 and versions <= {"1.0.0", "2.0.0"}:
-        raise VideoDemoError(ErrorCode.RESULT_SCHEMA_UNSUPPORTED, "结果 Schema 不是 3.0")
-    if versions != {"3.0.0"}:
+    if len(versions) == 1 and versions <= {"1.0.0", "2.0.0", "3.0.0"}:
+        raise VideoDemoError(
+            ErrorCode.RESULT_SCHEMA_UNSUPPORTED,
+            "结果 Schema 3.0.0 已停用，请重新处理视频（当前支持 4.0.0）",
+        )
+    if versions != {"4.0.0"}:
         _invalid("结果行 Schema 版本非法或混杂")
 
 

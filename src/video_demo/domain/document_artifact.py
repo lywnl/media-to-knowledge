@@ -60,7 +60,7 @@ MODEL_METRIC_NAMES = frozenset(
 
 
 class DocumentArtifactPayload(FrozenModel):
-    artifact_schema_version: Literal["3.0.0"] = "3.0.0"
+    artifact_schema_version: Literal["4.0.0"] = "4.0.0"
     result: VideoUnderstandingResult
     evidence: tuple[DocumentEvidenceItem, ...]
     stage_metrics: dict[str, StrictInt]

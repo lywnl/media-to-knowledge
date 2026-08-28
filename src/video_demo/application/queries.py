@@ -57,7 +57,7 @@ class ResultRunMetadata:
 
 
 class ResultQueryService:
-    """唯一 3.0 结果发布与四接口查询服务。"""
+    """唯一 4.0 结果发布与四接口查询服务。"""
 
     def __init__(
         self,
@@ -123,7 +123,7 @@ class ResultQueryService:
         scope: Scope,
         run_id: str,
     ) -> tuple[DocumentArtifactPayload, bytes]:
-        """受限读取已发布的 3.0 bundle 与确定性 Markdown。"""
+        """受限读取已发布的 4.0 bundle 与确定性 Markdown。"""
 
         return self._publication.get_artifact(scope, run_id)
 
@@ -131,10 +131,10 @@ class ResultQueryService:
         self,
         scope: Scope,
         run_id: str,
-        schema_version: str = "3.0.0",
+        schema_version: str = "4.0.0",
     ) -> DocumentArtifactPayload:
-        if schema_version != "3.0.0":
-            raise ValueError("只支持 3.0.0")
+        if schema_version != "4.0.0":
+            raise ValueError("只支持 4.0.0")
         artifact, _ = self.get_artifact(scope, run_id)
         return artifact
 
@@ -317,9 +317,9 @@ def read_result_rows(
     run_id: str,
     asset_sha256: str,
 ) -> VideoUnderstandingResult:
-    """供闭包校验复用生产 3.0 行映射。"""
+    """供闭包校验复用生产 4.0 行映射。"""
     try:
         with database.session() as session:
             return ResultRepository(session).get(scope, run_id, asset_sha256)
     except (ValidationError, TypeError, ValueError) as error:
-        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "3.0 结果行非法") from error
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "4.0 结果行非法") from error

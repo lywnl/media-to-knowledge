@@ -273,7 +273,7 @@ class VideoRunRepository:
         after_id: int,
         limit: int = 100,
     ) -> tuple[PublishedRunCleanupRecord, ...]:
-        """固定 keyset 扫描已发布 3.0 Run；返回轻量恢复记录。"""
+        """固定 keyset 扫描已发布 4.0 Run；返回轻量恢复记录。"""
 
         if after_id < 0 or limit != 100:
             raise ValueError("视觉恢复只允许固定 100 条 keyset 扫描")
@@ -287,7 +287,7 @@ class VideoRunRepository:
                     VideoSummaryModel.knowledge_base_id
                     == VideoUnderstandingRunModel.knowledge_base_id,
                     VideoSummaryModel.run_id == VideoUnderstandingRunModel.run_id,
-                    VideoSummaryModel.schema_version == "3.0.0",
+                    VideoSummaryModel.schema_version == "4.0.0",
                 ),
             )
             .where(

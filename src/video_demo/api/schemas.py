@@ -34,7 +34,7 @@ class CreateRunRequest(ApiModel):
     document_config: DocumentGenerationConfig = Field(
         default_factory=DocumentGenerationConfig,
     )
-    result_schema_version: Literal["3.0.0"] = "3.0.0"
+    result_schema_version: Literal["4.0.0"] = "4.0.0"
 
     @model_validator(mode="after")
     def normalize_speech_configuration(self) -> Self:
@@ -148,8 +148,6 @@ class PublicVisualObservationEvidence(PublicTimedEvidence):
         "INDEPENDENT",
     ]
     certainty: Probability
-    quality_flags: tuple[str, ...]
-    uncertainties: tuple[str, ...]
 
 
 PublicEvidence = Annotated[

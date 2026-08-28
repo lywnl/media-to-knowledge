@@ -188,7 +188,7 @@ def prompt_for_vision(request: ChapterVisionRequest) -> tuple[str, str, str]:
             "如果图片无法确认目标，返回 observations=[]，不要猜测或选择额外图片。"
             "selected_frame_ids 必须是实际最能支持该 observation 的最少图片。"
             "先逐字复制输入中的 evidence_id：INDEPENDENT 时 "
-            "transcript_evidence_refs 必须为空；CONFLICTING 时 uncertainties 必须非空；"
+            "transcript_evidence_refs 必须为空；"
             "其他音画关系必须至少引用 1 条当前转写证据。"
         ),
         _vision_context(request),
@@ -205,7 +205,7 @@ def prompt_for_vision_repair(request: ChapterVisionRepairRequest) -> tuple[str, 
             "每个 observation 最多选择 2 张图片，整份响应最多使用 2 张不同图片；"
             "无法确认时返回 observations=[]。先逐字复制输入中的 evidence_id："
             "INDEPENDENT 时 transcript_evidence_refs 必须为空；"
-            "CONFLICTING 时 uncertainties 必须非空；其他音画关系必须至少引用 1 条当前转写证据。"
+            "其他音画关系必须至少引用 1 条当前转写证据。"
         ),
         context,
     )
@@ -323,7 +323,7 @@ def prompt_for_writing_repair(request: ChapterWritingRepairRequest) -> tuple[str
 def prompt_for_global_editing(request: GlobalWritingRequest) -> tuple[str, str, str]:
     return _prompt(
         request.prompt_version,
-        "你只能整理已验证章节分组；不得新增章节、证据或关键帧 ID；"
+        "你只能整理已验证章节；不得新增章节、证据或关键帧 ID；"
         "overview_zh 必须返回非空的中文核心概览，概括输入中的事实章节。",
         request.model_dump(mode="json"),
     )
@@ -332,7 +332,7 @@ def prompt_for_global_editing(request: GlobalWritingRequest) -> tuple[str, str, 
 def prompt_for_global_repair(request: GlobalWritingRepairRequest) -> tuple[str, str, str]:
     return _prompt(
         request.prompt_version,
-        "只修复全局摘要和 Section 结构；不得新增、遗漏、重复或重排章节；"
+        "只修复全局摘要结构；不得新增、遗漏、重复或重排章节；"
         "overview_zh 必须返回非空的中文核心概览，概括输入中的事实章节。",
         request.model_dump(mode="json"),
     )

@@ -717,8 +717,6 @@ def _validate_global_response(
 ) -> None:
     for point in response.key_points:
         _require_known_ids(point.chapter_refs, allowed_chapter_ids, "key_points.chapter_refs")
-    for section in response.sections:
-        _require_known_ids(section.chapter_refs, allowed_chapter_ids, "sections.chapter_refs")
 
 
 class _ReferenceValidationError(ValueError):

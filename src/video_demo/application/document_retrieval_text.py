@@ -25,7 +25,7 @@ def render_document_chapter_retrieval_text(
     chapter: SemanticChapter,
     visual_observations: Sequence[VisualObservationEvidence],
 ) -> str:
-    """字段级投影 3.0 章节，不泄露内部引用或重复转写原文。"""
+    """字段级投影 4.0 章节，不泄露内部引用或重复转写原文。"""
 
     if chapter.content_status == "NO_SEMANTIC_EVIDENCE":
         return ""
@@ -33,25 +33,11 @@ def render_document_chapter_retrieval_text(
     selected_visual_blocks = tuple(
         block for block in chapter.body_blocks if isinstance(block, VisualBlock)
     )
-    selected_observations = tuple(
-        observation_by_id[block.visual_observation_ref]
-        for block in selected_visual_blocks
-        if block.visual_observation_ref in observation_by_id
-    )
     body = _join_plain_text(_body_block_text(block) for block in chapter.body_blocks)
     visual_captions = _join_plain_text(
         dict.fromkeys(
             normalize_retrieval_value(block.caption)
             for block in selected_visual_blocks
-        ),
-    )
-    uncertainties = _join(
-        tuple(
-            dict.fromkeys(
-                uncertainty
-                for item in selected_observations
-                for uncertainty in item.uncertainties
-            ),
         ),
     )
     lines = [
@@ -68,8 +54,6 @@ def render_document_chapter_retrieval_text(
         lines.append(f"关键结论：{claims}")
     if visual_captions:
         lines.append(f"视觉补充：{visual_captions}")
-    if uncertainties:
-        lines.append(f"不确定性：{uncertainties}")
     for block in chapter.body_blocks:
         if (
             isinstance(block, VisualBlock)
@@ -80,7 +64,7 @@ def render_document_chapter_retrieval_text(
 
 
 def render_document_summary_retrieval_text(summary: VideoDocumentSummary) -> str:
-    """字段级投影 3.0 全局摘要。"""
+    """字段级投影 4.0 全局摘要。"""
 
     lines = [f"视频标题：{normalize_retrieval_value(summary.title)}"]
     overview = normalize_retrieval_value(summary.overview_zh)

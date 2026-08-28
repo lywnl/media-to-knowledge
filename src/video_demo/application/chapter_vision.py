@@ -1280,8 +1280,6 @@ def _to_evidence(
         ),
         relation_to_transcript=draft.relation_to_transcript,
         certainty=draft.certainty,
-        quality_flags=draft.quality_flags,
-        uncertainties=draft.uncertainties,
     )
 
 

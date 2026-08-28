@@ -16,7 +16,6 @@ from video_demo.domain.document import (
     ParagraphBlock,
     QuoteBlock,
     SemanticChapter,
-    SemanticSection,
     TableBlock,
     VideoUnderstandingResult,
     VisualBlock,
@@ -48,49 +47,30 @@ def render_markdown(
 
     validate_evidence_references(result, evidence)
     evidence_by_id = {item.evidence_id: item for item in evidence}
-    chapters_by_id = {chapter.chapter_id: chapter for chapter in result.chapters}
     lines: list[str] = []
 
     _heading(lines, 1, result.summary.title)
     _heading(lines, 2, "核心概览")
     _paragraph(lines, result.summary.overview_zh or "未提供核心概览。")
 
+    if result.summary.key_points:
+        _heading(lines, 2, "全文关键结论")
+        for point in result.summary.key_points:
+            _paragraph(lines, point.text)
+
     _heading(lines, 2, "目录")
-    for section_index, section in enumerate(result.sections, start=1):
-        section_chapters = tuple(chapters_by_id[ref] for ref in section.chapter_refs)
-        start_ms = min(chapter.start_ms for chapter in section_chapters)
-        end_ms = max(chapter.end_ms for chapter in section_chapters)
+    for chapter_index, chapter in enumerate(result.chapters, start=1):
         lines.append(
-            f"- 第{_chinese_ordinal(section_index)}部分："
-            f"{_escape_markdown(section.title)}"
-            f" \N{FULLWIDTH LEFT PARENTHESIS}{_format_time(start_ms)} - "
-            f"{_format_time(end_ms)}\N{FULLWIDTH RIGHT PARENTHESIS}",
+            f"- 第{_chinese_ordinal(chapter_index)}章："
+            f"{_escape_markdown(chapter.title)}"
+            f" \N{FULLWIDTH LEFT PARENTHESIS}{_format_time(chapter.start_ms)} - "
+            f"{_format_time(chapter.end_ms)}\N{FULLWIDTH RIGHT PARENTHESIS}",
         )
     lines.append("")
 
-    for section_index, section in enumerate(result.sections, start=1):
-        _heading(lines, 2, f"第{_chinese_ordinal(section_index)}部分：{section.title}")
-        if section.summary_zh:
-            _paragraph(lines, section.summary_zh)
-        single_chapter_summary = _single_chapter_summary(section, chapters_by_id)
-        for chapter_ref in section.chapter_refs:
-            chapter = chapters_by_id[chapter_ref]
-            if chapter.content_status == "GROUNDED":
-                _render_chapter(
-                    lines,
-                    chapter,
-                    include_title=not single_chapter_summary,
-                    include_summary=not single_chapter_summary,
-                )
-
-    _heading(lines, 2, "信息边界")
-    boundaries = _information_boundaries(result, evidence_by_id)
-    if boundaries:
-        for boundary in boundaries:
-            lines.append(f"- {_escape_markdown(boundary)}")
-        lines.append("")
-    else:
-        _paragraph(lines, "未记录额外的不确定性、视觉质量问题或音画冲突。")
+    for chapter_index, chapter in enumerate(result.chapters, start=1):
+        _heading(lines, 2, f"第{_chinese_ordinal(chapter_index)}章：{chapter.title}")
+        _render_chapter(lines, chapter)
 
     encoded = ("\n".join(lines).rstrip("\n") + "\n").encode("utf-8")
     return RenderedDocument(
@@ -103,25 +83,14 @@ def render_markdown(
 def _render_chapter(
     lines: list[str],
     chapter: SemanticChapter,
-    *,
-    include_title: bool = True,
-    include_summary: bool = True,
 ) -> None:
-    if include_title:
-        _heading(
-            lines,
-            3,
-            f"{_format_time(chapter.start_ms)} - "
-            f"{_format_time(chapter.end_ms)} {chapter.title}",
-        )
-    else:
-        _paragraph(
-            lines,
-            f"时间：{_format_time(chapter.start_ms)} - "
-            f"{_format_time(chapter.end_ms)}",
-        )
+    _paragraph(
+        lines,
+        f"时间：{_format_time(chapter.start_ms)} - "
+        f"{_format_time(chapter.end_ms)}",
+    )
     if chapter.content_status == "GROUNDED":
-        if include_summary and chapter.summary_zh:
+        if chapter.summary_zh:
             _paragraph(lines, chapter.summary_zh)
         for block in chapter.body_blocks:
             _render_body_block(lines, block)
@@ -130,24 +99,6 @@ def _render_chapter(
             for claim in chapter.claims:
                 lines.append(f"- {_escape_markdown(claim.text)}")
             lines.append("")
-
-
-def _single_chapter_summary(
-    section: SemanticSection,
-    chapters_by_id: dict[str, SemanticChapter],
-) -> bool:
-    if len(section.chapter_refs) != 1:
-        return False
-    chapter = chapters_by_id[section.chapter_refs[0]]
-    return (
-        chapter.content_status == "GROUNDED"
-        and _normalized_text(section.title) == _normalized_text(chapter.title)
-        and _normalized_text(section.summary_zh) == _normalized_text(chapter.summary_zh)
-    )
-
-
-def _normalized_text(value: str) -> str:
-    return " ".join(value.split())
 
 
 def _render_body_block(lines: list[str], block: object) -> None:
@@ -192,68 +143,6 @@ def _render_table(lines: list[str], block: TableBlock) -> None:
         cells = tuple(_escape_markdown(value).replace("\n", " / ") for value in row)
         lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
-
-
-def _information_boundaries(
-    result: VideoUnderstandingResult,
-    evidence_by_id: dict[str, DocumentEvidenceItem],
-) -> tuple[str, ...]:
-    boundaries: list[str] = []
-    config = result.generation.document_config
-    observations_by_chapter: dict[str, list[VisualObservationEvidence]] = {}
-    for item in evidence_by_id.values():
-        if isinstance(item, VisualObservationEvidence):
-            observations_by_chapter.setdefault(item.chapter_id, []).append(item)
-    for chapter in result.chapters:
-        rendered_observation_refs = {
-            block.visual_observation_ref
-            for block in chapter.body_blocks
-            if isinstance(block, VisualBlock)
-        }
-        if chapter.content_status == "NO_SEMANTIC_EVIDENCE":
-            boundaries.append(
-                f"{_format_time(chapter.start_ms)} - {_format_time(chapter.end_ms)} "
-                "未提取到可验证语义内容",
-            )
-        for item in observations_by_chapter.get(chapter.chapter_id, ()):
-            if item.relation_to_transcript == "CONFLICTING":
-                visual_detail = (
-                    ""
-                    if item.evidence_id in rendered_observation_refs
-                    else f"，视觉观察：{item.caption}"
-                )
-                boundaries.append(
-                    f"{_format_time(item.start_ms)} - {_format_time(item.end_ms)} "
-                    f"画面与转写存在冲突{visual_detail}",
-                )
-            if (
-                config.uncertainty_policy == "conservative"
-                and item.certainty < 0.7
-                and item.relation_to_transcript != "CONFLICTING"
-            ):
-                boundaries.append(
-                    f"{_format_time(item.start_ms)} - {_format_time(item.end_ms)} "
-                    f"低置信视觉观察，未纳入正文：{item.caption}",
-                )
-            boundaries.extend(
-                f"{_format_time(item.start_ms)} - {_format_time(item.end_ms)} "
-                f"视觉质量：{flag}"
-                for flag in item.quality_flags
-            )
-            boundaries.extend(
-                f"{_format_time(item.start_ms)} - {_format_time(item.end_ms)} "
-                f"不确定性：{uncertainty}"
-                for uncertainty in item.uncertainties
-            )
-    return tuple(_deduplicate(boundaries))
-
-
-def _deduplicate(values: Iterable[str]) -> Iterable[str]:
-    seen: set[str] = set()
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            yield value
 
 
 def _heading(lines: list[str], level: int, title: str) -> None:

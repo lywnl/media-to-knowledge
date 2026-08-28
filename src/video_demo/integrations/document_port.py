@@ -16,7 +16,6 @@ from video_demo.domain.document import (
     ChapterBodyBlock,
     DocumentGenerationConfig,
     GroundedClaim,
-    SectionDraft,
     SummaryPoint,
 )
 from video_demo.domain.document_plan import (
@@ -218,49 +217,48 @@ class ChapterWritingRepairRequest(FrozenModel):
         return self
 
 
-class GlobalChapterGroup(FrozenModel):
+class GlobalChapterInput(FrozenModel):
+    """全局编辑器所需的章节事实投影，不携带正文证据闭包。"""
+
+    chapter_id: StableId
     start_ms: int = Field(ge=0)
     end_ms: int = Field(gt=0, le=7_200_000)
-    chapter_refs: tuple[StableId, ...] = Field(min_length=1, max_length=20)
-    grounded_chapter_refs: tuple[StableId, ...] = Field(max_length=20)
-    digest_zh: str = Field(max_length=4_000)
+    title: str = Field(min_length=1, max_length=200)
+    summary_zh: str = Field(max_length=4_000)
+    key_conclusions: tuple[str, ...] = Field(max_length=16)
+    content_status: Literal["GROUNDED", "NO_SEMANTIC_EVIDENCE"]
 
     @model_validator(mode="after")
-    def validate_group(self) -> Self:
+    def validate_range(self) -> Self:
         if self.end_ms <= self.start_ms:
-            raise ValueError("全局章节组的 end_ms 必须大于 start_ms")
-        _reject_duplicate_ids(self.chapter_refs, "chapter_refs")
-        _reject_duplicate_ids(self.grounded_chapter_refs, "grounded_chapter_refs")
-        if not set(self.grounded_chapter_refs).issubset(self.chapter_refs):
-            raise ValueError("grounded_chapter_refs 必须属于 chapter_refs")
-        if bool(self.grounded_chapter_refs) != bool(self.digest_zh):
-            raise ValueError("只有包含事实章节的分组才能提供 digest_zh")
+            raise ValueError("全局章节时间范围非法")
         return self
 
 
 class GlobalWritingRequest(FrozenModel):
     context: DocumentWritingContext
-    groups: tuple[GlobalChapterGroup, ...] = Field(min_length=1, max_length=240)
+    chapters: tuple[GlobalChapterInput, ...] = Field(min_length=1, max_length=240)
     prompt_version: Literal["global-editor-v1"]
 
     @model_validator(mode="after")
-    def validate_group_timeline(self) -> Self:
-        if self.groups[0].start_ms != 0:
-            raise ValueError("全局章节组必须从 0 开始")
-        if self.groups[-1].end_ms != self.context.duration_ms:
-            raise ValueError("全局章节组必须覆盖完整视频时长")
-        for previous, current in zip(self.groups[:-1], self.groups[1:], strict=True):
+    def validate_chapter_timeline(self) -> Self:
+        if self.chapters[0].start_ms != 0:
+            raise ValueError("全局章节必须从 0 开始")
+        if self.chapters[-1].end_ms != self.context.duration_ms:
+            raise ValueError("全局章节必须覆盖完整视频时长")
+        for previous, current in zip(self.chapters[:-1], self.chapters[1:], strict=True):
             if previous.end_ms != current.start_ms:
-                raise ValueError("全局章节组必须连续且无重叠")
-        chapter_refs = tuple(ref for group in self.groups for ref in group.chapter_refs)
-        _reject_duplicate_ids(chapter_refs, "groups.chapter_refs")
+                raise ValueError("全局章节必须连续且无重叠")
+        _reject_duplicate_ids(
+            tuple(chapter.chapter_id for chapter in self.chapters),
+            "chapters.chapter_id",
+        )
         return self
 
 
 class GlobalWritingResponse(FrozenModel):
     overview_zh: str = Field(max_length=8_000)
     key_points: tuple[SummaryPoint, ...] = Field(max_length=64)
-    sections: tuple[SectionDraft, ...] = Field(min_length=1, max_length=240)
 
 
 class GlobalWritingRepairRequest(FrozenModel):
@@ -351,7 +349,7 @@ def allowed_writing_evidence_ids(request: ChapterWritingRequest) -> tuple[str, .
 
 
 def allowed_global_chapter_ids(request: GlobalWritingRequest) -> tuple[str, ...]:
-    return tuple(ref for group in request.groups for ref in group.chapter_refs)
+    return tuple(chapter.chapter_id for chapter in request.chapters)
 
 
 def invalid_model_response(

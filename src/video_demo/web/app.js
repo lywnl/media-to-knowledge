@@ -340,7 +340,7 @@
     if (version !== documentRenderVersion) return;
 
     renderDocumentOverview(result.summary, run);
-    renderDocumentToc(result.sections ?? [], result.chapters ?? []);
+    renderDocumentToc(result.chapters ?? []);
     const chapterList = element("ol", "segment-list");
     const keyframePromises = new Map();
     result.chapters.forEach((chapter, chapterIndex) => {
@@ -356,7 +356,6 @@
         item.append(renderBodyBlock(block, evidenceById, chapter, run.run_id, keyframePromises, renderedFrames));
       });
       appendChapterClaims(item, chapter);
-      appendUncertainties(item, chapter, evidenceById);
       [...new Set(chapter.selected_keyframe_refs)].forEach((evidenceRef) => {
         const keyframeId = keyframeIdForEvidenceRef(evidenceRef, evidenceById);
         if (!keyframeId || renderedFrames.has(keyframeId)) return;
@@ -397,7 +396,7 @@
     documentKeyPoints.replaceChildren(points);
   }
 
-  function renderDocumentToc(sections, chapters) {
+  function renderDocumentToc(chapters) {
     documentToc.replaceChildren(element("h3", "result-section-title", "目录"));
     const list = element("ol");
     chapters.forEach((chapter, index) => {
@@ -407,9 +406,6 @@
       item.append(link, element("span", "toc-time", timeRange(chapter.start_ms, chapter.end_ms)));
       list.append(item);
     });
-    if (sections.length > 0) {
-      documentToc.append(element("p", "toc-sections", sections.map((section) => section.title).join(" · ")));
-    }
     documentToc.append(list);
   }
 
@@ -505,22 +501,6 @@
   function keyframeIdForEvidenceRef(evidenceRef, evidenceById) {
     const evidence = evidenceById.get(evidenceRef);
     return evidence?.evidence_type === "KEYFRAME" ? evidence.keyframe_id : null;
-  }
-
-  function appendUncertainties(parent, chapter, evidenceById) {
-    const uncertainties = [];
-    chapter.body_blocks.forEach((block) => {
-      if (block.block_type !== "VISUAL") return;
-      const observation = evidenceById.get(block.visual_observation_ref);
-      (observation?.uncertainties ?? []).forEach((value) => uncertainties.push(value));
-    });
-    if (uncertainties.length === 0) return;
-    const note = element("aside", "uncertainty-note");
-    note.append(element("strong", null, "不确定性"));
-    const list = element("ul");
-    [...new Set(uncertainties)].forEach((value) => list.append(element("li", null, value)));
-    note.append(list);
-    parent.append(note);
   }
 
   function appendChapterClaims(parent, chapter) {

@@ -78,7 +78,7 @@ def scope_key(scope: Scope) -> str:
 
 
 class DocumentPublicationService:
-    """原子发布正式 3.0 结构化结果、证据和确定性 Markdown。"""
+    """原子发布正式 4.0 结构化结果、证据和确定性 Markdown。"""
 
     def __init__(
         self,
