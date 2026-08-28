@@ -206,6 +206,8 @@ def test_writing_prompts_require_discriminated_body_block_type() -> None:
     for instruction in (prompt_for_writing(writing)[1], prompt_for_writing_repair(repair)[1]):
         assert "每个 body_blocks 项都必须包含 block_type" in instruction
         assert "PARAGRAPH、BULLET_LIST、QUOTE、CODE、TABLE、FORMULA 或 VISUAL" in instruction
+        assert "所有 evidence_id 必须从输入白名单逐字复制" in instruction
+        assert "输出前逐项检查每个引用都在上述白名单中" in instruction
 
 
 def test_compact_planning_request_maps_indexes_back_to_stable_ids() -> None:
