@@ -486,7 +486,26 @@ def _pydantic_error_summary(error: object) -> str:
     location_value = error.get("loc", ())
     location = ".".join(str(item) for item in location_value) or "response"
     error_type = str(error.get("type", "invalid"))
-    return f"{location}:{error_type}"[:500]
+    summary = f"{location}:{error_type}"
+    if error_type == "value_error":
+        context = error.get("ctx")
+        reason = context.get("error") if isinstance(context, dict) else None
+        reason_text = str(reason).strip() if reason is not None else ""
+        if _is_safe_validation_reason(reason_text):
+            summary += f":{reason_text}"
+    return summary[:500]
+
+
+def _is_safe_validation_reason(value: str) -> bool:
+    """只把固定的业务校验原因带入修复上下文，避免回显模型内容。"""
+
+    if not value or len(value) > 200 or any(ord(char) < 32 for char in value):
+        return False
+    lowered = value.lower()
+    return not any(
+        marker in lowered
+        for marker in ("http://", "https://", "data:", "bearer ", "api_key", "token")
+    )
 
 
 def _validate_input_budget(data: str, max_chars: int, max_bytes: int) -> None:

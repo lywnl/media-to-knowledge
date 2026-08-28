@@ -668,6 +668,28 @@ def test_unknown_frame_returns_repairable_validation_error(tmp_path: Path) -> No
     )
 
 
+def test_qwen_validation_error_includes_safe_business_reason(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs" / "scope_001" / "run_001"
+    run_root.mkdir(parents=True)
+    body = _valid_observation()
+    observation = body["observations"][0]
+    assert isinstance(observation, dict)
+    observation["relation_to_transcript"] = "INDEPENDENT"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _provider_response(request, body)
+
+    with pytest.raises(ModelResponseValidationError) as raised:
+        _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+            _request(run_root),
+            allowed_run_root=run_root,
+        )
+
+    assert raised.value.invalid_response.validation_errors == (
+        "observations.0:value_error:INDEPENDENT 草稿不得引用转写证据",
+    )
+
+
 def test_qwen_requires_every_claimed_target_to_have_a_selected_frame(tmp_path: Path) -> None:
     run_root = tmp_path / "runs/scope_001/run_001"
     run_root.mkdir(parents=True)

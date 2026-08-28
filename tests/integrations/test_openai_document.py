@@ -185,6 +185,29 @@ def test_writing_prompts_separate_observation_and_content_references() -> None:
         assert "只有 VisualBlock.visual_content_refs 才能引用视觉内容 ID" in instruction
 
 
+def test_writing_prompts_require_discriminated_body_block_type() -> None:
+    writing = ChapterWritingRequest(
+        context=_context(),
+        chapter=_chapter(),
+        transcript_evidence=(_speech(),),
+        visual_observations=(),
+        prompt_version="chapter-writer-v1",
+    )
+    repair = ChapterWritingRepairRequest(
+        request=writing,
+        invalid_response=InvalidModelResponse(
+            content_sha256="b" * 64,
+            validation_errors=("body_blocks.0:union_tag_not_found",),
+        ),
+        allowed_evidence_ids=("asr_001",),
+        prompt_version="chapter-writer-repair-v1",
+    )
+
+    for instruction in (prompt_for_writing(writing)[1], prompt_for_writing_repair(repair)[1]):
+        assert "每个 body_blocks 项都必须包含 block_type" in instruction
+        assert "PARAGRAPH、BULLET_LIST、QUOTE、CODE、TABLE、FORMULA 或 VISUAL" in instruction
+
+
 def test_compact_planning_request_maps_indexes_back_to_stable_ids() -> None:
     payloads: list[dict[str, object]] = []
 

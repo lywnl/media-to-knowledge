@@ -277,6 +277,8 @@ def prompt_for_writing(request: ChapterWritingRequest) -> tuple[str, str, str]:
         request.prompt_version,
         (
             "你只能使用输入证据写作；不得发明事实、时间、章节 ID 或关键帧 ID。"
+            "每个 body_blocks 项都必须包含 block_type，且只能是 PARAGRAPH、BULLET_LIST、"
+            "QUOTE、CODE、TABLE、FORMULA 或 VISUAL，并填写该类型要求的字段。"
             "title_evidence_refs、summary_evidence_refs、普通正文 evidence_refs 和 "
             "claims.evidence_refs 只能引用 ASR/字幕 evidence_id 或 "
             "visual_observation.evidence_id。不能引用 keyframe_refs、keyframe_id、"
@@ -293,6 +295,8 @@ def prompt_for_writing_repair(request: ChapterWritingRepairRequest) -> tuple[str
         request.prompt_version,
         (
             "只修复章节正文结构和证据引用；不得扩展原请求证据范围。"
+            "每个 body_blocks 项都必须包含 block_type，且只能是 PARAGRAPH、BULLET_LIST、"
+            "QUOTE、CODE、TABLE、FORMULA 或 VISUAL，并填写该类型要求的字段。"
             "title_evidence_refs、summary_evidence_refs、普通正文 evidence_refs 和 "
             "claims.evidence_refs 只能引用 ASR/字幕 evidence_id 或 "
             "visual_observation.evidence_id。不能引用 keyframe_refs、keyframe_id、"
