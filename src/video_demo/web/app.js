@@ -356,8 +356,9 @@
         item.append(renderBodyBlock(block, evidenceById, chapter, run.run_id, keyframePromises, renderedFrames));
       });
       appendUncertainties(item, chapter, evidenceById);
-      [...new Set(chapter.selected_keyframe_refs)].forEach((keyframeId) => {
-        if (renderedFrames.has(keyframeId)) return;
+      [...new Set(chapter.selected_keyframe_refs)].forEach((evidenceRef) => {
+        const keyframeId = keyframeIdForEvidenceRef(evidenceRef, evidenceById);
+        if (!keyframeId || renderedFrames.has(keyframeId)) return;
         renderedFrames.add(keyframeId);
         item.append(renderKeyframeFigure(chapter.title, run.run_id, keyframeId, keyframePromises));
       });
@@ -460,7 +461,7 @@
         const visual = element("div", "chapter-body chapter-body--visual");
         visual.append(element("p", null, block.caption || "视觉补充"));
         const observation = evidenceById.get(block.visual_observation_ref);
-        const frameRefs = visualFrameRefs(block, observation);
+        const frameRefs = visualFrameRefs(block, observation, evidenceById);
         frameRefs.forEach((keyframeId) => {
           if (renderedFrames.has(keyframeId)) return;
           renderedFrames.add(keyframeId);
@@ -488,7 +489,7 @@
     return table;
   }
 
-  function visualFrameRefs(block, observation) {
+  function visualFrameRefs(block, observation, evidenceById) {
     if (!observation) return [];
     const byContent = new Map();
     [...(observation.content_blocks ?? []), ...(observation.visual_facts ?? [])].forEach((content) => {
@@ -496,7 +497,13 @@
       if (id) byContent.set(id, content.source_keyframe_refs ?? []);
     });
     const mapped = [...new Set(block.visual_content_refs.flatMap((ref) => byContent.get(ref) ?? []))];
-    return mapped.length > 0 ? mapped : [...new Set(observation.keyframe_refs ?? [])];
+    const refs = mapped.length > 0 ? mapped : [...new Set(observation.keyframe_refs ?? [])];
+    return refs.map((ref) => keyframeIdForEvidenceRef(ref, evidenceById)).filter(Boolean);
+  }
+
+  function keyframeIdForEvidenceRef(evidenceRef, evidenceById) {
+    const evidence = evidenceById.get(evidenceRef);
+    return evidence?.evidence_type === "KEYFRAME" ? evidence.keyframe_id : null;
   }
 
   function appendUncertainties(parent, chapter, evidenceById) {

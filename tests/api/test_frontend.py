@@ -178,6 +178,14 @@ def test_frontend_script_exposes_structured_document_reading_contract(
     assert "下载 Markdown失败" in script
 
 
+def test_frontend_maps_keyframe_evidence_refs_to_content_ids(client: TestClient) -> None:
+    script = client.get("/static/app.js").text
+
+    assert "keyframe_id" in script
+    assert "keyframeIdForEvidenceRef" in script
+    assert "keyframeIdForEvidenceRef(evidenceRef, evidenceById)" in script
+
+
 def test_frontend_styles_include_document_reading_states(client: TestClient) -> None:
     stylesheet = client.get("/static/styles.css").text
 
