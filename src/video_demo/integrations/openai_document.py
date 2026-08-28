@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from video_demo.domain.document import VisualBlock
 from video_demo.domain.document_plan import ChapterDraft, VisualTargetDraft
-from video_demo.domain.evidence import VisualObservationEvidence
+from video_demo.domain.evidence import SpeechSegment, SubtitleCue, VisualObservationEvidence
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.document_port import (
     ChapterPlanningRequest,
@@ -47,6 +47,7 @@ _DEFAULT_MAX_OUTPUT_TOKENS = 8_192
 # 结构化 JSON 因输出预算过小被截断并触发额外修复调用。
 _COMPACT_PLANNING_MAX_OUTPUT_TOKENS = 8_192
 _COMPACT_PLANNING_MIN_OUTPUT_TOKENS = 1_024
+_COMPACT_MAX_TARGET_ANCHOR_SPAN_MS = 30_000
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -612,16 +613,40 @@ def _expanded_semantic_targets(
         for index, evidence in enumerate(request.transcript_evidence)
         if evidence.evidence_id in segment.evidence_refs
     }
-    return tuple(
-        VisualTargetDraft(
-            query_zh=target.query_zh,
-            anchor_evidence_refs=tuple(
-                transcript_ids[index] for index in target.anchor_transcript_indexes
+    evidence = request.transcript_evidence
+    expanded: list[VisualTargetDraft] = []
+    for target in draft.semantic_targets:
+        indexes = target.anchor_transcript_indexes
+        if not _compact_target_is_valid(indexes, segment_transcript_indexes, evidence):
+            continue
+        expanded.append(
+            VisualTargetDraft(
+                query_zh=target.query_zh,
+                anchor_evidence_refs=tuple(transcript_ids[index] for index in indexes),
             ),
         )
-        for target in draft.semantic_targets
-        if set(target.anchor_transcript_indexes) <= segment_transcript_indexes
-    )
+    return tuple(expanded)
+
+
+def _compact_target_is_valid(
+    indexes: tuple[int, ...],
+    allowed_indexes: set[int],
+    evidence: tuple[SpeechSegment | SubtitleCue, ...],
+) -> bool:
+    """丢弃不影响章节边界的视觉锚点错误，避免为整批章节付费修复。"""
+
+    if (
+        not indexes
+        or len(indexes) != len(set(indexes))
+        or not set(indexes) <= allowed_indexes
+    ):
+        return False
+    anchors = tuple(evidence[index] for index in indexes)
+    if anchors != tuple(
+        sorted(anchors, key=lambda item: (item.start_ms, item.end_ms, item.evidence_id)),
+    ):
+        return False
+    return anchors[-1].end_ms - anchors[0].start_ms <= _COMPACT_MAX_TARGET_ANCHOR_SPAN_MS
 
 
 def _expanded_visual_mode(

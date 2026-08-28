@@ -405,6 +405,72 @@ def test_compact_planning_drops_anchor_from_another_chapter_without_repair() -> 
     assert result.chapter_drafts[1].semantic_targets == ()
 
 
+def test_compact_planning_drops_invalid_anchor_span_without_repair() -> None:
+    first_segment = _segment()
+    second_segment = first_segment.model_copy(
+        update={
+            "segment_id": "segment_002",
+            "start_ms": 10_000,
+            "end_ms": 60_000,
+            "evidence_refs": ("asr_002",),
+        },
+    )
+    request = _planning_request().model_copy(
+        update={
+            "segments": (first_segment, second_segment),
+            "transcript_evidence": (
+                _speech(),
+                _speech().model_copy(
+                    update={
+                        "evidence_id": "asr_002",
+                        "start_ms": 50_000,
+                        "end_ms": 51_000,
+                    },
+                ),
+            ),
+            "duration_ms": 60_000,
+        },
+    )
+    payloads: list[dict[str, object]] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(http_request.content))
+        return _provider_response(
+            http_request,
+            {
+                "chapter_drafts": [
+                    {
+                        "start_segment_index": 0,
+                        "end_segment_index": 2,
+                        "title_hint": "章节",
+                        "visual_mode": "SINGLE",
+                        "semantic_targets": [
+                            {
+                                "query_zh": "跨度过大的目标",
+                                "anchor_transcript_indexes": [0, 1],
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+
+    client = OpenAIDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="text-secret",
+        model_id="text-model",
+        compact_planning=True,
+        sleeper=lambda _delay: None,
+    )
+
+    result = client.plan_chapters(request)
+
+    assert len(payloads) == 1
+    assert result.chapter_drafts[0].visual_mode == "NONE"
+    assert result.chapter_drafts[0].semantic_targets == ()
+
+
 def test_compact_planning_ignores_trailing_empty_draft_without_repair() -> None:
     payloads: list[dict[str, object]] = []
 
