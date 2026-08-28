@@ -155,6 +155,39 @@ def test_dense_sentence_end_candidates_do_not_recreate_one_segment_per_asr() -> 
     assert sum(len(item.evidence_refs) for item in segments) == len(transcript)
 
 
+def test_dense_scene_boundaries_do_not_recreate_one_segment_per_scene() -> None:
+    scenes = tuple(
+        _scene(index, index * 1_000, (index + 1) * 1_000)
+        for index in range(120)
+    )
+
+    segments = _build(120_000, scenes=scenes)
+
+    assert [(item.start_ms, item.end_ms) for item in segments] == [
+        (0, 30_000),
+        (30_000, 60_000),
+        (60_000, 90_000),
+        (90_000, 120_000),
+    ]
+    assert sum(len(item.scene_refs) for item in segments) == len(scenes)
+
+
+def test_dense_asr_only_adds_sparse_boundaries_for_oversized_ranges() -> None:
+    transcript = tuple(
+        _speech(
+            f"asr_{index:03d}",
+            index * 31_000,
+            (index + 1) * 31_000,
+        )
+        for index in range(20)
+    )
+
+    segments = _build(620_000, transcript)
+
+    assert len(segments) <= 4
+    assert sum(len(item.evidence_refs) for item in segments) == len(transcript)
+
+
 def test_short_asr_crossing_grid_does_not_create_extra_boundaries() -> None:
     transcript = (
         _speech("asr_001", 29_000, 31_000),

@@ -110,9 +110,12 @@ def _safe_boundaries(
     # 章节规划输入膨胀成数百个基础片段。优先使用稀疏的网格、镜头和
     # 高价值语音边界，只有在这些边界无法满足 5 分钟硬上限时才补充
     # 转写结束点。
+    # 场景检测边界用于给每个基础片段建立 scene_refs，不再直接变成切点。
+    # 视频编辑中的短镜头可能只有 1~2 秒；把每个镜头都切成基础片段会让
+    # 章节规划输入按镜头数量膨胀，迫使模型重复调用，而不会改善章节语义。
+    # 网格边界提供稳定的稀疏覆盖，章节抽帧阶段仍会读取完整场景索引。
     candidates = {
         *range(_GRID_INTERVAL_MS, duration_ms, _GRID_INTERVAL_MS),
-        *(scene.start_ms for scene in scenes[1:]),
         *(
             candidate.timestamp_ms
             for candidate in speech_boundaries
@@ -165,14 +168,17 @@ def _add_required_transcript_boundaries(
         if oversized is None:
             return tuple(boundaries)
         start_ms, end_ms = oversized
-        endpoint = next(
+        # 在安全上限内取最晚的证据结束点，尽量把密集 ASR 合并进同一片段。
+        # 取最早结束点会把连续的 1~3 秒 ASR 退化成“一条证据一个片段”，
+        # 既增加章节规划批次，也没有带来更可靠的时间边界。
+        endpoint = max(
             (
                 item.end_ms
                 for item in transcript
                 if start_ms < item.end_ms <= min(end_ms, start_ms + _MAX_SEGMENT_DURATION_MS)
                 and _is_safe_transcript_endpoint(item.end_ms, transcript)
             ),
-            None,
+            default=None,
         )
         if endpoint is None or endpoint in boundaries:
             return tuple(boundaries)
