@@ -258,6 +258,78 @@ def test_render_markdown_keeps_visual_body_without_leaking_storage_path() -> Non
     assert KEYFRAME_SHA256 not in markdown
 
 
+def test_render_markdown_deduplicates_single_chapter_section_summary() -> None:
+    result, evidence = _document_fixture()
+    chapter = result.chapters[0].model_copy(
+        update={
+            "title": "AI自动化小红书账号案例介绍",
+            "summary_zh": "本章概要只应展示一次。",
+        },
+    )
+    section = result.sections[0].model_copy(
+        update={
+            "title": chapter.title,
+            "summary_zh": chapter.summary_zh,
+        },
+    )
+    result = result.model_copy(update={"chapters": (chapter,), "sections": (section,)})
+
+    markdown = render_markdown(result, evidence).content.decode("utf-8")
+    body = markdown.split("## 第一部分：", maxsplit=1)[1].split(
+        "## 信息边界\n",
+        maxsplit=1,
+    )[0]
+
+    assert body.count("AI自动化小红书账号案例介绍") == 1
+    assert body.count("本章概要只应展示一次。") == 1
+    assert "### 00:00:00 - 00:00:10 AI自动化小红书账号案例介绍" not in body
+    assert "时间：00:00:00 - 00:00:10" in body
+    assert "不能成为标题" in body
+
+
+def test_render_markdown_keeps_chapter_summary_when_section_has_multiple_chapters() -> None:
+    result, evidence = _document_fixture()
+    first = result.chapters[0].model_copy(
+        update={"chapter_id": "chapter_001", "title": "第一章", "summary_zh": "第一章概要。"},
+    )
+    second = first.model_copy(
+        update={
+            "chapter_id": "chapter_002",
+            "start_ms": 10_000,
+            "end_ms": 20_000,
+            "title": "第二章",
+            "summary_zh": "第二章概要。",
+            "title_evidence_refs": (),
+            "summary_evidence_refs": (),
+            "body_blocks": (),
+            "claims": (),
+            "evidence_refs": (),
+            "selected_keyframe_refs": (),
+            "transcript_source": "NONE",
+            "retrieval_text": "",
+            "retrieval_hash": _sha256(""),
+        },
+    )
+    section = result.sections[0].model_copy(
+        update={
+            "chapter_refs": (first.chapter_id, second.chapter_id),
+            "section_id": section_id_for(ASSET_SHA256, (first.chapter_id, second.chapter_id)),
+            "title": "合并部分",
+            "summary_zh": "合并部分概要。",
+        },
+    )
+    result = result.model_copy(
+        update={"chapters": (first, second), "sections": (section,)},
+    )
+
+    markdown = render_markdown(result, evidence).content.decode("utf-8")
+
+    assert "### 00:00:00 - 00:00:10 第一章" in markdown
+    assert "第一章概要。" in markdown
+    assert "### 00:00:10 - 00:00:20 第二章" in markdown
+    assert "第二章概要。" in markdown
+
+
 def test_render_markdown_summarizes_visual_information_boundaries() -> None:
     result, evidence = _document_fixture()
     observation = evidence[2]

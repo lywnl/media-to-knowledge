@@ -16,6 +16,7 @@ from video_demo.domain.document import (
     ParagraphBlock,
     QuoteBlock,
     SemanticChapter,
+    SemanticSection,
     TableBlock,
     VideoUnderstandingResult,
     VisualBlock,
@@ -71,10 +72,16 @@ def render_markdown(
         _heading(lines, 2, f"第{_chinese_ordinal(section_index)}部分：{section.title}")
         if section.summary_zh:
             _paragraph(lines, section.summary_zh)
+        single_chapter_summary = _single_chapter_summary(section, chapters_by_id)
         for chapter_ref in section.chapter_refs:
             chapter = chapters_by_id[chapter_ref]
             if chapter.content_status == "GROUNDED":
-                _render_chapter(lines, chapter)
+                _render_chapter(
+                    lines,
+                    chapter,
+                    include_title=not single_chapter_summary,
+                    include_summary=not single_chapter_summary,
+                )
 
     _heading(lines, 2, "信息边界")
     boundaries = _information_boundaries(result, evidence_by_id)
@@ -96,14 +103,25 @@ def render_markdown(
 def _render_chapter(
     lines: list[str],
     chapter: SemanticChapter,
+    *,
+    include_title: bool = True,
+    include_summary: bool = True,
 ) -> None:
-    _heading(
-        lines,
-        3,
-        f"{_format_time(chapter.start_ms)} - {_format_time(chapter.end_ms)} {chapter.title}",
-    )
+    if include_title:
+        _heading(
+            lines,
+            3,
+            f"{_format_time(chapter.start_ms)} - "
+            f"{_format_time(chapter.end_ms)} {chapter.title}",
+        )
+    else:
+        _paragraph(
+            lines,
+            f"时间：{_format_time(chapter.start_ms)} - "
+            f"{_format_time(chapter.end_ms)}",
+        )
     if chapter.content_status == "GROUNDED":
-        if chapter.summary_zh:
+        if include_summary and chapter.summary_zh:
             _paragraph(lines, chapter.summary_zh)
         for block in chapter.body_blocks:
             _render_body_block(lines, block)
@@ -112,6 +130,24 @@ def _render_chapter(
             for claim in chapter.claims:
                 lines.append(f"- {_escape_markdown(claim.text)}")
             lines.append("")
+
+
+def _single_chapter_summary(
+    section: SemanticSection,
+    chapters_by_id: dict[str, SemanticChapter],
+) -> bool:
+    if len(section.chapter_refs) != 1:
+        return False
+    chapter = chapters_by_id[section.chapter_refs[0]]
+    return (
+        chapter.content_status == "GROUNDED"
+        and _normalized_text(section.title) == _normalized_text(chapter.title)
+        and _normalized_text(section.summary_zh) == _normalized_text(chapter.summary_zh)
+    )
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(value.split())
 
 
 def _render_body_block(lines: list[str], block: object) -> None:
