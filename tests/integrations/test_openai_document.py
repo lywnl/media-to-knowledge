@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 
 import httpx
 import pytest
@@ -189,6 +190,7 @@ def test_compact_planning_request_maps_indexes_back_to_stable_ids() -> None:
     assert payloads[0]["thinking"] == {"type": "disabled"}
     sent = json.loads(payloads[0]["messages"][1]["content"].split("\n", 1)[1])  # type: ignore[index]
     assert sent["segments"][0] == [0, 0, 10_000, [0]]
+    assert sent["segment_transcript_index_ranges"] == [[0, 0]]
     assert sent["transcript_evidence"][0] == [0, 1_000, 2_000, "请打开设置页面"]
     assert "segment_001" not in json.dumps(sent, ensure_ascii=False)
     assert "asr_001" not in json.dumps(sent, ensure_ascii=False)
@@ -228,7 +230,7 @@ def test_compact_planning_output_budget_scales_with_batch_size() -> None:
     assert payloads[0]["max_tokens"] == 1_024
 
 
-def test_compact_planning_rejects_anchor_from_another_chapter() -> None:
+def test_compact_planning_drops_anchor_from_another_chapter_without_repair() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _provider_response(
             request,
@@ -266,37 +268,77 @@ def test_compact_planning_rejects_anchor_from_another_chapter() -> None:
         sleeper=lambda _delay: None,
     )
 
-    with pytest.raises(ModelResponseValidationError) as raised:
-        client.plan_chapters(_planning_request().model_copy(
-            update={
-                "segments": (
-                    _segment(),
-                    _segment().model_copy(
-                        update={
-                            "segment_id": "segment_002",
-                            "start_ms": 10_000,
-                            "end_ms": 20_000,
-                            "evidence_refs": ("asr_002",),
-                        },
-                    ),
+    result = client.plan_chapters(_planning_request().model_copy(
+        update={
+            "segments": (
+                _segment(),
+                _segment().model_copy(
+                    update={
+                        "segment_id": "segment_002",
+                        "start_ms": 10_000,
+                        "end_ms": 20_000,
+                        "evidence_refs": ("asr_002",),
+                    },
                 ),
-                "transcript_evidence": (
-                    _speech(),
-                    _speech().model_copy(
-                        update={
-                            "evidence_id": "asr_002",
-                            "start_ms": 11_000,
-                            "end_ms": 12_000,
-                        },
-                    ),
+            ),
+            "transcript_evidence": (
+                _speech(),
+                _speech().model_copy(
+                    update={
+                        "evidence_id": "asr_002",
+                        "start_ms": 11_000,
+                        "end_ms": 12_000,
+                    },
                 ),
-                "duration_ms": 20_000,
-            },
-        ))
+            ),
+            "duration_ms": 20_000,
+        },
+    ))
 
-    assert raised.value.invalid_response.validation_errors == (
-        "semantic_targets.anchor_indexes:not_in_chapter",
+    assert result.chapter_drafts[1].visual_mode == "NONE"
+    assert result.chapter_drafts[1].semantic_targets == ()
+
+
+def test_compact_planning_ignores_trailing_empty_draft_without_repair() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return _provider_response(
+            request,
+            {
+                "chapter_drafts": [
+                    {
+                        "start_segment_index": 0,
+                        "end_segment_index": 1,
+                        "title_hint": "章节",
+                        "visual_mode": "NONE",
+                        "semantic_targets": [],
+                    },
+                    {
+                        "start_segment_index": 1,
+                        "end_segment_index": 1,
+                        "title_hint": "多余空章",
+                        "visual_mode": "NONE",
+                        "semantic_targets": [],
+                    },
+                ],
+            },
+        )
+
+    client = OpenAIDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="text-secret",
+        model_id="text-model",
+        compact_planning=True,
+        sleeper=lambda _delay: None,
     )
+
+    result = client.plan_chapters(_planning_request())
+
+    assert len(payloads) == 1
+    assert len(result.chapter_drafts) == 1
 
 
 def test_plan_request_allows_large_repair_budget_for_provider_validation() -> None:
@@ -342,6 +384,36 @@ def test_invalid_model_json_raises_bounded_repair_context_without_leaking_conten
     assert error.invalid_response.safe_json_excerpt is not None
     assert raw_message not in str(error)
     assert raw_message not in json.dumps(error.details, ensure_ascii=False)
+
+
+def test_invalid_model_response_logs_finish_reason_length_and_safe_summary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_message = '{"chapter_drafts":[]}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": raw_message},
+                    },
+                ],
+            },
+            request=request,
+        )
+
+    caplog.set_level(logging.WARNING, logger="video_demo.integrations.openai_document")
+    with pytest.raises(ModelResponseValidationError):
+        _client(httpx.MockTransport(handler)).plan_chapters(_planning_request())
+
+    message = "\n".join(record.getMessage() for record in caplog.records)
+    assert "finish_reason=length" in message
+    assert "response_bytes=" in message
+    assert "chapter_drafts" in message
+    assert raw_message not in message
 
 
 def test_unknown_reference_raises_model_response_validation_error() -> None:

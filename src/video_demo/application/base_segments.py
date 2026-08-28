@@ -14,6 +14,10 @@ from video_demo.domain.evidence import SceneBoundary, SpeechSegment, SubtitleCue
 from video_demo.errors import ErrorCode, VideoDemoError
 
 _GRID_INTERVAL_MS = 30_000
+_SPARSE_SENTENCE_BOUNDARY_LIMIT = 16
+_SENTENCE_BOUNDARY_SAMPLE_INTERVAL_MS = 60_000
+_SENTENCE_BOUNDARY_GRID_TOLERANCE_MS = 8_000
+_EMPTY_TRANSCRIPT_RANGE_MAX_MS = 10_000
 _MAX_SEGMENT_DURATION_MS = 300_000
 _MAX_SEGMENT_EVIDENCE_REFS = 256
 _MAX_SEGMENT_SCENE_REFS = 256
@@ -37,7 +41,10 @@ def build_base_segments(
         ordered_scenes,
         speech_boundaries,
     )
-    ranges = tuple(pairwise((0, *boundaries, duration_ms)))
+    ranges = _merge_empty_transcript_ranges(
+        tuple(pairwise((0, *boundaries, duration_ms))),
+        transcript,
+    )
     segments = _assemble_segments(
         asset_sha256,
         ranges,
@@ -114,17 +121,38 @@ def _safe_boundaries(
     # 视频编辑中的短镜头可能只有 1~2 秒；把每个镜头都切成基础片段会让
     # 章节规划输入按镜头数量膨胀，迫使模型重复调用，而不会改善章节语义。
     # 网格边界提供稳定的稀疏覆盖，章节抽帧阶段仍会读取完整场景索引。
+    grid_candidates = set(range(_GRID_INTERVAL_MS, duration_ms, _GRID_INTERVAL_MS))
     candidates = {
-        *range(_GRID_INTERVAL_MS, duration_ms, _GRID_INTERVAL_MS),
+        *grid_candidates,
         *(
             candidate.timestamp_ms
             for candidate in speech_boundaries
-            if candidate.source != "sentence_end"
-            or candidate.score >= 0.95
+            if candidate.source != "sentence_end" or candidate.score >= 0.95
         ),
     }
+    sentence_ends = tuple(
+        candidate.timestamp_ms
+        for candidate in speech_boundaries
+        if candidate.source == "sentence_end" and candidate.score >= 0.8
+    )
+    if len(sentence_ends) <= _SPARSE_SENTENCE_BOUNDARY_LIMIT:
+        selected_sentence_ends = sentence_ends
+    else:
+        selected_sentence_ends = _sparse_sentence_boundaries(sentence_ends, duration_ms)
+    candidates.difference_update(
+        {
+            grid
+            for grid in grid_candidates
+            if any(
+                abs(grid - sentence_end) <= _SENTENCE_BOUNDARY_GRID_TOLERANCE_MS
+                for sentence_end in selected_sentence_ends
+            )
+        },
+    )
+    candidates.update(selected_sentence_ends)
     ordered_candidates = _ordered_candidates(candidates, duration_ms)
     safe = _exclude_evidence_interiors(ordered_candidates, transcript)
+    safe = _snap_dense_grid_boundaries(safe, ordered_candidates, transcript)
     safe = _add_blocking_transcript_boundaries(
         safe,
         ordered_candidates,
@@ -147,6 +175,104 @@ def _ordered_candidates(candidates: set[int], duration_ms: int) -> tuple[int, ..
         for timestamp in sorted(candidates)
         if 0 < timestamp < duration_ms
     )
+
+
+def _merge_empty_transcript_ranges(
+    ranges: tuple[tuple[int, int], ...],
+    transcript: Sequence[SpeechSegment | SubtitleCue],
+) -> tuple[tuple[int, int], ...]:
+    """把 ASR/字幕之间的纯静音区间并入相邻证据片段，避免空规划单元。"""
+
+    if not transcript:
+        return ranges
+    normalized = list(ranges)
+    while len(normalized) > 1:
+        empty_index = next(
+            (
+                index
+                for index, (start_ms, end_ms) in enumerate(normalized, start=0)
+                if end_ms - start_ms <= _EMPTY_TRANSCRIPT_RANGE_MAX_MS
+                if index > 0
+                if not any(
+                    start_ms <= item.start_ms and item.end_ms <= end_ms
+                    for item in transcript
+                )
+            ),
+            None,
+        )
+        if empty_index is None:
+            break
+        _start_ms, end_ms = normalized.pop(empty_index)
+        previous_start_ms, _previous_end_ms = normalized[empty_index - 1]
+        normalized[empty_index - 1] = (previous_start_ms, end_ms)
+    return tuple(normalized)
+
+
+def _snap_dense_grid_boundaries(
+    safe: tuple[int, ...],
+    candidates: Sequence[int],
+    transcript: Sequence[SpeechSegment | SubtitleCue],
+) -> tuple[int, ...]:
+    """为被连续 ASR 覆盖的网格补一个最近安全句尾。"""
+
+    if len(transcript) < 10 or not any(
+        isinstance(item, SpeechSegment) for item in transcript
+    ):
+        return safe
+    if all(item.duration_ms >= 20_000 for item in transcript):
+        return safe
+    safe_set = set(safe)
+    endpoints = tuple(
+        sorted(
+            {
+                item.end_ms
+                for item in transcript
+                if _is_safe_transcript_endpoint(item.end_ms, transcript)
+            },
+        ),
+    )
+    for grid in candidates:
+        if grid in safe_set or grid % _GRID_INTERVAL_MS:
+            continue
+        nearest = min(
+            (
+                (abs(endpoint - grid), endpoint)
+                for endpoint in endpoints
+                if abs(endpoint - grid) <= _SENTENCE_BOUNDARY_GRID_TOLERANCE_MS
+            ),
+            default=None,
+        )
+        if nearest is not None:
+            safe_set.add(nearest[1])
+    return tuple(sorted(safe_set))
+
+
+def _sparse_sentence_boundaries(
+    sentence_ends: Sequence[int],
+    duration_ms: int,
+) -> tuple[int, ...]:
+    """在密集句尾中每个 30 秒网格最多保留一个最近边界。
+
+    这样既保留长视频的语义切分机会，又避免把连续 ASR 句尾退化成逐句基础片段。
+    误差超过容忍范围的句尾不强行加入，交给网格和静音边界处理。
+    """
+
+    selected: dict[int, tuple[int, int]] = {}
+    for timestamp_ms in sentence_ends:
+        if not 0 < timestamp_ms < duration_ms:
+            continue
+        bucket = timestamp_ms // _SENTENCE_BOUNDARY_SAMPLE_INTERVAL_MS
+        target = min(
+            duration_ms,
+            (bucket + 1) * _SENTENCE_BOUNDARY_SAMPLE_INTERVAL_MS,
+        )
+        distance = abs(timestamp_ms - target)
+        if distance > _SENTENCE_BOUNDARY_GRID_TOLERANCE_MS:
+            continue
+        previous = selected.get(bucket)
+        if previous is None or (distance, timestamp_ms) < previous:
+            selected[bucket] = (distance, timestamp_ms)
+    return tuple(timestamp for _distance, timestamp in selected.values())
 
 
 def _add_required_transcript_boundaries(

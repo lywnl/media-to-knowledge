@@ -639,6 +639,23 @@ def test_compact_planning_prompt_uses_programmatic_visual_targets() -> None:
     assert "end_segment_index 只能引用 segments 数组位置" in instruction
 
 
+def test_compact_planning_prompt_declares_batch_local_transcript_indexes() -> None:
+    segments, transcript, _scenes = _planning_fixture(2, text="批次索引")
+    request = ChapterPlanningRequest(
+        title_hint="测试视频",
+        duration_ms=segments[-1].end_ms,
+        segments=segments,
+        transcript_evidence=transcript,
+        document_config=DocumentGenerationConfig(),
+        prompt_version="chapter-planner-v1",
+    )
+
+    _version, instruction, _data = prompt_for_compact_planning(request)
+
+    assert "当前请求 transcript_evidence 数组的位置" in instruction
+    assert "不得使用整部视频的全局转写编号" in instruction
+
+
 def test_chapter_planner_applies_utf8_byte_budget_independently_of_char_budget(
     tmp_path: Path,
 ) -> None:

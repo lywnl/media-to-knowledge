@@ -47,12 +47,22 @@ def prompt_for_compact_planning(request: ChapterPlanningRequest) -> tuple[str, s
             "完整覆盖 segments (最后一个 end_segment_index 必须等于 segments 长度)；"
             "end_segment_index 只能引用 segments 数组位置，不得使用毫秒时间或全片位置。"
             "segments 每项为 [segment_index, start_ms, end_ms, transcript_evidence_indexes]；"
+            "segment_transcript_index_ranges 与 segments 一一对应，给出每个基础片段所拥有的"
+            "全局转写索引首尾(无转写片段为 null)；语义锚点只能从章节所含片段的这些范围中选择；"
             "visual_mode=NONE 时 semantic_targets 必须为空；"
             "否则语义目标的 anchor_transcript_indexes 必须是当前章节内；"
             "如果无法确认章节边界，semantic_targets 必须返回空数组；"
             "COMPARISON/MULTI_STEP 至少需要 2 个互不重叠的语义目标；"
             "当转写明确提到截图、界面、图文、漫画或操作步骤时，优先返回"
             "visual_mode=SINGLE 并绑定 1 个最相关语义目标，不要无理由返回 NONE；"
+            "transcript_evidence_indexes 是当前请求 transcript_evidence 数组的位置；"
+            "不得使用整部视频的全局转写编号。请先根据每个 segment 的"
+            "transcript_evidence_indexes 判断章节实际拥有的索引，"
+            "不得把相邻章节或空片段的索引绑定到当前章节；"
+            "返回前逐章执行集合校验：把该章节所有 segment 的 transcript_evidence_indexes 合并，"
+            "每个 semantic_targets.anchor_transcript_indexes 必须是这个集合的子集；"
+            "校验不通过就删除该 semantic target(必要时将 visual_mode 改为 NONE)，"
+            "绝对不要复制上一章或下一章的锚点。"
             "1~3 个按时间排序且不重复的 transcript_evidence 索引，跨度不得超过 30 秒。"
             "章节粒度优先目标为 fine 60~120 秒、standard 60~180 秒、coarse 120~300 秒；"
             "任何章节不得超过 300 秒。不得生成时间、ID 或未知索引。transcript_evidence 每项为"
@@ -131,11 +141,25 @@ def _compact_planning_context(request: ChapterPlanningRequest) -> dict[str, obje
         )
         for index, segment in enumerate(request.segments)
     )
+    segment_transcript_index_ranges = tuple(
+        (
+            min(indexes) if indexes else None,
+            max(indexes) if indexes else None,
+        )
+        for indexes in (
+            tuple(
+                transcript_index_by_id[ref]
+                for ref in segment.evidence_refs
+            )
+            for segment in request.segments
+        )
+    )
     return {
         "title_hint": request.title_hint,
         "duration_ms": request.duration_ms,
         "chapter_granularity": request.document_config.chapter_granularity,
         "segments": segments,
+        "segment_transcript_index_ranges": segment_transcript_index_ranges,
         "transcript_evidence": tuple(
             (index, evidence.start_ms, evidence.end_ms, evidence.text)
             for index, evidence in enumerate(request.transcript_evidence)

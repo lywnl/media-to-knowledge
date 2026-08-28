@@ -155,6 +155,26 @@ def test_dense_sentence_end_candidates_do_not_recreate_one_segment_per_asr() -> 
     assert sum(len(item.evidence_refs) for item in segments) == len(transcript)
 
 
+def test_dense_asr_snaps_grid_inside_speech_to_safe_endpoint() -> None:
+    transcript = tuple(
+        _speech(
+            f"asr_{index:03d}",
+            index * 2_000 + 500,
+            index * 2_000 + 1_500,
+        )
+        for index in range(100)
+    )
+
+    segments = _build(201_000, transcript)
+
+    assert len(segments) <= 10
+    assert any(
+        29_000 <= item.end_ms <= 32_000
+        for item in segments[:-1]
+    )
+    assert sum(len(item.evidence_refs) for item in segments) == len(transcript)
+
+
 def test_dense_scene_boundaries_do_not_recreate_one_segment_per_scene() -> None:
     scenes = tuple(
         _scene(index, index * 1_000, (index + 1) * 1_000)
@@ -202,6 +222,40 @@ def test_short_asr_crossing_grid_does_not_create_extra_boundaries() -> None:
         (90_000, 120_000),
     ]
     assert sum(len(item.evidence_refs) for item in segments) == len(transcript)
+
+
+def test_transcript_gaps_are_attached_to_adjacent_evidence_segments() -> None:
+    transcript = (
+        _speech("asr_001", 0, 10_000),
+        _speech("asr_002", 30_000, 40_000),
+    )
+
+    segments = _build(
+        40_000,
+        transcript,
+        boundaries=(
+            SpeechBoundaryCandidate(20_000, "silence"),
+            SpeechBoundaryCandidate(40_000, "silence"),
+        ),
+    )
+
+    assert all(item.evidence_refs for item in segments)
+    assert [(item.start_ms, item.end_ms) for item in segments] == [
+        (0, 30_000),
+        (30_000, 40_000),
+    ]
+    assert sum(len(item.evidence_refs) for item in segments) == len(transcript)
+
+
+def test_short_trailing_empty_range_is_attached_to_previous_segment() -> None:
+    segments = _build(
+        20_000,
+        transcript=(_speech("asr_001", 0, 10_000),),
+        boundaries=(SpeechBoundaryCandidate(19_900, "silence"),),
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in segments] == [(0, 20_000)]
+    assert segments[0].evidence_refs == ("asr_001",)
 
 
 def test_boundary_inside_subtitle_is_removed_and_evidence_has_unique_owner() -> None:

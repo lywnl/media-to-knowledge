@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable
 from typing import Literal, TypeVar
@@ -46,6 +47,7 @@ _DEFAULT_MAX_OUTPUT_TOKENS = 8_192
 # 结构化 JSON 因输出预算过小被截断并触发额外修复调用。
 _COMPACT_PLANNING_MAX_OUTPUT_TOKENS = 8_192
 _COMPACT_PLANNING_MIN_OUTPUT_TOKENS = 1_024
+_LOGGER = logging.getLogger(__name__)
 
 
 class _CompactVisualTargetDraft(BaseModel):
@@ -124,6 +126,7 @@ class OpenAIDocumentClient(DocumentTextPort):
                 ),
                 on_provider_attempt=on_provider_attempt,
             )
+            compact = _trim_trailing_empty_drafts(compact)
             return _expand_compact_planning_response(compact, request)
         return self._call(
             prompt_for_planning(request),
@@ -395,7 +398,7 @@ def _parse_and_validate_response(
     *,
     validate_response: Callable[[ResponseModel], None],
 ) -> ResponseModel:
-    raw_message, parsed = _extract_model_message(content)
+    raw_message, parsed, finish_reason = _extract_model_message(content)
     try:
         response = response_type.model_validate(parsed)
         validate_response(response)
@@ -404,6 +407,12 @@ def _parse_and_validate_response(
         summaries = tuple(_pydantic_error_summary(item) for item in error.errors())
     except _ReferenceValidationError as error:
         summaries = (error.summary,)
+    _LOGGER.warning(
+        "文本模型响应校验失败 finish_reason=%s response_bytes=%d validation_errors=%s",
+        finish_reason,
+        len(raw_message),
+        ",".join(summaries[:8]),
+    )
     raise ModelResponseValidationError(
         ErrorCode.TEXT_LLM_RESPONSE_INVALID,
         "文本模型响应结构非法",
@@ -415,15 +424,26 @@ def _parse_and_validate_response(
     ) from None
 
 
-def _extract_model_message(content: bytes) -> tuple[bytes, object | None]:
+def _extract_model_message(content: bytes) -> tuple[bytes, object | None, str]:
     envelope: object | None = None
     raw: bytes | None = None
+    finish_reason = "unknown"
     try:
         envelope = json.loads(
             content,
             parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
         )
-        message = envelope["choices"][0]["message"]["content"]  # type: ignore[index]
+        if not isinstance(envelope, dict):
+            raise ValueError
+        choices = envelope["choices"]
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ValueError
+        choice = choices[0]
+        finish_reason = _safe_finish_reason(choice.get("finish_reason"))
+        message_value = choice["message"]
+        if not isinstance(message_value, dict):
+            raise ValueError
+        message = message_value["content"]
         if not isinstance(message, str):
             raise ValueError
         raw = message.encode("utf-8")
@@ -431,9 +451,15 @@ def _extract_model_message(content: bytes) -> tuple[bytes, object | None]:
             message,
             parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
         )
-        return raw, parsed
+        return raw, parsed, finish_reason
     except (KeyError, IndexError, TypeError, ValueError, UnicodeDecodeError):
         safe_envelope = envelope if raw is None else None
+        _LOGGER.warning(
+            "文本模型响应解析失败 finish_reason=%s response_bytes=%d "
+            "validation_errors=response_envelope:invalid",
+            finish_reason,
+            len(raw) if raw is not None else len(content),
+        )
         raise ModelResponseValidationError(
             ErrorCode.TEXT_LLM_RESPONSE_INVALID,
             "文本模型响应结构非法",
@@ -443,6 +469,16 @@ def _extract_model_message(content: bytes) -> tuple[bytes, object | None]:
                 parsed_json=safe_envelope,
             ),
         ) from None
+
+
+def _safe_finish_reason(value: object) -> str:
+    if isinstance(value, str):
+        normalized = " ".join(value.split())
+        if normalized and len(normalized) <= 64 and all(
+            character.isprintable() for character in normalized
+        ):
+            return normalized
+    return "unknown"
 
 
 def _pydantic_error_summary(error: object) -> str:
@@ -484,16 +520,9 @@ def _validate_compact_planning_response(
 ) -> None:
     segment_count = len(request.segments)
     transcript_count = len(request.transcript_evidence)
-    segment_transcript_indexes = tuple(
-        tuple(
-            index
-            for index, evidence in enumerate(request.transcript_evidence)
-            if evidence.evidence_id in segment.evidence_refs
-        )
-        for segment in request.segments
-    )
     expected_start = 0
-    for draft in response.chapter_drafts:
+    drafts = _trim_trailing_empty_drafts(response).chapter_drafts
+    for draft in drafts:
         if draft.start_segment_index != expected_start:
             raise _ReferenceValidationError("chapter_drafts.segment_indexes:not_contiguous")
         if draft.end_segment_index > segment_count:
@@ -511,19 +540,22 @@ def _validate_compact_planning_response(
                 target.anchor_transcript_indexes
             ):
                 raise _ReferenceValidationError("semantic_targets.anchor_indexes:duplicate")
-            chapter_transcript_indexes = {
-                index
-                for indexes in segment_transcript_indexes[
-                    draft.start_segment_index : draft.end_segment_index
-                ]
-                for index in indexes
-            }
-            if not set(target.anchor_transcript_indexes) <= chapter_transcript_indexes:
-                raise _ReferenceValidationError(
-                    "semantic_targets.anchor_indexes:not_in_chapter",
-                )
+            # 章节范围是模型最容易出错的索引映射。该类错误不会影响章节的
+            # 时间分区，展开时会丢弃越界目标并把视觉模式降为纯文本，避免
+            # 为可确定修复的单个目标再发起一次付费结构修复调用。
     if expected_start != segment_count:
         raise _ReferenceValidationError("chapter_drafts.segment_indexes:not_complete")
+
+
+def _trim_trailing_empty_drafts(
+    response: _CompactChapterPlanningResponse,
+) -> _CompactChapterPlanningResponse:
+    drafts = tuple(response.chapter_drafts)
+    while len(drafts) > 1 and drafts[-1].start_segment_index == drafts[-1].end_segment_index:
+        drafts = drafts[:-1]
+    if drafts == response.chapter_drafts:
+        return response
+    return _CompactChapterPlanningResponse(chapter_drafts=drafts)
 
 
 def _expand_compact_planning_response(
@@ -538,21 +570,53 @@ def _expand_compact_planning_response(
                 draft.start_segment_index : draft.end_segment_index
             ],
             title_hint=draft.title_hint,
-            visual_mode=draft.visual_mode,
-            semantic_targets=tuple(
-                VisualTargetDraft(
-                    query_zh=target.query_zh,
-                    anchor_evidence_refs=tuple(
-                        transcript_ids[index]
-                        for index in target.anchor_transcript_indexes
-                    ),
-                )
-                for target in draft.semantic_targets
-            ),
+            visual_mode=_expanded_visual_mode(draft, request),
+            semantic_targets=_expanded_semantic_targets(draft, request, transcript_ids),
         )
         for draft in response.chapter_drafts
     )
     return ChapterPlanningResponse(chapter_drafts=drafts)
+
+
+def _expanded_semantic_targets(
+    draft: _CompactChapterDraft,
+    request: ChapterPlanningRequest,
+    transcript_ids: tuple[str, ...],
+) -> tuple[VisualTargetDraft, ...]:
+    segment_transcript_indexes = {
+        index
+        for segment in request.segments[draft.start_segment_index : draft.end_segment_index]
+        for index, evidence in enumerate(request.transcript_evidence)
+        if evidence.evidence_id in segment.evidence_refs
+    }
+    return tuple(
+        VisualTargetDraft(
+            query_zh=target.query_zh,
+            anchor_evidence_refs=tuple(
+                transcript_ids[index] for index in target.anchor_transcript_indexes
+            ),
+        )
+        for target in draft.semantic_targets
+        if set(target.anchor_transcript_indexes) <= segment_transcript_indexes
+    )
+
+
+def _expanded_visual_mode(
+    draft: _CompactChapterDraft,
+    request: ChapterPlanningRequest,
+) -> Literal["NONE", "SINGLE", "COMPARISON", "MULTI_STEP"]:
+    valid_target_count = len(
+        _expanded_semantic_targets(
+            draft,
+            request,
+            tuple(item.evidence_id for item in request.transcript_evidence),
+        )
+    )
+    if valid_target_count == 0:
+        return "NONE"
+    if draft.visual_mode in {"COMPARISON", "MULTI_STEP"} and valid_target_count < 2:
+        return "SINGLE"
+    return draft.visual_mode
 
 
 def _validate_writing_response(
