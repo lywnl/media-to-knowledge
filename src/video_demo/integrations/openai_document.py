@@ -39,6 +39,10 @@ from video_demo.integrations.document_prompts import (
     prompt_for_writing,
     prompt_for_writing_repair,
 )
+from video_demo.integrations.model_response import (
+    extract_model_message_content,
+    parse_json_content,
+)
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 Prompt = tuple[str, str, str]
@@ -440,22 +444,14 @@ def _extract_model_message(content: bytes) -> tuple[bytes, object | None, str]:
         )
         if not isinstance(envelope, dict):
             raise ValueError
-        choices = envelope["choices"]
-        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-            raise ValueError
-        choice = choices[0]
-        finish_reason = _safe_finish_reason(choice.get("finish_reason"))
-        message_value = choice["message"]
-        if not isinstance(message_value, dict):
-            raise ValueError
-        message = message_value["content"]
-        if not isinstance(message, str):
+        choices = envelope.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            finish_reason = _safe_finish_reason(choices[0].get("finish_reason"))
+        message = extract_model_message_content(envelope)
+        if not message:
             raise ValueError
         raw = message.encode("utf-8")
-        parsed = json.loads(
-            message,
-            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
-        )
+        parsed = parse_json_content(message)
         return raw, parsed, finish_reason
     except (KeyError, IndexError, TypeError, ValueError, UnicodeDecodeError):
         safe_envelope = envelope if raw is None else None

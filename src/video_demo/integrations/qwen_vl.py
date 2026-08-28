@@ -33,6 +33,10 @@ from video_demo.integrations.document_prompts import (
 from video_demo.integrations.document_validation import (
     validate_chapter_vision_response,
 )
+from video_demo.integrations.model_response import (
+    extract_model_message_content,
+    parse_json_content,
+)
 from video_demo.storage.workspace import reject_symlink_components, validate_path_component
 from video_demo.visual.candidate_artifacts import read_verified_candidate_jpeg
 
@@ -539,17 +543,11 @@ def _parse_response(content: bytes) -> tuple[ChapterVisionResponse, bytes, objec
         provider_id = envelope.get("id")
         if provider_id is not None and not isinstance(provider_id, str):
             raise ValueError("供应商响应 ID 必须是字符串")
-        choices = envelope.get("choices")
-        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-            raise ValueError("供应商响应 choices 非法")
-        message_data = choices[0].get("message")
-        if not isinstance(message_data, dict):
-            raise ValueError("供应商响应 message 非法")
-        message = message_data.get("content")
-        if not isinstance(message, str):
+        message = extract_model_message_content(envelope)
+        if not message:
             raise ValueError
         raw_message = message.encode("utf-8")
-        parsed = json.loads(message, parse_constant=_reject_json_constant)
+        parsed = parse_json_content(message)
         return ChapterVisionResponse.model_validate(parsed), raw_message, parsed
     except ValidationError as error:
         summaries = tuple(_pydantic_error_summary(item) for item in error.errors())

@@ -149,6 +149,42 @@ def test_plan_request_uses_main_schema_prompt_and_temperature_zero() -> None:
     assert "text-secret" not in json.dumps(payloads)
 
 
+def test_plan_accepts_content_blocks_and_markdown_wrapped_json() -> None:
+    body = {
+        "chapter_drafts": [
+            {
+                "segment_refs": ["segment_001"],
+                "title_hint": "设置页面",
+                "visual_mode": "NONE",
+                "semantic_targets": [],
+            },
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        message = "结果如下：\n```json\n" + json.dumps(body, ensure_ascii=False) + "\n```"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {"type": "thinking", "text": "内部思考"},
+                                {"type": "text", "text": message},
+                            ],
+                        },
+                    },
+                ],
+            },
+            request=request,
+        )
+
+    result = _client(httpx.MockTransport(handler)).plan_chapters(_planning_request())
+
+    assert result.chapter_drafts[0].title_hint == "设置页面"
+
+
 def test_writing_requests_disable_thinking_for_latency() -> None:
     payloads: list[dict[str, object]] = []
 

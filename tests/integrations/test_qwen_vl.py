@@ -162,6 +162,38 @@ def test_qwen_sends_sorted_jpeg_frames_in_one_request_without_local_metadata(
     assert payloads[0]["response_format"]["json_schema"]["name"] == "chapter_vlm_v2"  # type: ignore[index]
 
 
+def test_qwen_accepts_content_blocks_and_explanatory_text_before_json(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs" / "scope_001" / "run_001"
+    run_root.mkdir(parents=True)
+    body = _valid_observation()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        message = "我识别到以下内容：\n" + json.dumps(body, ensure_ascii=False)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {"type": "reasoning", "text": "内部思考"},
+                                {"type": "text", "text": message},
+                            ],
+                        },
+                    },
+                ],
+            },
+            request=request,
+        )
+
+    result = _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+        _request(run_root),
+        allowed_run_root=run_root,
+    )
+
+    assert result.observations[0].caption == "画面文字"
+
+
 def test_qwen_request_bytes_do_not_exceed_shared_payload_upper_bound(tmp_path: Path) -> None:
     run_root = tmp_path / "runs/scope_001/run_001"
     run_root.mkdir(parents=True)
