@@ -336,6 +336,53 @@ def test_compact_planning_output_budget_scales_with_batch_size() -> None:
     assert payloads[0]["max_tokens"] == 1_024
 
 
+def test_compact_planning_large_batch_keeps_full_output_budget() -> None:
+    payloads: list[dict[str, object]] = []
+    segments = tuple(
+        BaseSegment(
+            segment_id=f"segment_{index:03d}",
+            start_ms=index * 10_000,
+            end_ms=(index + 1) * 10_000,
+            evidence_refs=("asr_001",),
+            transcript_source="ASR",
+        )
+        for index in range(48)
+    )
+    request = _planning_request().model_copy(
+        update={"duration_ms": 480_000, "segments": segments},
+    )
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(http_request.content))
+        return _provider_response(
+            http_request,
+            {
+                "chapter_drafts": [
+                    {
+                        "start_segment_index": 0,
+                        "end_segment_index": 48,
+                        "title_hint": "设置页面",
+                        "visual_mode": "NONE",
+                        "semantic_targets": [],
+                    },
+                ],
+            },
+        )
+
+    client = OpenAIDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="text-secret",
+        model_id="text-model",
+        compact_planning=True,
+        sleeper=lambda _delay: None,
+    )
+
+    client.plan_chapters(request)
+
+    assert payloads[0]["max_tokens"] == 8_192
+
+
 def test_compact_planning_drops_anchor_from_another_chapter_without_repair() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _provider_response(

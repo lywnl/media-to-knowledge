@@ -367,7 +367,7 @@ def _compact_planning_output_tokens(segment_count: int) -> int:
         raise ValueError("章节规划批次至少包含一个基础片段")
     return min(
         _COMPACT_PLANNING_MAX_OUTPUT_TOKENS,
-        max(_COMPACT_PLANNING_MIN_OUTPUT_TOKENS, segment_count * 64),
+        max(_COMPACT_PLANNING_MIN_OUTPUT_TOKENS, segment_count * 192),
     )
 
 
