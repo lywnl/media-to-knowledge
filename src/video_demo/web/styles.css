@@ -546,6 +546,27 @@ input {
   margin: 0;
 }
 
+.chapter-claims {
+  margin-top: 18px;
+  padding: 12px 14px;
+  background: #f8fafc;
+  border-left: 3px solid var(--signal);
+}
+
+.chapter-claims h5 {
+  margin: 0;
+  font-size: 0.92rem;
+}
+
+.chapter-claims ul {
+  margin: 7px 0 0;
+  padding-left: 1.2rem;
+}
+
+.chapter-claims li + li {
+  margin-top: 5px;
+}
+
 .uncertainty-note {
   margin-top: 18px;
   padding: 12px 14px;

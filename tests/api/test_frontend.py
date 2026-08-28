@@ -170,12 +170,20 @@ def test_frontend_script_exposes_structured_document_reading_contract(
     assert 'id="document-toc"' in html
     assert 'id="download-status"' in html
     assert "fetchEvidence" in script
+    assert 'summary.overview_zh || "未提供核心概览。"' in script
     assert "visual_content_refs" in script
     assert "source_keyframe_refs" in script
     assert "new Set(chapter.selected_keyframe_refs)" in script
     assert "AbortController" in script
     assert "URL.revokeObjectURL" in script
     assert "下载 Markdown失败" in script
+
+
+def test_frontend_script_renders_chapter_claims(client: TestClient) -> None:
+    script = client.get("/static/app.js").text
+
+    assert "本章结论" in script
+    assert "chapter.claims" in script
 
 
 def test_frontend_maps_keyframe_evidence_refs_to_content_ids(client: TestClient) -> None:

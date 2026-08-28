@@ -25,6 +25,7 @@ from video_demo.domain.document import (
     CodeBlock,
     DocumentGenerationMetadata,
     FormulaBlock,
+    GroundedClaim,
     ParagraphBlock,
     PromptVersions,
     QuoteBlock,
@@ -1343,6 +1344,7 @@ def _materialize_chapter(
     response: ChapterWritingResponse,
     keyframes: tuple[KeyframeEvidence, ...],
 ) -> SemanticChapter:
+    response = _ensure_chapter_claims(response)
     selected = _selected_keyframes(
         response.body_blocks,
         request.visual_observations,
@@ -1384,6 +1386,35 @@ def _materialize_chapter(
             "retrieval_hash": hashlib.sha256(retrieval.encode("utf-8")).hexdigest(),
         },
     )
+
+
+def _ensure_chapter_claims(response: ChapterWritingResponse) -> ChapterWritingResponse:
+    """模型漏返结论时，复用已校验的章节摘要补出最小可检索结论。"""
+
+    if response.claims or not response.summary_zh.strip():
+        return response
+    evidence_refs = response.summary_evidence_refs or response.title_evidence_refs
+    if not evidence_refs:
+        return response
+    claim_text = _first_summary_sentence(response.summary_zh)
+    return response.model_copy(
+        update={
+            "claims": (
+                GroundedClaim(
+                    text=claim_text,
+                    evidence_refs=evidence_refs,
+                    certainty=0.7,
+                ),
+            ),
+        },
+    )
+
+
+def _first_summary_sentence(summary: str) -> str:
+    for index, character in enumerate(summary):
+        if character in "。!?\uff01\uff1f":
+            return summary[: index + 1]
+    return summary[:2_000]
 
 
 def _selected_keyframes(
@@ -1665,10 +1696,11 @@ def _materialize_result(
         )
         for draft in global_response.sections
     )
+    overview = global_response.overview_zh.strip() or _fallback_global_overview(chapters)
     provisional_summary = VideoDocumentSummary(
         title=context.document_config.document_title or context.title_hint,
         duration_ms=context.duration_ms,
-        overview_zh=global_response.overview_zh,
+        overview_zh=overview,
         key_points=global_response.key_points,
         retrieval_text="",
         retrieval_hash=hashlib.sha256(b"").hexdigest(),
@@ -1697,6 +1729,15 @@ def _materialize_result(
             prompt_versions=prompt_versions,
         ),
     )
+
+
+def _fallback_global_overview(chapters: tuple[SemanticChapter, ...]) -> str:
+    grounded_summaries = tuple(
+        chapter.summary_zh.strip()
+        for chapter in chapters
+        if chapter.content_status == "GROUNDED" and chapter.summary_zh.strip()
+    )
+    return "；".join(grounded_summaries)[:8_000] or _PLACEHOLDER
 
 
 def _invalid_local_response(response: FrozenModel, error: BaseException) -> InvalidModelResponse:

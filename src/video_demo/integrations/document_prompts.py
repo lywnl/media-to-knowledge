@@ -291,6 +291,8 @@ def prompt_for_writing(request: ChapterWritingRequest) -> tuple[str, str, str]:
             "visual_observation_ref。"
             "所有 evidence_id 必须从输入白名单逐字复制，不得自行编造、截断或替换；"
             "输出前逐项检查每个引用都在上述白名单中，无法确认时删除该引用或对应事实。"
+            "只要本章存在可验证语义且 summary_zh 非空，必须返回 1-2 条 claims；"
+            "每条 claim 都应是有证据支持的独立关键结论，不要只重复章节标题。"
         ),
         request.model_dump(mode="json"),
     )
@@ -311,6 +313,8 @@ def prompt_for_writing_repair(request: ChapterWritingRepairRequest) -> tuple[str
             "visual_observation_ref。"
             "所有 evidence_id 必须从输入白名单逐字复制，不得自行编造、截断或替换；"
             "输出前逐项检查每个引用都在上述白名单中，无法确认时删除该引用或对应事实。"
+            "只要本章存在可验证语义且 summary_zh 非空，必须返回 1-2 条 claims；"
+            "每条 claim 都应是有证据支持的独立关键结论，不要只重复章节标题。"
         ),
         request.model_dump(mode="json"),
     )
@@ -319,7 +323,8 @@ def prompt_for_writing_repair(request: ChapterWritingRepairRequest) -> tuple[str
 def prompt_for_global_editing(request: GlobalWritingRequest) -> tuple[str, str, str]:
     return _prompt(
         request.prompt_version,
-        "你只能整理已验证章节分组；不得新增章节、证据或关键帧 ID。",
+        "你只能整理已验证章节分组；不得新增章节、证据或关键帧 ID；"
+        "overview_zh 必须返回非空的中文核心概览，概括输入中的事实章节。",
         request.model_dump(mode="json"),
     )
 
@@ -327,7 +332,8 @@ def prompt_for_global_editing(request: GlobalWritingRequest) -> tuple[str, str, 
 def prompt_for_global_repair(request: GlobalWritingRepairRequest) -> tuple[str, str, str]:
     return _prompt(
         request.prompt_version,
-        "只修复全局摘要和 Section 结构；不得新增、遗漏、重复或重排章节。",
+        "只修复全局摘要和 Section 结构；不得新增、遗漏、重复或重排章节；"
+        "overview_zh 必须返回非空的中文核心概览，概括输入中的事实章节。",
         request.model_dump(mode="json"),
     )
 

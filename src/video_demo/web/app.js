@@ -355,6 +355,7 @@
       chapter.body_blocks.forEach((block) => {
         item.append(renderBodyBlock(block, evidenceById, chapter, run.run_id, keyframePromises, renderedFrames));
       });
+      appendChapterClaims(item, chapter);
       appendUncertainties(item, chapter, evidenceById);
       [...new Set(chapter.selected_keyframe_refs)].forEach((evidenceRef) => {
         const keyframeId = keyframeIdForEvidenceRef(evidenceRef, evidenceById);
@@ -385,7 +386,7 @@
     card.append(
       element("p", "result-source", run.original_filename ? `视频文件：${run.original_filename}` : "知识文档"),
       element("h3", null, summary.title),
-      element("p", null, summary.overview_zh),
+      element("p", null, summary.overview_zh || "未提供核心概览。"),
     );
     documentOverview.replaceChildren(card);
     const points = element("section", "key-points");
@@ -520,6 +521,17 @@
     [...new Set(uncertainties)].forEach((value) => list.append(element("li", null, value)));
     note.append(list);
     parent.append(note);
+  }
+
+  function appendChapterClaims(parent, chapter) {
+    const claims = (chapter.claims ?? []).filter((claim) => claim.text);
+    if (claims.length === 0) return;
+    const section = element("section", "chapter-claims");
+    section.append(element("h5", null, "本章结论"));
+    const list = element("ul");
+    claims.forEach((claim) => list.append(element("li", null, claim.text)));
+    section.append(list);
+    parent.append(section);
   }
 
   async function fetchEvidence(runId, result, signal) {

@@ -287,6 +287,15 @@ def test_render_markdown_deduplicates_single_chapter_section_summary() -> None:
     assert "不能成为标题" in body
 
 
+def test_render_markdown_renders_chapter_claims() -> None:
+    result, evidence = _document_fixture()
+
+    markdown = render_markdown(result, evidence).content.decode("utf-8")
+
+    assert "#### 本章结论" in markdown
+    assert "- 默认参数可以调整。" in markdown
+
+
 def test_render_markdown_keeps_chapter_summary_when_section_has_multiple_chapters() -> None:
     result, evidence = _document_fixture()
     first = result.chapters[0].model_copy(

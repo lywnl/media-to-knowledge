@@ -910,6 +910,42 @@ def test_global_reorder_is_repaired_once_and_input_contains_only_digest_groups(
     assert "body_blocks" not in sent and "evidence_id" not in sent
 
 
+def test_writer_falls_back_to_chapter_summary_when_global_overview_is_empty(
+    tmp_path: Path,
+) -> None:
+    def empty_overview(request: GlobalWritingRequest) -> GlobalWritingResponse:
+        response = _global_response(request)
+        return response.model_copy(update={"overview_zh": ""})
+
+    written = _writer(_TextPort(global_edit=empty_overview)).write(
+        _context(),
+        (_plan(0), _plan(1)),
+        (_speech(0), _speech(1)),
+        (),
+        (),
+        cache=_cache(tmp_path),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert written.result.summary.overview_zh == "章节摘要；章节摘要"
+
+
+def test_writer_adds_grounded_claim_when_model_omits_claims(tmp_path: Path) -> None:
+    written = _writer(_TextPort()).write(
+        _context(),
+        (_plan(0), _plan(1)),
+        (_speech(0), _speech(1)),
+        (),
+        (),
+        cache=_cache(tmp_path),
+        is_cancel_requested=lambda: False,
+    )
+
+    claim = written.result.chapters[0].claims[0]
+    assert claim.text == "章节摘要"
+    assert claim.evidence_refs == ("asr_000",)
+
+
 def test_chapter_input_budget_is_checked_before_any_provider_attempt(tmp_path: Path) -> None:
     port = _TextPort()
     with pytest.raises(VideoDemoError) as raised:
