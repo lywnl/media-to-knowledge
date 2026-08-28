@@ -634,6 +634,8 @@ def test_compact_planning_prompt_uses_programmatic_visual_targets() -> None:
 
     assert "semantic_targets 必须返回空数组" in instruction
     assert "visual_mode=NONE 时 semantic_targets 必须为空" in instruction
+    assert "COMPARISON/MULTI_STEP 至少需要 2 个互不重叠的语义目标" in instruction
+    assert "截图、界面、图文、漫画或操作步骤" in instruction
     assert "end_segment_index 只能引用 segments 数组位置" in instruction
 
 

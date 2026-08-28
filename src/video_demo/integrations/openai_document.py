@@ -45,6 +45,7 @@ _DEFAULT_MAX_OUTPUT_TOKENS = 8_192
 # 紧凑索引协议关闭 thinking 以减少延迟；保留 8192 上限，避免长批次的
 # 结构化 JSON 因输出预算过小被截断并触发额外修复调用。
 _COMPACT_PLANNING_MAX_OUTPUT_TOKENS = 8_192
+_COMPACT_PLANNING_MIN_OUTPUT_TOKENS = 1_024
 
 
 class _CompactVisualTargetDraft(BaseModel):
@@ -115,7 +116,7 @@ class OpenAIDocumentClient(DocumentTextPort):
                 prompt_for_compact_planning(request),
                 response_type=_CompactChapterPlanningResponse,
                 schema_name="chapter_planning_compact_v1",
-                max_output_tokens=_COMPACT_PLANNING_MAX_OUTPUT_TOKENS,
+                max_output_tokens=_compact_planning_output_tokens(len(request.segments)),
                 extra_payload={"thinking": {"type": "disabled"}},
                 validate_response=lambda response: _validate_compact_planning_response(
                     response,
@@ -149,7 +150,9 @@ class OpenAIDocumentClient(DocumentTextPort):
                 prompt_for_compact_plan_repair(request),
                 response_type=_CompactChapterPlanningResponse,
                 schema_name="chapter_planning_compact_repair_v1",
-                max_output_tokens=_COMPACT_PLANNING_MAX_OUTPUT_TOKENS,
+                max_output_tokens=_compact_planning_output_tokens(
+                    len(request.request.segments),
+                ),
                 extra_payload={"thinking": {"type": "disabled"}},
                 validate_response=lambda response: _validate_compact_planning_response(
                     response,
@@ -347,6 +350,17 @@ def _request_payload(
             },
         ],
     }
+
+
+def _compact_planning_output_tokens(segment_count: int) -> int:
+    """按批次规模给紧凑规划分配输出预算，避免小批次预留 8192 token。"""
+
+    if segment_count < 1:
+        raise ValueError("章节规划批次至少包含一个基础片段")
+    return min(
+        _COMPACT_PLANNING_MAX_OUTPUT_TOKENS,
+        max(_COMPACT_PLANNING_MIN_OUTPUT_TOKENS, segment_count * 64),
+    )
 
 
 def _bounded_response(response: httpx.Response, max_bytes: int) -> bytes:

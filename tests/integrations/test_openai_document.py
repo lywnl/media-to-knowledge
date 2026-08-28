@@ -132,7 +132,7 @@ def test_plan_request_uses_main_schema_prompt_and_temperature_zero() -> None:
 
     assert result.chapter_drafts[0].segment_refs == ("segment_001",)
     assert payloads[0]["temperature"] == 0
-    assert payloads[0]["max_tokens"] == 8192
+    assert payloads[0]["max_tokens"] == 8_192
     assert payloads[0]["response_format"]["json_schema"]["name"] == (  # type: ignore[index]
         "chapter_planning_v1"
     )
@@ -185,13 +185,47 @@ def test_compact_planning_request_maps_indexes_back_to_stable_ids() -> None:
     assert payloads[0]["response_format"]["json_schema"]["name"] == (  # type: ignore[index]
         "chapter_planning_compact_v1"
     )
-    assert payloads[0]["max_tokens"] == 8192
+    assert payloads[0]["max_tokens"] == 1_024
     assert payloads[0]["thinking"] == {"type": "disabled"}
     sent = json.loads(payloads[0]["messages"][1]["content"].split("\n", 1)[1])  # type: ignore[index]
     assert sent["segments"][0] == [0, 0, 10_000, [0]]
     assert sent["transcript_evidence"][0] == [0, 1_000, 2_000, "请打开设置页面"]
     assert "segment_001" not in json.dumps(sent, ensure_ascii=False)
     assert "asr_001" not in json.dumps(sent, ensure_ascii=False)
+
+
+def test_compact_planning_output_budget_scales_with_batch_size() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return _provider_response(
+            request,
+            {
+                "chapter_drafts": [
+                    {
+                        "start_segment_index": 0,
+                        "end_segment_index": 1,
+                        "title_hint": "设置页面",
+                        "visual_mode": "NONE",
+                        "semantic_targets": [],
+                    },
+                ],
+            },
+        )
+
+    client = OpenAIDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="text-secret",
+        model_id="text-model",
+        compact_planning=True,
+        sleeper=lambda _delay: None,
+    )
+
+    client.plan_chapters(_planning_request())
+
+    assert payloads[0]["max_tokens"] == 1_024
 
 
 def test_compact_planning_rejects_anchor_from_another_chapter() -> None:
