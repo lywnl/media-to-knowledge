@@ -563,7 +563,7 @@ def test_chapter_planner_caps_thinking_batches_at_twenty_segments(
     assert batch.metrics["chapter_planner_logical_calls"] == 1
 
 
-def test_compact_planning_splits_only_after_forty_eight_segments(
+def test_compact_planning_splits_sixty_segments_into_32_and_28(
     tmp_path: Path,
 ) -> None:
     segments, transcript, scenes = _planning_fixture(60, text="短文本")
@@ -584,7 +584,7 @@ def test_compact_planning_splits_only_after_forty_eight_segments(
     batch = _plan(_planner(port, compact_planning=True), tmp_path, segments, transcript, scenes)
 
     # 两个批次并发执行，模型端口记录顺序取决于完成先后。
-    assert sorted(len(request.segments) for request in port.main_requests) == [12, 48]
+    assert sorted(len(request.segments) for request in port.main_requests) == [28, 32]
     assert batch.metrics["chapter_planner_logical_calls"] == 2
 
 
