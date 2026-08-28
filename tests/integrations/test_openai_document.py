@@ -25,6 +25,10 @@ from video_demo.integrations.document_port import (
     ModelResponseValidationError,
     invalid_model_response,
 )
+from video_demo.integrations.document_prompts import (
+    prompt_for_writing,
+    prompt_for_writing_repair,
+)
 from video_demo.integrations.openai_document import OpenAIDocumentClient
 
 
@@ -143,6 +147,42 @@ def test_plan_request_uses_main_schema_prompt_and_temperature_zero() -> None:
     assert "30 秒" in payloads[0]["messages"][0]["content"]  # type: ignore[index]
     assert "fine 60~120 秒" in payloads[0]["messages"][0]["content"]  # type: ignore[index]
     assert "text-secret" not in json.dumps(payloads)
+
+
+def test_writing_prompts_separate_observation_and_content_references() -> None:
+    writing = ChapterWritingRequest(
+        context=_context(),
+        chapter=_chapter(),
+        transcript_evidence=(_speech(),),
+        visual_observations=(),
+        prompt_version="chapter-writer-v1",
+    )
+    repair = ChapterWritingRepairRequest(
+        request=writing,
+        invalid_response=InvalidModelResponse(
+            content_sha256="b" * 64,
+            validation_errors=("claims.evidence_refs:unknown_reference",),
+        ),
+        allowed_evidence_ids=("asr_001",),
+        prompt_version="chapter-writer-repair-v1",
+    )
+
+    main_instruction = prompt_for_writing(writing)[1]
+    repair_instruction = prompt_for_writing_repair(repair)[1]
+
+    for instruction in (main_instruction, repair_instruction):
+        assert (
+            "title_evidence_refs、summary_evidence_refs、普通正文 evidence_refs 和 "
+            "claims.evidence_refs"
+        ) in instruction
+        assert (
+            "只能引用 ASR/字幕 evidence_id 或 visual_observation.evidence_id"
+        ) in instruction
+        assert (
+            "keyframe_refs、keyframe_id、visual_content_id、visual_fact_id、"
+            "source_keyframe_refs"
+        ) in instruction
+        assert "只有 VisualBlock.visual_content_refs 才能引用视觉内容 ID" in instruction
 
 
 def test_compact_planning_request_maps_indexes_back_to_stable_ids() -> None:
