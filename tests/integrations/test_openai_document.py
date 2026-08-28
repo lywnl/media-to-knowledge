@@ -185,8 +185,8 @@ def test_compact_planning_request_maps_indexes_back_to_stable_ids() -> None:
     assert payloads[0]["response_format"]["json_schema"]["name"] == (  # type: ignore[index]
         "chapter_planning_compact_v1"
     )
-    assert payloads[0]["max_tokens"] == 4096
-    assert payloads[0]["thinking"] == {"type": "enabled"}
+    assert payloads[0]["max_tokens"] == 8192
+    assert payloads[0]["thinking"] == {"type": "disabled"}
     sent = json.loads(payloads[0]["messages"][1]["content"].split("\n", 1)[1])  # type: ignore[index]
     assert sent["segments"][0] == [0, 0, 10_000, [0]]
     assert sent["transcript_evidence"][0] == [0, 1_000, 2_000, "请打开设置页面"]

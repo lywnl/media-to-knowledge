@@ -1103,13 +1103,29 @@ def test_worst_repair_budget_is_rejected_before_paid_chapter_call(
     assert not port.chapter_requests and not port.repair_requests
 
 
-def test_chapter_budget_trims_observation_without_breaking_transcript_dependency_closure(
+def test_chapter_budget_preserves_visual_observation_before_transcript(
     tmp_path: Path,
 ) -> None:
     observation = _observation()
-    port = _TextPort()
 
-    written = _writer(port, max_input_chars=49_300).write(
+    def visual_first_response(request: ChapterWritingRequest) -> ChapterWritingResponse:
+        evidence_ref = (
+            request.transcript_evidence[0].evidence_id
+            if request.transcript_evidence
+            else request.visual_observations[0].evidence_id
+        )
+        return ChapterWritingResponse(
+            title=request.chapter.title_hint,
+            title_evidence_refs=(evidence_ref,),
+            summary_zh="视觉证据优先",
+            summary_evidence_refs=(evidence_ref,),
+            body_blocks=(),
+            claims=(),
+        )
+
+    port = _TextPort(chapter=visual_first_response)
+
+    written = _writer(port, max_input_chars=49_525).write(
         _context(),
         (_plan(0), _plan(1)),
         (_speech(0), _speech(1)),
@@ -1123,8 +1139,8 @@ def test_chapter_budget_trims_observation_without_breaking_transcript_dependency
         request for request in port.chapter_requests if request.chapter.chapter_id == "chapter_000"
     )
     assert written.status == "SUCCEEDED"
-    assert first_request.visual_observations == ()
-    assert tuple(item.evidence_id for item in first_request.transcript_evidence) == ("asr_000",)
+    assert first_request.visual_observations == (observation,)
+    assert first_request.transcript_evidence == ()
 
 
 def test_chapter_budget_does_not_turn_the_only_visual_evidence_into_an_empty_request(

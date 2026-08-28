@@ -814,12 +814,13 @@ def _chapter_request(
         )
         if _chapter_request_fits(request, max_chars, max_bytes):
             return request
-        if chapter_observations and (
-            chapter_transcript or len(chapter_observations) > 1
-        ):
-            chapter_observations = chapter_observations[:-1]
-        elif len(chapter_transcript) > 1:
+        # 视觉观察是前序 VLM 已经付费验证的结果，必须优先保留；输入超限时
+        # 先裁剪冗余 ASR，再在确实存在多个观察时裁剪视觉观察。否则写作请求
+        # 会丢掉唯一的视觉证据，最终 Markdown 无法生成关键帧引用。
+        if (chapter_observations and chapter_transcript) or len(chapter_transcript) > 1:
             chapter_transcript = chapter_transcript[:-1]
+        elif len(chapter_observations) > 1:
+            chapter_observations = chapter_observations[:-1]
         else:
             raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "单章最小证据包超过输入预算")
 

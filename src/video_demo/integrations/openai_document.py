@@ -42,9 +42,9 @@ from video_demo.integrations.document_prompts import (
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 Prompt = tuple[str, str, str]
 _DEFAULT_MAX_OUTPUT_TOKENS = 8_192
-# 紧凑索引协议只需返回章节范围、标题和少量目标；保留 thinking，同时把
-# 可见 JSON 输出从默认 8192 收紧到 4096，兼顾响应速度与长批次完整性。
-_COMPACT_PLANNING_MAX_OUTPUT_TOKENS = 4_096
+# 紧凑索引协议关闭 thinking 以减少延迟；保留 8192 上限，避免长批次的
+# 结构化 JSON 因输出预算过小被截断并触发额外修复调用。
+_COMPACT_PLANNING_MAX_OUTPUT_TOKENS = 8_192
 
 
 class _CompactVisualTargetDraft(BaseModel):
@@ -116,7 +116,7 @@ class OpenAIDocumentClient(DocumentTextPort):
                 response_type=_CompactChapterPlanningResponse,
                 schema_name="chapter_planning_compact_v1",
                 max_output_tokens=_COMPACT_PLANNING_MAX_OUTPUT_TOKENS,
-                extra_payload={"thinking": {"type": "enabled"}},
+                extra_payload={"thinking": {"type": "disabled"}},
                 validate_response=lambda response: _validate_compact_planning_response(
                     response,
                     request,
@@ -150,7 +150,7 @@ class OpenAIDocumentClient(DocumentTextPort):
                 response_type=_CompactChapterPlanningResponse,
                 schema_name="chapter_planning_compact_repair_v1",
                 max_output_tokens=_COMPACT_PLANNING_MAX_OUTPUT_TOKENS,
-                extra_payload={"thinking": {"type": "enabled"}},
+                extra_payload={"thinking": {"type": "disabled"}},
                 validate_response=lambda response: _validate_compact_planning_response(
                     response,
                     request.request,

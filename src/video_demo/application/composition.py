@@ -232,7 +232,7 @@ def build_production_pipeline(
                     prompt_versions.chapter_planner,
                     "chapter_planning_compact_repair_v1",
                     prompt_versions.chapter_planner_repair,
-                    generation_config=(("temperature", "0"), ("thinking", "enabled")),
+                    generation_config=(("temperature", "0"), ("thinking", "disabled")),
                 ),
                 max_input_chars=text.max_input_chars,
                 max_input_bytes=text.max_input_bytes,
