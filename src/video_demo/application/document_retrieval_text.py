@@ -55,15 +55,21 @@ def render_document_chapter_retrieval_text(
         ),
     )
     lines = [
-        "文档类型：SEMANTIC_CHAPTER",
         f"章节标题：{normalize_retrieval_value(chapter.title)}",
         f"时间范围：[{chapter.start_ms}, {chapter.end_ms})",
-        f"章节摘要：{normalize_retrieval_value(chapter.summary_zh)}",
-        f"正文：{body or '无'}",
-        f"关键结论：{_join(tuple(claim.text for claim in chapter.claims))}",
-        f"视觉补充：{visual_captions or '无'}",
-        f"不确定性：{uncertainties}",
     ]
+    summary = normalize_retrieval_value(chapter.summary_zh)
+    if summary:
+        lines.append(f"章节摘要：{summary}")
+    if body:
+        lines.append(f"正文：{body}")
+    claims = _join(tuple(claim.text for claim in chapter.claims))
+    if claims:
+        lines.append(f"关键结论：{claims}")
+    if visual_captions:
+        lines.append(f"视觉补充：{visual_captions}")
+    if uncertainties:
+        lines.append(f"不确定性：{uncertainties}")
     for block in chapter.body_blocks:
         if (
             isinstance(block, VisualBlock)
@@ -76,16 +82,12 @@ def render_document_chapter_retrieval_text(
 def render_document_summary_retrieval_text(summary: VideoDocumentSummary) -> str:
     """字段级投影 3.0 全局摘要。"""
 
-    if not summary.overview_zh and not summary.key_points:
-        return ""
+    lines = [f"视频标题：{normalize_retrieval_value(summary.title)}"]
+    overview = normalize_retrieval_value(summary.overview_zh)
+    if overview:
+        lines.append(f"核心概览：{overview}")
     return _fit_retrieval_lines(
-        (
-            "文档类型：VIDEO_DOCUMENT_SUMMARY",
-            f"视频标题：{normalize_retrieval_value(summary.title)}",
-            f"视频时长：{summary.duration_ms}",
-            f"核心概览：{normalize_retrieval_value(summary.overview_zh) or '无'}",
-            f"关键结论：{_join(tuple(point.text for point in summary.key_points))}",
-        ),
+        lines,
         _MAX_DOCUMENT_SUMMARY_RETRIEVAL_CHARS,
     )
 
@@ -144,4 +146,4 @@ def normalize_retrieval_value(value: str) -> str:
 
 def _join(values: Sequence[str]) -> str:
     normalized = tuple(normalize_retrieval_value(value) for value in values)
-    return "、".join(value for value in normalized if value) or "无"
+    return "、".join(value for value in normalized if value)

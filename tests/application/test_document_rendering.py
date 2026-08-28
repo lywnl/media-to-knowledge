@@ -204,17 +204,21 @@ def test_render_markdown_is_deterministic_utf8_and_has_fixed_structure() -> None
     ordered_markers = (
         "# faster-whisper",
         "## 核心概览",
-        "## 关键结论",
         "## 目录",
+        "- 第一部分：准备 \\| 安装 (00:00:00 - 00:00:10)",
         "## 第一部分：",
         "### 00:00:00 - 00:00:10",
         "不能成为标题",
-        "#### 关键画面与引用",
         "## 信息边界",
     )
     positions = tuple(markdown.index(marker) for marker in ordered_markers)
     assert positions == tuple(sorted(positions))
     assert "00:00:05" in markdown
+    assert "## 关键结论" not in markdown
+    assert "关键画面与引用" not in markdown
+    assert "video-demo-keyframe:keyframe_001" not in markdown
+    assert markdown.count("准备 \\| 安装") == 2
+    assert markdown.count("00:00:00 - 00:00:10") == 2
 
 
 def test_render_markdown_escapes_untrusted_text_and_renders_every_block_type() -> None:
@@ -237,14 +241,15 @@ def test_render_markdown_escapes_untrusted_text_and_renders_every_block_type() -
     assert "音画信息存在冲突" in markdown
 
 
-def test_render_markdown_uses_keyframe_placeholder_without_leaking_storage_path() -> None:
+def test_render_markdown_keeps_visual_body_without_leaking_storage_path() -> None:
     result, evidence = _document_fixture()
 
     markdown = render_markdown(result, evidence).content.decode("utf-8")
 
-    assert "video-demo-keyframe:keyframe_001" in markdown
-    assert "图片处理：章节视觉模型已分析 1 条观察，处理 1 张 JPEG 关键帧。" in markdown
-    assert "视觉观察类型：TEXT" in markdown
+    assert "**视觉补充：** 画面给出了更精确的参数。" in markdown
+    assert "video-demo-keyframe:keyframe_001" not in markdown
+    assert "图片处理：章节视觉模型已分析" not in markdown
+    assert "视觉观察类型：TEXT" not in markdown
     assert f"visual/keyframes/{KEYFRAME_SHA256}.jpg" not in markdown
     assert KEYFRAME_SHA256 not in markdown
 

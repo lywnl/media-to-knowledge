@@ -11,6 +11,7 @@ from video_demo.domain.document import (
     GroundedClaim,
     ParagraphBlock,
     SemanticChapter,
+    SummaryPoint,
     VideoDocumentSummary,
     VisualBlock,
 )
@@ -66,7 +67,6 @@ def test_document_chapter_retrieval_projection_excludes_internal_fields() -> Non
     rendered = render_document_chapter_retrieval_text(chapter, (observation,))
 
     assert rendered.splitlines() == [
-        "文档类型：SEMANTIC_CHAPTER",
         "章节标题：参数设置",
         "时间范围：[0, 1000)",
         "章节摘要：介绍参数配置。",
@@ -86,7 +86,9 @@ def test_document_retrieval_projection_preserves_labels_under_character_limits()
         title="测试",
         duration_ms=1_000,
         overview_zh="概" * 8_000,
-        key_points=(),
+        key_points=(
+            SummaryPoint(text="不再重复写入全文关键结论。", chapter_refs=("chapter_001",)),
+        ),
         retrieval_text="",
         retrieval_hash=hashlib.sha256(b"").hexdigest(),
     )
@@ -94,11 +96,60 @@ def test_document_retrieval_projection_preserves_labels_under_character_limits()
     rendered = render_document_summary_retrieval_text(summary)
 
     assert len(rendered) <= 8_000
-    assert "文档类型：" in rendered
     assert "视频标题：" in rendered
-    assert "视频时长：" in rendered
     assert "核心概览：" in rendered
-    assert "关键结论：" in rendered
+    assert "文档类型：" not in rendered
+    assert "视频时长：" not in rendered
+    assert "关键结论：" not in rendered
+    assert "不再重复写入全文关键结论" not in rendered
+
+
+def test_document_chapter_retrieval_omits_empty_optional_fields() -> None:
+    chapter = SemanticChapter.model_construct(
+        chapter_id="chapter_001",
+        start_ms=0,
+        end_ms=1_000,
+        title="参数设置",
+        summary_zh="介绍参数配置。",
+        body_blocks=(
+            ParagraphBlock(text="打开设置页面。", evidence_refs=("asr_001",)),
+        ),
+        claims=(),
+        content_status="GROUNDED",
+        evidence_refs=("asr_001",),
+        selected_keyframe_refs=(),
+        transcript_source="ASR",
+        retrieval_text="",
+        retrieval_hash="0" * 64,
+    )
+
+    rendered = render_document_chapter_retrieval_text(chapter, ())
+
+    assert rendered.splitlines() == [
+        "章节标题：参数设置",
+        "时间范围：[0, 1000)",
+        "章节摘要：介绍参数配置。",
+        "正文：打开设置页面。",
+    ]
+    assert "关键结论：无" not in rendered
+    assert "视觉补充：无" not in rendered
+    assert "不确定性：无" not in rendered
+
+
+def test_document_summary_retrieval_keeps_title_when_overview_is_empty() -> None:
+    summary = VideoDocumentSummary(
+        title="只有标题的视频",
+        duration_ms=1_000,
+        overview_zh="",
+        key_points=(),
+        retrieval_text="",
+        retrieval_hash=hashlib.sha256(b"").hexdigest(),
+    )
+
+    rendered = render_document_summary_retrieval_text(summary)
+
+    assert rendered == "视频标题：只有标题的视频"
+    assert "核心概览：" not in rendered
 
 
 def test_document_retrieval_uses_only_selected_visual_blocks_without_duplicate_caption() -> None:
@@ -157,7 +208,7 @@ def test_document_retrieval_uses_only_selected_visual_blocks_without_duplicate_c
     rendered = render_document_chapter_retrieval_text(chapter, (selected, unused))
 
     assert rendered.count("最终视觉描述。") == 1
-    assert "正文：无" in rendered
+    assert "正文：" not in rendered
     assert "视觉补充：最终视觉描述。" in rendered
     assert "选中观察的不确定性" in rendered
     assert "未使用的视觉事实不得进入检索" not in rendered

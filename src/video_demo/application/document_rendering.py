@@ -23,7 +23,6 @@ from video_demo.domain.document import (
 )
 from video_demo.domain.evidence import (
     DocumentEvidenceItem,
-    KeyframeEvidence,
     VisualObservationEvidence,
 )
 
@@ -55,34 +54,16 @@ def render_markdown(
     _heading(lines, 2, "核心概览")
     _paragraph(lines, result.summary.overview_zh or "未提供核心概览。")
 
-    _heading(lines, 2, "关键结论")
-    if result.summary.key_points:
-        for point in result.summary.key_points:
-            lines.append(f"- {_escape_markdown(point.text)}")
-        lines.append("")
-    else:
-        _paragraph(lines, "未提取到可验证的关键结论。")
-
     _heading(lines, 2, "目录")
     for section_index, section in enumerate(result.sections, start=1):
+        section_chapters = tuple(chapters_by_id[ref] for ref in section.chapter_refs)
+        start_ms = min(chapter.start_ms for chapter in section_chapters)
+        end_ms = max(chapter.end_ms for chapter in section_chapters)
         lines.append(
             f"- 第{_chinese_ordinal(section_index)}部分："
-            f"{_escape_markdown(section.title)}",
+            f"{_escape_markdown(section.title)}"
+            f" ({_format_time(start_ms)} - {_format_time(end_ms)})",
         )
-        for chapter_ref in section.chapter_refs:
-            chapter = chapters_by_id[chapter_ref]
-            chapter_title = (
-                _escape_markdown(chapter.title)
-                if chapter.content_status == "GROUNDED"
-                else ""
-            )
-            lines.append(
-                (
-                    "  - "
-                    f"{_format_time(chapter.start_ms)} - {_format_time(chapter.end_ms)} "
-                    f"{chapter_title}"
-                ).rstrip(),
-            )
     lines.append("")
 
     for section_index, section in enumerate(result.sections, start=1):
@@ -92,7 +73,7 @@ def render_markdown(
         for chapter_ref in section.chapter_refs:
             chapter = chapters_by_id[chapter_ref]
             if chapter.content_status == "GROUNDED":
-                _render_chapter(lines, chapter, evidence_by_id)
+                _render_chapter(lines, chapter)
 
     _heading(lines, 2, "信息边界")
     boundaries = _information_boundaries(result, evidence_by_id)
@@ -114,7 +95,6 @@ def render_markdown(
 def _render_chapter(
     lines: list[str],
     chapter: SemanticChapter,
-    evidence_by_id: dict[str, DocumentEvidenceItem],
 ) -> None:
     _heading(
         lines,
@@ -131,40 +111,6 @@ def _render_chapter(
             for claim in chapter.claims:
                 lines.append(f"- {_escape_markdown(claim.text)}")
             lines.append("")
-
-    _heading(lines, 4, "关键画面与引用")
-    observations = tuple(
-        item
-        for item in evidence_by_id.values()
-        if isinstance(item, VisualObservationEvidence)
-        and item.chapter_id == chapter.chapter_id
-    )
-    frame_refs = {
-        frame_ref
-        for item in observations
-        for frame_ref in item.keyframe_refs
-    }
-    frame_refs.update(chapter.selected_keyframe_refs)
-    lines.extend(
-        (
-            f"图片处理：章节视觉模型已分析 {len(observations)} 条观察，"
-            f"处理 {len(frame_refs)} 张 JPEG 关键帧。",
-            f"视觉观察类型：{', '.join(item.visual_type for item in observations) or '无'}。",
-            "",
-        ),
-    )
-    if chapter.selected_keyframe_refs:
-        for evidence_ref in chapter.selected_keyframe_refs:
-            keyframe = evidence_by_id[evidence_ref]
-            if not isinstance(keyframe, KeyframeEvidence):  # 已由闭包校验保证，仅用于类型收窄。
-                raise AssertionError("selected_keyframe_refs 必须引用 KeyframeEvidence")
-            lines.append(
-                f"- `video-demo-keyframe:{keyframe.keyframe_id}`"
-                f" ({_format_time(keyframe.timestamp_ms)})",
-            )
-        lines.append("")
-    else:
-        _paragraph(lines, "本章未保留关键画面。")
 
 
 def _render_body_block(lines: list[str], block: object) -> None:
