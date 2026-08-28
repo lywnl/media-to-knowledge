@@ -185,8 +185,8 @@ def prompt_for_vision(request: ChapterVisionRequest) -> tuple[str, str, str]:
             "evidence_id。每个 observation 最多选择 2 张图片；整份响应最多使用 2 张不同图片。"
             "如果图片无法确认目标，返回 observations=[]，不要猜测或选择额外图片。"
             "selected_frame_ids 必须是实际最能支持该 observation 的最少图片。"
-            "INDEPENDENT 时 transcript_evidence_refs 必须为空；"
-            "CONFLICTING 时 uncertainties 必须非空；"
+            "先逐字复制输入中的 evidence_id：INDEPENDENT 时 "
+            "transcript_evidence_refs 必须为空；CONFLICTING 时 uncertainties 必须非空；"
             "其他音画关系必须至少引用 1 条当前转写证据。"
         ),
         _vision_context(request),
@@ -201,7 +201,9 @@ def prompt_for_vision_repair(request: ChapterVisionRepairRequest) -> tuple[str, 
         (
             "只修复结构和引用；图片顺序和原始取证问题不得改变，不得添加新事实。"
             "每个 observation 最多选择 2 张图片，整份响应最多使用 2 张不同图片；"
-            "无法确认时返回 observations=[]。"
+            "无法确认时返回 observations=[]。先逐字复制输入中的 evidence_id："
+            "INDEPENDENT 时 transcript_evidence_refs 必须为空；"
+            "CONFLICTING 时 uncertainties 必须非空；其他音画关系必须至少引用 1 条当前转写证据。"
         ),
         context,
     )
@@ -285,6 +287,8 @@ def prompt_for_writing(request: ChapterWritingRequest) -> tuple[str, str, str]:
             "visual_content_id、visual_fact_id、source_keyframe_refs；只有 "
             "VisualBlock.visual_content_refs 才能引用视觉内容 ID，并且必须属于该块的 "
             "visual_observation_ref。"
+            "所有 evidence_id 必须从输入白名单逐字复制，不得自行编造、截断或替换；"
+            "输出前逐项检查每个引用都在上述白名单中，无法确认时删除该引用或对应事实。"
         ),
         request.model_dump(mode="json"),
     )
@@ -303,6 +307,8 @@ def prompt_for_writing_repair(request: ChapterWritingRepairRequest) -> tuple[str
             "visual_content_id、visual_fact_id、source_keyframe_refs；只有 "
             "VisualBlock.visual_content_refs 才能引用视觉内容 ID，并且必须属于该块的 "
             "visual_observation_ref。"
+            "所有 evidence_id 必须从输入白名单逐字复制，不得自行编造、截断或替换；"
+            "输出前逐项检查每个引用都在上述白名单中，无法确认时删除该引用或对应事实。"
         ),
         request.model_dump(mode="json"),
     )

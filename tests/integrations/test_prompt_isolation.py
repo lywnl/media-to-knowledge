@@ -93,3 +93,29 @@ def test_vision_prompt_states_transcript_relation_contract(tmp_path: Path) -> No
     assert "INDEPENDENT 时 transcript_evidence_refs 必须为空" in instruction
     assert "CONFLICTING 时 uncertainties 必须非空" in instruction
     assert "其他音画关系必须至少引用 1 条当前转写证据" in instruction
+
+
+def test_vision_repair_prompt_repeats_transcript_relation_contract(tmp_path: Path) -> None:
+    request = _request(tmp_path, "画面文字")
+    from video_demo.integrations.document_port import (
+        ChapterVisionRepairRequest,
+        InvalidModelResponse,
+    )
+
+    repair = ChapterVisionRepairRequest(
+        request=request,
+        invalid_response=InvalidModelResponse(
+            content_sha256="d" * 64,
+            validation_errors=("observations.0:value_error",),
+        ),
+        allowed_frame_ids=("frame-001",),
+        allowed_target_ids=("target-001",),
+        allowed_transcript_evidence_ids=("asr-001",),
+        prompt_version="chapter-vlm-repair-v1",
+    )
+    from video_demo.integrations.document_prompts import prompt_for_vision_repair
+
+    instruction = prompt_for_vision_repair(repair)[1]
+    assert "INDEPENDENT 时 transcript_evidence_refs 必须为空" in instruction
+    assert "其他音画关系必须至少引用 1 条当前转写证据" in instruction
+    assert "逐字复制输入中的 evidence_id" in instruction
