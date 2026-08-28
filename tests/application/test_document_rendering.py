@@ -205,7 +205,11 @@ def test_render_markdown_is_deterministic_utf8_and_has_fixed_structure() -> None
         "# faster-whisper",
         "## 核心概览",
         "## 目录",
-        "- 第一部分：准备 \\| 安装 (00:00:00 - 00:00:10)",
+        (
+            "- 第一部分：准备 \\| 安装 "
+            "\N{FULLWIDTH LEFT PARENTHESIS}00:00:00 - 00:00:10"
+            "\N{FULLWIDTH RIGHT PARENTHESIS}"
+        ),
         "## 第一部分：",
         "### 00:00:00 - 00:00:10",
         "不能成为标题",

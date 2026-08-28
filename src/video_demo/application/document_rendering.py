@@ -62,7 +62,8 @@ def render_markdown(
         lines.append(
             f"- 第{_chinese_ordinal(section_index)}部分："
             f"{_escape_markdown(section.title)}"
-            f" ({_format_time(start_ms)} - {_format_time(end_ms)})",
+            f" \N{FULLWIDTH LEFT PARENTHESIS}{_format_time(start_ms)} - "
+            f"{_format_time(end_ms)}\N{FULLWIDTH RIGHT PARENTHESIS}",
         )
     lines.append("")
 
