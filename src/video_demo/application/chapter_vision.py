@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from collections.abc import Callable, Iterable, Mapping
@@ -96,6 +97,7 @@ _RELATION_VALUE = {
     "COMPLEMENTARY": 3,
     "CONFLICTING": 4,
 }
+_LOGGER = logging.getLogger(__name__)
 
 
 class ChapterVisionBatch(FrozenModel):
@@ -573,6 +575,13 @@ class ChapterVisionService:
                 )
             except ModelResponseValidationError as error:
                 invalid = error.invalid_response
+                _log_validation_failure(
+                    chapter_id=request.chapter_id,
+                    phase="main",
+                    code=error.code,
+                    invalid=invalid,
+                    provider_attempts=counters.provider_attempts,
+                )
             except VideoDemoError as error:
                 if error.code in _FALLBACK_CODES:
                     return None
@@ -582,6 +591,13 @@ class ChapterVisionService:
                     validate(response)
                 except _VisionSemanticValidationError as error:
                     invalid = _invalid_semantic_response(response, error)
+                    _log_validation_failure(
+                        chapter_id=request.chapter_id,
+                        phase="main",
+                        code=ErrorCode.QWEN_RESPONSE_INVALID,
+                        invalid=invalid,
+                        provider_attempts=counters.provider_attempts,
+                    )
                 else:
                     successful_path: Literal["MAIN", "REPAIR"] = "MAIN"
                     return cache.put(
@@ -601,7 +617,23 @@ class ChapterVisionService:
                         on_provider_attempt=counters.provider_attempt,
                     )
                     validate(response)
-                except (ModelResponseValidationError, _VisionSemanticValidationError):
+                except ModelResponseValidationError as error:
+                    _log_validation_failure(
+                        chapter_id=request.chapter_id,
+                        phase="repair",
+                        code=error.code,
+                        invalid=error.invalid_response,
+                        provider_attempts=counters.provider_attempts,
+                    )
+                    return None
+                except _VisionSemanticValidationError as error:
+                    _log_validation_failure(
+                        chapter_id=request.chapter_id,
+                        phase="repair",
+                        code=ErrorCode.QWEN_RESPONSE_INVALID,
+                        invalid=_invalid_semantic_response(response, error),
+                        provider_attempts=counters.provider_attempts,
+                    )
                     return None
                 except VideoDemoError as error:
                     if error.code in _FALLBACK_CODES:
@@ -993,6 +1025,25 @@ class _VisionSemanticValidationError(ValueError):
     def __init__(self, summary: str) -> None:
         super().__init__(summary)
         self.summary = summary
+
+
+def _log_validation_failure(
+    *,
+    chapter_id: StableId,
+    phase: Literal["main", "repair"],
+    code: ErrorCode,
+    invalid: InvalidModelResponse,
+    provider_attempts: int,
+) -> None:
+    _LOGGER.warning(
+        "章节视觉响应校验失败 chapter_id=%s phase=%s code=%s "
+        "provider_attempts=%d validation_errors=%s",
+        chapter_id,
+        phase,
+        code,
+        provider_attempts,
+        ",".join(invalid.validation_errors[:8]),
+    )
 
 
 def _invalid_semantic_response(

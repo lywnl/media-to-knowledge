@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import unicodedata
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -92,6 +93,7 @@ _MAX_GLOBAL_GROUP_CHAPTERS = 20
 _MAX_GLOBAL_DIGEST_CHARS = 4_000
 _MAX_INPUT_CHARS = 60_000
 _MAX_INPUT_BYTES = 1_048_576
+_LOGGER = logging.getLogger(__name__)
 
 
 class WrittenDocument(FrozenModel):
@@ -509,6 +511,13 @@ class DocumentWriter:
             except ModelResponseValidationError as error:
                 _raise_if_cancelled(is_cancel_requested)
                 invalid = error.invalid_response
+                _log_chapter_validation_failure(
+                    chapter_id=request.chapter.chapter_id,
+                    phase="main",
+                    code=error.code,
+                    invalid=invalid,
+                    provider_attempts=counters.chapter_attempts,
+                )
             except VideoDemoError as error:
                 _raise_if_cancelled(is_cancel_requested)
                 if _is_fallback_error(error):
@@ -520,6 +529,13 @@ class DocumentWriter:
                     validate(response)
                 except (ValueError, TypeError) as error:
                     invalid = _invalid_local_response(response, error)
+                    _log_chapter_validation_failure(
+                        chapter_id=request.chapter.chapter_id,
+                        phase="main",
+                        code=ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+                        invalid=invalid,
+                        provider_attempts=counters.chapter_attempts,
+                    )
             if invalid is None:
                 path: Literal["MAIN", "REPAIR"] = "MAIN"
             else:
@@ -538,8 +554,15 @@ class DocumentWriter:
                             is_cancel_requested,
                         ),
                     )
-                except ModelResponseValidationError:
+                except ModelResponseValidationError as error:
                     _raise_if_cancelled(is_cancel_requested)
+                    _log_chapter_validation_failure(
+                        chapter_id=request.chapter.chapter_id,
+                        phase="repair",
+                        code=error.code,
+                        invalid=error.invalid_response,
+                        provider_attempts=counters.chapter_attempts,
+                    )
                     return None
                 except VideoDemoError as error:
                     _raise_if_cancelled(is_cancel_requested)
@@ -549,7 +572,14 @@ class DocumentWriter:
                 _raise_if_cancelled(is_cancel_requested)
                 try:
                     validate(response)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as error:
+                    _log_chapter_validation_failure(
+                        chapter_id=request.chapter.chapter_id,
+                        phase="repair",
+                        code=ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+                        invalid=_invalid_local_response(response, error),
+                        provider_attempts=counters.chapter_attempts,
+                    )
                     return None
                 path = "REPAIR"
             commit_gate.begin_commit(is_cancel_requested)
@@ -1676,6 +1706,25 @@ def _invalid_local_response(response: FrozenModel, error: BaseException) -> Inva
         raw,
         (str(error)[:500] or "document_writing:invalid",),
         parsed_json=payload,
+    )
+
+
+def _log_chapter_validation_failure(
+    *,
+    chapter_id: str,
+    phase: Literal["main", "repair"],
+    code: ErrorCode,
+    invalid: InvalidModelResponse,
+    provider_attempts: int,
+) -> None:
+    _LOGGER.warning(
+        "章节写作响应校验失败 chapter_id=%s phase=%s code=%s "
+        "provider_attempts=%d validation_errors=%s",
+        chapter_id,
+        phase,
+        code,
+        provider_attempts,
+        ",".join(invalid.validation_errors[:8]),
     )
 
 

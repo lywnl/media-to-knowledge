@@ -689,6 +689,7 @@ class _RepairingVisionPort(_VisionPort):
 
 def test_structure_repair_reuses_original_ordered_frames_once_and_counts_real_attempts(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
     first = frame_batch.frame_sets[0].candidates[0]
@@ -719,6 +720,11 @@ def test_structure_repair_reuses_original_ordered_frames_once_and_counts_real_at
     assert result.metrics["vlm_logical_analyses"] == 1
     assert result.metrics["vlm_provider_attempts"] == 2
     assert result.metrics["vlm_structure_repairs"] == 1
+    messages = "\n".join(caplog.messages)
+    assert "章节视觉响应校验失败" in messages
+    assert "chapter_id=chapter_001" in messages
+    assert "phase=main" in messages
+    assert "observations.0.selected_frame_ids:unknown_reference" in messages
 
 
 def test_reverse_time_frame_relation_is_rejected_as_local_invalid_response(

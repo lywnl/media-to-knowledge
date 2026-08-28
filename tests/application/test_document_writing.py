@@ -771,6 +771,7 @@ def test_quote_policy_repairs_disabled_quotes_and_downgrades_unmatched_quotes(
 
 def test_invalid_main_and_repair_fall_back_but_authentication_fails_closed(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     invalid = ModelResponseValidationError(
         ErrorCode.TEXT_LLM_RESPONSE_INVALID,
@@ -793,6 +794,12 @@ def test_invalid_main_and_repair_fall_back_but_authentication_fails_closed(
         "CHAPTER_WRITING_DEGRADED:chapter_000",
         "CHAPTER_WRITING_DEGRADED:chapter_001",
     )
+    messages = "\n".join(caplog.messages)
+    assert "章节写作响应校验失败" in messages
+    assert "chapter_id=chapter_000" in messages
+    assert "phase=main" in messages
+    assert "phase=repair" in messages
+    assert "root:invalid" in messages
 
     auth = VideoDemoError(ErrorCode.TEXT_LLM_AUTHENTICATION_FAILED, "鉴权失败")
     with pytest.raises(VideoDemoError) as raised:
