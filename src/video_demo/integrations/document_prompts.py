@@ -187,10 +187,6 @@ def prompt_for_vision(request: ChapterVisionRequest) -> tuple[str, str, str]:
             "evidence_id。每个 observation 最多选择 2 张图片；整份响应最多使用 2 张不同图片。"
             "如果图片无法确认目标，返回 observations=[]，不要猜测或选择额外图片。"
             "selected_frame_ids 必须是实际最能支持该 observation 的最少图片。"
-            "target_ids 必须逐字复制所选 frame 的 target_ids；"
-            "不得从其他未选 frame 或 targets 列表猜测。"
-            "每个 selected_frame_id 都必须与 target_ids 有交集；"
-            "不确定时宁可返回 observations=[]。"
             "先逐字复制输入中的 evidence_id：INDEPENDENT 时 "
             "transcript_evidence_refs 必须为空；CONFLICTING 时 uncertainties 必须非空；"
             "其他音画关系必须至少引用 1 条当前转写证据。"
@@ -207,11 +203,7 @@ def prompt_for_vision_repair(request: ChapterVisionRepairRequest) -> tuple[str, 
         (
             "只修复结构和引用；图片顺序和原始取证问题不得改变，不得添加新事实。"
             "每个 observation 最多选择 2 张图片，整份响应最多使用 2 张不同图片；"
-            "target_ids 必须逐字复制所选 frame 的 target_ids，"
-            "不得从其他未选 frame 猜测；每个 selected_frame_id 都必须与 target_ids 有交集；"
-            "遇到 frame_binding_mismatch 时只保留所选 frame 实际携带的 target_ids，"
-            "无法确认时返回 observations=[]。"
-            "先逐字复制输入中的 evidence_id："
+            "无法确认时返回 observations=[]。先逐字复制输入中的 evidence_id："
             "INDEPENDENT 时 transcript_evidence_refs 必须为空；"
             "CONFLICTING 时 uncertainties 必须非空；其他音画关系必须至少引用 1 条当前转写证据。"
         ),

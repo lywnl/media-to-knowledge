@@ -8,10 +8,7 @@ from video_demo.domain.document import DocumentGenerationConfig
 from video_demo.domain.document_plan import FrameCandidateArtifact, VisualSearchTarget
 from video_demo.domain.evidence import SpeechSegment
 from video_demo.integrations.document_port import ChapterVisionRequest
-from video_demo.integrations.document_prompts import (
-    prompt_for_vision,
-    prompt_for_vision_repair,
-)
+from video_demo.integrations.document_prompts import prompt_for_vision
 
 
 def _request(root: Path, text: str) -> ChapterVisionRequest:
@@ -90,15 +87,6 @@ def test_vision_prompt_limits_selected_frames_and_allows_empty_observations(
     assert "返回 observations=[]" in instruction
 
 
-def test_vision_prompt_requires_copying_target_bindings_from_selected_frames(
-    tmp_path: Path,
-) -> None:
-    _version, instruction, _data = prompt_for_vision(_request(tmp_path, "画面文字"))
-
-    assert "target_ids 必须逐字复制所选 frame 的 target_ids" in instruction
-    assert "每个 selected_frame_id 都必须与 target_ids 有交集" in instruction
-
-
 def test_vision_prompt_states_transcript_relation_contract(tmp_path: Path) -> None:
     _version, instruction, _data = prompt_for_vision(_request(tmp_path, "画面文字"))
 
@@ -125,34 +113,9 @@ def test_vision_repair_prompt_repeats_transcript_relation_contract(tmp_path: Pat
         allowed_transcript_evidence_ids=("asr-001",),
         prompt_version="chapter-vlm-repair-v1",
     )
+    from video_demo.integrations.document_prompts import prompt_for_vision_repair
+
     instruction = prompt_for_vision_repair(repair)[1]
     assert "INDEPENDENT 时 transcript_evidence_refs 必须为空" in instruction
     assert "其他音画关系必须至少引用 1 条当前转写证据" in instruction
     assert "逐字复制输入中的 evidence_id" in instruction
-
-
-def test_vision_repair_prompt_spells_out_frame_binding_mismatch_recovery(
-    tmp_path: Path,
-) -> None:
-    request = _request(tmp_path, "画面文字")
-    from video_demo.integrations.document_port import (
-        ChapterVisionRepairRequest,
-        InvalidModelResponse,
-    )
-
-    repair = ChapterVisionRepairRequest(
-        request=request,
-        invalid_response=InvalidModelResponse(
-            content_sha256="d" * 64,
-            validation_errors=("observations.target_ids:frame_binding_mismatch",),
-        ),
-        allowed_frame_ids=("frame-001",),
-        allowed_target_ids=("target-001",),
-        allowed_transcript_evidence_ids=("asr-001",),
-        prompt_version="chapter-vlm-repair-v1",
-    )
-
-    instruction = prompt_for_vision_repair(repair)[1]
-
-    assert "frame_binding_mismatch" in instruction
-    assert "只保留所选 frame 实际携带的 target_ids" in instruction
