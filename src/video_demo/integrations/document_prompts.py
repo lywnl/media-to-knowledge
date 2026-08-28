@@ -52,6 +52,8 @@ def prompt_for_compact_planning(request: ChapterPlanningRequest) -> tuple[str, s
             "visual_mode=NONE 时 semantic_targets 必须为空；"
             "否则语义目标的 anchor_transcript_indexes 必须是当前章节内；"
             "如果无法确认章节边界，semantic_targets 必须返回空数组；"
+            "title_hint 必须概括当前章节自己的转写内容，优先使用该章节内明确出现的主题、"
+            "账号或操作名称；不得把相邻章节的主题、赛道或编号写入当前章节标题。"
             "COMPARISON/MULTI_STEP 至少需要 2 个互不重叠的语义目标；"
             "当转写明确提到截图、界面、图文、漫画或操作步骤时，优先返回"
             "visual_mode=SINGLE 并绑定 1 个最相关语义目标，不要无理由返回 NONE；"
