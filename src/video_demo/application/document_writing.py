@@ -1177,7 +1177,106 @@ def _normalize_response_blocks(
                 )
                 continue
         blocks.append(block)
+    blocks = _append_omitted_visual_blocks(tuple(blocks), request)
     return response.model_copy(update={"body_blocks": tuple(blocks)})
+
+
+def _append_omitted_visual_blocks(
+    blocks: tuple[ChapterBodyBlock, ...],
+    request: ChapterWritingRequest,
+) -> list[ChapterBodyBlock]:
+    """模型漏写视觉块时，确定性保留已验证的最少关键画面。"""
+
+    mutable_blocks = list(blocks)
+    observations = {
+        item.evidence_id: item for item in request.visual_observations
+    }
+    rendered_observations = {
+        block.visual_observation_ref
+        for block in mutable_blocks
+        if isinstance(block, VisualBlock)
+    }
+    maximum = min(
+        request.context.document_config.max_visuals_per_chapter,
+        3 if request.chapter.visual_mode in {"COMPARISON", "MULTI_STEP"} else 2,
+    )
+    used_sources = set(
+        ref
+        for block in mutable_blocks
+        if isinstance(block, VisualBlock)
+        for ref in _visual_block_sources(block, observations)
+    )
+    body_limit = _DETAIL_BODY_LIMITS[request.context.document_config.detail_level]
+    body_size = sum(_block_character_count(block) for block in mutable_blocks)
+    for observation in request.visual_observations:
+        if observation.evidence_id in rendered_observations:
+            continue
+        if not _visual_observation_is_renderable(observation, request):
+            continue
+        selection = _fallback_visual_selection(
+            observation,
+            used_sources=used_sources,
+            maximum=maximum,
+        )
+        if selection is None:
+            continue
+        content_refs, sources = selection
+        visual = VisualBlock(
+            visual_observation_ref=observation.evidence_id,
+            visual_content_refs=content_refs,
+            caption=visual_caption_for_policy(
+                observation,
+                request.context.document_config,
+            ),
+            evidence_refs=(observation.evidence_id,),
+        )
+        if body_size + _block_character_count(visual) > body_limit:
+            continue
+        mutable_blocks.append(visual)
+        body_size += _block_character_count(visual)
+        used_sources.update(sources)
+        if len(used_sources) >= maximum:
+            break
+    return mutable_blocks
+
+
+def _visual_block_sources(
+    block: VisualBlock,
+    observations: dict[str, VisualObservationEvidence],
+) -> tuple[str, ...]:
+    observation = observations[block.visual_observation_ref]
+    content_by_id = {
+        item.visual_content_id: item.source_keyframe_refs
+        for item in observation.content_blocks
+    }
+    content_by_id.update(
+        {
+            item.visual_fact_id: item.source_keyframe_refs
+            for item in observation.visual_facts
+        },
+    )
+    return tuple(
+        dict.fromkeys(
+            ref
+            for content_ref in block.visual_content_refs
+            for ref in content_by_id[content_ref]
+        )
+    ) or observation.keyframe_refs
+
+
+def _visual_observation_is_renderable(
+    observation: VisualObservationEvidence,
+    request: ChapterWritingRequest,
+) -> bool:
+    # 冲突观察必须由模型显式组织为 VISUAL block，避免程序自动追加后
+    # 把冲突信息误包装成正文；支持/补充观察则可安全确定性展示。
+    if observation.relation_to_transcript in {"DUPLICATE", "CONFLICTING"}:
+        return False
+    return not (
+        request.context.document_config.uncertainty_policy == "conservative"
+        and observation.certainty < 0.7
+        and observation.relation_to_transcript != "CONFLICTING"
+    )
 
 
 def _quote_matches(

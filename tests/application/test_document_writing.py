@@ -509,6 +509,39 @@ def test_writer_scopes_evidence_refills_images_and_reuses_cache(tmp_path: Path) 
     assert second.metrics["global_editor_cache_hits"] == 1
 
 
+def test_writer_adds_visual_block_when_model_omits_valid_visual_observation(
+    tmp_path: Path,
+) -> None:
+    observation = _observation()
+
+    def chapter_without_visual(request: ChapterWritingRequest) -> ChapterWritingResponse:
+        evidence_ref = request.transcript_evidence[0].evidence_id
+        return ChapterWritingResponse(
+            title=request.chapter.title_hint,
+            title_evidence_refs=(evidence_ref,),
+            summary_zh="章节摘要",
+            summary_evidence_refs=(evidence_ref,),
+            body_blocks=(
+                ParagraphBlock(text="根据转写整理正文。", evidence_refs=(evidence_ref,)),
+            ),
+            claims=(),
+        )
+
+    written = _writer(_TextPort(chapter=chapter_without_visual)).write(
+        _context(),
+        (_plan(0), _plan(1)),
+        (_speech(0), _speech(1)),
+        (observation,),
+        (_keyframe(),),
+        cache=_cache(tmp_path),
+        is_cancel_requested=lambda: False,
+    )
+
+    chapter = written.result.chapters[0]
+    assert chapter.selected_keyframe_refs == ("keyframe_evidence_001",)
+    assert any(isinstance(block, VisualBlock) for block in chapter.body_blocks)
+
+
 def test_visual_block_refills_only_selected_content_frame(tmp_path: Path) -> None:
     frames = tuple(
         _keyframe().model_copy(

@@ -42,8 +42,8 @@ from video_demo.integrations.document_prompts import (
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 Prompt = tuple[str, str, str]
 _DEFAULT_MAX_OUTPUT_TOKENS = 8_192
-# 紧凑索引协议的正文很短；保留足够的 thinking 预算，同时避免 8192 的过大
-# 输出上限让服务端为一次章节规划预留不必要的生成空间。
+# 紧凑索引协议只需返回章节范围、标题和少量目标；保留 thinking，同时把
+# 可见 JSON 输出从默认 8192 收紧到 4096，兼顾响应速度与长批次完整性。
 _COMPACT_PLANNING_MAX_OUTPUT_TOKENS = 4_096
 
 
