@@ -11,6 +11,10 @@ import json
 import re
 from collections.abc import Iterator
 
+_REMOVED_DOCUMENT_FIELDS = frozenset(
+    {"sections", "quality_flags", "uncertainties", "uncertainty_policy"},
+)
+
 
 def extract_model_message_content(body: object) -> str:
     """兼容常见 OpenAI/Responses/Anthropic 响应形态，提取文本内容。"""
@@ -93,6 +97,20 @@ def parse_json_content(text: str) -> object:
             if parsed is not None:
                 return parsed
     raise ValueError("模型消息中没有可解析的 JSON")
+
+
+def strip_removed_document_fields(value: object) -> object:
+    """丢弃已从 4.0 契约删除的模型展示字段，保留其余结构校验。"""
+
+    if isinstance(value, dict):
+        return {
+            key: strip_removed_document_fields(nested)
+            for key, nested in value.items()
+            if key not in _REMOVED_DOCUMENT_FIELDS
+        }
+    if isinstance(value, list):
+        return [strip_removed_document_fields(item) for item in value]
+    return value
 
 
 def _strip_markdown_fence(text: str) -> str:

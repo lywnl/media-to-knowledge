@@ -36,6 +36,7 @@ from video_demo.integrations.document_validation import (
 from video_demo.integrations.model_response import (
     extract_model_message_content,
     parse_json_content,
+    strip_removed_document_fields,
 )
 from video_demo.storage.workspace import reject_symlink_components, validate_path_component
 from video_demo.visual.candidate_artifacts import read_verified_candidate_jpeg
@@ -547,7 +548,7 @@ def _parse_response(content: bytes) -> tuple[ChapterVisionResponse, bytes, objec
         if not message:
             raise ValueError
         raw_message = message.encode("utf-8")
-        parsed = parse_json_content(message)
+        parsed = strip_removed_document_fields(parse_json_content(message))
         return ChapterVisionResponse.model_validate(parsed), raw_message, parsed
     except ValidationError as error:
         summaries = tuple(_pydantic_error_summary(item) for item in error.errors())

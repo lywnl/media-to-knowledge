@@ -42,6 +42,7 @@ from video_demo.integrations.document_prompts import (
 from video_demo.integrations.model_response import (
     extract_model_message_content,
     parse_json_content,
+    strip_removed_document_fields,
 )
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
@@ -408,6 +409,7 @@ def _parse_and_validate_response(
     validate_response: Callable[[ResponseModel], None],
 ) -> ResponseModel:
     raw_message, parsed, finish_reason = _extract_model_message(content)
+    parsed = strip_removed_document_fields(parsed)
     try:
         response = response_type.model_validate(parsed)
         validate_response(response)
