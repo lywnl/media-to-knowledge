@@ -1244,9 +1244,7 @@ def _visual_observation_is_renderable(
 ) -> bool:
     # 冲突观察必须由模型显式组织为 VISUAL block，避免程序自动追加后
     # 把冲突信息误包装成正文；支持/补充观察则可安全确定性展示。
-    if observation.relation_to_transcript in {"DUPLICATE", "CONFLICTING"}:
-        return False
-    return True
+    return observation.relation_to_transcript not in {"DUPLICATE", "CONFLICTING"}
 
 
 def _quote_matches(

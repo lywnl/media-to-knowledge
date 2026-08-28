@@ -12,16 +12,12 @@ from video_demo.domain.document import (
     ParagraphBlock,
     PromptVersions,
     SemanticChapter,
-    SemanticSection,
     VideoDocumentSummary,
     VideoUnderstandingResult,
     VisualBlock,
-    section_id_for,
     validate_evidence_references,
-    visual_caption_for_policy,
 )
 from video_demo.domain.evidence import (
-    ChapterVisualObservation,
     KeyframeEvidence,
     SpeechSegment,
     VisualFrameRelation,
@@ -52,15 +48,8 @@ def _chapter() -> SemanticChapter:
 
 def _result(chapter: SemanticChapter | None = None) -> VideoUnderstandingResult:
     actual = chapter or _chapter()
-    section = SemanticSection(
-        section_id=section_id_for("a" * 64, (actual.chapter_id,)),
-        title="章节",
-        summary_zh="摘要",
-        chapter_refs=(actual.chapter_id,),
-    )
     summary_text = "视频摘要"
     return VideoUnderstandingResult(
-        schema_version="3.0.0",
         run_id="run_document_002",
         asset_sha256="a" * 64,
         summary=VideoDocumentSummary(
@@ -71,7 +60,6 @@ def _result(chapter: SemanticChapter | None = None) -> VideoUnderstandingResult:
             retrieval_text=summary_text,
             retrieval_hash=hashlib.sha256(summary_text.encode()).hexdigest(),
         ),
-        sections=(section,),
         chapters=(actual,),
         generation=DocumentGenerationMetadata(
             document_config=DocumentGenerationConfig(),
@@ -159,40 +147,6 @@ def test_visual_observation_rejects_unknown_local_frame_reference() -> None:
         VisualObservationEvidence.model_validate(payload)
 
 
-def test_visual_observation_requires_uncertainty_for_conflict() -> None:
-    payload = _observation().model_dump(exclude={"duration_ms"})
-    payload["relation_to_transcript"] = "CONFLICTING"
-    payload["uncertainties"] = ()
-    with pytest.raises(ValidationError, match=r"uncertainties|冲突"):
-        VisualObservationEvidence.model_validate(payload)
-
-
-@pytest.mark.parametrize("uncertainty", ["", "   ", "\n\t"])
-def test_conflicting_visual_models_reject_blank_uncertainty(uncertainty: str) -> None:
-    evidence_payload = _observation().model_dump(exclude={"duration_ms"})
-    evidence_payload.update(
-        {
-            "relation_to_transcript": "CONFLICTING",
-            "uncertainties": (uncertainty,),
-        },
-    )
-    with pytest.raises(ValidationError, match="uncertainties"):
-        VisualObservationEvidence.model_validate(evidence_payload)
-
-    draft_payload = {
-        "target_ids": ("target_001",),
-        "selected_frame_ids": ("frame_001",),
-        "transcript_evidence_refs": ("asr_001",),
-        "visual_type": "TEXT",
-        "caption": "画面显示参数为 42。",
-        "relation_to_transcript": "CONFLICTING",
-        "certainty": 0.9,
-        "uncertainties": (uncertainty,),
-    }
-    with pytest.raises(ValidationError, match="uncertainties"):
-        ChapterVisualObservation.model_validate(draft_payload)
-
-
 def test_cross_object_validation_requires_frame_and_transcript_membership() -> None:
     result = _result()
 
@@ -217,27 +171,16 @@ def test_cross_object_validation_rejects_keyframe_without_visual_observation() -
     assert raised.value.code == ErrorCode.UNKNOWN_EVIDENCE_REFERENCE
 
 
-@pytest.mark.parametrize(
-    ("relation", "certainty", "policy"),
-    (
-        ("DUPLICATE", 0.9, "explicit"),
-        ("CONFLICTING", 0.9, "explicit"),
-        ("COMPLEMENTARY", 0.6, "conservative"),
-    ),
-)
+@pytest.mark.parametrize("relation", ["DUPLICATE", "CONFLICTING"])
 @pytest.mark.parametrize("surface", ["title", "summary", "paragraph", "claim"])
-def test_cross_object_validation_reapplies_visual_policy_to_attributed_text(
+def test_cross_object_validation_rejects_disallowed_visual_attribution(
     relation: str,
-    certainty: float,
-    policy: str,
     surface: str,
 ) -> None:
     payload = _observation().model_dump(exclude={"duration_ms"})
     payload.update(
         {
             "relation_to_transcript": relation,
-            "certainty": certainty,
-            "uncertainties": ("画面信息需要审慎处理",),
         },
     )
     observation = VisualObservationEvidence.model_validate(payload)
@@ -264,17 +207,7 @@ def test_cross_object_validation_reapplies_visual_policy_to_attributed_text(
             ),
         )
     chapter = _chapter().model_copy(update=chapter_updates)
-    result = _result(chapter).model_copy(
-        update={
-            "generation": _result(chapter).generation.model_copy(
-                update={
-                    "document_config": DocumentGenerationConfig(
-                        uncertainty_policy=policy,
-                    ),
-                },
-            ),
-        },
-    )
+    result = _result(chapter)
 
     with pytest.raises(VideoDemoError) as raised:
         validate_evidence_references(
@@ -356,14 +289,10 @@ def test_cross_object_validation_rejects_direct_keyframe_attribution(surface: st
     assert raised.value.code == ErrorCode.EVIDENCE_TYPE_MISMATCH
 
 
-@pytest.mark.parametrize("policy", ["explicit", "conservative"])
-def test_cross_object_validation_rejects_unmarked_conflicting_visual_caption(
-    policy: str,
-) -> None:
+def test_cross_object_validation_rejects_conflicting_visual_caption() -> None:
     observation = _observation().model_copy(
         update={
             "relation_to_transcript": "CONFLICTING",
-            "uncertainties": ("屏幕数字与口述不一致",),
         },
     )
     chapter = _chapter().model_copy(
@@ -380,17 +309,7 @@ def test_cross_object_validation_rejects_unmarked_conflicting_visual_caption(
             "selected_keyframe_refs": (_keyframe().evidence_id,),
         },
     )
-    result = _result(chapter).model_copy(
-        update={
-            "generation": _result(chapter).generation.model_copy(
-                update={
-                    "document_config": DocumentGenerationConfig(
-                        uncertainty_policy=policy,
-                    ),
-                },
-            ),
-        },
-    )
+    result = _result(chapter)
 
     with pytest.raises(VideoDemoError) as raised:
         validate_evidence_references(
@@ -399,25 +318,6 @@ def test_cross_object_validation_rejects_unmarked_conflicting_visual_caption(
         )
 
     assert raised.value.code == ErrorCode.EVIDENCE_RELATION_INVALID
-
-
-def test_conservative_conflict_caption_preserves_both_visual_side_and_uncertainty() -> None:
-    observation = _observation().model_copy(
-        update={
-            "caption": "画面显示参数为 42。",
-            "relation_to_transcript": "CONFLICTING",
-            "uncertainties": ("口述参数为 7，与画面不一致",),
-        },
-    )
-
-    caption = visual_caption_for_policy(
-        observation,
-        DocumentGenerationConfig(uncertainty_policy="conservative"),
-    )
-
-    assert observation.caption in caption
-    assert observation.uncertainties[0] in caption
-    assert "未采纳为确定事实" in caption
 
 
 def test_cross_object_validation_requires_visual_block_to_reference_only_its_observation() -> None:

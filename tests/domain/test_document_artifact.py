@@ -10,10 +10,8 @@ from video_demo.domain.document import (
     DocumentGenerationMetadata,
     PromptVersions,
     SemanticChapter,
-    SemanticSection,
     VideoDocumentSummary,
     VideoUnderstandingResult,
-    section_id_for,
 )
 from video_demo.domain.document_artifact import (
     MODEL_METRIC_NAMES,
@@ -51,14 +49,6 @@ def _result() -> VideoUnderstandingResult:
             retrieval_text=text,
             retrieval_hash=hashlib.sha256(text.encode()).hexdigest(),
         ),
-        sections=(
-            SemanticSection(
-                section_id=section_id_for("a" * 64, (chapter.chapter_id,)),
-                title="全部内容",
-                summary_zh="无可验证语义",
-                chapter_refs=(chapter.chapter_id,),
-            ),
-        ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(
             document_config=DocumentGenerationConfig(),
@@ -92,11 +82,11 @@ def _artifact_payload() -> dict[str, object]:
     }
 
 
-def test_document_artifact_requires_3_schema_and_document_digest() -> None:
+def test_document_artifact_requires_4_schema_and_document_digest() -> None:
     artifact = DocumentArtifactPayload.model_validate(_artifact_payload())
 
-    assert artifact.artifact_schema_version == "3.0.0"
-    assert artifact.result.schema_version == "3.0.0"
+    assert artifact.artifact_schema_version == "4.0.0"
+    assert artifact.result.schema_version == "4.0.0"
 
 
 @pytest.mark.parametrize("field,names", [

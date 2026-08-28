@@ -43,7 +43,7 @@ class VisualCleanupPort(Protocol):
 
 
 class PublishedVisualCleanupRecovery:
-    """按数据库主键分页恢复已发布 3.0 Run 的视觉临时制品。"""
+    """按数据库主键分页恢复已发布 4.0 Run 的视觉临时制品。"""
 
     _BATCH_SIZE = 100
 
@@ -75,7 +75,7 @@ class PublishedVisualCleanupRecovery:
 
     def _list_batch(self, cursor: int) -> tuple[PublishedRunCleanupRecord, ...]:
         with self._database.session() as session:
-            return VideoRunRepository(session).list_published_3_for_cleanup(
+            return VideoRunRepository(session).list_published_4_for_cleanup(
                 after_id=cursor,
                 limit=self._BATCH_SIZE,
             )

@@ -18,10 +18,8 @@ from video_demo.domain.document import (
     ParagraphBlock,
     PromptVersions,
     SemanticChapter,
-    SemanticSection,
     VideoDocumentSummary,
     VideoUnderstandingResult,
-    section_id_for,
 )
 from video_demo.domain.document_artifact import MODEL_METRIC_NAMES, RESULT_STAGE_NAMES
 from video_demo.domain.evidence import SpeechSegment
@@ -190,16 +188,6 @@ def _worker_factory(app: FastAPI, calls: list[str]):
                     key_points=(),
                     retrieval_text="视频问候",
                     retrieval_hash=_sha("视频问候"),
-                ),
-                sections=(
-                    SemanticSection(
-                        section_id=section_id_for(
-                            media_sha, tuple(item.chapter_id for item in chapters)
-                        ),
-                        title="内容",
-                        summary_zh="问候内容。",
-                        chapter_refs=tuple(item.chapter_id for item in chapters),
-                    ),
                 ),
                 chapters=chapters,
                 generation=DocumentGenerationMetadata(

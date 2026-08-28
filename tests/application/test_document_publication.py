@@ -20,10 +20,8 @@ from video_demo.domain.document import (
     DocumentGenerationMetadata,
     PromptVersions,
     SemanticChapter,
-    SemanticSection,
     VideoDocumentSummary,
     VideoUnderstandingResult,
-    section_id_for,
 )
 from video_demo.domain.document_artifact import MODEL_METRIC_NAMES, RESULT_STAGE_NAMES
 from video_demo.domain.evidence import KeyframeEvidence
@@ -70,14 +68,6 @@ def _result() -> VideoUnderstandingResult:
             key_points=(),
             retrieval_text="摘要检索",
             retrieval_hash=_digest("摘要检索"),
-        ),
-        sections=(
-            SemanticSection(
-                section_id=section_id_for("a" * 64, (chapter.chapter_id,)),
-                title="全部内容",
-                summary_zh="无可验证语义",
-                chapter_refs=(chapter.chapter_id,),
-            ),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(
@@ -249,10 +239,9 @@ def test_document_publication_marks_pending_when_committed_bundle_reread_fails(
         ("1.0.0", "1.0.0", ErrorCode.RESULT_SCHEMA_UNSUPPORTED),
         ("2.0.0", "2.0.0", ErrorCode.RESULT_SCHEMA_UNSUPPORTED),
         ("1.0.0", "2.0.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
-        ("2.0.0", "3.0.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
-        ("3.0.0", "1.0.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
+        ("2.0.0", "4.0.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
+        ("3.0.0", "4.0.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
         ("", "", ErrorCode.ARTIFACT_SCHEMA_INVALID),
-        ("4.0.0", "4.0.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
     ),
 )
 def test_document_repository_rejects_unsupported_or_mixed_version_matrix(
@@ -272,7 +261,7 @@ def test_document_repository_rejects_unsupported_or_mixed_version_matrix(
     assert raised.value.code == expected
 
 
-def test_document_repository_round_trips_3_result(
+def test_document_repository_round_trips_4_result(
     publication: tuple[DocumentPublicationService, Database, Scope, ResultWriteFence, Path],
 ) -> None:
     _, database, scope, _, _ = publication

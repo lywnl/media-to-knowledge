@@ -176,7 +176,7 @@ def _require_supported_rows(
     if len(versions) == 1 and versions <= {"1.0.0", "2.0.0", "3.0.0"}:
         raise VideoDemoError(
             ErrorCode.RESULT_SCHEMA_UNSUPPORTED,
-            "结果 Schema 3.0.0 已停用，请重新处理视频（当前支持 4.0.0）",
+            "结果 Schema 3.0.0 已停用，请重新处理视频 (当前支持 4.0.0)",
         )
     if versions != {"4.0.0"}:
         _invalid("结果行 Schema 版本非法或混杂")

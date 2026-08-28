@@ -79,7 +79,7 @@ def test_production_pipeline_uses_only_3_components(tmp_path: Path) -> None:
 def test_production_identity_contains_asr_text_vlm_and_scene_only(tmp_path: Path) -> None:
     report = composition.build_production_model_identity_report(_model_settings(tmp_path))
 
-    assert report.schema_version == "3.0.0"
+    assert report.schema_version == "4.0.0"
     assert {item.component for item in report.models} == {
         "silero_vad",
         "cloud_whisper",

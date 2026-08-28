@@ -11,7 +11,6 @@ import pytest
 
 from video_demo.application.document_writing import (
     DocumentWriter,
-    _global_groups,
     _global_request,
     _global_request_fits,
 )
@@ -22,7 +21,6 @@ from video_demo.domain.document import (
     ParagraphBlock,
     PromptVersions,
     QuoteBlock,
-    SectionDraft,
     SemanticChapter,
     SummaryPoint,
     VisualBlock,
@@ -41,6 +39,7 @@ from video_demo.integrations.document_port import (
     ChapterWritingRequest,
     ChapterWritingResponse,
     DocumentTextPort,
+    GlobalChapterInput,
     GlobalWritingRepairRequest,
     GlobalWritingRequest,
     GlobalWritingResponse,
@@ -125,7 +124,6 @@ def _observation() -> VisualObservationEvidence:
         ),
         relation_to_transcript="COMPLEMENTARY",
         certainty=0.9,
-        uncertainties=("小字号可能识别有误",),
     )
 
 
@@ -162,12 +160,14 @@ def _chapter_response(request: ChapterWritingRequest) -> ChapterWritingResponse:
 
 
 def _global_response(request: GlobalWritingRequest) -> GlobalWritingResponse:
-    refs = tuple(ref for group in request.groups for ref in group.chapter_refs)
-    grounded = tuple(ref for group in request.groups for ref in group.grounded_chapter_refs)
+    grounded = tuple(
+        chapter.chapter_id
+        for chapter in request.chapters
+        if chapter.content_status == "GROUNDED"
+    )
     return GlobalWritingResponse(
         overview_zh="全局概览",
         key_points=(SummaryPoint(text="关键点", chapter_refs=(grounded[0],)),) if grounded else (),
-        sections=(SectionDraft(title="完整内容", summary_zh="分节摘要", chapter_refs=refs),),
     )
 
 
@@ -502,7 +502,7 @@ def test_writer_scopes_evidence_refills_images_and_reuses_cache(tmp_path: Path) 
     ]
     assert first.result.chapters == second.result.chapters
     assert first.result.chapters[0].selected_keyframe_refs == ("keyframe_evidence_001",)
-    assert "小字号可能识别有误" in first.result.chapters[0].retrieval_text
+    assert "小字号可能识别有误" not in first.result.chapters[0].retrieval_text
     assert "visual_001" not in first.result.chapters[0].retrieval_text
     assert first.metrics["chapter_writer_provider_attempts"] == 2
     assert second.metrics["chapter_writer_cache_hits"] == 2
@@ -815,7 +815,7 @@ def test_invalid_main_and_repair_fall_back_but_authentication_fails_closed(
     assert raised.value.code == ErrorCode.TEXT_LLM_AUTHENTICATION_FAILED
 
 
-def test_visual_only_fallback_without_safe_header_evidence_becomes_placeholder(
+def test_visual_only_fallback_without_transcript_uses_visual_evidence(
     tmp_path: Path,
 ) -> None:
     payload = _observation().model_dump(exclude={"duration_ms"})
@@ -824,7 +824,6 @@ def test_visual_only_fallback_without_safe_header_evidence_becomes_placeholder(
             "relation_to_transcript": "INDEPENDENT",
             "certainty": 0.6,
             "transcript_evidence_refs": (),
-            "uncertainties": ("视觉事实不能安全写入标题或摘要",),
         },
     )
     observation = VisualObservationEvidence.model_validate(payload)
@@ -835,7 +834,7 @@ def test_visual_only_fallback_without_safe_header_evidence_becomes_placeholder(
         chapter_writer_concurrency=1,
     ).write(
         _context(
-            DocumentGenerationConfig(uncertainty_policy="conservative"),
+            DocumentGenerationConfig(),
         ).model_copy(update={"transcript_source": "NONE"}),
         (_plan(0), _plan(1)),
         (),
@@ -847,9 +846,9 @@ def test_visual_only_fallback_without_safe_header_evidence_becomes_placeholder(
 
     first = written.result.chapters[0]
     assert written.status == "PARTIAL_SUCCEEDED"
-    assert first.content_status == "NO_SEMANTIC_EVIDENCE"
-    assert first.title_evidence_refs == ()
-    assert first.summary_evidence_refs == ()
+    assert first.content_status == "GROUNDED"
+    assert first.title_evidence_refs == (observation.evidence_id,)
+    assert first.summary_evidence_refs == (observation.evidence_id,)
 
 
 def test_repair_programming_error_is_not_hidden_as_rule_fallback(tmp_path: Path) -> None:
@@ -875,20 +874,10 @@ def test_repair_programming_error_is_not_hidden_as_rule_fallback(tmp_path: Path)
         )
 
 
-def test_global_reorder_is_repaired_once_and_input_contains_only_digest_groups(
+def test_global_editor_uses_chapter_facts_and_repairs_invalid_response(
     tmp_path: Path,
 ) -> None:
-    invalid = GlobalWritingResponse(
-        overview_zh="错误顺序",
-        key_points=(),
-        sections=(
-            SectionDraft(
-                title="倒序",
-                summary_zh="",
-                chapter_refs=("chapter_001", "chapter_000"),
-            ),
-        ),
-    )
+    invalid = GlobalWritingResponse(overview_zh="", key_points=())
     port = _TextPort(global_edit=lambda _request: invalid)
 
     written = _writer(port).write(
@@ -902,22 +891,23 @@ def test_global_reorder_is_repaired_once_and_input_contains_only_digest_groups(
     )
 
     assert written.metrics["global_editor_structure_repairs"] == 1
-    assert tuple(ref for section in written.result.sections for ref in section.chapter_refs) == (
+    assert tuple(chapter.chapter_id for chapter in written.result.chapters) == (
         "chapter_000",
         "chapter_001",
     )
     sent = port.global_requests[0].model_dump_json()
-    assert "body_blocks" not in sent and "evidence_id" not in sent
+    assert "body_blocks" not in sent and "evidence_id" not in sent and "chapters" in sent
 
 
 def test_writer_falls_back_to_chapter_summary_when_global_overview_is_empty(
     tmp_path: Path,
 ) -> None:
-    def empty_overview(request: GlobalWritingRequest) -> GlobalWritingResponse:
-        response = _global_response(request)
-        return response.model_copy(update={"overview_zh": ""})
+    def empty_overview(_request: GlobalWritingRequest) -> GlobalWritingResponse:
+        return GlobalWritingResponse(overview_zh="", key_points=())
 
-    written = _writer(_TextPort(global_edit=empty_overview)).write(
+    written = _writer(
+        _TextPort(global_edit=empty_overview, global_repair=empty_overview),
+    ).write(
         _context(),
         (_plan(0), _plan(1)),
         (_speech(0), _speech(1)),
@@ -1214,26 +1204,34 @@ def test_chapter_budget_does_not_turn_the_only_visual_evidence_into_an_empty_req
     assert port.chapter_requests == []
 
 
-def test_global_digest_trimming_reaches_a_non_empty_solution_below_one_percent() -> None:
+def test_global_chapter_fact_trimming_reaches_a_non_empty_solution_below_one_percent() -> None:
     chapters = tuple(
         _materialized_chapter_for_global_test(index, count=105)
         for index in range(105)
     )
     context = _context().model_copy(update={"duration_ms": 1_050_000})
-    groups = _global_groups(chapters)
-    twenty_character_groups = tuple(
-        group.model_copy(update={"digest_zh": group.digest_zh[:20]}) for group in groups
+    chapter_inputs = tuple(
+        GlobalChapterInput(
+            chapter_id=chapter.chapter_id,
+            start_ms=chapter.start_ms,
+            end_ms=chapter.end_ms,
+            title=chapter.title,
+            summary_zh=chapter.summary_zh[:20],
+            key_conclusions=(),
+            content_status=chapter.content_status,
+        )
+        for chapter in chapters
     )
     candidate = GlobalWritingRequest(
         context=context,
-        groups=twenty_character_groups,
+        chapters=chapter_inputs,
         prompt_version="global-editor-v1",
     )
     repair = GlobalWritingRepairRequest(
         request=candidate,
         invalid_response=_maximal_escaped_invalid_response(),
         allowed_chapter_ids=tuple(
-            ref for group in candidate.groups for ref in group.chapter_refs
+            chapter.chapter_id for chapter in candidate.chapters
         ),
         prompt_version="global-editor-repair-v1",
     )
@@ -1248,7 +1246,7 @@ def test_global_digest_trimming_reaches_a_non_empty_solution_below_one_percent()
         1_048_576,
     )
 
-    assert all(1 <= len(group.digest_zh) <= 20 for group in request.groups)
+    assert all(1 <= len(chapter.summary_zh) <= 20 for chapter in request.chapters)
 
 
 def test_cancellation_does_not_wait_for_blocked_chapter_provider(tmp_path: Path) -> None:
@@ -1618,24 +1616,18 @@ def test_cancelled_writer_prevents_next_provider_attempt(
 
 
 @pytest.mark.parametrize(
-    ("relation", "certainty", "policy"),
-    (
-        ("DUPLICATE", 0.9, "explicit"),
-        ("CONFLICTING", 0.9, "explicit"),
-        ("COMPLEMENTARY", 0.69, "conservative"),
-    ),
+    ("relation", "certainty"),
+    (("DUPLICATE", 0.9), ("CONFLICTING", 0.9)),
 )
 def test_visual_policy_cannot_be_bypassed_by_paragraphs_or_claims(
     tmp_path: Path,
     relation: str,
     certainty: float,
-    policy: str,
 ) -> None:
     observation = _observation().model_copy(
         update={
             "relation_to_transcript": relation,
             "certainty": certainty,
-            "uncertainties": ("画面信息存在不确定性",),
         },
     )
     unsafe = ChapterWritingResponse(
@@ -1671,7 +1663,7 @@ def test_visual_policy_cannot_be_bypassed_by_paragraphs_or_claims(
         ),
         repair=lambda _request: safe,
     )
-    config = DocumentGenerationConfig(uncertainty_policy=policy)  # type: ignore[arg-type]
+    config = DocumentGenerationConfig()
 
     written = _writer(port).write(
         _context(config),
@@ -1741,7 +1733,7 @@ def test_visual_policy_cannot_be_bypassed_by_title_or_summary(tmp_path: Path) ->
     assert first.title == safe.title
     assert first.summary_zh == safe.summary_zh
     assert "秘密参数" not in first.retrieval_text
-    assert "秘密参数" not in port.global_requests[0].groups[0].digest_zh
+    assert "秘密参数" not in port.global_requests[0].chapters[0].summary_zh
 
 
 def test_conflict_caption_normalization_cannot_exceed_final_body_budget(
@@ -1751,7 +1743,6 @@ def test_conflict_caption_normalization_cannot_exceed_final_body_budget(
         update={
             "relation_to_transcript": "CONFLICTING",
             "caption": "画" * 700,
-            "uncertainties": ("不" * 200,),
         },
     )
     unsafe = ChapterWritingResponse(
@@ -1968,7 +1959,7 @@ def _materialized_chapter_for_global_test(
     return _empty_semantic_chapter_for_test(index, end_ms=end_ms)
 
 
-def test_global_group_digest_retains_content_from_every_grounded_chapter() -> None:
+def test_global_chapter_input_retains_content_from_every_grounded_chapter() -> None:
     first = _empty_semantic_chapter_for_test(0, end_ms=10_000).model_copy(
         update={
             "title": "首章",
@@ -1985,12 +1976,23 @@ def test_global_group_digest_retains_content_from_every_grounded_chapter() -> No
         },
     )
 
-    group = _global_groups((first, second))[0]
+    inputs = tuple(
+        GlobalChapterInput(
+            chapter_id=chapter.chapter_id,
+            start_ms=chapter.start_ms,
+            end_ms=chapter.end_ms,
+            title=chapter.title,
+            summary_zh=chapter.summary_zh,
+            key_conclusions=(),
+            content_status=chapter.content_status,
+        )
+        for chapter in (first, second)
+    )
 
-    assert len(group.digest_zh) <= 4_000
-    assert "首章" in group.digest_zh
-    assert "末章唯一标题" in group.digest_zh
-    assert "末章唯一摘要" in group.digest_zh
+    assert len(inputs[0].summary_zh) <= 4_000
+    assert inputs[0].title == "首章"
+    assert inputs[1].title == "末章唯一标题"
+    assert inputs[1].summary_zh == "末章唯一摘要"
 
 
 def _empty_semantic_chapter_for_test(index: int, *, end_ms: int) -> SemanticChapter:

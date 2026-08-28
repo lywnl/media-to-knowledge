@@ -33,10 +33,8 @@ from video_demo.domain.document import (
     ParagraphBlock,
     PromptVersions,
     SemanticChapter,
-    SemanticSection,
     VideoDocumentSummary,
     VideoUnderstandingResult,
-    section_id_for,
 )
 from video_demo.domain.document_artifact import MODEL_METRIC_NAMES, RESULT_STAGE_NAMES
 from video_demo.domain.document_plan import (
@@ -119,14 +117,6 @@ def _result(run_id: str, asset_sha256: str, speech: SpeechSegment) -> VideoUnder
             retrieval_text="流水线摘要",
             retrieval_hash=_digest("流水线摘要"),
         ),
-        sections=(
-            SemanticSection(
-                section_id=section_id_for(asset_sha256, (chapter.chapter_id,)),
-                title="全部内容",
-                summary_zh="流水线概览",
-                chapter_refs=(chapter.chapter_id,),
-            ),
-        ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(
             document_config=DocumentGenerationConfig(),
@@ -174,14 +164,6 @@ def _empty_result(run_id: str, asset_sha256: str) -> VideoUnderstandingResult:
             key_points=(),
             retrieval_text="无语义内容",
             retrieval_hash=_digest("无语义内容"),
-        ),
-        sections=(
-            SemanticSection(
-                section_id=section_id_for(asset_sha256, (chapter.chapter_id,)),
-                title="全部内容",
-                summary_zh="未提取到可验证语义内容。",
-                chapter_refs=(chapter.chapter_id,),
-            ),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(

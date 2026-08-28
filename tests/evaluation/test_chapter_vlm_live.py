@@ -205,8 +205,6 @@ def _response(manifest: ChapterVlmInputManifest) -> ChapterVisionResponse:
                 frame_relations=(),
                 relation_to_transcript="INDEPENDENT",
                 certainty=0.9,
-                quality_flags=(),
-                uncertainties=(),
             ),
         )
     )

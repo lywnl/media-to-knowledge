@@ -123,8 +123,6 @@ def _valid_observation(frame_id: str = "frame_a") -> dict[str, object]:
                 "frame_relations": [],
                 "relation_to_transcript": "COMPLEMENTARY",
                 "certainty": 0.9,
-                "quality_flags": [],
-                "uncertainties": [],
             },
         ],
     }

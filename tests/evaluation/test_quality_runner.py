@@ -13,10 +13,8 @@ from video_demo.domain.document import (
     ParagraphBlock,
     PromptVersions,
     SemanticChapter,
-    SemanticSection,
     VideoDocumentSummary,
     VideoUnderstandingResult,
-    section_id_for,
 )
 from video_demo.domain.document_artifact import (
     MODEL_METRIC_NAMES,
@@ -118,17 +116,6 @@ def _write_prediction(
             key_points=(),
             retrieval_text="视频问候",
             retrieval_hash=_hash("视频问候"),
-        ),
-        sections=(
-            SemanticSection(
-                section_id=section_id_for(
-                    sample.media_sha256,
-                    (first_chapter.chapter_id, second_chapter.chapter_id),
-                ),
-                title="内容",
-                summary_zh="问候内容。",
-                chapter_refs=(first_chapter.chapter_id, second_chapter.chapter_id),
-            ),
         ),
         chapters=(first_chapter, second_chapter),
         generation=DocumentGenerationMetadata(

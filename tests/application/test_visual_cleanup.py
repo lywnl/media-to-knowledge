@@ -625,7 +625,7 @@ def test_startup_recovery_uses_fixed_keyset_batches_and_skips_active_owner(
         keyset_calls.append((after_id, limit))
         return tuple(item for item in records if item.run_pk > after_id)[:limit]
 
-    monkeypatch.setattr(VideoRunRepository, "list_published_3_for_cleanup", list_batch)
+    monkeypatch.setattr(VideoRunRepository, "list_published_4_for_cleanup", list_batch)
     monkeypatch.setattr(
         JobRepository,
         "has_active_owner",
@@ -689,7 +689,7 @@ def test_startup_recovery_isolates_residual_probe_and_pending_failures(
     )
     monkeypatch.setattr(
         VideoRunRepository,
-        "list_published_3_for_cleanup",
+        "list_published_4_for_cleanup",
         lambda *_args, **_kwargs: records,
     )
     monkeypatch.setattr(JobRepository, "has_active_owner", lambda *_args, **_kwargs: False)
@@ -821,7 +821,7 @@ def test_cleanup_repository_uses_real_sqlite_keyset_and_active_lease(tmp_path: P
                     application_id=scope.application_id,
                     knowledge_base_id=scope.knowledge_base_id,
                     run_id=run.run_id,
-                    schema_version="2.0.0" if index == 102 else "3.0.0",
+                    schema_version="2.0.0" if index == 102 else "4.0.0",
                     payload_json={},
                     retrieval_text="",
                     retrieval_hash="c" * 64,
@@ -857,8 +857,8 @@ def test_cleanup_repository_uses_real_sqlite_keyset_and_active_lease(tmp_path: P
 
     with database.session() as session:
         repository = VideoRunRepository(session)
-        first = repository.list_published_3_for_cleanup(after_id=0, limit=100)
-        second = repository.list_published_3_for_cleanup(
+        first = repository.list_published_4_for_cleanup(after_id=0, limit=100)
+        second = repository.list_published_4_for_cleanup(
             after_id=first[-1].run_pk,
             limit=100,
         )

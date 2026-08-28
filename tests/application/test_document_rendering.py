@@ -16,14 +16,11 @@ from video_demo.domain.document import (
     PromptVersions,
     QuoteBlock,
     SemanticChapter,
-    SemanticSection,
     SummaryPoint,
     TableBlock,
     VideoDocumentSummary,
     VideoUnderstandingResult,
     VisualBlock,
-    section_id_for,
-    visual_caption_for_policy,
 )
 from video_demo.domain.evidence import (
     DocumentEvidenceItem,
@@ -101,8 +98,6 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
         ),
         relation_to_transcript="CONFLICTING",
         certainty=0.65,
-        quality_flags=("右下角轻微模糊",),
-        uncertainties=("屏幕参数与口述参数可能不一致",),
     )
     retrieval_text = "章节检索正文"
     chapter = SemanticChapter(
@@ -144,7 +139,7 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
             VisualBlock(
                 visual_observation_ref=observation.evidence_id,
                 visual_content_refs=("visual_content_001",),
-                caption=visual_caption_for_policy(observation, DocumentGenerationConfig()),
+                caption=observation.caption,
                 evidence_refs=(observation.evidence_id,),
             ),
         ),
@@ -161,12 +156,6 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
         retrieval_text=retrieval_text,
         retrieval_hash=_sha256(retrieval_text),
     )
-    section = SemanticSection(
-        section_id=section_id_for(ASSET_SHA256, (chapter.chapter_id,)),
-        title="准备 | 安装",
-        summary_zh="准备开发环境。",
-        chapter_refs=(chapter.chapter_id,),
-    )
     summary_retrieval = "视频检索摘要"
     result = VideoUnderstandingResult(
         run_id="run_document_rendering_001",
@@ -181,7 +170,6 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
             retrieval_text=summary_retrieval,
             retrieval_hash=_sha256(summary_retrieval),
         ),
-        sections=(section,),
         chapters=(chapter,),
         generation=_metadata(),
     )
@@ -206,22 +194,19 @@ def test_render_markdown_is_deterministic_utf8_and_has_fixed_structure() -> None
         "## 核心概览",
         "## 目录",
         (
-            "- 第一部分：准备 \\| 安装 "
+            "- 第一章：安装 \\#1 &lt;script&gt; "
             "\N{FULLWIDTH LEFT PARENTHESIS}00:00:00 - 00:00:10"
             "\N{FULLWIDTH RIGHT PARENTHESIS}"
         ),
-        "## 第一部分：",
-        "### 00:00:00 - 00:00:10",
+        "## 第一章：安装 \\#1 &lt;script&gt;",
         "不能成为标题",
-        "## 信息边界",
     )
     positions = tuple(markdown.index(marker) for marker in ordered_markers)
     assert positions == tuple(sorted(positions))
-    assert "00:00:05" in markdown
-    assert "## 关键结论" not in markdown
+    assert "## 全文关键结论" in markdown
     assert "关键画面与引用" not in markdown
     assert "video-demo-keyframe:keyframe_001" not in markdown
-    assert markdown.count("准备 \\| 安装") == 2
+    assert markdown.count("安装 \\#1") == 2
     assert markdown.count("00:00:00 - 00:00:10") == 2
 
 
@@ -242,7 +227,7 @@ def test_render_markdown_escapes_untrusted_text_and_renders_every_block_type() -
     assert r"| 参数\|名 | &lt;script&gt;值&lt;/script&gt; |" in markdown
     assert r"5\|推荐 / 第二行" in markdown
     assert "$$\nx = y + 1\n$$" in markdown
-    assert "音画信息存在冲突" in markdown
+    assert "画面给出了更精确的参数。" in markdown
 
 
 def test_render_markdown_keeps_visual_body_without_leaking_storage_path() -> None:
@@ -266,19 +251,10 @@ def test_render_markdown_deduplicates_single_chapter_section_summary() -> None:
             "summary_zh": "本章概要只应展示一次。",
         },
     )
-    section = result.sections[0].model_copy(
-        update={
-            "title": chapter.title,
-            "summary_zh": chapter.summary_zh,
-        },
-    )
-    result = result.model_copy(update={"chapters": (chapter,), "sections": (section,)})
+    result = result.model_copy(update={"chapters": (chapter,)})
 
     markdown = render_markdown(result, evidence).content.decode("utf-8")
-    body = markdown.split("## 第一部分：", maxsplit=1)[1].split(
-        "## 信息边界\n",
-        maxsplit=1,
-    )[0]
+    body = markdown.split("## 第一章：", maxsplit=1)[1]
 
     assert body.count("AI自动化小红书账号案例介绍") == 1
     assert body.count("本章概要只应展示一次。") == 1
@@ -319,131 +295,14 @@ def test_render_markdown_keeps_chapter_summary_when_section_has_multiple_chapter
             "retrieval_hash": _sha256(""),
         },
     )
-    section = result.sections[0].model_copy(
-        update={
-            "chapter_refs": (first.chapter_id, second.chapter_id),
-            "section_id": section_id_for(ASSET_SHA256, (first.chapter_id, second.chapter_id)),
-            "title": "合并部分",
-            "summary_zh": "合并部分概要。",
-        },
-    )
-    result = result.model_copy(
-        update={"chapters": (first, second), "sections": (section,)},
-    )
+    result = result.model_copy(update={"chapters": (first, second)})
 
     markdown = render_markdown(result, evidence).content.decode("utf-8")
 
-    assert "### 00:00:00 - 00:00:10 第一章" in markdown
+    assert "## 第一章：第一章" in markdown
     assert "第一章概要。" in markdown
-    assert "### 00:00:10 - 00:00:20 第二章" in markdown
+    assert "## 第二章：第二章" in markdown
     assert "第二章概要。" in markdown
-
-
-def test_render_markdown_summarizes_visual_information_boundaries() -> None:
-    result, evidence = _document_fixture()
-    observation = evidence[2]
-    assert isinstance(observation, VisualObservationEvidence)
-
-    markdown = render_markdown(result, evidence).content.decode("utf-8")
-    boundary = markdown.split("## 信息边界\n", maxsplit=1)[1]
-
-    assert "屏幕参数与口述参数可能不一致" in boundary
-    assert "右下角轻微模糊" in boundary
-    assert "画面与转写存在冲突" in boundary
-    assert markdown.count(observation.caption) == 1
-
-
-def test_conservative_policy_moves_low_confidence_visual_caption_to_boundary() -> None:
-    result, evidence = _document_fixture()
-    observation = evidence[2]
-    assert isinstance(observation, VisualObservationEvidence)
-    observation = observation.model_copy(
-        update={
-            "relation_to_transcript": "COMPLEMENTARY",
-            "certainty": 0.6,
-        },
-    )
-    chapter = result.chapters[0].model_copy(
-        update={
-            "body_blocks": tuple(
-                block
-                for block in result.chapters[0].body_blocks
-                if not isinstance(block, VisualBlock)
-            ),
-            "selected_keyframe_refs": (),
-        },
-    )
-    result = result.model_copy(
-        update={
-            "chapters": (chapter,),
-            "generation": result.generation.model_copy(
-                update={
-                    "document_config": DocumentGenerationConfig(
-                        uncertainty_policy="conservative",
-                    ),
-                },
-            ),
-        },
-    )
-
-    markdown = render_markdown(
-        result,
-        (evidence[0], evidence[1], observation),
-    ).content.decode("utf-8")
-    before_boundary, boundary = markdown.split("## 信息边界\n", maxsplit=1)
-
-    assert observation.caption not in before_boundary
-    assert f"低置信视觉观察，未纳入正文：{observation.caption}" in boundary
-
-
-@pytest.mark.parametrize("relation", ["CONFLICTING", "COMPLEMENTARY"])
-def test_information_boundary_includes_observation_omitted_from_chapter_evidence(
-    relation: str,
-) -> None:
-    result, evidence = _document_fixture()
-    observation = evidence[2]
-    assert isinstance(observation, VisualObservationEvidence)
-    observation = observation.model_copy(
-        update={
-            "relation_to_transcript": relation,
-            "certainty": 0.6,
-        },
-    )
-    chapter = result.chapters[0].model_copy(
-        update={
-            "body_blocks": tuple(
-                block
-                for block in result.chapters[0].body_blocks
-                if not isinstance(block, VisualBlock)
-            ),
-            "evidence_refs": (evidence[0].evidence_id,),
-            "selected_keyframe_refs": (),
-        },
-    )
-    result = result.model_copy(
-        update={
-            "chapters": (chapter,),
-            "generation": result.generation.model_copy(
-                update={
-                    "document_config": DocumentGenerationConfig(
-                        uncertainty_policy="conservative",
-                    ),
-                },
-            ),
-        },
-    )
-
-    markdown = render_markdown(
-        result,
-        (evidence[0], evidence[1], observation),
-    ).content.decode("utf-8")
-    boundary = markdown.split("## 信息边界\n", maxsplit=1)[1]
-
-    if relation == "CONFLICTING":
-        assert "画面与转写存在冲突" in boundary
-        assert observation.caption in boundary
-    else:
-        assert f"低置信视觉观察，未纳入正文：{observation.caption}" in boundary
 
 
 def test_render_markdown_revalidates_selected_keyframe_evidence() -> None:
@@ -465,10 +324,9 @@ def test_render_markdown_revalidates_selected_keyframe_evidence() -> None:
     assert invalid.value.code == ErrorCode.EVIDENCE_RELATION_INVALID
 
 
-def test_no_semantic_evidence_placeholder_only_appears_in_information_boundary() -> None:
+def test_no_semantic_evidence_placeholder_is_rendered_without_information_boundary() -> None:
     result, _evidence = _document_fixture()
     placeholder = "本时段未提取到可验证语义内容"
-    boundary_message = "未提取到可验证语义内容"
     chapter = SemanticChapter(
         chapter_id="chapter_empty",
         start_ms=0,
@@ -485,22 +343,15 @@ def test_no_semantic_evidence_placeholder_only_appears_in_information_boundary()
         retrieval_text="",
         retrieval_hash=_sha256(""),
     )
-    section = SemanticSection(
-        section_id=section_id_for(ASSET_SHA256, (chapter.chapter_id,)),
-        title="信息不足时段",
-        summary_zh="",
-        chapter_refs=(chapter.chapter_id,),
-    )
     empty_result = result.model_copy(
         update={
             "summary": result.summary.model_copy(update={"key_points": ()}),
-            "sections": (section,),
             "chapters": (chapter,),
         },
     )
 
     markdown = render_markdown(empty_result, ()).content.decode("utf-8")
-    before_boundary, boundary = markdown.split("## 信息边界\n", maxsplit=1)
 
-    assert placeholder not in before_boundary
-    assert boundary.count(boundary_message) == 1
+    assert "## 第一章" in markdown
+    assert placeholder in markdown
+    assert "信息边界" not in markdown

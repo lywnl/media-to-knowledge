@@ -12,12 +12,10 @@ from video_demo.domain.document import (
     ParagraphBlock,
     PromptVersions,
     SemanticChapter,
-    SemanticSection,
     SummaryPoint,
     VideoDocumentSummary,
     VideoUnderstandingResult,
     sanitize_document_title,
-    section_id_for,
 )
 
 
@@ -124,17 +122,8 @@ def _chapter(
 def _result(
     chapters: tuple[SemanticChapter, ...],
     *,
-    sections: tuple[SemanticSection, ...] | None = None,
     key_points: tuple[SummaryPoint, ...] = (),
 ) -> VideoUnderstandingResult:
-    section_values = sections or (
-        SemanticSection(
-            section_id=section_id_for(ASSET_SHA, tuple(item.chapter_id for item in chapters)),
-            title="全部内容",
-            summary_zh="章节汇总。",
-            chapter_refs=tuple(item.chapter_id for item in chapters),
-        ),
-    )
     summary_text = "视频摘要"
     summary = VideoDocumentSummary(
         title="测试视频",
@@ -145,11 +134,9 @@ def _result(
         retrieval_hash=_hash(summary_text),
     )
     return VideoUnderstandingResult(
-        schema_version="3.0.0",
         run_id="run_document_001",
         asset_sha256=ASSET_SHA,
         summary=summary,
-        sections=section_values,
         chapters=chapters,
         generation=_metadata(),
     )
@@ -158,7 +145,7 @@ def _result(
 def test_document_accepts_contiguous_chapters_and_valid_retrieval_hashes() -> None:
     result = _result((_chapter("ch_001", 0, 1_000), _chapter("ch_002", 1_000, 2_000)))
 
-    assert result.schema_version == "3.0.0"
+    assert result.schema_version == "4.0.0"
     assert result.summary.duration_ms == result.chapters[-1].end_ms
 
 
@@ -181,46 +168,11 @@ def test_grounded_chapter_requires_header_evidence_references(field: str) -> Non
         SemanticChapter.model_validate(payload)
 
 
-def test_document_rejects_non_3_schema() -> None:
+def test_document_rejects_non_4_schema() -> None:
     payload = _result((_chapter("ch_001", 0, 1_000),)).model_dump()
     payload["schema_version"] = "2.0.0"
     with pytest.raises(ValidationError):
         VideoUnderstandingResult.model_validate(payload)
-
-
-def test_section_refs_must_cover_each_chapter_exactly_once() -> None:
-    chapters = (_chapter("ch_001", 0, 1_000), _chapter("ch_002", 1_000, 2_000))
-    duplicate = SemanticSection(
-        section_id="section_bad",
-        title="重复章节",
-        summary_zh="非法。",
-        chapter_refs=("ch_001", "ch_001"),
-    )
-
-    with pytest.raises(ValidationError, match=r"Section|章节"):
-        _result(chapters, sections=(duplicate,))
-
-
-def test_section_id_is_stable_and_does_not_depend_on_title() -> None:
-    first = section_id_for(ASSET_SHA, ("ch_001", "ch_002"))
-    second = section_id_for(ASSET_SHA, ("ch_001", "ch_002"))
-    different_order = section_id_for(ASSET_SHA, ("ch_002", "ch_001"))
-
-    assert first == second
-    assert first != different_order
-
-
-def test_document_rejects_section_id_not_derived_from_asset_and_chapters() -> None:
-    chapters = (_chapter("ch_001", 0, 1_000),)
-    section = SemanticSection(
-        section_id="section_wrong",
-        title="章节",
-        summary_zh="摘要",
-        chapter_refs=("ch_001",),
-    )
-
-    with pytest.raises(ValidationError, match=r"section_id|Section ID"):
-        _result(chapters, sections=(section,))
 
 
 def test_prompt_versions_requires_main_and_repair_versions() -> None:

@@ -267,7 +267,7 @@ class VideoRunRepository:
             ),
         )
 
-    def list_published_3_for_cleanup(
+    def list_published_4_for_cleanup(
         self,
         *,
         after_id: int,

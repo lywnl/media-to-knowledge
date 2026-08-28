@@ -91,7 +91,6 @@ def test_vision_prompt_states_transcript_relation_contract(tmp_path: Path) -> No
     _version, instruction, _data = prompt_for_vision(_request(tmp_path, "画面文字"))
 
     assert "INDEPENDENT 时 transcript_evidence_refs 必须为空" in instruction
-    assert "CONFLICTING 时 uncertainties 必须非空" in instruction
     assert "其他音画关系必须至少引用 1 条当前转写证据" in instruction
 
 

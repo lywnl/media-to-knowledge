@@ -18,7 +18,7 @@ from video_demo.integrations.document_port import (
     ChapterPlanRepairRequest,
     ChapterWritingRepairRequest,
     ChapterWritingRequest,
-    GlobalChapterGroup,
+    GlobalChapterInput,
     GlobalWritingRepairRequest,
     GlobalWritingRequest,
     InvalidModelResponse,
@@ -204,13 +204,15 @@ def test_writing_requests_disable_thinking_for_latency() -> None:
     )
     global_request = GlobalWritingRequest(
         context=_context(),
-        groups=(
-            GlobalChapterGroup(
+        chapters=(
+            GlobalChapterInput(
                 start_ms=0,
                 end_ms=10_000,
-                chapter_refs=("chapter_001",),
-                grounded_chapter_refs=("chapter_001",),
-                digest_zh="摘要",
+                chapter_id="chapter_001",
+                title="章节",
+                summary_zh="摘要",
+                key_conclusions=(),
+                content_status="GROUNDED",
             ),
         ),
         prompt_version="global-editor-v1",
@@ -909,13 +911,15 @@ def test_all_six_operations_use_distinct_schema_and_prompt_versions() -> None:
     )
     global_request = GlobalWritingRequest(
         context=_context(),
-        groups=(
-            GlobalChapterGroup(
+        chapters=(
+            GlobalChapterInput(
                 start_ms=0,
                 end_ms=10_000,
-                chapter_refs=("chapter_001",),
-                grounded_chapter_refs=("chapter_001",),
-                digest_zh="摘要",
+                chapter_id="chapter_001",
+                title="章节",
+                summary_zh="摘要",
+                key_conclusions=(),
+                content_status="GROUNDED",
             ),
         ),
         prompt_version="global-editor-v1",
@@ -1057,11 +1061,4 @@ def _global_body() -> dict[str, object]:
     return {
         "overview_zh": "概览",
         "key_points": [],
-        "sections": [
-            {
-                "title": "章节",
-                "summary_zh": "摘要",
-                "chapter_refs": ["chapter_001"],
-            },
-        ],
     }

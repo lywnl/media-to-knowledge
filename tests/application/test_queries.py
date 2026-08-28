@@ -16,10 +16,8 @@ from video_demo.domain.document import (
     ParagraphBlock,
     PromptVersions,
     SemanticChapter,
-    SemanticSection,
     VideoDocumentSummary,
     VideoUnderstandingResult,
-    section_id_for,
 )
 from video_demo.domain.document_artifact import MODEL_METRIC_NAMES, RESULT_STAGE_NAMES
 from video_demo.domain.evidence import SpeechSegment
@@ -80,14 +78,6 @@ def _result() -> tuple[VideoUnderstandingResult, SpeechSegment]:
             key_points=(),
             retrieval_text="模型用途",
             retrieval_hash=_digest("模型用途"),
-        ),
-        sections=(
-            SemanticSection(
-                section_id=section_id_for("a" * 64, (chapter.chapter_id,)),
-                title="基础",
-                summary_zh="模型基础",
-                chapter_refs=(chapter.chapter_id,),
-            ),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(

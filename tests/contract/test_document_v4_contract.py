@@ -187,4 +187,8 @@ def test_global_editor_rejects_empty_overview() -> None:
     )
 
     with pytest.raises(ValueError, match="核心概览"):
-        _validate_global_response(GlobalWritingResponse(overview_zh="", key_points=()), request, result.chapters)
+        _validate_global_response(
+            GlobalWritingResponse(overview_zh="", key_points=()),
+            request,
+            result.chapters,
+        )

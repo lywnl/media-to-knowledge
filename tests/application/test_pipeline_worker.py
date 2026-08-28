@@ -20,10 +20,8 @@ from video_demo.domain.document import (
     DocumentGenerationMetadata,
     PromptVersions,
     SemanticChapter,
-    SemanticSection,
     VideoDocumentSummary,
     VideoUnderstandingResult,
-    section_id_for,
 )
 from video_demo.domain.document_artifact import MODEL_METRIC_NAMES, RESULT_STAGE_NAMES
 from video_demo.errors import ErrorCode, VideoDemoError
@@ -121,14 +119,6 @@ def _outcome() -> PipelineOutcome:
             key_points=(),
             retrieval_text="摘要",
             retrieval_hash=_digest("摘要"),
-        ),
-        sections=(
-            SemanticSection(
-                section_id=section_id_for("a" * 64, (chapter.chapter_id,)),
-                title="全部内容",
-                summary_zh="未提取到可验证语义内容",
-                chapter_refs=(chapter.chapter_id,),
-            ),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(

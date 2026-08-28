@@ -14,11 +14,9 @@ from video_demo.domain.document import (
     ParagraphBlock,
     PromptVersions,
     SemanticChapter,
-    SemanticSection,
     VideoDocumentSummary,
     VideoUnderstandingResult,
     VisualBlock,
-    section_id_for,
 )
 from video_demo.domain.document_artifact import MODEL_METRIC_NAMES, RESULT_STAGE_NAMES
 from video_demo.domain.evidence import (
@@ -164,14 +162,6 @@ def _publish_result(
             retrieval_text="模型用途",
             retrieval_hash=_sha256("模型用途"),
         ),
-        sections=(
-            SemanticSection(
-                section_id=section_id_for(asset_sha256, (chapter.chapter_id,)),
-                title="基础",
-                summary_zh="模型基础。",
-                chapter_refs=(chapter.chapter_id,),
-            ),
-        ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(
             document_config=DocumentGenerationConfig(),
@@ -208,7 +198,7 @@ def _publish_result(
     return result, image
 
 
-def test_result_document_evidence_and_keyframe_are_one_3_contract(
+def test_result_document_evidence_and_keyframe_are_one_4_contract(
     client: TestClient,
     scope_headers: dict[str, str],
     mp4_content: bytes,
@@ -225,7 +215,7 @@ def test_result_document_evidence_and_keyframe_are_one_3_contract(
     )
 
     assert result_response.status_code == 200
-    assert result_response.json()["schema_version"] == "3.0.0"
+    assert result_response.json()["schema_version"] == "4.0.0"
     assert result_response.json()["chapters"][0]["chapter_id"] == "chapter_001"
     evidence = client.app.state.container.result_query_service.get_evidence(
         Scope("tenant-a", "app-a", "kb-a"), run_id

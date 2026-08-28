@@ -8,7 +8,7 @@ from typing import Annotated, Literal, TypeAlias
 
 from pydantic import Field, field_validator, model_validator
 
-from video_demo.domain.base import FrozenModel, Probability, Sha256, StableId, stable_identifier
+from video_demo.domain.base import FrozenModel, Probability, Sha256, StableId
 from video_demo.domain.evidence import (
     DocumentEvidenceItem,
     KeyframeEvidence,

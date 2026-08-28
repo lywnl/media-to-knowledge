@@ -32,7 +32,6 @@ def test_document_chapter_retrieval_projection_excludes_internal_fields() -> Non
         caption="界面显示参数 42。",
         relation_to_transcript="INDEPENDENT",
         certainty=0.8,
-        uncertainties=("小字号可能识别有误",),
     )
     chapter = SemanticChapter.model_construct(
         chapter_id="chapter_001",
@@ -73,7 +72,6 @@ def test_document_chapter_retrieval_projection_excludes_internal_fields() -> Non
         "正文：打开设置页面。",
         "关键结论：参数可以调整。",
         "视觉补充：参数为 42。",
-        "不确定性：小字号可能识别有误",
     ]
     assert "chapter_001" not in rendered
     assert "visual_001" not in rendered
@@ -165,7 +163,6 @@ def test_document_retrieval_uses_only_selected_visual_blocks_without_duplicate_c
         caption="观察原始描述。",
         relation_to_transcript="INDEPENDENT",
         certainty=0.9,
-        uncertainties=("选中观察的不确定性",),
     )
     unused = selected.model_copy(
         update={
@@ -173,7 +170,6 @@ def test_document_retrieval_uses_only_selected_visual_blocks_without_duplicate_c
             "target_ids": ("target_unused",),
             "keyframe_refs": ("keyframe_unused",),
             "caption": "未使用的视觉事实不得进入检索。",
-            "uncertainties": ("未使用观察的不确定性",),
         },
     )
     chapter = SemanticChapter.model_construct(
@@ -210,9 +206,7 @@ def test_document_retrieval_uses_only_selected_visual_blocks_without_duplicate_c
     assert rendered.count("最终视觉描述。") == 1
     assert "正文：" not in rendered
     assert "视觉补充：最终视觉描述。" in rendered
-    assert "选中观察的不确定性" in rendered
     assert "未使用的视觉事实不得进入检索" not in rendered
-    assert "未使用观察的不确定性" not in rendered
 
 
 def test_document_writing_import_closure_excludes_legacy_fusion_and_result_dto() -> None:
