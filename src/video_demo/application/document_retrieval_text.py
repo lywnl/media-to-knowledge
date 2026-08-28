@@ -45,7 +45,7 @@ def render_document_chapter_retrieval_text(
         f"时间范围：[{chapter.start_ms}, {chapter.end_ms})",
     ]
     summary = normalize_retrieval_value(chapter.summary_zh)
-    if summary:
+    if summary and summary != normalize_retrieval_value(body):
         lines.append(f"章节摘要：{summary}")
     if body:
         lines.append(f"正文：{body}")

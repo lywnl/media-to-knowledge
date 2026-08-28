@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import html
 import re
-from collections.abc import Iterable
 from typing import Literal
 
 from pydantic import Field
@@ -21,10 +20,7 @@ from video_demo.domain.document import (
     VisualBlock,
     validate_evidence_references,
 )
-from video_demo.domain.evidence import (
-    DocumentEvidenceItem,
-    VisualObservationEvidence,
-)
+from video_demo.domain.evidence import DocumentEvidenceItem
 
 _MARKDOWN_SPECIAL_PATTERN = re.compile(r"([\\`*_\[\]{}()#|>!])")
 _LEADING_BLOCK_PATTERN = re.compile(r"^(\s*)([-+*]\s|\d+[.)]\s)")
@@ -46,7 +42,6 @@ def render_markdown(
     """把已闭包校验的结构化结果投影为唯一、可下载的 Markdown。"""
 
     validate_evidence_references(result, evidence)
-    evidence_by_id = {item.evidence_id: item for item in evidence}
     lines: list[str] = []
 
     _heading(lines, 1, result.summary.title)
@@ -90,7 +85,7 @@ def _render_chapter(
         f"{_format_time(chapter.end_ms)}",
     )
     if chapter.content_status == "GROUNDED":
-        if chapter.summary_zh:
+        if chapter.summary_zh and not _summary_repeats_body(chapter):
             _paragraph(lines, chapter.summary_zh)
         for block in chapter.body_blocks:
             _render_body_block(lines, block)
@@ -99,6 +94,15 @@ def _render_chapter(
             for claim in chapter.claims:
                 lines.append(f"- {_escape_markdown(claim.text)}")
             lines.append("")
+
+
+def _summary_repeats_body(chapter: SemanticChapter) -> bool:
+    body_text = " ".join(
+        block.text
+        for block in chapter.body_blocks
+        if isinstance(block, (ParagraphBlock, QuoteBlock))
+    )
+    return bool(body_text) and " ".join(chapter.summary_zh.split()) == " ".join(body_text.split())
 
 
 def _render_body_block(lines: list[str], block: object) -> None:

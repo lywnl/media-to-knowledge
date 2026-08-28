@@ -1558,6 +1558,8 @@ def _validate_global_response(
     request: GlobalWritingRequest,
     chapters: tuple[SemanticChapter, ...],
 ) -> None:
+    if not response.overview_zh.strip():
+        raise ValueError("全局核心概览不能为空")
     expected = set(allowed_global_chapter_ids(request))
     grounded = {chapter.chapter_id for chapter in chapters if chapter.content_status == "GROUNDED"}
     if any(ref not in grounded for point in response.key_points for ref in point.chapter_refs):
