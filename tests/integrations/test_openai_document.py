@@ -149,6 +149,47 @@ def test_plan_request_uses_main_schema_prompt_and_temperature_zero() -> None:
     assert "text-secret" not in json.dumps(payloads)
 
 
+def test_writing_requests_disable_thinking_for_latency() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        payloads.append(payload)
+        schema = payload["response_format"]["json_schema"]["name"]
+        body = _writing_body() if schema == "chapter_writing_v2" else _global_body()
+        return _provider_response(request, body)
+
+    writing = ChapterWritingRequest(
+        context=_context(),
+        chapter=_chapter(),
+        transcript_evidence=(_speech(),),
+        visual_observations=(),
+        prompt_version="chapter-writer-v1",
+    )
+    global_request = GlobalWritingRequest(
+        context=_context(),
+        groups=(
+            GlobalChapterGroup(
+                start_ms=0,
+                end_ms=10_000,
+                chapter_refs=("chapter_001",),
+                grounded_chapter_refs=("chapter_001",),
+                digest_zh="摘要",
+            ),
+        ),
+        prompt_version="global-editor-v1",
+    )
+
+    client = _client(httpx.MockTransport(handler))
+    client.write_chapter(writing)
+    client.organize_document(global_request)
+
+    assert [payload["thinking"] for payload in payloads] == [
+        {"type": "disabled"},
+        {"type": "disabled"},
+    ]
+
+
 def test_writing_prompts_separate_observation_and_content_references() -> None:
     writing = ChapterWritingRequest(
         context=_context(),

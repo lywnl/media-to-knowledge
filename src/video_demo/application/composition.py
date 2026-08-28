@@ -295,6 +295,10 @@ def build_production_pipeline(
                     prompt_versions.chapter_writer,
                     "chapter_writing_repair_v2",
                     prompt_versions.chapter_writer_repair,
+                    generation_config=(
+                        ("temperature", "0"),
+                        ("thinking", "disabled"),
+                    ),
                 ),
                 global_identity=_identity(
                     "global_editing",
@@ -304,6 +308,10 @@ def build_production_pipeline(
                     prompt_versions.global_editor,
                     "global_writing_repair_v1",
                     prompt_versions.global_editor_repair,
+                    generation_config=(
+                        ("temperature", "0"),
+                        ("thinking", "disabled"),
+                    ),
                 ),
                 chapter_writer_concurrency=settings.chapter_writer_concurrency,
                 max_input_chars=text.max_input_chars,

@@ -186,6 +186,7 @@ class OpenAIDocumentClient(DocumentTextPort):
             prompt_for_writing(request),
             response_type=ChapterWritingResponse,
             schema_name="chapter_writing_v2",
+            extra_payload={"thinking": {"type": "disabled"}},
             validate_response=lambda response: _validate_writing_response(
                 response,
                 allowed_evidence_ids=set(allowed_writing_evidence_ids(request)),
@@ -204,6 +205,7 @@ class OpenAIDocumentClient(DocumentTextPort):
             prompt_for_writing_repair(request),
             response_type=ChapterWritingResponse,
             schema_name="chapter_writing_repair_v2",
+            extra_payload={"thinking": {"type": "disabled"}},
             validate_response=lambda response: _validate_writing_response(
                 response,
                 allowed_evidence_ids=set(request.allowed_evidence_ids),
@@ -222,6 +224,7 @@ class OpenAIDocumentClient(DocumentTextPort):
             prompt_for_global_editing(request),
             response_type=GlobalWritingResponse,
             schema_name="global_writing_v1",
+            extra_payload={"thinking": {"type": "disabled"}},
             validate_response=lambda response: _validate_global_response(
                 response,
                 allowed_chapter_ids=set(allowed_global_chapter_ids(request)),
@@ -239,6 +242,7 @@ class OpenAIDocumentClient(DocumentTextPort):
             prompt_for_global_repair(request),
             response_type=GlobalWritingResponse,
             schema_name="global_writing_repair_v1",
+            extra_payload={"thinking": {"type": "disabled"}},
             validate_response=lambda response: _validate_global_response(
                 response,
                 allowed_chapter_ids=set(request.allowed_chapter_ids),
