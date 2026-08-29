@@ -18,6 +18,10 @@ from video_demo.persistence.media_repositories import MediaObjectRepository
 from video_demo.persistence.models import AudioObjectModel, ImageObjectModel
 from video_demo.persistence.repositories import Scope
 
+MediaUploadFile = Annotated[UploadFile, File()]
+MediaScope = Annotated[Scope, Depends(get_scope)]
+MediaContainer = Annotated[AppContainer, Depends(get_container)]
+
 
 def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
     label = "音频" if kind == "AUDIO" else "图片"
@@ -37,9 +41,9 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
         status_code=status.HTTP_201_CREATED,
     )
     def upload_object(
-        file: Annotated[UploadFile, File(description=f"{label}文件")],
-        scope: Annotated[Scope, Depends(get_scope)],
-        container: Annotated[AppContainer, Depends(get_container)],
+        file: MediaUploadFile,
+        scope: MediaScope,
+        container: MediaContainer,
     ) -> MediaObjectResponse:
         upload = container.media_upload_services[kind]
         record = upload.upload(file.file, file.filename or "", file.content_type or "", scope)
@@ -55,8 +59,8 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
     @router.get("-objects/{object_ref}", response_model=MediaObjectResponse)
     def get_object(
         object_ref: str,
-        scope: Annotated[Scope, Depends(get_scope)],
-        container: Annotated[AppContainer, Depends(get_container)],
+        scope: MediaScope,
+        container: MediaContainer,
     ) -> MediaObjectResponse:
         with container.database.session() as session:
             model = MediaObjectRepository(session, object_model).get(scope, object_ref)
@@ -83,8 +87,8 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
     )
     def create_run(
         payload: CreateMediaRunRequest,
-        scope: Annotated[Scope, Depends(get_scope)],
-        container: Annotated[AppContainer, Depends(get_container)],
+        scope: MediaScope,
+        container: MediaContainer,
     ) -> MediaRunResponse:
         view = service(container).create(
             scope=scope,
@@ -99,8 +103,8 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
 
     @router.get("-understanding-runs", response_model=MediaRunHistoryResponse)
     def list_runs(
-        scope: Annotated[Scope, Depends(get_scope)],
-        container: Annotated[AppContainer, Depends(get_container)],
+        scope: MediaScope,
+        container: MediaContainer,
     ) -> MediaRunHistoryResponse:
         return MediaRunHistoryResponse(
             items=tuple(
@@ -112,8 +116,8 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
     @router.get("-understanding-runs/{run_id}", response_model=MediaRunResponse)
     def get_run(
         run_id: str,
-        scope: Annotated[Scope, Depends(get_scope)],
-        container: Annotated[AppContainer, Depends(get_container)],
+        scope: MediaScope,
+        container: MediaContainer,
     ) -> MediaRunResponse:
         return _run_response(service(container).get(scope, run_id))
 
