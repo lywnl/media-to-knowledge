@@ -65,7 +65,7 @@ class ResultQueryService:
         artifact_store: AtomicArtifactStore,
         *,
         max_evidence_items: int = 25_000,
-        max_keyframe_bytes: int = 5 * 1024 * 1024,
+        max_keyframe_bytes: int = 8 * 1024 * 1024,
         max_document_bytes: int = 16 * 1024 * 1024,
         max_bundle_bytes: int = 64 * 1024 * 1024,
         visual_cleaner: VisualCleaner | None = None,

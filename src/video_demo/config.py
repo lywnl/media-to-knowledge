@@ -125,7 +125,7 @@ class ApiRuntimeConfig(FrozenModel):
     max_result_bundle_bytes: int = Field(ge=1, le=64 * 1024 * 1024)
     max_document_bytes: int = Field(ge=1, le=16 * 1024 * 1024)
     max_result_evidence_items: int = Field(ge=1, le=25_000)
-    vlm_max_image_bytes: int = Field(ge=1, le=5 * 1024 * 1024)
+    vlm_max_image_bytes: int = Field(ge=1, le=8 * 1024 * 1024)
 
 
 class ApiRuntimeSettings(BaseSettings):
@@ -144,7 +144,7 @@ class ApiRuntimeSettings(BaseSettings):
     max_result_bundle_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
     max_document_bytes: int = Field(default=16 * 1024 * 1024, ge=1)
     max_result_evidence_items: int = Field(default=25_000, ge=1)
-    vlm_max_image_bytes: int = Field(default=5 * 1024 * 1024, ge=1)
+    vlm_max_image_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
 
     def to_runtime_config(self) -> ApiRuntimeConfig:
         workspace = self.workspace_root.expanduser().resolve(strict=False)
@@ -205,10 +205,10 @@ class Settings(BaseSettings):
     vlm_model_id: str = "qwen3-vl-flash"
     vlm_timeout_seconds: float = Field(default=180.0, gt=0, allow_inf_nan=False)
     vlm_max_attempts: int = Field(default=3, ge=1, le=5)
-    vlm_max_image_bytes: int = Field(default=5 * 1024 * 1024, ge=1)
-    vlm_max_request_image_bytes: int = Field(default=24 * 1024 * 1024, ge=1)
-    vlm_max_encoded_request_bytes: int = Field(default=36 * 1024 * 1024, ge=1)
-    vlm_max_inflight_encoded_bytes: int = Field(default=72 * 1024 * 1024, ge=1)
+    vlm_max_image_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
+    vlm_max_request_image_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
+    vlm_max_encoded_request_bytes: int = Field(default=48 * 1024 * 1024, ge=1)
+    vlm_max_inflight_encoded_bytes: int = Field(default=96 * 1024 * 1024, ge=1)
     vlm_concurrency: int = Field(default=2, ge=1, le=2)
     chapter_writer_concurrency: int = Field(default=2, ge=1, le=2)
     visual_proxy_max_edge: int = Field(default=1_920, ge=1_280, le=2_560)
@@ -456,7 +456,7 @@ def _validate_first_release_budgets(settings: Settings) -> None:
     """保证 Settings 不会放宽领域层和受限读取器的首版硬上限。"""
 
     limits = (
-        (settings.vlm_max_image_bytes, 5 * 1024 * 1024, "单图"),
+        (settings.vlm_max_image_bytes, 8 * 1024 * 1024, "单图"),
         (
             settings.max_candidate_frame_files_per_run,
             20_000,

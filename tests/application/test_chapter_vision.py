@@ -1241,6 +1241,41 @@ def test_chapter_vision_limits_candidates_to_selected_frame_budget(
     assert result.chapter_status == ((chapter.chapter_id, "SUCCEEDED"),)
 
 
+def test_chapter_vision_logs_input_budget_rejection(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    run_root, chapter, frame_batch, speech, payload = _fixture(tmp_path)
+    port = _VisionPort(_response())
+    service = ChapterVisionService(
+        port,
+        _identity(),
+        runtime_root=tmp_path,
+        concurrency=1,
+        max_image_bytes=1024,
+        max_request_image_bytes=len(payload) - 1,
+        max_encoded_request_bytes=64 * 1024,
+        max_published_keyframe_bytes=4096,
+        max_published_keyframe_files=10,
+        invocation_wait_timeout_seconds=2,
+        candidate_lock_timeout_seconds=2,
+    )
+
+    result = service.analyze_all(
+        (chapter,),
+        frame_batch,
+        (speech,),
+        DocumentGenerationConfig(),
+        cache=_cache(run_root),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert result.warnings == (f"CHAPTER_VLM_INPUT_BUDGET_DEGRADED:{chapter.chapter_id}",)
+    assert "章节视觉输入预算拒绝" in caplog.text
+    assert "chapter_id=chapter_001" in caplog.text
+    assert "candidate_count=1" in caplog.text
+
+
 def test_cancellation_stops_submitting_and_waits_for_inflight_chapters(tmp_path: Path) -> None:
     run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
     chapter_speeches = tuple(

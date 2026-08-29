@@ -655,6 +655,7 @@ class ChapterVisionService:
         transcript_evidence: tuple[TranscriptEvidence, ...],
         document_config: DocumentGenerationConfig,
     ) -> tuple[FrameCandidateArtifact, ...] | None:
+        candidate_count = len(frames)
         admitted = tuple(frame for frame in frames if frame.size_bytes <= self._max_image_bytes)
         required_targets = {target.target_id for target in _targets(chapter)}
         max_selected_frames = min(
@@ -662,23 +663,69 @@ class ChapterVisionService:
             3 if chapter.visual_mode in {"COMPARISON", "MULTI_STEP"} else 2,
         )
         if max_selected_frames == 0:
+            _log_input_budget_rejection(
+                chapter,
+                reason="MAX_VISUALS_DISABLED",
+                candidate_count=candidate_count,
+                admitted_count=len(admitted),
+                raw_bytes=sum(frame.size_bytes for frame in admitted),
+                raw_limit=self._max_request_image_bytes,
+                encoded_main=None,
+                encoded_repair=None,
+                encoded_limit=self._max_encoded_request_bytes,
+                selected_limit=max_selected_frames,
+                covers_targets=False,
+            )
             return None
         while admitted:
             request = _vision_request(chapter, admitted, transcript_evidence, document_config)
+            encoded_main, encoded_repair = self._request_pair_sizes(request)
+            raw_bytes = sum(frame.size_bytes for frame in admitted)
+            covers_targets = _covers_targets(admitted, required_targets)
             if (
                 len(admitted) <= max_selected_frames
-                and sum(frame.size_bytes for frame in admitted) <= self._max_request_image_bytes
-                and self._request_pair_fits(request)
-                and _covers_targets(admitted, required_targets)
+                and raw_bytes <= self._max_request_image_bytes
+                and max(encoded_main, encoded_repair) <= self._max_encoded_request_bytes
+                and covers_targets
             ):
                 return admitted
             removable = _lowest_removable_frame(admitted, required_targets)
             if removable is None:
+                _log_input_budget_rejection(
+                    chapter,
+                    reason="NO_REMOVABLE_FRAME",
+                    candidate_count=candidate_count,
+                    admitted_count=len(admitted),
+                    raw_bytes=raw_bytes,
+                    raw_limit=self._max_request_image_bytes,
+                    encoded_main=encoded_main,
+                    encoded_repair=encoded_repair,
+                    encoded_limit=self._max_encoded_request_bytes,
+                    selected_limit=max_selected_frames,
+                    covers_targets=covers_targets,
+                )
                 return None
             admitted = tuple(frame for frame in admitted if frame.frame_id != removable.frame_id)
+        _log_input_budget_rejection(
+            chapter,
+            reason="NO_ADMITTED_FRAME",
+            candidate_count=candidate_count,
+            admitted_count=0,
+            raw_bytes=0,
+            raw_limit=self._max_request_image_bytes,
+            encoded_main=None,
+            encoded_repair=None,
+            encoded_limit=self._max_encoded_request_bytes,
+            selected_limit=max_selected_frames,
+            covers_targets=False,
+        )
         return None
 
     def _request_pair_fits(self, request: ChapterVisionRequest) -> bool:
+        main_size, repair_size = self._request_pair_sizes(request)
+        return max(main_size, repair_size) <= self._max_encoded_request_bytes
+
+    def _request_pair_sizes(self, request: ChapterVisionRequest) -> tuple[int, int]:
         frames = tuple(
             (frame.frame_id, frame.size_bytes)
             for frame in sorted(request.frames, key=lambda item: (item.timestamp_ms, item.frame_id))
@@ -698,7 +745,7 @@ class ChapterVisionService:
             response_schema=ChapterVisionResponse.model_json_schema(),
             ordered_frames=frames,
         )
-        return max(main_size, repair_size) <= self._max_encoded_request_bytes
+        return main_size, repair_size
 
     def _assemble_batch(
         self,
@@ -1043,6 +1090,38 @@ def _log_validation_failure(
         code,
         provider_attempts,
         ",".join(invalid.validation_errors[:8]),
+    )
+
+
+def _log_input_budget_rejection(
+    chapter: ChapterPlan,
+    *,
+    reason: str,
+    candidate_count: int,
+    admitted_count: int,
+    raw_bytes: int,
+    raw_limit: int,
+    encoded_main: int | None,
+    encoded_repair: int | None,
+    encoded_limit: int,
+    selected_limit: int,
+    covers_targets: bool,
+) -> None:
+    _LOGGER.warning(
+        "章节视觉输入预算拒绝 chapter_id=%s reason=%s candidate_count=%d "
+        "admitted_count=%d raw_bytes=%d raw_limit=%d encoded_main=%s "
+        "encoded_repair=%s encoded_limit=%d selected_limit=%d covers_targets=%s",
+        chapter.chapter_id,
+        reason,
+        candidate_count,
+        admitted_count,
+        raw_bytes,
+        raw_limit,
+        encoded_main if encoded_main is not None else "NA",
+        encoded_repair if encoded_repair is not None else "NA",
+        encoded_limit,
+        selected_limit,
+        covers_targets,
     )
 
 

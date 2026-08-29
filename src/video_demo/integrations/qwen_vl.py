@@ -43,9 +43,9 @@ from video_demo.visual.candidate_artifacts import read_verified_candidate_jpeg
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 _MAX_FRAMES = 6
-_MAX_IMAGE_BYTES = 5 * 1024 * 1024
-_MAX_RAW_REQUEST_BYTES = 24 * 1024 * 1024
-_MAX_ENCODED_REQUEST_BYTES = 36 * 1024 * 1024
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024
+_MAX_RAW_REQUEST_BYTES = 32 * 1024 * 1024
+_MAX_ENCODED_REQUEST_BYTES = 48 * 1024 * 1024
 
 
 class QwenVisionProviderReceipt(FrozenModel):

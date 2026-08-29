@@ -87,7 +87,7 @@ class ChapterVlmInputFrame(FrozenModel):
     relative_path: str = Field(min_length=1, max_length=1024)
     mime_type: Literal["image/jpeg"] = "image/jpeg"
     sha256: Sha256
-    size_bytes: StrictInt = Field(gt=0, le=5 * 1024 * 1024)
+    size_bytes: StrictInt = Field(gt=0, le=8 * 1024 * 1024)
     perceptual_hash: str = Field(pattern=r"^[0-9a-f]{16}$")
     target_ids: tuple[StableId, ...] = Field(min_length=1, max_length=1)
 
@@ -259,7 +259,7 @@ class ValidatedChapterVlmInputContext(FrozenModel):
     duration_tolerance_ms: StrictInt = Field(ge=0, le=1_000)
     frame_tolerance_ms: StrictInt = Field(ge=1, le=100)
     jpeg_quality: StrictInt = Field(ge=1, le=100)
-    vlm_max_image_bytes: StrictInt = Field(gt=0, le=5 * 1024 * 1024)
+    vlm_max_image_bytes: StrictInt = Field(gt=0, le=8 * 1024 * 1024)
     max_candidate_frame_bytes_per_run: StrictInt = Field(gt=0, le=512 * 1024 * 1024)
     max_candidate_frame_files_per_run: StrictInt = Field(gt=0, le=20_000)
 
