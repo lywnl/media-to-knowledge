@@ -72,7 +72,7 @@ class AudioUnderstandingResult(FrozenModel):
             raise ValueError("音频摘要时长必须等于最后章节终点")
         if any(
             left.end_ms != right.start_ms
-            for left, right in zip(self.chapters, self.chapters[1:], strict=True)
+            for left, right in zip(self.chapters, self.chapters[1:], strict=False)
         ):
             raise ValueError("音频章节必须连续且无重叠")
         return self

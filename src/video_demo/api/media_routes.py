@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, File, UploadFile, status
+from fastapi import APIRouter, Depends, File, Response, UploadFile, status
 
 from video_demo.api.dependencies import AppContainer, get_container, get_scope
 from video_demo.api.schemas import (
@@ -120,6 +120,26 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
         container: MediaContainer,
     ) -> MediaRunResponse:
         return _run_response(service(container).get(scope, run_id))
+
+    @router.get("-understanding-runs/{run_id}/result")
+    def get_result(
+        run_id: str,
+        scope: MediaScope,
+        container: MediaContainer,
+    ) -> object:
+        return container.media_query_services[kind].get_result(scope, run_id)
+
+    @router.get("-understanding-runs/{run_id}/document")
+    def get_document(
+        run_id: str,
+        scope: MediaScope,
+        container: MediaContainer,
+    ) -> Response:
+        return Response(
+            content=container.media_query_services[kind].get_document(scope, run_id),
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": 'inline; filename="knowledge-note.md"'},
+        )
 
     return router
 

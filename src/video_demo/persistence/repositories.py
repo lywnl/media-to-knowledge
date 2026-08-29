@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import Select, and_, exists, func, or_, select, update
 from sqlalchemy.orm import Session
@@ -712,6 +712,7 @@ class JobRepository:
         attempt_count: int,
         scope: Scope,
         run_id: str,
+        resource_type: str = "VIDEO_UNDERSTANDING_RUN",
         now: datetime | None = None,
     ) -> bool:
         """仅允许目标运行对应的租约赢得结果发布。"""
@@ -721,6 +722,7 @@ class JobRepository:
             worker_id,
             attempt_count=attempt_count,
             target=(scope, run_id),
+            resource_type=resource_type,
             now=now,
         )
 
@@ -731,6 +733,7 @@ class JobRepository:
         *,
         attempt_count: int,
         target: tuple[Scope, str] | None,
+        resource_type: str = "VIDEO_UNDERSTANDING_RUN",
         now: datetime | None,
     ) -> bool:
         try:
@@ -742,6 +745,7 @@ class JobRepository:
                 error_code=None,
                 allow_cancel_requested=False,
                 target=target,
+                resource_type=resource_type,
                 now=now,
             )
         except VideoDemoError as error:
@@ -923,15 +927,28 @@ class JobRepository:
         resource_type: str,
         resource_id: str,
     ) -> None:
-        if resource_type != "VIDEO_UNDERSTANDING_RUN":
+        from video_demo.persistence.models import (
+            AudioUnderstandingRunModel,
+            ImageUnderstandingRunModel,
+        )
+
+        run_model = cast(
+            type[Any] | None,
+            {
+                "VIDEO_UNDERSTANDING_RUN": VideoUnderstandingRunModel,
+                "AUDIO_UNDERSTANDING_RUN": AudioUnderstandingRunModel,
+                "IMAGE_UNDERSTANDING_RUN": ImageUnderstandingRunModel,
+            }.get(resource_type),
+        )
+        if run_model is None:
             return
         result = self._session.execute(
-            update(VideoUnderstandingRunModel)
+            update(run_model)
             .where(
-                VideoUnderstandingRunModel.tenant_id == scope.tenant_id,
-                VideoUnderstandingRunModel.application_id == scope.application_id,
-                VideoUnderstandingRunModel.knowledge_base_id == scope.knowledge_base_id,
-                VideoUnderstandingRunModel.run_id == resource_id,
+                run_model.tenant_id == scope.tenant_id,
+                run_model.application_id == scope.application_id,
+                run_model.knowledge_base_id == scope.knowledge_base_id,
+                run_model.run_id == resource_id,
             )
             .values(
                 status=RunStatusValue.CANCELLED,
@@ -978,6 +995,7 @@ class JobRepository:
         error_code: str | None,
         allow_cancel_requested: bool,
         target: tuple[Scope, str] | None,
+        resource_type: str = "VIDEO_UNDERSTANDING_RUN",
         now: datetime | None,
     ) -> bool:
         current_time = now or datetime.now(UTC)
@@ -995,7 +1013,7 @@ class JobRepository:
                 JobModel.tenant_id == scope.tenant_id,
                 JobModel.application_id == scope.application_id,
                 JobModel.knowledge_base_id == scope.knowledge_base_id,
-                JobModel.resource_type == "VIDEO_UNDERSTANDING_RUN",
+                JobModel.resource_type == resource_type,
                 JobModel.resource_id == run_id,
             )
         result = self._session.execute(
@@ -1026,7 +1044,7 @@ class JobRepository:
                 JobModel.tenant_id == scope.tenant_id,
                 JobModel.application_id == scope.application_id,
                 JobModel.knowledge_base_id == scope.knowledge_base_id,
-                JobModel.resource_type == "VIDEO_UNDERSTANDING_RUN",
+                JobModel.resource_type == resource_type,
                 JobModel.resource_id == run_id,
             )
         if self._session.scalar(select(JobModel.id).where(and_(*completed))) is not None:

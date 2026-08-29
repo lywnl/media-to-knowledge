@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - 受支持平台均提供，分支用�
     fcntl = None  # type: ignore[assignment]
 
 _LEGACY_REVISION = "0001_video_demo"
-_HEAD_REVISION = "0004_audio_image_media"
+_HEAD_REVISION = "0005_media_artifact_pointers"
 _SCOPE = {
     "tenant_id": ("VARCHAR(128)", False),
     "application_id": ("VARCHAR(128)", False),
@@ -148,6 +148,8 @@ _MEDIA_RUN_COLUMNS = {
         warning_codes=("JSON", False),
         error_code=("VARCHAR(128)", True),
         config_snapshot=("JSON", False),
+        artifact_relative_path=("VARCHAR(1024)", True),
+        artifact_sha256=("VARCHAR(64)", True),
         document_relative_path=("VARCHAR(1024)", True),
         document_sha256=("VARCHAR(64)", True),
         document_size_bytes=("BIGINT", True),

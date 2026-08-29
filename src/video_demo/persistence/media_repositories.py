@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, TypeVar
+from typing import Any
 
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
@@ -15,9 +15,6 @@ from video_demo.persistence.models import (
 )
 from video_demo.persistence.repositories import Scope
 
-ObjectModel = TypeVar("ObjectModel", AudioObjectModel, ImageObjectModel)
-RunModel = TypeVar("RunModel", AudioUnderstandingRunModel, ImageUnderstandingRunModel)
-
 
 def _scope_where(statement: Select[Any], model: type[Any], scope: Scope) -> Select[Any]:
     return statement.where(
@@ -28,7 +25,7 @@ def _scope_where(statement: Select[Any], model: type[Any], scope: Scope) -> Sele
 
 
 class MediaObjectRepository:
-    def __init__(self, session: Session, model: type[ObjectModel]) -> None:
+    def __init__(self, session: Session, model: type[Any]) -> None:
         self._session = session
         self._model = model
 
@@ -43,7 +40,7 @@ class MediaObjectRepository:
         size_bytes: int,
         sha256: str,
         relative_path: str,
-    ) -> ObjectModel:
+    ) -> Any:
         model = self._model(
             tenant_id=scope.tenant_id,
             application_id=scope.application_id,
@@ -62,14 +59,14 @@ class MediaObjectRepository:
         self._session.flush()
         return model
 
-    def get_ready(self, scope: Scope, object_ref: str) -> ObjectModel | None:
+    def get_ready(self, scope: Scope, object_ref: str) -> Any | None:
         statement = _scope_where(select(self._model), self._model, scope).where(
             self._model.object_ref == object_ref,
             self._model.status == VideoObjectStatus.READY,
         )
         return self._session.scalar(statement)
 
-    def get(self, scope: Scope, object_ref: str) -> ObjectModel | None:
+    def get(self, scope: Scope, object_ref: str) -> Any | None:
         statement = _scope_where(select(self._model), self._model, scope).where(
             self._model.object_ref == object_ref,
         )
@@ -77,7 +74,7 @@ class MediaObjectRepository:
 
 
 class MediaRunRepository:
-    def __init__(self, session: Session, model: type[RunModel]) -> None:
+    def __init__(self, session: Session, model: type[Any]) -> None:
         self._session = session
         self._model = model
 
@@ -89,7 +86,7 @@ class MediaRunRepository:
         object_ref: str,
         idempotency_key: str,
         config_snapshot: dict[str, Any],
-    ) -> RunModel:
+    ) -> Any:
         model = self._model(
             tenant_id=scope.tenant_id,
             application_id=scope.application_id,
@@ -106,19 +103,19 @@ class MediaRunRepository:
         self._session.flush()
         return model
 
-    def get(self, scope: Scope, run_id: str) -> RunModel | None:
+    def get(self, scope: Scope, run_id: str) -> Any | None:
         statement = _scope_where(select(self._model), self._model, scope).where(
             self._model.run_id == run_id,
         )
         return self._session.scalar(statement)
 
-    def get_by_idempotency(self, scope: Scope, key: str) -> RunModel | None:
+    def get_by_idempotency(self, scope: Scope, key: str) -> Any | None:
         statement = _scope_where(select(self._model), self._model, scope).where(
             self._model.idempotency_key == key,
         )
         return self._session.scalar(statement)
 
-    def list_with_objects(self, scope: Scope) -> list[RunModel]:
+    def list_with_objects(self, scope: Scope) -> list[Any]:
         statement = _scope_where(
             select(self._model).order_by(self._model.created_at.desc(), self._model.id.desc()),
             self._model,
@@ -150,7 +147,7 @@ class MediaRunRepository:
         return True
 
 
-def media_model_for_kind(kind: str) -> tuple[type[ObjectModel], type[RunModel]]:
+def media_model_for_kind(kind: str) -> tuple[type[Any], type[Any]]:
     if kind == "AUDIO":
         return AudioObjectModel, AudioUnderstandingRunModel
     if kind == "IMAGE":

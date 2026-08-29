@@ -126,6 +126,9 @@ class ApiRuntimeConfig(FrozenModel):
     max_document_bytes: int = Field(ge=1, le=16 * 1024 * 1024)
     max_result_evidence_items: int = Field(ge=1, le=25_000)
     vlm_max_image_bytes: int = Field(ge=1, le=8 * 1024 * 1024)
+    max_audio_bytes: int = Field(ge=1)
+    max_audio_duration_ms: int = Field(ge=1, le=7_200_000)
+    max_image_bytes: int = Field(ge=1, le=8 * 1024 * 1024)
 
 
 class ApiRuntimeSettings(BaseSettings):
@@ -145,6 +148,9 @@ class ApiRuntimeSettings(BaseSettings):
     max_document_bytes: int = Field(default=16 * 1024 * 1024, ge=1)
     max_result_evidence_items: int = Field(default=25_000, ge=1)
     vlm_max_image_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
+    max_audio_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
+    max_audio_duration_ms: int = Field(default=7_200_000, ge=1, le=7_200_000)
+    max_image_bytes: int = Field(default=8 * 1024 * 1024, ge=1, le=8 * 1024 * 1024)
 
     def to_runtime_config(self) -> ApiRuntimeConfig:
         workspace = self.workspace_root.expanduser().resolve(strict=False)
@@ -160,6 +166,9 @@ class ApiRuntimeSettings(BaseSettings):
             max_document_bytes=self.max_document_bytes,
             max_result_evidence_items=self.max_result_evidence_items,
             vlm_max_image_bytes=self.vlm_max_image_bytes,
+            max_audio_bytes=self.max_audio_bytes,
+            max_audio_duration_ms=self.max_audio_duration_ms,
+            max_image_bytes=self.max_image_bytes,
         )
 
 
@@ -185,6 +194,9 @@ class Settings(BaseSettings):
     speech_subprocess_timeout_seconds: int = Field(default=3_600, ge=1, le=14_400)
     max_video_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
     max_video_duration_ms: int = Field(default=7_200_000, ge=1, le=7_200_000)
+    max_audio_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
+    max_audio_duration_ms: int = Field(default=7_200_000, ge=1, le=7_200_000)
+    max_image_bytes: int = Field(default=8 * 1024 * 1024, ge=1, le=8 * 1024 * 1024)
     # 仅供本地演示显式开启；默认保持严格外部依赖失败语义。
     demo_degraded_mode: bool = False
 
@@ -333,6 +345,9 @@ class Settings(BaseSettings):
             max_document_bytes=self.max_document_bytes,
             max_result_evidence_items=self.max_result_evidence_items,
             vlm_max_image_bytes=self.vlm_max_image_bytes,
+            max_audio_bytes=self.max_audio_bytes,
+            max_audio_duration_ms=self.max_audio_duration_ms,
+            max_image_bytes=self.max_image_bytes,
         )
 
     def require_text_llm_configuration(self) -> TextLlmConfiguration:

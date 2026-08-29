@@ -12,16 +12,27 @@ from video_demo.api.media_routes import build_media_router
 from video_demo.api.objects import router as objects_router
 from video_demo.api.runs import router as runs_router
 from video_demo.api.schemas import ErrorBody, ErrorResponse
+from video_demo.application.audio_rendering import render_audio_markdown
+from video_demo.application.image_rendering import render_image_markdown
+from video_demo.application.media_publication import MediaPublicationService
+from video_demo.application.media_queries import MediaQueryService
 from video_demo.application.media_runs import MediaRunService
 from video_demo.application.media_uploads import MediaUploadService
 from video_demo.application.queries import ResultQueryService
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
 from video_demo.config import ApiRuntimeConfig, ApiRuntimeSettings, Settings
+from video_demo.domain.audio_document import AudioUnderstandingResult
+from video_demo.domain.image_document import ImageUnderstandingResult
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
-from video_demo.persistence.models import AudioObjectModel, ImageObjectModel
+from video_demo.persistence.models import (
+    AudioObjectModel,
+    AudioUnderstandingRunModel,
+    ImageObjectModel,
+    ImageUnderstandingRunModel,
+)
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.audio_object_store import AudioObjectStore
 from video_demo.storage.image_object_store import ImageObjectStore
@@ -105,18 +116,46 @@ def create_app(
         media_upload_services={
             "AUDIO": MediaUploadService(
                 database,
-                AudioObjectStore(runtime.runtime_root, max_bytes=runtime.max_video_bytes),
+                AudioObjectStore(runtime.runtime_root, max_bytes=runtime.max_audio_bytes),
                 AudioObjectModel,
             ),
             "IMAGE": MediaUploadService(
                 database,
-                ImageObjectStore(runtime.runtime_root, max_bytes=8 * 1024 * 1024),
+                ImageObjectStore(runtime.runtime_root, max_bytes=runtime.max_image_bytes),
                 ImageObjectModel,
             ),
         },
         media_run_services={
             "AUDIO": MediaRunService(database, kind="AUDIO"),
             "IMAGE": MediaRunService(database, kind="IMAGE"),
+        },
+        media_query_services={
+            "AUDIO": MediaQueryService(
+                MediaPublicationService(
+                    database,
+                    AtomicArtifactStore(runtime.runtime_root),
+                    run_model=AudioUnderstandingRunModel,
+                    result_type=AudioUnderstandingResult,
+                    render=render_audio_markdown,
+                    resource_type="AUDIO_UNDERSTANDING_RUN",
+                    not_found_code=ErrorCode.AUDIO_RUN_NOT_FOUND,
+                    max_document_bytes=runtime.max_document_bytes,
+                    max_bundle_bytes=runtime.max_result_bundle_bytes,
+                ),
+            ),
+            "IMAGE": MediaQueryService(
+                MediaPublicationService(
+                    database,
+                    AtomicArtifactStore(runtime.runtime_root),
+                    run_model=ImageUnderstandingRunModel,
+                    result_type=ImageUnderstandingResult,
+                    render=render_image_markdown,
+                    resource_type="IMAGE_UNDERSTANDING_RUN",
+                    not_found_code=ErrorCode.IMAGE_RUN_NOT_FOUND,
+                    max_document_bytes=runtime.max_document_bytes,
+                    max_bundle_bytes=runtime.max_result_bundle_bytes,
+                ),
+            ),
         },
     )
 
@@ -140,6 +179,8 @@ def create_app(
     app.include_router(jobs_router)
     app.add_exception_handler(VideoDemoError, _handle_video_demo_error)
     return app
+
+
 
 
 async def _handle_video_demo_error(

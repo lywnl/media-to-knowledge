@@ -5,15 +5,20 @@ import importlib.metadata
 import json
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 import httpx
 
+from video_demo.application.audio_pipeline import AudioPipeline, AudioSpeechAnalyzer
+from video_demo.application.audio_rendering import render_audio_markdown
 from video_demo.application.chapter_frames import ChapterFrameSearcher
 from video_demo.application.chapter_planning import ChapterPlanner
 from video_demo.application.chapter_vision import ChapterVisionService
 from video_demo.application.document_pipeline import VideoUnderstandingPipeline
 from video_demo.application.document_writing import DocumentWriter
+from video_demo.application.image_rendering import render_image_markdown
+from video_demo.application.media_publication import MediaPublicationService
+from video_demo.application.media_workers import AudioJobHandler, ImageJobHandler
 from video_demo.application.pipeline import PipelineJobHandler
 from video_demo.application.pipeline_contracts import EvidencePreparationLimits
 from video_demo.application.production_media import (
@@ -24,18 +29,28 @@ from video_demo.application.production_media import (
     build_ffprobe_factory,
 )
 from video_demo.application.production_scene import ProductionSceneIndexProvider
+from video_demo.application.production_speech import AudioSliceClient, VerifiedAudioSlicer
 from video_demo.application.queries import ResultQueryService
 from video_demo.application.visual_cleanup import PublishedVisualCleaner
 from video_demo.application.visual_cleanup_recovery import PublishedVisualCleanupRecovery
 from video_demo.config import Settings
+from video_demo.domain.audio_document import AudioUnderstandingResult
 from video_demo.domain.base import FrozenModel, Sha256
 from video_demo.domain.document import PromptVersions
+from video_demo.domain.image_document import ImageUnderstandingResult
 from video_demo.domain.run import ModelIdentity
+from video_demo.errors import ErrorCode
+from video_demo.integrations.image_vlm import ImageVlmClient
 from video_demo.integrations.openai_document import OpenAIDocumentClient
 from video_demo.integrations.qwen_vl import QwenVisionClient
+from video_demo.media.audio_probe import FFprobeAudioClient
 from video_demo.media.probe import ProbeLimits
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
+from video_demo.persistence.models import (
+    AudioUnderstandingRunModel,
+    ImageUnderstandingRunModel,
+)
 from video_demo.speech.isolated import IsolatedSpeechAnalyzer
 from video_demo.speech.snapshots import SpeechFingerprintInputs
 from video_demo.speech.subprocess_protocol import (
@@ -43,7 +58,9 @@ from video_demo.speech.subprocess_protocol import (
     SpeechSubprocessCredentials,
 )
 from video_demo.storage.artifacts import AtomicArtifactStore
+from video_demo.storage.audio_object_store import AudioObjectStore
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
+from video_demo.storage.image_object_store import ImageObjectStore
 from video_demo.storage.object_store import LocalVideoObjectStore
 from video_demo.storage.snapshots import SnapshotStore
 from video_demo.visual.keyframes import OpenCvFrameExtractor
@@ -381,6 +398,182 @@ def build_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
         return worker
 
 
+def build_audio_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
+    """构造只领取 AUDIO_UNDERSTANDING 的独立 Worker。"""
+
+    assert settings.runtime_root is not None
+    runtime_root = settings.runtime_root
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    database_url = f"sqlite+pysqlite:///{runtime_root / 'video-demo.db'}"
+    upgrade_runtime_database(settings.workspace_root, runtime_root, database_url)
+    database = Database(database_url)
+    cloud = settings.require_cloud_asr_configuration()
+    text = settings.require_text_llm_configuration()
+    http = httpx.Client()
+    ffmpeg = production_tool_path(settings, "ffmpeg")
+    ffmpeg_factory = build_ffmpeg_factory(
+        settings.workspace_root,
+        runtime_root,
+        ffmpeg,
+        max_output_bytes=settings.max_audio_bytes,
+        timeout_seconds=settings.process_timeout_seconds,
+    )
+    from video_demo.integrations.cloud_whisper import CloudWhisperClient
+    from video_demo.speech.vad import NativeSileroBackend, SileroVadAdapter
+
+    recognizer = CloudWhisperClient(http, cloud, allowed_audio_root=runtime_root)
+    planner_client = OpenAIDocumentClient(
+        http,
+        base_url=text.base_url,
+        api_key=text.api_key.get_secret_value(),
+        model_id=text.model_id,
+        timeout_seconds=text.timeout_seconds,
+        max_attempts=text.max_attempts,
+        max_input_chars=text.max_input_chars,
+        max_input_bytes=text.max_input_bytes,
+        max_response_bytes=text.max_response_bytes,
+        compact_planning=True,
+    )
+    prompt_versions = _prompt_versions()
+    planner = ChapterPlanner(
+        planner_client,
+        _identity(
+            "chapter_planning", _component_fingerprint({"model": text.model_id}), text.model_id,
+            "chapter_planning_compact_v1", prompt_versions.chapter_planner,
+            "chapter_planning_compact_repair_v1", prompt_versions.chapter_planner_repair,
+            generation_config=(("temperature", "0"), ("thinking", "disabled")),
+        ),
+        max_input_chars=text.max_input_chars,
+        max_input_bytes=text.max_input_bytes,
+        max_chapters=settings.max_document_chapters,
+        invocation_wait_timeout_seconds=text.timeout_seconds,
+        concurrency=settings.chapter_planning_concurrency,
+        compact_planning=True,
+    )
+    writer = DocumentWriter(
+        planner_client,
+        text_model_id=text.model_id,
+        vlm_model_id="not-used-for-audio",
+        prompt_versions=prompt_versions,
+        chapter_identity=_identity(
+            "chapter_writing", _component_fingerprint({"model": text.model_id}), text.model_id,
+            "chapter_writing_v2", prompt_versions.chapter_writer,
+            "chapter_writing_repair_v2", prompt_versions.chapter_writer_repair,
+            generation_config=(("temperature", "0"), ("thinking", "disabled")),
+        ),
+        global_identity=_identity(
+            "global_editing", _component_fingerprint({"model": text.model_id}), text.model_id,
+            "global_writing_v1", prompt_versions.global_editor,
+            "global_writing_repair_v1", prompt_versions.global_editor_repair,
+            generation_config=(("temperature", "0"), ("thinking", "disabled")),
+        ),
+        chapter_writer_concurrency=settings.chapter_writer_concurrency,
+        max_input_chars=text.max_input_chars,
+        max_input_bytes=text.max_input_bytes,
+        invocation_wait_timeout_seconds=text.timeout_seconds,
+    )
+    def pipeline_factory(_duration_ms: int) -> AudioPipeline:
+        ffmpeg_client = ffmpeg_factory(lambda: False)
+        slicer = VerifiedAudioSlicer(
+            runtime_root,
+            cast(AudioSliceClient, ffmpeg_client),
+            _duration_ms,
+        )
+        return AudioPipeline(
+            AudioSpeechAnalyzer(
+                SileroVadAdapter(NativeSileroBackend()),
+                recognizer,
+                slicer,
+                max_window_ms=cloud.max_window_ms,
+                overlap_ms=cloud.overlap_ms,
+                max_upload_bytes=cloud.max_upload_bytes,
+            ),
+            planner,
+            writer,
+            evidence_limits=_evidence_limits(settings),
+        )
+    publication = MediaPublicationService(
+        database,
+        AtomicArtifactStore(runtime_root),
+        run_model=AudioUnderstandingRunModel,
+        result_type=AudioUnderstandingResult,
+        render=render_audio_markdown,
+        resource_type="AUDIO_UNDERSTANDING_RUN",
+        not_found_code=ErrorCode.AUDIO_RUN_NOT_FOUND,
+        max_document_bytes=settings.max_document_bytes,
+        max_bundle_bytes=settings.max_result_bundle_bytes,
+    )
+    handler = AudioJobHandler(
+        database,
+        FFprobeAudioClient(
+            production_tool_path(settings, "ffprobe"),
+            workspace_root=settings.workspace_root,
+        ),
+        lambda duration_ms: pipeline_factory(duration_ms),
+        publication,
+        AudioObjectStore(runtime_root, max_bytes=settings.max_audio_bytes),
+        lambda callback: ffmpeg_factory(callback),
+        runtime_root=runtime_root,
+        max_duration_ms=settings.max_audio_duration_ms,
+        max_cache_entry_bytes=settings.model_cache_max_entry_bytes,
+        max_cache_run_bytes=settings.model_cache_max_run_bytes,
+    )
+    return ReliableWorker(
+        database,
+        worker_id,
+        handler,
+        job_type="AUDIO_UNDERSTANDING",
+        owned_resources=(http,),
+    )
+
+
+def build_image_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
+    """构造只领取 IMAGE_UNDERSTANDING 的独立 Worker。"""
+
+    assert settings.runtime_root is not None
+    runtime_root = settings.runtime_root
+    database_url = f"sqlite+pysqlite:///{runtime_root / 'video-demo.db'}"
+    upgrade_runtime_database(settings.workspace_root, runtime_root, database_url)
+    database = Database(database_url)
+    vision = settings.require_vlm_configuration()
+    http = httpx.Client()
+    analyzer = ImageVlmClient(
+        http,
+        base_url=vision.base_url,
+        api_key=vision.api_key.get_secret_value(),
+        model_id=vision.model_id,
+        timeout_seconds=vision.timeout_seconds,
+        max_attempts=vision.max_attempts,
+        max_response_bytes=settings.model_max_response_bytes,
+    )
+    publication = MediaPublicationService(
+        database,
+        AtomicArtifactStore(runtime_root),
+        run_model=ImageUnderstandingRunModel,
+        result_type=ImageUnderstandingResult,
+        render=render_image_markdown,
+        resource_type="IMAGE_UNDERSTANDING_RUN",
+        not_found_code=ErrorCode.IMAGE_RUN_NOT_FOUND,
+        max_document_bytes=settings.max_document_bytes,
+        max_bundle_bytes=settings.max_result_bundle_bytes,
+    )
+    handler = ImageJobHandler(
+        database,
+        lambda: analyzer,
+        publication,
+        ImageObjectStore(runtime_root, max_bytes=settings.max_image_bytes),
+        runtime_root=runtime_root,
+        max_image_bytes=settings.max_image_bytes,
+    )
+    return ReliableWorker(
+        database,
+        worker_id,
+        handler,
+        job_type="IMAGE_UNDERSTANDING",
+        owned_resources=(http,),
+    )
+
+
 def production_tool_path(settings: Settings, name: str) -> Path:
     assert settings.runtime_root is not None
     configured = settings.ffprobe_path if name == "ffprobe" else settings.ffmpeg_path
@@ -558,6 +751,8 @@ def _speech_runtime_config(settings: Settings, ffmpeg: Path) -> SpeechRuntimeCon
 __all__ = [
     "ProductionModelIdentityReport",
     "ProductionPipeline",
+    "build_audio_worker",
+    "build_image_worker",
     "build_production_model_identity_report",
     "build_production_pipeline",
     "build_worker",

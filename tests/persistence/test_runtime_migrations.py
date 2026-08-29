@@ -14,7 +14,7 @@ from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
 
-HEAD_REVISION = "0004_audio_image_media"
+HEAD_REVISION = "0005_media_artifact_pointers"
 
 
 @pytest.fixture

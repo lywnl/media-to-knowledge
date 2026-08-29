@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from video_demo.application.pipeline_contracts import PipelineRunConfig
 from video_demo.domain.document import DocumentGenerationConfig
@@ -38,13 +38,13 @@ class MediaRunService:
         self._database = database
         self._kind = kind
         if kind == "AUDIO":
-            self._object_model = AudioObjectModel
-            self._run_model = AudioUnderstandingRunModel
+            self._object_model = cast(type[Any], AudioObjectModel)
+            self._run_model = cast(type[Any], AudioUnderstandingRunModel)
             self._job_type = "AUDIO_UNDERSTANDING"
             self._resource_type = "AUDIO_UNDERSTANDING_RUN"
         else:
-            self._object_model = ImageObjectModel
-            self._run_model = ImageUnderstandingRunModel
+            self._object_model = cast(type[Any], ImageObjectModel)
+            self._run_model = cast(type[Any], ImageUnderstandingRunModel)
             self._job_type = "IMAGE_UNDERSTANDING"
             self._resource_type = "IMAGE_UNDERSTANDING_RUN"
 
