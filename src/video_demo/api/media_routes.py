@@ -13,6 +13,8 @@ from video_demo.api.schemas import (
     MediaRunResponse,
 )
 from video_demo.application.media_runs import MediaRunService
+from video_demo.domain.audio_document import AudioUnderstandingResult
+from video_demo.domain.image_document import ImageUnderstandingResult
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.media_repositories import MediaObjectRepository
 from video_demo.persistence.models import AudioObjectModel, ImageObjectModel
@@ -26,6 +28,7 @@ MediaContainer = Annotated[AppContainer, Depends(get_container)]
 def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
     label = "音频" if kind == "AUDIO" else "图片"
     object_model = AudioObjectModel if kind == "AUDIO" else ImageObjectModel
+    result_model = AudioUnderstandingResult if kind == "AUDIO" else ImageUnderstandingResult
     object_prefix = kind.lower()
     router = APIRouter(
         prefix=f"/api/kb/knowledge-bases/{{kb_id}}/{object_prefix}",
@@ -121,7 +124,7 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
     ) -> MediaRunResponse:
         return _run_response(service(container).get(scope, run_id))
 
-    @router.get("-understanding-runs/{run_id}/result")
+    @router.get("-understanding-runs/{run_id}/result", response_model=result_model)
     def get_result(
         run_id: str,
         scope: MediaScope,

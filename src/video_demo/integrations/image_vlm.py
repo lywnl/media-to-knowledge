@@ -116,7 +116,33 @@ def _parse_image_document(content: bytes) -> ImageDocument:
     try:
         envelope = json.loads(content)
         message = extract_model_message_content(envelope)
-        parsed = strip_removed_document_fields(parse_json_content(message))
+        parsed = _normalize_image_document(
+            strip_removed_document_fields(parse_json_content(message)),
+        )
         return ImageDocument.model_validate(parsed)
     except (json.JSONDecodeError, TypeError, ValueError, ValidationError) as error:
         raise VideoDemoError(ErrorCode.IMAGE_VLM_UNAVAILABLE, "图片模型响应结构非法") from error
+
+
+def _normalize_image_document(value: object) -> object:
+    """在模型不知道内部证据 ID 时注入待绑定占位符，随后由流水线替换。"""
+
+    if not isinstance(value, dict):
+        return value
+    placeholder = "image_source_pending"
+    normalized = dict(value)
+    normalized["evidence_refs"] = [placeholder]
+    for field in ("content_blocks", "claims"):
+        entries = normalized.get(field)
+        if not isinstance(entries, list):
+            continue
+        normalized[field] = [
+            {
+                **entry,
+                "evidence_refs": [placeholder],
+            }
+            if isinstance(entry, dict)
+            else entry
+            for entry in entries
+        ]
+    return normalized

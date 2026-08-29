@@ -4,7 +4,7 @@ import base64
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from video_demo.application.document_rendering import RenderedDocument
 from video_demo.application.image_rendering import render_image_markdown
@@ -27,7 +27,7 @@ class ImagePipelineOutcome:
     result: ImageUnderstandingResult
     document: RenderedDocument
     warnings: tuple[str, ...] = ()
-    status: str = "SUCCEEDED"
+    status: Literal["SUCCEEDED", "PARTIAL_SUCCEEDED"] = "SUCCEEDED"
 
 
 def run_image_pipeline(
@@ -40,8 +40,9 @@ def run_image_pipeline(
     title_hint: str,
     analyzer: ImageAnalyzer,
     runtime_root: Path,
+    max_image_bytes: int = 8 * 1024 * 1024,
 ) -> ImagePipelineOutcome:
-    probe = probe_image(source, runtime_root=runtime_root, max_bytes=8 * 1024 * 1024)
+    probe = probe_image(source, runtime_root=runtime_root, max_bytes=max_image_bytes)
     content = source.read_bytes()
     digest = hashlib.sha256(content).hexdigest()
     if digest != asset_sha256:

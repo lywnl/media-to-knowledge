@@ -279,6 +279,7 @@ class ImageJobHandler:
                 title_hint=config.document_config.document_title or filename,
                 analyzer=self._analyzer_factory(),
                 runtime_root=self._runtime_root,
+                max_image_bytes=self._max_image_bytes,
             )
             self._publication.persist(
                 job.scope,
