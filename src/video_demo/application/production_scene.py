@@ -22,7 +22,7 @@ _MIN_NORMALIZED_SCENE_MS = 1_200
 
 
 class ProductionSceneIndexProvider:
-    """只基于已验证代理视频和场景检测器构造 3.0 场景索引。"""
+    """只基于已验证视觉输入和场景检测器构造 3.0 场景索引。"""
 
     def __init__(
         self,
@@ -51,7 +51,7 @@ class ProductionSceneIndexProvider:
             expected_sha256=media.proxy_sha256,
             expected_size_bytes=media.proxy_size_bytes,
             max_size_bytes=self._max_video_bytes,
-            message="代理视频必须位于当前运行目录内",
+            message="视觉输入必须位于当前运行目录内",
         )
         _check_cancelled(is_cancel_requested)
         duration_ms = media.source.duration_ms

@@ -34,13 +34,15 @@ class WritingRunner:
         pass_fds: tuple[int, ...] = (),
         output_paths: tuple[Path, ...] = (),
     ) -> ProcessResult:
-        del pass_fds
         command = list(args)
         self.calls.append(command)
         self.timeouts.append(timeout_seconds)
-        if self.returncode == 0:
-            target = output_paths[0] if output_paths else Path(command[-1])
-            target.write_bytes(self.output)
+        if self.returncode == 0 and (output_paths or pass_fds):
+            if pass_fds:
+                output_descriptor = pass_fds[-1]
+                os.write(output_descriptor, self.output)
+            else:
+                output_paths[0].write_bytes(self.output)
         return ProcessResult(self.returncode, b"", b"safe failure")
 
 
@@ -108,6 +110,43 @@ def test_extract_subtitle_maps_absolute_stream_and_forces_webvtt(
     assert artifact.stream_index == 7
     assert artifact.language == "zh"
     assert artifact.codec_name == "mov_text"
+
+
+def test_validate_visual_source_checks_three_timestamps_without_writing_video(
+    tmp_path: Path,
+    source: Path,
+) -> None:
+    runner = WritingRunner()
+    result = _transcoder(tmp_path, runner).validate_visual_source(
+        source,
+        duration_ms=30_000,
+        is_cancel_requested=lambda: False,
+    )
+
+    assert result is None
+    assert len(runner.calls) == 3
+    assert all(command[-5:] == ["-frames:v", "1", "-f", "null", "-"] for command in runner.calls)
+    assert [command[command.index("-ss") + 1] for command in runner.calls] == [
+        "0.000",
+        "15.000",
+        "29.000",
+    ]
+
+
+def test_validate_visual_source_returns_decode_failure_reason(
+    tmp_path: Path,
+    source: Path,
+) -> None:
+    result = _transcoder(
+        tmp_path,
+        WritingRunner(returncode=1),
+    ).validate_visual_source(
+        source,
+        duration_ms=30_000,
+        is_cancel_requested=lambda: False,
+    )
+
+    assert result == "DECODE_CHECK_FAILED"
 
 
 @pytest.mark.parametrize("linked_component", ["subtitles", "media"])

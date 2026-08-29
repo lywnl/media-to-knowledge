@@ -36,7 +36,7 @@ _MAX_AUDIO_LED_CONTAINER_TAIL_MS = 100
 
 
 class PySceneDetectAdapter:
-    """通过 PySceneDetect 0.6 公共 API 懒加载执行完整代理视频检测。"""
+    """通过 PySceneDetect 0.6 公共 API 懒加载执行视觉输入检测。"""
 
     def __init__(self, *, module_loader: SceneModuleLoader | None = None) -> None:
         self._module_loader = module_loader or _load_scenedetect
@@ -77,7 +77,7 @@ class PySceneDetectAdapter:
         except Exception:
             raise VideoDemoError(
                 ErrorCode.VISUAL_MEDIA_INVALID,
-                "PySceneDetect 无法分析代理视频",
+                "PySceneDetect 无法分析视觉输入",
             ) from None
 
 

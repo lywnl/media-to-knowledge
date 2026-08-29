@@ -192,7 +192,7 @@ class OpenCvFrameExtractor:
                 if not capture.isOpened():
                     raise VideoDemoError(
                         ErrorCode.VISUAL_MEDIA_INVALID,
-                        "OpenCV 无法打开代理视频",
+                        "OpenCV 无法打开视觉输入",
                     )
                 groups: list[WindowFrameCandidates] = []
                 seen_actual_timestamps: set[int] = set()
@@ -283,7 +283,7 @@ class OpenCvFrameExtractor:
             if not capture.isOpened():
                 raise VideoDemoError(
                     ErrorCode.VISUAL_MEDIA_INVALID,
-                    "OpenCV 无法打开代理视频",
+                    "OpenCV 无法打开视觉输入",
                 )
             by_sample_id = self._extract_grouped_samples(
                 cv2,

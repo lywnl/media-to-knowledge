@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
@@ -105,8 +106,8 @@ def test_production_probe_uses_registered_metadata_and_preserves_manifest_warnin
         {
             "path": source,
             "object_ref": "obj_001",
-            "source_sha256": "a" * 64,
-            "source_size_bytes": 6,
+            "source_sha256": hashlib.sha256(b"source").hexdigest(),
+            "source_size_bytes": len(b"source"),
             "source_mime": "video/mp4",
             "limits": probed.limits,
         },
@@ -147,9 +148,9 @@ def test_production_transcoder_generates_scoped_proxy_and_explicit_no_audio_warn
     source = runtime_root / "runs/scope/run_001/input/source.mp4"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"source")
-    registered = _registered(
-        source,
-        run_relative_root=Path("runs/scope/run_001"),
+    registered = replace(
+        _registered(source, run_relative_root=Path("runs/scope/run_001")),
+        source_sha256=hashlib.sha256(b"source").hexdigest(),
     )
     probed = ProductionAssetProbe(
         lambda: _StaticProbeClient(_manifest(has_audio=False)),
@@ -204,6 +205,125 @@ def test_production_transcoder_generates_scoped_proxy_and_explicit_no_audio_warn
     assert prepared.audio_sha256 is None
     assert prepared.subtitle is None
     assert prepared.warnings == ("NO_AUDIO_TRACK",)
+
+
+def test_production_transcoder_uses_source_video_when_visual_decode_is_safe(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime_root, probed = _probed_media(
+        tmp_path,
+        has_audio=True,
+        subtitle_streams=(),
+        duration_ms=30_000,
+    )
+    client = _RecordingTranscoder(runtime_root, visual_source_reason=None)
+    caplog.set_level(logging.INFO, logger="video_demo.application.production_media")
+
+    prepared = ProductionMediaTranscoder(
+        runtime_root,
+        lambda _cancel: client,
+    ).transcode(probed)
+
+    source = probed.asset.source_path
+    assert prepared.proxy_path == source
+    assert prepared.proxy_sha256 == probed.asset.source_sha256
+    assert prepared.proxy_size_bytes == probed.asset.source_size_bytes
+    assert client.create_proxy_durations == []
+    assert client.visual_source_calls == [(source, 30_000)]
+    assert client.extract_audio_calls == [(True, 30_000)]
+    assert "视觉输入选择 mode=SOURCE" in "\n".join(caplog.messages)
+
+
+def test_production_transcoder_falls_back_to_proxy_when_visual_decode_is_unsafe(
+    tmp_path: Path,
+) -> None:
+    runtime_root, probed = _probed_media(
+        tmp_path,
+        has_audio=False,
+        subtitle_streams=(),
+        duration_ms=30_000,
+    )
+    client = _RecordingTranscoder(
+        runtime_root,
+        visual_source_reason="DECODE_CHECK_FAILED",
+    )
+
+    prepared = ProductionMediaTranscoder(
+        runtime_root,
+        lambda _cancel: client,
+    ).transcode(probed)
+
+    assert prepared.proxy_path == runtime_root / "runs/scope/run_001/media/proxy.mp4"
+    assert client.create_proxy_durations == [30_000]
+
+
+@pytest.mark.parametrize(
+    ("source_mime", "codec_name"),
+    [
+        ("video/quicktime", "h264"),
+        ("video/mp4", "hevc"),
+    ],
+)
+def test_production_transcoder_falls_back_for_unsupported_source_contract(
+    tmp_path: Path,
+    source_mime: str,
+    codec_name: str,
+) -> None:
+    runtime_root, probed = _probed_media(
+        tmp_path,
+        has_audio=False,
+        subtitle_streams=(),
+        duration_ms=30_000,
+    )
+    asset = replace(probed.asset, source_mime=source_mime)
+    manifest = probed.manifest.model_copy(
+        update={
+            "video_stream": probed.manifest.video_stream.model_copy(
+                update={"codec_name": codec_name},
+            ),
+        },
+    )
+    probed = probed.__class__(
+        asset=asset,
+        manifest=manifest,
+        limits=probed.limits,
+        warnings=probed.warnings,
+        timeline_duration_ms=probed.timeline_duration_ms,
+    )
+    client = _RecordingTranscoder(runtime_root, visual_source_reason=None)
+
+    ProductionMediaTranscoder(
+        runtime_root,
+        lambda _cancel: client,
+    ).transcode(probed)
+
+    assert client.visual_source_calls == []
+    assert client.create_proxy_durations == [30_000]
+
+
+def test_production_transcoder_rejects_source_digest_mismatch_before_media_work(
+    tmp_path: Path,
+) -> None:
+    runtime_root, probed = _probed_media(
+        tmp_path,
+        has_audio=False,
+        subtitle_streams=(),
+        duration_ms=30_000,
+    )
+    probed.asset.source_path.write_bytes(b"tampered")
+    client = _RecordingTranscoder(runtime_root, visual_source_reason=None)
+
+    with pytest.raises(VideoDemoError) as raised:
+        ProductionMediaTranscoder(
+            runtime_root,
+            lambda _cancel: client,
+        ).transcode(probed)
+
+    assert raised.value.code == ErrorCode.VIDEO_DIGEST_MISMATCH
+    assert client.visual_source_calls == []
+    assert client.create_proxy_durations == []
+    assert client.extract_audio_calls == []
 
 
 def test_complete_text_subtitle_is_selected_before_audio_extraction(tmp_path: Path) -> None:
@@ -348,6 +468,26 @@ def test_short_video_capacity_does_not_reserve_four_gib_proxy() -> None:
         reserve_bytes=60,
         required_free_bytes=19_554_210,
     )
+
+
+def test_source_visual_bypass_does_not_reserve_proxy_space() -> None:
+    profile = build_document_capacity_profile(
+        duration_ms=10_000,
+        proxy_estimated_bytes_per_second=100,
+        max_proxy_bytes=4 * 1024 * 1024 * 1024,
+        max_asr_window_ms=600_001,
+        candidate_frame_bytes=10,
+        published_keyframe_bytes=20,
+        model_cache_bytes=30,
+        result_bundle_bytes=40,
+        document_bytes=50,
+        reserve_bytes=60,
+        proxy_transcode_required=False,
+    )
+
+    assert profile.proxy_output_bytes == 0
+    assert profile.proxy_temporary_bytes == 0
+    assert profile.required_free_bytes == 19_552_210
 
 
 def test_document_capacity_check_rejects_insufficient_space(tmp_path: Path) -> None:
@@ -512,7 +652,10 @@ def test_production_transcoder_rejects_invalid_proxy_before_prepared_media(
     source = runtime_root / "runs/scope/run_001/input/source.mp4"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"source")
-    registered = _registered(source)
+    registered = replace(
+        _registered(source),
+        source_sha256=hashlib.sha256(b"source").hexdigest(),
+    )
     probed = ProductionAssetProbe(
         lambda: _StaticProbeClient(_manifest(has_audio=False)),
     ).probe(registered)
@@ -572,9 +715,9 @@ def _registered(
 
     return RegisteredAsset(
         source_path=source,
-        source_sha256="a" * 64,
+        source_sha256=hashlib.sha256(b"source").hexdigest(),
         object_ref="obj_001",
-        source_size_bytes=6,
+        source_size_bytes=len(b"source"),
         source_mime="video/mp4",
         run_relative_root=run_relative_root,
         config=PipelineRunConfig(language_hints=("en",)),
@@ -589,8 +732,8 @@ def _manifest(
 ) -> VideoAssetManifest:
     return VideoAssetManifest(
         object_ref="obj_001",
-        source_sha256="a" * 64,
-        source_size_bytes=6,
+        source_sha256=hashlib.sha256(b"source").hexdigest(),
+        source_size_bytes=len(b"source"),
         source_mime="video/mp4",
         duration_ms=duration_ms,
         video_stream=VideoStream(
@@ -651,13 +794,27 @@ class _RecordingTranscoder:
         *,
         subtitle_payloads: dict[int, str] | None = None,
         subtitle_errors: dict[int, ErrorCode] | None = None,
+        visual_source_reason: str | None = "TEST_DOUBLE_NO_VALIDATION",
     ) -> None:
         self._runtime_root = runtime_root
         self._subtitle_payloads = subtitle_payloads or {}
         self._subtitle_errors = subtitle_errors or {}
+        self._visual_source_reason = visual_source_reason
         self.extract_subtitle_calls: list[int] = []
         self.extract_audio_calls: list[tuple[bool, int]] = []
         self.create_proxy_durations: list[int | None] = []
+        self.visual_source_calls: list[tuple[Path, int]] = []
+
+    def validate_visual_source(
+        self,
+        source: Path,
+        *,
+        duration_ms: int,
+        is_cancel_requested: object,
+    ) -> str | None:
+        del is_cancel_requested
+        self.visual_source_calls.append((source, duration_ms))
+        return self._visual_source_reason
 
     def create_proxy(
         self,

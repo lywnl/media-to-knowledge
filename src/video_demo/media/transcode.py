@@ -187,6 +187,60 @@ class FFmpegTranscoder:
             proxy_max_edge=proxy_max_edge,
         )
 
+    def validate_visual_source(
+        self,
+        source: Path,
+        *,
+        duration_ms: int,
+        is_cancel_requested: Callable[[], bool],
+    ) -> str | None:
+        """用三个代表性时间点验证原视频可直接供视觉链路解码。"""
+
+        source = self._validate_source(source)
+        if type(duration_ms) is not int or duration_ms < 1:
+            return "INVALID_DURATION"
+        timestamps = tuple(
+            dict.fromkeys(
+                (0, duration_ms // 2, max(0, duration_ms - 1_000)),
+            ),
+        )
+        timeout_seconds = max(1, min(60, self._limits.timeout_seconds))
+        for timestamp_ms in timestamps:
+            try:
+                result = self._runner.run(
+                    [
+                        str(self._executable),
+                        "-nostdin",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-ss",
+                        _seconds(timestamp_ms),
+                        "-i",
+                        str(source),
+                        "-map",
+                        "0:v:0",
+                        "-an",
+                        "-sn",
+                        "-frames:v",
+                        "1",
+                        "-f",
+                        "null",
+                        "-",
+                    ],
+                    timeout_seconds=timeout_seconds,
+                )
+            except VideoDemoError as error:
+                if error.code in {
+                    ErrorCode.VIDEO_PROCESS_CANCELLED,
+                    ErrorCode.JOB_CANCELLED,
+                } or is_cancel_requested():
+                    raise
+                return f"DECODE_CHECK_{error.code.value}"
+            if result.returncode != 0:
+                return "DECODE_CHECK_FAILED"
+        return None
+
     def extract_subtitle(
         self,
         source: Path,

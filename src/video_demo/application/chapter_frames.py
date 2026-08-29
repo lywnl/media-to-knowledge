@@ -259,7 +259,7 @@ class ChapterFrameSearcher:
         scene_index: SceneIndex,
     ) -> Path:
         if scene_index.proxy_sha256 != media.proxy_sha256:
-            raise VideoDemoError(ErrorCode.VIDEO_DIGEST_MISMATCH, "场景索引与代理视频摘要不一致")
+            raise VideoDemoError(ErrorCode.VIDEO_DIGEST_MISMATCH, "场景索引与视觉输入摘要不一致")
         if scene_index.duration_ms != media.source.duration_ms:
             raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "场景索引与规范媒体时长不一致")
         if scene_index.index_sha256 != scene_index_sha256(
@@ -316,10 +316,10 @@ class ChapterFrameSearcher:
         proxy = reject_symlink_components(
             self._runtime_root,
             media.proxy_path,
-            message="代理视频必须位于当前 Run 根",
+            message="视觉输入必须位于当前 Run 根",
         )
         if not proxy.is_relative_to(allowed_run_root) or not proxy.is_file():
-            raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "代理视频必须位于当前 Run 根")
+            raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "视觉输入必须位于当前 Run 根")
         return allowed_run_root
 
     def _build_samples(

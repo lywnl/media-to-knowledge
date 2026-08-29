@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -38,11 +39,12 @@ from video_demo.media.transcode import (
 from video_demo.persistence.database import Database
 from video_demo.persistence.repositories import VideoObjectRepository, VideoRunRepository
 from video_demo.storage.object_store import LocalVideoObjectStore, VideoObjectRecord
-from video_demo.storage.workspace import safe_runtime_path, verified_mp4_file
+from video_demo.storage.workspace import safe_runtime_path, verified_mp4_file, verified_run_file
 
 _SUPPORTED_MIME_TYPES = frozenset(
     {"video/mp4", "video/quicktime", "video/x-matroska", "video/webm"},
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProbeClient(Protocol):
@@ -59,6 +61,14 @@ class ProbeClient(Protocol):
 
 
 class TranscodeClient(Protocol):
+    def validate_visual_source(
+        self,
+        source: Path,
+        *,
+        duration_ms: int,
+        is_cancel_requested: Callable[[], bool],
+    ) -> str | None: ...
+
     def create_proxy(
         self,
         source: Path,
@@ -135,6 +145,7 @@ def build_document_capacity_profile(
     result_bundle_bytes: int,
     document_bytes: int,
     reserve_bytes: int,
+    proxy_transcode_required: bool = True,
 ) -> DocumentCapacityProfile:
     """计算 Probe 后容量；已经落盘的 source 不在此重复计入。"""
 
@@ -156,11 +167,17 @@ def build_document_capacity_profile(
     }
     if any(type(value) is not int or value < 0 for value in byte_budgets.values()):
         raise ValueError("容量画像的字节预算必须是非负整数")
+    if not isinstance(proxy_transcode_required, bool):
+        raise ValueError("代理转码开关必须是布尔值")
 
     duration_seconds = (duration_ms + 999) // 1_000
-    proxy_output_bytes = min(
-        duration_seconds * proxy_estimated_bytes_per_second,
-        max_proxy_bytes,
+    proxy_output_bytes = (
+        min(
+            duration_seconds * proxy_estimated_bytes_per_second,
+            max_proxy_bytes,
+        )
+        if proxy_transcode_required
+        else 0
     )
     pcm_audio_bytes = duration_seconds * 32_000
     max_asr_slice_bytes = ((max_asr_window_ms + 999) // 1_000) * 32_000
@@ -308,19 +325,12 @@ class ProductionMediaTranscoder:
     ) -> PreparedMedia:
         client = self._client_factory(is_cancel_requested)
         asset = probed.asset
-        proxy = client.create_proxy(
-            asset.source_path,
-            asset.run_relative_root,
-            duration_ms=probed.duration_ms,
-        )
-        proxy_path = verified_mp4_file(
-            self._runtime_root,
-            asset.run_relative_root,
-            Path(proxy.relative_path),
-            expected_sha256=proxy.sha256,
-            expected_size_bytes=proxy.size_bytes,
-            max_size_bytes=self._max_proxy_bytes,
-            message="代理视频必须位于当前运行目录内",
+        source = self._verified_source(asset)
+        proxy_path, proxy_sha256, proxy_size_bytes = self._visual_input(
+            client,
+            probed,
+            source,
+            is_cancel_requested,
         )
         warnings = list(probed.warnings)
         subtitle = self._select_subtitle(client, probed, warnings)
@@ -329,7 +339,7 @@ class ProductionMediaTranscoder:
             audio_sha256 = None
         else:
             audio = client.extract_audio(
-                asset.source_path,
+                source,
                 asset.run_relative_root,
                 has_audio=bool(probed.manifest.audio_streams),
                 duration_ms=probed.duration_ms,
@@ -348,13 +358,84 @@ class ProductionMediaTranscoder:
         return PreparedMedia(
             source=probed,
             proxy_path=proxy_path,
-            proxy_sha256=proxy.sha256,
-            proxy_size_bytes=proxy.size_bytes,
+            proxy_sha256=proxy_sha256,
+            proxy_size_bytes=proxy_size_bytes,
             audio_path=audio_path,
             audio_sha256=audio_sha256,
             subtitle=subtitle,
             warnings=tuple(dict.fromkeys(warnings)),
         )
+
+    def _verified_source(self, asset: RegisteredAsset) -> Path:
+        source = verified_run_file(
+            self._runtime_root,
+            asset.run_relative_root,
+            asset.source_path,
+            expected_sha256=asset.source_sha256,
+            digest=_sha256_file,
+            message="原始视频必须位于当前 Run 根目录内",
+        )
+        if source.stat().st_size != asset.source_size_bytes:
+            raise VideoDemoError(ErrorCode.VIDEO_DIGEST_MISMATCH, "原始视频大小校验失败")
+        return source
+
+    def _visual_input(
+        self,
+        client: TranscodeClient,
+        probed: ProbedAsset,
+        source: Path,
+        is_cancel_requested: Callable[[], bool],
+    ) -> tuple[Path, str, int]:
+        asset = probed.asset
+        reason = self._source_bypass_reason(probed)
+        if reason is None:
+            validator = getattr(client, "validate_visual_source", None)
+            reason = (
+                "VALIDATION_UNAVAILABLE"
+                if not callable(validator)
+                else validator(
+                    source,
+                    duration_ms=probed.duration_ms,
+                    is_cancel_requested=is_cancel_requested,
+                )
+            )
+        if reason is None:
+            _LOGGER.info(
+                "视觉输入选择 mode=SOURCE source_mime=%s codec=%s reason=NONE",
+                asset.source_mime,
+                probed.manifest.video_stream.codec_name,
+            )
+            return source, asset.source_sha256, asset.source_size_bytes
+
+        _LOGGER.warning(
+            "视觉输入选择 mode=TRANSCODE source_mime=%s codec=%s reason=%s",
+            asset.source_mime,
+            probed.manifest.video_stream.codec_name,
+            reason,
+        )
+        proxy = client.create_proxy(source, asset.run_relative_root, duration_ms=probed.duration_ms)
+        proxy_path = verified_mp4_file(
+            self._runtime_root,
+            asset.run_relative_root,
+            Path(proxy.relative_path),
+            expected_sha256=proxy.sha256,
+            expected_size_bytes=proxy.size_bytes,
+            max_size_bytes=self._max_proxy_bytes,
+            message="视觉输入必须位于当前运行目录内",
+        )
+        return proxy_path, proxy.sha256, proxy.size_bytes
+
+    @staticmethod
+    def _source_bypass_reason(probed: ProbedAsset) -> str | None:
+        asset = probed.asset
+        stream = probed.manifest.video_stream
+        if asset.source_mime != "video/mp4":
+            return "SOURCE_MIME_UNSUPPORTED"
+        if stream.codec_name.casefold() != "h264":
+            return "VIDEO_CODEC_UNSUPPORTED"
+        if stream.rotation_degrees != 0:
+            return "ROTATION_METADATA_UNSUPPORTED"
+        return None
 
     def _select_subtitle(
         self,

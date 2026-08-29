@@ -178,6 +178,7 @@ class ProbedAsset:
 @dataclass(frozen=True, slots=True)
 class PreparedMedia:
     source: ProbedAsset
+    # 视觉输入可以是原始视频，也可以是兼容性 fallback 生成的 proxy.mp4。
     proxy_path: Path
     proxy_sha256: str
     proxy_size_bytes: int
