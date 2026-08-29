@@ -286,9 +286,14 @@ class ChapterPlanner:
                     request = requests[index]
                     data = self._planning_prompt(request)[2]
                     _LOGGER.info(
-                        "章节规划批次完成 batch=%d/%d chars=%d bytes=%d elapsed_ms=%d status=%s",
+                        "章节规划批次完成 batch=%d/%d segments=%d "
+                        "segment_start_ms=%d segment_end_ms=%d chars=%d bytes=%d "
+                        "elapsed_ms=%d status=%s",
                         index + 1,
                         len(requests),
+                        len(request.segments),
+                        request.segments[0].start_ms,
+                        request.segments[-1].end_ms,
                         len(data),
                         len(data.encode("utf-8")),
                         max(0, round((time.monotonic() - started_at) * 1_000)),
