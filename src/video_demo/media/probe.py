@@ -33,7 +33,7 @@ class ProcessRunner(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ProbeLimits:
-    max_duration_ms: int = 1_800_000
+    max_duration_ms: int = 7_200_000
     max_width: int = 1920
     max_height: int = 1080
     max_frame_rate: float = 60.0

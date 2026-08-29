@@ -105,7 +105,7 @@ def test_parse_rejects_explicit_invalid_video_stream_duration(
 
 @pytest.mark.parametrize(
     ("container_duration", "video_duration"),
-    [("1800.001", "1799.000"), ("1800.000", "1800.001")],
+    [("7200.001", "7199.000"), ("7200.000", "7200.001")],
 )
 def test_parse_rejects_when_container_or_video_stream_exceeds_duration_limit(
     container_duration: str,
@@ -280,7 +280,7 @@ def test_parse_rotation_vfr_and_no_audio_warning() -> None:
     [
         (lambda payload: payload["streams"].clear(), ErrorCode.VIDEO_STREAM_MISSING),
         (
-            lambda payload: payload["format"].update({"duration": "1800.001"}),
+            lambda payload: payload["format"].update({"duration": "7200.001"}),
             ErrorCode.VIDEO_DURATION_LIMIT_EXCEEDED,
         ),
         (

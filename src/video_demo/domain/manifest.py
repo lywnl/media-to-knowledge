@@ -54,7 +54,7 @@ class VideoAssetManifest(FrozenModel):
     source_sha256: Sha256
     source_size_bytes: int = Field(gt=0)
     source_mime: Literal["video/mp4", "video/quicktime", "video/x-matroska", "video/webm"]
-    # 领域层只保留 2 小时安全硬上限；部署默认仍由 ProbeLimits 限制为 30 分钟。
+    # 领域层和媒体预检默认均采用 2 小时上限。
     duration_ms: int = Field(gt=0, le=7_200_000)
     video_stream: VideoStream
     audio_streams: tuple[AudioStream, ...] = ()

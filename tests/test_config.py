@@ -395,7 +395,7 @@ class SettingsTest(unittest.TestCase):
             )
             self.assertEqual(settings.worker_concurrency, 1)
             self.assertEqual(settings.speech_subprocess_timeout_seconds, 3_600)
-            self.assertEqual(settings.max_video_duration_ms, 1_800_000)
+            self.assertEqual(settings.max_video_duration_ms, 7_200_000)
             self.assertFalse(settings.demo_degraded_mode)
 
     def test_video_duration_and_subprocess_timeout_hard_limits_are_validated(self) -> None:
