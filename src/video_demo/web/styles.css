@@ -557,46 +557,6 @@ input {
   margin-top: 5px;
 }
 
-.chapter-keyframe {
-  display: inline-flex;
-  flex-direction: column;
-  gap: 6px;
-  width: min(100%, 360px);
-  margin: 14px 12px 0 0;
-  padding: 8px;
-  vertical-align: top;
-  background: var(--surface);
-  border: 1px solid var(--line);
-}
-
-.chapter-keyframe img {
-  display: block;
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  object-fit: contain;
-  background: #e9eef5;
-}
-
-.chapter-keyframe figcaption {
-  color: var(--ink-muted);
-  font-size: 0.8rem;
-}
-
-.chapter-keyframe.is-failed {
-  color: var(--danger);
-  border-color: #e8b7b7;
-}
-
-.retrieval-text {
-  margin: 18px 0 0;
-  padding: 14px;
-  white-space: pre-wrap;
-  color: #334157;
-  background: #f7f9fc;
-  border-left: 3px solid var(--line-strong);
-  font-size: 0.88rem;
-}
-
 @keyframes track-pulse {
   from { opacity: 0.4; }
   to { opacity: 1; }

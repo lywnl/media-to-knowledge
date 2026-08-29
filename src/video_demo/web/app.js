@@ -51,9 +51,6 @@
   const documentChapters = document.querySelector("#document-chapters");
   const downloadStatus = document.querySelector("#download-status");
   let activeController = null;
-  let activeKeyframeUrls = [];
-  let keyframeController = null;
-  let documentRenderVersion = 0;
 
   class RequestError extends Error {
     constructor(message, code = null, httpStatus = null) {
@@ -124,8 +121,6 @@
 
   window.addEventListener("beforeunload", () => {
     activeController?.abort();
-    keyframeController?.abort();
-    revokeKeyframeUrls();
   });
 
   async function requestJson(url, options = {}) {
@@ -329,19 +324,12 @@
     });
   }
 
-  async function renderResult(result, run) {
-    const version = ++documentRenderVersion;
-    revokeKeyframeUrls();
-    keyframeController?.abort();
-    keyframeController = new AbortController();
+  function renderResult(result, run) {
     downloadStatus.textContent = "";
-    const evidenceById = await fetchEvidence(run.run_id, result, keyframeController.signal);
-    if (version !== documentRenderVersion) return;
 
     renderDocumentOverview(result.summary, run);
     renderDocumentToc(result.chapters ?? []);
     const chapterList = element("ol", "segment-list");
-    const keyframePromises = new Map();
     result.chapters.forEach((chapter, chapterIndex) => {
       const item = element("li", "segment-card");
       item.id = `chapter-${chapterIndex + 1}`;
@@ -350,17 +338,10 @@
         element("h4", null, chapter.title),
         element("p", "segment-summary", chapter.summary_zh),
       );
-      const renderedFrames = new Set();
       chapter.body_blocks.forEach((block) => {
-        item.append(renderBodyBlock(block, evidenceById, chapter, run.run_id, keyframePromises, renderedFrames));
+        item.append(renderBodyBlock(block));
       });
       appendChapterClaims(item, chapter);
-      [...new Set(chapter.selected_keyframe_refs)].forEach((evidenceRef) => {
-        const keyframeId = keyframeIdForEvidenceRef(evidenceRef, evidenceById);
-        if (!keyframeId || renderedFrames.has(keyframeId)) return;
-        renderedFrames.add(keyframeId);
-        item.append(renderKeyframeFigure(chapter.title, run.run_id, keyframeId, keyframePromises));
-      });
       chapterList.append(item);
     });
     documentChapters.replaceChildren(chapterList);
@@ -426,7 +407,7 @@
     }
   }
 
-  function renderBodyBlock(block, evidenceById, chapter, runId, keyframePromises, renderedFrames) {
+  function renderBodyBlock(block) {
     switch (block.block_type) {
       case "PARAGRAPH": return element("p", "chapter-body", block.text);
       case "BULLET_LIST": {
@@ -449,13 +430,6 @@
       case "VISUAL": {
         const visual = element("div", "chapter-body chapter-body--visual");
         visual.append(element("p", null, block.caption || "视觉补充"));
-        const observation = evidenceById.get(block.visual_observation_ref);
-        const frameRefs = visualFrameRefs(block, observation, evidenceById);
-        frameRefs.forEach((keyframeId) => {
-          if (renderedFrames.has(keyframeId)) return;
-          renderedFrames.add(keyframeId);
-          visual.append(renderKeyframeFigure(chapter.title, runId, keyframeId, keyframePromises));
-        });
         return visual;
       }
       default: return element("p", "chapter-body", "未识别的正文块");
@@ -478,23 +452,6 @@
     return table;
   }
 
-  function visualFrameRefs(block, observation, evidenceById) {
-    if (!observation) return [];
-    const byContent = new Map();
-    [...(observation.content_blocks ?? []), ...(observation.visual_facts ?? [])].forEach((content) => {
-      const id = content.visual_content_id ?? content.visual_fact_id;
-      if (id) byContent.set(id, content.source_keyframe_refs ?? []);
-    });
-    const mapped = [...new Set(block.visual_content_refs.flatMap((ref) => byContent.get(ref) ?? []))];
-    const refs = mapped.length > 0 ? mapped : [...new Set(observation.keyframe_refs ?? [])];
-    return refs.map((ref) => keyframeIdForEvidenceRef(ref, evidenceById)).filter(Boolean);
-  }
-
-  function keyframeIdForEvidenceRef(evidenceRef, evidenceById) {
-    const evidence = evidenceById.get(evidenceRef);
-    return evidence?.evidence_type === "KEYFRAME" ? evidence.keyframe_id : null;
-  }
-
   function appendChapterClaims(parent, chapter) {
     const claims = (chapter.claims ?? []).filter((claim) => claim.text);
     if (claims.length === 0) return;
@@ -506,72 +463,8 @@
     parent.append(section);
   }
 
-  async function fetchEvidence(runId, result, signal) {
-    const hasVisual = result.chapters.some((chapter) => chapter.body_blocks.some((block) => block.block_type === "VISUAL"));
-    if (!hasVisual) return new Map();
-    const items = [];
-    let cursor = null;
-    try {
-      do {
-        const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
-        const page = await requestJson(`/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs/${encodeURIComponent(runId)}/evidence?limit=100${suffix}`, { signal });
-        items.push(...(page.items ?? []));
-        cursor = page.next_cursor;
-      } while (cursor);
-    } catch {
-      return new Map();
-    }
-    return new Map(items.map((item) => [item.evidence_id, item]));
-  }
-
-  function renderKeyframeFigure(chapterTitle, runId, keyframeId, keyframePromises) {
-    const figure = element("figure", "chapter-keyframe");
-    const image = element("img");
-    image.alt = `${chapterTitle}关键画面`;
-    const caption = element("figcaption", null, "正在加载关键画面");
-    figure.append(image, caption);
-    if (!keyframePromises.has(keyframeId)) {
-      keyframePromises.set(keyframeId, loadKeyframe(image, caption, runId, keyframeId));
-    } else {
-      keyframePromises.get(keyframeId).then((url) => { if (url) image.src = url; });
-    }
-    return figure;
-  }
-
-  async function loadKeyframe(image, caption, runId, keyframeId) {
-    try {
-      const response = await fetch(
-        `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs/${encodeURIComponent(runId)}/keyframes/${encodeURIComponent(keyframeId)}/content`,
-        { headers: scopeHeaders(), signal: keyframeController?.signal },
-      );
-      if (!response.ok) throw new RequestError(`关键画面加载失败（HTTP ${response.status}）`, null, response.status);
-      const url = URL.createObjectURL(await response.blob());
-      activeKeyframeUrls.push(url);
-      image.src = url;
-      caption.textContent = "关键画面";
-      return url;
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") return null;
-      image.hidden = true;
-      caption.textContent = "关键画面暂时无法加载，正文仍可阅读";
-      image.closest(".chapter-keyframe")?.classList.add("is-failed");
-      return null;
-    }
-  }
-
   function scopeHeaders() {
     return { "X-Tenant-Id": SCOPE.tenantId, "X-Application-Id": SCOPE.applicationId };
-  }
-
-  function revokeKeyframeUrls() {
-    activeKeyframeUrls.forEach((url) => URL.revokeObjectURL(url));
-    activeKeyframeUrls = [];
-  }
-
-  function renderTags(values) {
-    const group = element("div", "tag-group");
-    [...new Set(values)].forEach((value) => group.append(element("span", "tag", value)));
-    return group;
   }
 
   function element(tagName, className = null, text = null) {

@@ -1,8 +1,8 @@
 # 视频知识文档 Demo
 
-这是一个独立的 Python 3.11 + FastAPI 视频理解 Demo。目标是对独立视频执行音频、场景和多模态理解，输出 Schema `3.0.0` 结构化知识文档、可定位证据和确定性 Markdown。
+这是一个独立的 Python 3.11 + FastAPI 视频理解 Demo。目标是对独立视频执行音频、场景和多模态理解，输出 Schema `4.1.0` 结构化知识文档和确定性 Markdown。
 
-当前状态：Demo 主链已完成。上传、可靠 Worker、ffprobe/FFmpeg、字幕优先、Silero VAD、云端 Whisper、镜头/关键帧、章节多图 VLM、结构化知识文档、证据分页和关键帧查询均已接通。生产链只使用云 ASR、文本 LLM 和章节视觉模型三套配置，结果 Schema 为 3.0.0。
+当前状态：Demo 主链已完成。上传、可靠 Worker、ffprobe/FFmpeg、字幕优先、Silero VAD、云端 Whisper、镜头/关键帧、章节多图 VLM 和结构化 Markdown 文档均已接通。关键帧只作为 VLM 的内部输入，前端仅展示文本，不加载或展示图片；项目不生成 RAG 检索文本，也不建立向量索引。生产链只使用云 ASR、文本 LLM 和章节视觉模型三套配置，结果 Schema 为 4.1.0。
 
 提交或验收时必须准确区分两类结论：
 
@@ -28,9 +28,9 @@ ASR 阶段仍在受监督的一次性子进程中执行，以隔离 FFmpeg、VAD
 
 ## 知识文档生产流程
 
-Worker 在本地完成媒体探测、音频转写、镜头与关键帧提取；章节视觉模型接收授权章节的多张 JPEG，文本模型根据转写与视觉观察生成带证据引用的知识文档。生产结果只写入 Schema 3.0；读取旧 Run 时返回 `RESULT_SCHEMA_UNSUPPORTED`，需要重新创建 Run。
+Worker 在本地完成媒体探测、音频转写、镜头与关键帧提取；章节视觉模型接收授权章节的多张 JPEG，文本模型根据转写与视觉观察生成 Markdown 知识文档。关键帧和证据用于内部可追溯校验，不作为前端展示内容。生产结果只写入 Schema 4.1；读取旧 Run 时返回 `RESULT_SCHEMA_UNSUPPORTED`，需要重新创建 Run。
 
-正式生产使用三套相互独立的模型配置：云端 ASR（`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL`）、文本 LLM（`VIDEO_DEMO_TEXT_LLM_*`）和章节视觉 VLM（`VIDEO_DEMO_VLM_*`）。章节 VLM 只接收本地授权章节的 2～4 张图片，最终结果、证据和文档均为 Schema `3.0.0`。用户可通过 `/document` 获取结构化知识文档视图，`/result`、`/evidence` 与关键帧内容接口使用同一 Run 作用域。
+正式生产使用三套相互独立的模型配置：云端 ASR（`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL`）、文本 LLM（`VIDEO_DEMO_TEXT_LLM_*`）和章节视觉 VLM（`VIDEO_DEMO_VLM_*`）。章节 VLM 只接收本地授权章节的 2～4 张图片，最终文本制品和结果均为 Schema `4.1.0`。用户通过 `/document` 获取唯一 Markdown 文本制品；`/result`、`/evidence` 与关键帧内容接口仅供内部校验和诊断使用，前端不会调用后两类接口。
 
 质量评测通过统一 CLI 执行：
 

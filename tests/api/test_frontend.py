@@ -170,13 +170,11 @@ def test_frontend_script_exposes_structured_document_reading_contract(
     assert "documentKeyPoints" not in script
     assert 'id="document-toc"' in html
     assert 'id="download-status"' in html
-    assert "fetchEvidence" in script
     assert 'summary.overview_zh || "未提供核心概览。"' in script
-    assert "visual_content_refs" in script
-    assert "source_keyframe_refs" in script
-    assert "new Set(chapter.selected_keyframe_refs)" in script
+    assert "fetchEvidence" not in script
+    assert "/keyframes/" not in script
+    assert "renderKeyframeFigure" not in script
     assert "AbortController" in script
-    assert "URL.revokeObjectURL" in script
     assert "下载 Markdown失败" in script
 
 
@@ -187,12 +185,12 @@ def test_frontend_script_renders_chapter_claims(client: TestClient) -> None:
     assert "chapter.claims" in script
 
 
-def test_frontend_maps_keyframe_evidence_refs_to_content_ids(client: TestClient) -> None:
+def test_frontend_does_not_map_keyframe_evidence_refs_to_images(client: TestClient) -> None:
     script = client.get("/static/app.js").text
 
-    assert "keyframe_id" in script
-    assert "keyframeIdForEvidenceRef" in script
-    assert "keyframeIdForEvidenceRef(evidenceRef, evidenceById)" in script
+    assert "keyframe_id" not in script
+    assert "keyframeIdForEvidenceRef" not in script
+    assert "renderKeyframeFigure" not in script
 
 
 def test_frontend_styles_include_document_reading_states(client: TestClient) -> None:
@@ -201,4 +199,5 @@ def test_frontend_styles_include_document_reading_states(client: TestClient) -> 
     assert ".document-reader" in stylesheet
     assert ".document-toc" in stylesheet
     assert ".chapter-body--quote" in stylesheet
-    assert ".chapter-keyframe.is-failed" in stylesheet
+    assert ".chapter-keyframe" not in stylesheet
+    assert ".retrieval-text" not in stylesheet

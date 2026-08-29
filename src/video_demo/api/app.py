@@ -97,7 +97,7 @@ def create_app(
     app = FastAPI(
         title="视频理解文本 Demo",
         version="0.1.0",
-        description="独立视频上传、异步理解、Markdown 文本与证据查询 API。",
+        description="独立视频上传、异步理解与 Markdown 文本 API；证据接口仅供内部校验和诊断。",
     )
     web_root = Path(__file__).resolve().parent.parent / "web"
     app.state.container = container
