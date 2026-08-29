@@ -12,7 +12,6 @@ from video_demo.domain.document import (
     ParagraphBlock,
     PromptVersions,
     SemanticChapter,
-    SummaryPoint,
     VideoDocumentSummary,
     VideoUnderstandingResult,
     sanitize_document_title,
@@ -97,8 +96,6 @@ def _chapter(
             evidence_refs=("asr_001",),
             selected_keyframe_refs=(),
             transcript_source="ASR",
-            retrieval_text=text,
-            retrieval_hash=_hash(text),
         )
     return SemanticChapter(
         chapter_id=chapter_id,
@@ -114,24 +111,16 @@ def _chapter(
         evidence_refs=(),
         selected_keyframe_refs=(),
         transcript_source="NONE",
-        retrieval_text="",
-        retrieval_hash=_hash(""),
     )
 
 
 def _result(
     chapters: tuple[SemanticChapter, ...],
-    *,
-    key_points: tuple[SummaryPoint, ...] = (),
 ) -> VideoUnderstandingResult:
-    summary_text = "视频摘要"
     summary = VideoDocumentSummary(
         title="测试视频",
         duration_ms=chapters[-1].end_ms,
         overview_zh="视频摘要。",
-        key_points=key_points,
-        retrieval_text=summary_text,
-        retrieval_hash=_hash(summary_text),
     )
     return VideoUnderstandingResult(
         run_id="run_document_001",
@@ -142,10 +131,10 @@ def _result(
     )
 
 
-def test_document_accepts_contiguous_chapters_and_valid_retrieval_hashes() -> None:
+def test_document_accepts_contiguous_chapters_without_retired_fields() -> None:
     result = _result((_chapter("ch_001", 0, 1_000), _chapter("ch_002", 1_000, 2_000)))
 
-    assert result.schema_version == "4.0.0"
+    assert result.schema_version == "4.1.0"
     assert result.summary.duration_ms == result.chapters[-1].end_ms
 
 
@@ -185,14 +174,6 @@ def test_prompt_versions_requires_main_and_repair_versions() -> None:
         )
 
 
-def test_summary_point_must_reference_grounded_existing_chapter() -> None:
-    chapters = (_chapter("ch_001", 0, 1_000, grounded=False),)
-    point = SummaryPoint(text="不能引用占位章节", chapter_refs=("ch_001",))
-
-    with pytest.raises(ValidationError, match=r"SummaryPoint|关键结论|GROUNDED"):
-        _result(chapters, key_points=(point,))
-
-
 def test_generation_metadata_rejects_endpoint_secret_and_timestamp_fields() -> None:
     with pytest.raises(ValidationError, match="extra_forbidden"):
         DocumentGenerationMetadata(
@@ -203,44 +184,10 @@ def test_generation_metadata_rejects_endpoint_secret_and_timestamp_fields() -> N
         )
 
 
-def test_no_semantic_evidence_chapter_has_no_claims_or_retrieval_text() -> None:
+def test_no_semantic_evidence_chapter_has_no_claims() -> None:
     payload = _chapter("ch_001", 0, 1_000, grounded=False).model_dump(
         exclude={"duration_ms"},
     )
     payload["claims"] = (GroundedClaim(text="伪造", evidence_refs=("asr_001",), certainty=0.8),)
     with pytest.raises(ValidationError, match=r"NO_SEMANTIC_EVIDENCE|语义"):
         SemanticChapter.model_validate(payload)
-
-
-def test_summary_retrieval_text_is_limited_to_eight_thousand_characters() -> None:
-    text = "a" * 8_001
-    with pytest.raises(ValidationError, match="string_too_long"):
-        VideoDocumentSummary(
-            title="测试视频",
-            duration_ms=1_000,
-            overview_zh="摘要",
-            key_points=(),
-            retrieval_text=text,
-            retrieval_hash=_hash(text),
-        )
-
-
-def test_chapter_retrieval_text_is_limited_to_thirty_two_thousand_characters() -> None:
-    text = "a" * 32_001
-    with pytest.raises(ValidationError, match="string_too_long"):
-        SemanticChapter(
-            chapter_id="ch_001",
-            start_ms=0,
-            end_ms=1_000,
-            title="章节",
-            title_evidence_refs=("asr_001",),
-            summary_zh="摘要",
-            summary_evidence_refs=("asr_001",),
-            body_blocks=(ParagraphBlock(text="正文", evidence_refs=("asr_001",)),),
-            claims=(GroundedClaim(text="结论", evidence_refs=("asr_001",), certainty=0.9),),
-            content_status="GROUNDED",
-            evidence_refs=("asr_001",),
-            transcript_source="ASR",
-            retrieval_text=text,
-            retrieval_hash=_hash(text),
-        )

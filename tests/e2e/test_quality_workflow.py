@@ -158,8 +158,6 @@ def _worker_factory(app: FastAPI, calls: list[str]):
                 ),
                 evidence_refs=(speech.evidence_id,),
                 transcript_source="ASR",
-                retrieval_text="你好",
-                retrieval_hash=_sha("你好"),
             )
             second = SemanticChapter(
                 chapter_id="chapter_002",
@@ -174,8 +172,6 @@ def _worker_factory(app: FastAPI, calls: list[str]):
                 content_status="NO_SEMANTIC_EVIDENCE",
                 evidence_refs=(),
                 transcript_source="NONE",
-                retrieval_text="",
-                retrieval_hash=_sha(""),
             )
             chapters = (first, second)
             result = VideoUnderstandingResult(
@@ -185,9 +181,6 @@ def _worker_factory(app: FastAPI, calls: list[str]):
                     title="测试视频",
                     duration_ms=500,
                     overview_zh="视频包含问候。",
-                    key_points=(),
-                    retrieval_text="视频问候",
-                    retrieval_hash=_sha("视频问候"),
                 ),
                 chapters=chapters,
                 generation=DocumentGenerationMetadata(

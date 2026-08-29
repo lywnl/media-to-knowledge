@@ -56,15 +56,15 @@ class Closable(Protocol):
 
 
 class ProductionModelIdentityReport(FrozenModel):
-    """4.0 生产组件身份和不含密钥的全局配置指纹。"""
+    """4.1 生产组件身份和不含密钥的全局配置指纹。"""
 
-    schema_version: Literal["4.0.0"] = "4.0.0"
+    schema_version: Literal["4.1.0"] = "4.1.0"
     models: tuple[ModelIdentity, ...]
     settings_fingerprint: Sha256
 
 
 class ProductionPipeline(VideoUnderstandingPipeline):
-    """唯一 4.0 生产流水线，并统一拥有模型 HTTP 资源。"""
+    """唯一 4.1 生产流水线，并统一拥有模型 HTTP 资源。"""
 
     def __init__(
         self,
@@ -450,7 +450,7 @@ def _settings_payload(settings: Settings) -> dict[str, object]:
     text = settings.require_text_llm_configuration()
     vision = settings.require_vlm_configuration()
     return {
-            "schema_version": "4.0.0",
+            "schema_version": "4.1.0",
             "cloud_asr": {
                 "base_url": cloud.base_url,
                 "model_id": cloud.model,

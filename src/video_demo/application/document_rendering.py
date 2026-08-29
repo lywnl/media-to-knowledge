@@ -48,11 +48,6 @@ def render_markdown(
     _heading(lines, 2, "核心概览")
     _paragraph(lines, result.summary.overview_zh or "未提供核心概览。")
 
-    if result.summary.key_points:
-        _heading(lines, 2, "全文关键结论")
-        for point in result.summary.key_points:
-            _paragraph(lines, point.text)
-
     _heading(lines, 2, "目录")
     for chapter_index, chapter in enumerate(result.chapters, start=1):
         lines.append(

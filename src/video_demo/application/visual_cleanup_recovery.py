@@ -43,7 +43,7 @@ class VisualCleanupPort(Protocol):
 
 
 class PublishedVisualCleanupRecovery:
-    """按数据库主键分页恢复已发布 4.0 Run 的视觉临时制品。"""
+    """按数据库主键分页恢复已发布 4.1 Run 的视觉临时制品。"""
 
     _BATCH_SIZE = 100
 

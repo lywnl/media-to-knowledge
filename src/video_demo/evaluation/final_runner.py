@@ -110,7 +110,7 @@ REQUIREMENT_SPECS: tuple[RequirementSpec, ...] = (
     RequirementSpec(27, "Qwen 输出严格校验且提示词与数据隔离", ("chapter_vlm_live",)),
     RequirementSpec(28, "边界合并仅吸附已有候选", ("automated_tests",)),
     RequirementSpec(29, "生产音画流水线发布结构化结果", ("five_language_models",)),
-    RequirementSpec(30, "retrieval_text 稳定生成且不建设检索索引", ("no_indexing",)),
+    RequirementSpec(30, "Markdown 作为唯一视频文本产物且不建设检索索引", ("no_indexing",)),
     RequirementSpec(31, "结果、证据和关键帧查询契约完整", ("openapi_contract",)),
     RequirementSpec(32, "失败恢复、重启续跑和取消语义正确", ("failure_matrix",)),
     RequirementSpec(33, "授权评测集不少于 30 条且五语各不少于 6 条", ("authorized_dataset",)),

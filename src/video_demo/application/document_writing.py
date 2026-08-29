@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import unicodedata
@@ -13,10 +12,6 @@ from typing import Literal, cast
 
 from pydantic import StrictInt, field_validator
 
-from video_demo.application.document_retrieval_text import (
-    render_document_chapter_retrieval_text,
-    render_document_summary_retrieval_text,
-)
 from video_demo.application.pipeline_contracts import DocumentWritingContext
 from video_demo.domain.base import FrozenModel
 from video_demo.domain.document import (
@@ -30,7 +25,6 @@ from video_demo.domain.document import (
     PromptVersions,
     QuoteBlock,
     SemanticChapter,
-    SummaryPoint,
     TableBlock,
     VideoDocumentSummary,
     VideoUnderstandingResult,
@@ -192,7 +186,7 @@ class _ChapterOutcome:
 
 
 class DocumentWriter:
-    """把有界模型草稿收敛为程序拥有引用、顺序与检索投影的 4.0 结果。"""
+    """把有界模型草稿收敛为程序拥有引用、顺序与 Markdown 产物的 4.1 结果。"""
 
     def __init__(
         self,
@@ -915,10 +909,6 @@ def _resized_global_request(
             end_ms=chapter.end_ms,
             title=chapter.title,
             summary_zh=chapter.summary_zh[: max(1, len(chapter.summary_zh) * scale // 1_000_000)],
-            key_conclusions=tuple(
-                claim.text[: max(1, len(claim.text) * scale // 1_000_000)]
-                for claim in chapter.claims
-            ),
             content_status=chapter.content_status,
         )
         for chapter in chapters
@@ -940,7 +930,6 @@ def _global_chapter_inputs(
             end_ms=chapter.end_ms,
             title=chapter.title,
             summary_zh=chapter.summary_zh,
-            key_conclusions=tuple(claim.text for claim in chapter.claims),
             content_status=chapter.content_status,
         )
         for chapter in chapters
@@ -1312,16 +1301,8 @@ def _materialize_chapter(
         transcript_source=(
             request.context.transcript_source if request.transcript_evidence else "NONE"
         ),
-        retrieval_text="",
-        retrieval_hash=hashlib.sha256(b"").hexdigest(),
     )
-    retrieval = render_document_chapter_retrieval_text(provisional, request.visual_observations)
-    return provisional.model_copy(
-        update={
-            "retrieval_text": retrieval,
-            "retrieval_hash": hashlib.sha256(retrieval.encode("utf-8")).hexdigest(),
-        },
-    )
+    return provisional
 
 
 def _ensure_chapter_claims(response: ChapterWritingResponse) -> ChapterWritingResponse:
@@ -1444,8 +1425,6 @@ def _empty_chapter(plan: ChapterPlan) -> SemanticChapter:
         evidence_refs=(),
         selected_keyframe_refs=(),
         transcript_source="NONE",
-        retrieval_text="",
-        retrieval_hash=hashlib.sha256(b"").hexdigest(),
     )
 
 
@@ -1559,27 +1538,17 @@ def _validate_global_response(
     if not response.overview_zh.strip():
         raise ValueError("全局核心概览不能为空")
     expected = set(allowed_global_chapter_ids(request))
-    grounded = {chapter.chapter_id for chapter in chapters if chapter.content_status == "GROUNDED"}
-    if any(ref not in grounded for point in response.key_points for ref in point.chapter_refs):
-        raise ValueError("全局关键点只能引用事实章节")
-    for point in response.key_points:
-        if not set(point.chapter_refs).issubset(expected):
-            raise ValueError("全局关键点引用了不存在的章节")
+    if not expected:
+        raise ValueError("全局编辑至少需要一个章节")
 
 
 def _fallback_global_response(chapters: tuple[SemanticChapter, ...]) -> GlobalWritingResponse:
     grounded = tuple(chapter for chapter in chapters if chapter.content_status == "GROUNDED")
     if not grounded:
         overview = _PLACEHOLDER
-        points: tuple[SummaryPoint, ...] = ()
     else:
         overview = "；".join(chapter.summary_zh for chapter in grounded)[:8_000]
-        points = tuple(
-            SummaryPoint(text=chapter.summary_zh, chapter_refs=(chapter.chapter_id,))
-            for chapter in grounded[:64]
-            if chapter.summary_zh
-        )
-    return GlobalWritingResponse(overview_zh=overview, key_points=points)
+    return GlobalWritingResponse(overview_zh=overview)
 
 
 def _materialize_result(
@@ -1596,21 +1565,8 @@ def _materialize_result(
         title=context.document_config.document_title or context.title_hint,
         duration_ms=context.duration_ms,
         overview_zh=overview,
-        key_points=global_response.key_points,
-        retrieval_text="",
-        retrieval_hash=hashlib.sha256(b"").hexdigest(),
     )
-    retrieval = (
-        render_document_summary_retrieval_text(provisional_summary)
-        if any(chapter.content_status == "GROUNDED" for chapter in chapters)
-        else ""
-    )
-    summary = provisional_summary.model_copy(
-        update={
-            "retrieval_text": retrieval,
-            "retrieval_hash": hashlib.sha256(retrieval.encode("utf-8")).hexdigest(),
-        },
-    )
+    summary = provisional_summary
     return VideoUnderstandingResult(
         run_id=context.run_id,
         asset_sha256=context.asset_sha256,

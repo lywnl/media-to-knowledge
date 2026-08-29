@@ -47,7 +47,6 @@
   const historyList = document.querySelector("#history-list");
   const refreshHistoryButton = document.querySelector("#refresh-history");
   const documentOverview = document.querySelector("#document-overview");
-  const documentKeyPoints = document.querySelector("#document-key-points");
   const documentToc = document.querySelector("#document-toc");
   const documentChapters = document.querySelector("#document-chapters");
   const downloadStatus = document.querySelector("#download-status");
@@ -370,7 +369,6 @@
     }
     resultContent.replaceChildren(
       documentOverview,
-      documentKeyPoints,
       documentToc,
       createDownloadLink(run.run_id),
       downloadStatus,
@@ -388,12 +386,6 @@
       element("p", null, summary.overview_zh || "未提供核心概览。"),
     );
     documentOverview.replaceChildren(card);
-    const points = element("section", "key-points");
-    points.append(element("h3", "result-section-title", "关键结论"));
-    const list = element("ul");
-    (summary.key_points ?? []).forEach((point) => list.append(element("li", null, point.text)));
-    points.append(list);
-    documentKeyPoints.replaceChildren(points);
   }
 
   function renderDocumentToc(chapters) {

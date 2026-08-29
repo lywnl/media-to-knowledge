@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-
 import pytest
 from pydantic import ValidationError
 
@@ -21,7 +19,6 @@ from video_demo.domain.document_artifact import (
 
 
 def _result() -> VideoUnderstandingResult:
-    text = ""
     chapter = SemanticChapter(
         chapter_id="chapter_001",
         start_ms=0,
@@ -35,8 +32,6 @@ def _result() -> VideoUnderstandingResult:
         content_status="NO_SEMANTIC_EVIDENCE",
         evidence_refs=(),
         transcript_source="NONE",
-        retrieval_text=text,
-        retrieval_hash=hashlib.sha256(text.encode()).hexdigest(),
     )
     return VideoUnderstandingResult(
         run_id="run_001",
@@ -45,9 +40,6 @@ def _result() -> VideoUnderstandingResult:
             title="测试",
             duration_ms=1_000,
             overview_zh="无可验证语义",
-            key_points=(),
-            retrieval_text=text,
-            retrieval_hash=hashlib.sha256(text.encode()).hexdigest(),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(
@@ -85,8 +77,8 @@ def _artifact_payload() -> dict[str, object]:
 def test_document_artifact_requires_4_schema_and_document_digest() -> None:
     artifact = DocumentArtifactPayload.model_validate(_artifact_payload())
 
-    assert artifact.artifact_schema_version == "4.0.0"
-    assert artifact.result.schema_version == "4.0.0"
+    assert artifact.artifact_schema_version == "4.1.0"
+    assert artifact.result.schema_version == "4.1.0"
 
 
 @pytest.mark.parametrize("field,names", [

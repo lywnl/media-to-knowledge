@@ -106,8 +106,6 @@ def _outcome() -> PipelineOutcome:
         content_status="NO_SEMANTIC_EVIDENCE",
         evidence_refs=(),
         transcript_source="NONE",
-        retrieval_text="",
-        retrieval_hash=_digest(""),
     )
     result = VideoUnderstandingResult(
         run_id="run_001",
@@ -116,9 +114,6 @@ def _outcome() -> PipelineOutcome:
             title="faster-whisper 教程",
             duration_ms=1_000,
             overview_zh="未提取到可验证语义内容",
-            key_points=(),
-            retrieval_text="摘要",
-            retrieval_hash=_digest("摘要"),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(

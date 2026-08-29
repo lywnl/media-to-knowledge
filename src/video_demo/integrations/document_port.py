@@ -16,7 +16,6 @@ from video_demo.domain.document import (
     ChapterBodyBlock,
     DocumentGenerationConfig,
     GroundedClaim,
-    SummaryPoint,
 )
 from video_demo.domain.document_plan import (
     BaseSegment,
@@ -225,7 +224,6 @@ class GlobalChapterInput(FrozenModel):
     end_ms: int = Field(gt=0, le=7_200_000)
     title: str = Field(min_length=1, max_length=200)
     summary_zh: str = Field(max_length=4_000)
-    key_conclusions: tuple[str, ...] = Field(max_length=16)
     content_status: Literal["GROUNDED", "NO_SEMANTIC_EVIDENCE"]
 
     @model_validator(mode="after")
@@ -258,7 +256,6 @@ class GlobalWritingRequest(FrozenModel):
 
 class GlobalWritingResponse(FrozenModel):
     overview_zh: str = Field(max_length=8_000)
-    key_points: tuple[SummaryPoint, ...] = Field(max_length=64)
 
 
 class GlobalWritingRepairRequest(FrozenModel):

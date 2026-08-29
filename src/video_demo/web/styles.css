@@ -391,25 +391,21 @@ input {
   min-width: 0;
 }
 
-.key-points,
 .document-toc {
   padding: 18px 20px;
   background: #f8fafc;
   border: 1px solid var(--line);
 }
 
-.key-points h3,
 .document-toc h3 {
   margin-top: 0;
 }
 
-.key-points ul,
 .document-toc ol {
   margin: 0;
   padding-left: 1.3rem;
 }
 
-.key-points li + li,
 .document-toc li + li {
   margin-top: 6px;
 }

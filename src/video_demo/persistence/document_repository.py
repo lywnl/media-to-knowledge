@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import NoReturn
@@ -48,7 +47,7 @@ def _reject_sensitive_json(value: object, path: str = "$") -> None:
 
 
 class ResultRepository:
-    """生产 4.0 结果行的唯一映射。"""
+    """生产 4.1 结果行的唯一映射。"""
 
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -59,14 +58,9 @@ class ResultRepository:
         )
         segment_payloads: list[tuple[SemanticChapter, dict[str, object]]] = []
         for chapter in validated.chapters:
-            _require_retrieval_hash(chapter.retrieval_text, chapter.retrieval_hash)
             payload = chapter.model_dump(mode="json", exclude_computed_fields=True)
             _reject_sensitive_json(payload)
             segment_payloads.append((chapter, payload))
-        _require_retrieval_hash(
-            validated.summary.retrieval_text,
-            validated.summary.retrieval_hash,
-        )
         summary_payload = {
             "summary": validated.summary.model_dump(mode="json", exclude_computed_fields=True),
             "generation": validated.generation.model_dump(
@@ -86,10 +80,8 @@ class ResultRepository:
                     segment_id=chapter.chapter_id,
                     start_ms=chapter.start_ms,
                     end_ms=chapter.end_ms,
-                    schema_version="4.0.0",
+                    schema_version="4.1.0",
                     payload_json=payload,
-                    retrieval_text=chapter.retrieval_text,
-                    retrieval_hash=chapter.retrieval_hash,
                 )
             )
         self._session.add(
@@ -98,10 +90,8 @@ class ResultRepository:
                 application_id=scope.application_id,
                 knowledge_base_id=scope.knowledge_base_id,
                 run_id=validated.run_id,
-                schema_version="4.0.0",
+                schema_version="4.1.0",
                 payload_json=summary_payload,
-                retrieval_text=validated.summary.retrieval_text,
-                retrieval_hash=validated.summary.retrieval_hash,
             )
         )
         self._session.flush()
@@ -118,7 +108,7 @@ class ResultRepository:
             summary = VideoDocumentSummary.model_validate(payload.get("summary"))
             generation = DocumentGenerationMetadata.model_validate(payload.get("generation"))
             chapters = tuple(SemanticChapter.model_validate(item.payload_json) for item in segments)
-            _validate_column_projections(summary_row, summary, segments, chapters)
+            _validate_column_projections(segments, chapters)
             return VideoUnderstandingResult(
                 run_id=run_id,
                 asset_sha256=asset_sha256,
@@ -127,7 +117,7 @@ class ResultRepository:
                 generation=generation,
             )
         except (ValidationError, TypeError, KeyError, AttributeError) as error:
-            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "4.0 结果行内容非法") from error
+            raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "4.1 结果行内容非法") from error
 
     def _delete_existing(self, scope: Scope, run_id: str) -> None:
         for model in (VideoSegmentModel, VideoSummaryModel):
@@ -169,48 +159,32 @@ def _require_supported_rows(
     if not segments and not summaries:
         raise VideoDemoError(ErrorCode.VIDEO_RESULT_NOT_READY, "知识文档结果尚未就绪")
     if not segments or len(summaries) != 1:
-        _invalid("4.0 结果行缺失或重复")
+        _invalid("4.1 结果行缺失或重复")
     versions = {str(item.schema_version) for item in segments} | {
         str(item.schema_version) for item in summaries
     }
-    if len(versions) == 1 and versions <= {"1.0.0", "2.0.0", "3.0.0"}:
+    if len(versions) == 1 and versions <= {"1.0.0", "2.0.0", "3.0.0", "4.0.0"}:
         raise VideoDemoError(
             ErrorCode.RESULT_SCHEMA_UNSUPPORTED,
-            "结果 Schema 3.0.0 已停用，请重新处理视频 (当前支持 4.0.0)",
+            "结果 Schema 4.0.0 及更早版本已停用，请重新处理视频 (当前支持 4.1.0)",
         )
-    if versions != {"4.0.0"}:
+    if versions != {"4.1.0"}:
         _invalid("结果行 Schema 版本非法或混杂")
 
 
 def _validate_column_projections(
-    summary_row: VideoSummaryModel,
-    summary: VideoDocumentSummary,
     segments: Sequence[VideoSegmentModel],
     chapters: tuple[SemanticChapter, ...],
 ) -> None:
-    if (
-        summary_row.retrieval_text != summary.retrieval_text
-        or summary_row.retrieval_hash != summary.retrieval_hash
-    ):
-        _invalid("Summary 检索投影不一致")
-    _require_retrieval_hash(summary.retrieval_text, summary.retrieval_hash)
     if len(segments) != len(chapters):
         _invalid("章节行数量不一致")
     for row, chapter in zip(segments, chapters, strict=True):
-        if (row.segment_id, row.start_ms, row.end_ms, row.retrieval_text, row.retrieval_hash) != (
+        if (row.segment_id, row.start_ms, row.end_ms) != (
             chapter.chapter_id,
             chapter.start_ms,
             chapter.end_ms,
-            chapter.retrieval_text,
-            chapter.retrieval_hash,
         ):
             _invalid("章节列投影与 payload 不一致")
-        _require_retrieval_hash(chapter.retrieval_text, chapter.retrieval_hash)
-
-
-def _require_retrieval_hash(text: str, expected: str) -> None:
-    if hashlib.sha256(text.encode("utf-8")).hexdigest() != expected:
-        _invalid("检索文本摘要不一致")
 
 
 def _invalid(message: str) -> NoReturn:

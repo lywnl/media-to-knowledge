@@ -120,7 +120,6 @@ def _publish_result(
         relation_to_transcript="SUPPORTING",
         certainty=0.98,
     )
-    retrieval = "faster-whisper 语音识别"
     chapter = SemanticChapter(
         chapter_id="chapter_001",
         start_ms=0,
@@ -148,8 +147,6 @@ def _publish_result(
         evidence_refs=(speech.evidence_id, keyframe.evidence_id, observation.evidence_id),
         selected_keyframe_refs=(keyframe.evidence_id,),
         transcript_source="ASR",
-        retrieval_text=retrieval,
-        retrieval_hash=_sha256(retrieval),
     )
     result = VideoUnderstandingResult(
         run_id=run_id,
@@ -158,9 +155,6 @@ def _publish_result(
             title="faster-whisper 教程",
             duration_ms=1_000,
             overview_zh="介绍模型用途。",
-            key_points=(),
-            retrieval_text="模型用途",
-            retrieval_hash=_sha256("模型用途"),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(
@@ -215,7 +209,7 @@ def test_result_document_evidence_and_keyframe_are_one_4_contract(
     )
 
     assert result_response.status_code == 200
-    assert result_response.json()["schema_version"] == "4.0.0"
+    assert result_response.json()["schema_version"] == "4.1.0"
     assert result_response.json()["chapters"][0]["chapter_id"] == "chapter_001"
     evidence = client.app.state.container.result_query_service.get_evidence(
         Scope("tenant-a", "app-a", "kb-a"), run_id

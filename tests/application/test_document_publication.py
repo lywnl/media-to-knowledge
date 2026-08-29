@@ -55,8 +55,6 @@ def _result() -> VideoUnderstandingResult:
         content_status="NO_SEMANTIC_EVIDENCE",
         evidence_refs=(),
         transcript_source="NONE",
-        retrieval_text="",
-        retrieval_hash=_digest(""),
     )
     return VideoUnderstandingResult(
         run_id="run_001",
@@ -65,9 +63,6 @@ def _result() -> VideoUnderstandingResult:
             title="测试知识文档",
             duration_ms=1_000,
             overview_zh="无可验证语义",
-            key_points=(),
-            retrieval_text="摘要检索",
-            retrieval_hash=_digest("摘要检索"),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(
@@ -239,8 +234,8 @@ def test_document_publication_marks_pending_when_committed_bundle_reread_fails(
         ("1.0.0", "1.0.0", ErrorCode.RESULT_SCHEMA_UNSUPPORTED),
         ("2.0.0", "2.0.0", ErrorCode.RESULT_SCHEMA_UNSUPPORTED),
         ("1.0.0", "2.0.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
-        ("2.0.0", "4.0.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
-        ("3.0.0", "4.0.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
+        ("2.0.0", "4.1.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
+        ("3.0.0", "4.1.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
         ("", "", ErrorCode.ARTIFACT_SCHEMA_INVALID),
     ),
 )
@@ -303,7 +298,7 @@ def test_document_repository_validates_before_deleting_existing_rows(
     original = _result()
     with database.session() as session:
         ResultRepository(session).replace(scope, original)
-    forged_summary = original.summary.model_copy(update={"retrieval_hash": "b" * 64})
+    forged_summary = original.summary.model_copy(update={"title": ""})
     forged = original.model_copy(update={"summary": forged_summary})
 
     with database.session() as session, pytest.raises(ValueError):
@@ -345,7 +340,7 @@ def test_document_read_rejects_any_tampered_fact(
     with database.session() as session:
         run = session.query(VideoUnderstandingRunModel).one()
         if tamper == "summary":
-            session.query(VideoSummaryModel).one().retrieval_text = "被篡改"
+            session.query(VideoSummaryModel).one().payload_json = {"summary": {"bad": "payload"}}
         elif tamper == "segment":
             session.query(VideoSegmentModel).one().end_ms = 999
         elif tamper == "bundle":

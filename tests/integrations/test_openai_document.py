@@ -211,7 +211,6 @@ def test_writing_requests_disable_thinking_for_latency() -> None:
                 chapter_id="chapter_001",
                 title="章节",
                 summary_zh="摘要",
-                key_conclusions=(),
                 content_status="GROUNDED",
             ),
         ),
@@ -598,6 +597,53 @@ def test_compact_planning_ignores_trailing_empty_draft_without_repair() -> None:
     assert len(result.chapter_drafts) == 1
 
 
+def test_compact_planning_normalizes_last_end_index_one_past_segment_count() -> None:
+    segments = tuple(
+        _segment().model_copy(
+            update={
+                "segment_id": f"segment_{index:03d}",
+                "start_ms": index * 10_000,
+                "end_ms": (index + 1) * 10_000,
+            },
+        )
+        for index in range(3)
+    )
+    request = _planning_request().model_copy(
+        update={"segments": segments, "duration_ms": 30_000},
+    )
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        return _provider_response(
+            http_request,
+            {
+                "chapter_drafts": [
+                    {
+                        "start_segment_index": 0,
+                        "end_segment_index": 4,
+                        "title_hint": "完整章节",
+                        "visual_mode": "NONE",
+                        "semantic_targets": [],
+                    },
+                ],
+            },
+        )
+
+    client = OpenAIDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="text-secret",
+        model_id="text-model",
+        compact_planning=True,
+        sleeper=lambda _delay: None,
+    )
+
+    result = client.plan_chapters(request)
+
+    assert result.chapter_drafts[0].segment_refs == tuple(
+        f"segment_{index:03d}" for index in range(3)
+    )
+
+
 def test_plan_request_allows_large_repair_budget_for_provider_validation() -> None:
     payloads: list[dict[str, object]] = []
 
@@ -918,7 +964,6 @@ def test_all_six_operations_use_distinct_schema_and_prompt_versions() -> None:
                 chapter_id="chapter_001",
                 title="章节",
                 summary_zh="摘要",
-                key_conclusions=(),
                 content_status="GROUNDED",
             ),
         ),

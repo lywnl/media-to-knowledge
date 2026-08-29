@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import hashlib
-
 import pytest
 from pydantic import ValidationError
 
 from video_demo.application.document_rendering import render_markdown
-from video_demo.application.document_retrieval_text import render_document_chapter_retrieval_text
 from video_demo.application.document_writing import _validate_global_response
 from video_demo.application.pipeline_contracts import DocumentWritingContext
 from video_demo.domain.document import (
@@ -15,7 +12,6 @@ from video_demo.domain.document import (
     ParagraphBlock,
     PromptVersions,
     SemanticChapter,
-    SummaryPoint,
     VideoDocumentSummary,
     VideoUnderstandingResult,
 )
@@ -55,7 +51,6 @@ def _fixture() -> tuple[VideoUnderstandingResult, tuple[SpeechSegment, ...]]:
         confidence=0.9,
         is_fully_evaluated_language=True,
     )
-    retrieval_text = "章节标题：安装步骤\n正文：讲解安装步骤。\n关键结论：完成安装。"
     chapter = SemanticChapter(
         chapter_id="chapter_001",
         start_ms=0,
@@ -69,10 +64,7 @@ def _fixture() -> tuple[VideoUnderstandingResult, tuple[SpeechSegment, ...]]:
         evidence_refs=(speech.evidence_id,),
         selected_keyframe_refs=(),
         transcript_source="ASR",
-        retrieval_text=retrieval_text,
-        retrieval_hash=hashlib.sha256(retrieval_text.encode()).hexdigest(),
     )
-    summary_retrieval = "视频标题：测试视频\n核心概览：全文介绍安装步骤。"
     result = VideoUnderstandingResult(
         run_id="run_001",
         asset_sha256="a" * 64,
@@ -80,9 +72,6 @@ def _fixture() -> tuple[VideoUnderstandingResult, tuple[SpeechSegment, ...]]:
             title="测试视频",
             duration_ms=10_000,
             overview_zh="全文介绍安装步骤。",
-            key_points=(SummaryPoint(text="完成安装。", chapter_refs=(chapter.chapter_id,)),),
-            retrieval_text=summary_retrieval,
-            retrieval_hash=hashlib.sha256(summary_retrieval.encode()).hexdigest(),
         ),
         chapters=(chapter,),
         generation=_metadata(),
@@ -93,7 +82,7 @@ def _fixture() -> tuple[VideoUnderstandingResult, tuple[SpeechSegment, ...]]:
 def test_v4_result_has_only_chapters_and_document_has_no_removed_blocks() -> None:
     result, evidence = _fixture()
 
-    assert result.schema_version == "4.0.0"
+    assert result.schema_version == "4.1.0"
     assert "sections" not in result.model_dump(mode="json")
     markdown = render_markdown(result, evidence).content.decode("utf-8")
     assert "## 第一章：安装步骤" in markdown
@@ -103,9 +92,7 @@ def test_v4_result_has_only_chapters_and_document_has_no_removed_blocks() -> Non
     assert "关键画面引用" not in markdown
     assert markdown.count("安装步骤") == 4
 
-    retrieval = render_document_chapter_retrieval_text(result.chapters[0], ())
-    assert "章节标题：安装步骤" in retrieval
-    assert "信息边界" not in retrieval
+    assert "retrieval_text" not in result.model_dump(mode="json")
 
 
 def test_global_editor_request_uses_chapter_fact_projection() -> None:
@@ -127,7 +114,6 @@ def test_global_editor_request_uses_chapter_fact_projection() -> None:
                 end_ms=10_000,
                 title="安装步骤",
                 summary_zh="讲解安装步骤。",
-                key_conclusions=("完成安装。",),
                 content_status="GROUNDED",
             ),
         ),
@@ -136,7 +122,7 @@ def test_global_editor_request_uses_chapter_fact_projection() -> None:
 
     payload = request.model_dump(mode="json")
     assert "sections" not in payload
-    assert payload["chapters"][0]["key_conclusions"] == ["完成安装。"]
+    assert "key_conclusions" not in payload["chapters"][0]
 
 
 def test_removed_visual_fields_are_rejected() -> None:
@@ -179,7 +165,6 @@ def test_global_editor_rejects_empty_overview() -> None:
                 end_ms=10_000,
                 title="安装步骤",
                 summary_zh="讲解安装步骤。",
-                key_conclusions=(),
                 content_status="GROUNDED",
             ),
         ),
@@ -188,7 +173,7 @@ def test_global_editor_rejects_empty_overview() -> None:
 
     with pytest.raises(ValueError, match="核心概览"):
         _validate_global_response(
-            GlobalWritingResponse(overview_zh="", key_points=()),
+            GlobalWritingResponse(overview_zh=""),
             request,
             result.chapters,
         )

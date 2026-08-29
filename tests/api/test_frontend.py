@@ -77,7 +77,7 @@ def test_create_app_upgrades_real_unversioned_0001_database(
     with create_engine(database_url).connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "0002_document_artifact"
+            == "0003_document_text_only"
         )
     assert app.state.container.database is not None
 
@@ -166,7 +166,8 @@ def test_frontend_script_exposes_structured_document_reading_contract(
     script = client.get("/static/app.js").text
 
     assert 'id="document-overview"' in html
-    assert 'id="document-key-points"' in html
+    assert 'id="document-key-points"' not in html
+    assert "documentKeyPoints" not in script
     assert 'id="document-toc"' in html
     assert 'id="download-status"' in html
     assert "fetchEvidence" in script

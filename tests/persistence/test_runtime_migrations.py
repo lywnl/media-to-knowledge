@@ -14,7 +14,7 @@ from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
 
-HEAD_REVISION = "0002_document_artifact"
+HEAD_REVISION = "0003_document_text_only"
 
 
 @pytest.fixture
@@ -65,6 +65,12 @@ def _assert_upgraded(database_url: str, run_id: str) -> None:
     }.issubset(
         {column["name"] for column in inspect(engine).get_columns("video_understanding_run")}
     )
+    assert not ({"retrieval_text", "retrieval_hash"} & {
+        column["name"] for column in inspect(engine).get_columns("video_segment")
+    })
+    assert not ({"retrieval_text", "retrieval_hash"} & {
+        column["name"] for column in inspect(engine).get_columns("video_summary")
+    })
     with engine.connect() as connection:
         assert (
             connection.execute(
@@ -107,17 +113,8 @@ def test_runtime_migration_accepts_legacy_create_schema_equivalent_database(
 ) -> None:
     workspace_root, runtime_root = workspace_runtime
     database_url = f"sqlite+pysqlite:///{runtime_root / 'orm.db'}"
-    Database(database_url).create_schema()
+    command.upgrade(_alembic_config(workspace_root, database_url), "0001_video_demo")
     _insert_legacy_run(database_url, "run-from-create-schema")
-    # 模拟 0002 发布前生产 create_schema() 的结构。
-    with create_engine(database_url).begin() as connection:
-        connection.execute(
-            text("ALTER TABLE video_understanding_run DROP COLUMN document_relative_path")
-        )
-        connection.execute(text("ALTER TABLE video_understanding_run DROP COLUMN document_sha256"))
-        connection.execute(
-            text("ALTER TABLE video_understanding_run DROP COLUMN document_size_bytes")
-        )
 
     upgrade_runtime_database(workspace_root, runtime_root, database_url)
 

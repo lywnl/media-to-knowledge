@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-
 import pytest
 from pydantic import ValidationError
 
@@ -41,14 +39,11 @@ def _chapter() -> SemanticChapter:
         claims=(GroundedClaim(text="结论", evidence_refs=("asr_001",), certainty=0.9),),
         evidence_refs=("asr_001",),
         transcript_source="ASR",
-        retrieval_text=text,
-        retrieval_hash=hashlib.sha256(text.encode()).hexdigest(),
     )
 
 
 def _result(chapter: SemanticChapter | None = None) -> VideoUnderstandingResult:
     actual = chapter or _chapter()
-    summary_text = "视频摘要"
     return VideoUnderstandingResult(
         run_id="run_document_002",
         asset_sha256="a" * 64,
@@ -56,9 +51,6 @@ def _result(chapter: SemanticChapter | None = None) -> VideoUnderstandingResult:
             title="测试",
             duration_ms=1_000,
             overview_zh="摘要",
-            key_points=(),
-            retrieval_text=summary_text,
-            retrieval_hash=hashlib.sha256(summary_text.encode()).hexdigest(),
         ),
         chapters=(actual,),
         generation=DocumentGenerationMetadata(

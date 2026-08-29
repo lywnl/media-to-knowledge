@@ -85,7 +85,6 @@ def _speech() -> SpeechSegment:
 
 
 def _result(run_id: str, asset_sha256: str, speech: SpeechSegment) -> VideoUnderstandingResult:
-    retrieval_text = "知识文档流水线"
     chapter = SemanticChapter(
         chapter_id="chapter_001",
         start_ms=0,
@@ -103,8 +102,6 @@ def _result(run_id: str, asset_sha256: str, speech: SpeechSegment) -> VideoUnder
         claims=(),
         evidence_refs=(speech.evidence_id,),
         transcript_source="ASR",
-        retrieval_text=retrieval_text,
-        retrieval_hash=_digest(retrieval_text),
     )
     return VideoUnderstandingResult(
         run_id=run_id,
@@ -113,9 +110,6 @@ def _result(run_id: str, asset_sha256: str, speech: SpeechSegment) -> VideoUnder
             title="测试知识文档",
             duration_ms=1_000,
             overview_zh="流水线概览",
-            key_points=(),
-            retrieval_text="流水线摘要",
-            retrieval_hash=_digest("流水线摘要"),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(
@@ -137,7 +131,6 @@ def _result(run_id: str, asset_sha256: str, speech: SpeechSegment) -> VideoUnder
 
 
 def _empty_result(run_id: str, asset_sha256: str) -> VideoUnderstandingResult:
-    retrieval_text = ""
     chapter = SemanticChapter(
         chapter_id="chapter_001",
         start_ms=0,
@@ -151,8 +144,6 @@ def _empty_result(run_id: str, asset_sha256: str) -> VideoUnderstandingResult:
         content_status="NO_SEMANTIC_EVIDENCE",
         evidence_refs=(),
         transcript_source="NONE",
-        retrieval_text=retrieval_text,
-        retrieval_hash=_digest(retrieval_text),
     )
     return VideoUnderstandingResult(
         run_id=run_id,
@@ -161,9 +152,6 @@ def _empty_result(run_id: str, asset_sha256: str) -> VideoUnderstandingResult:
             title="测试知识文档",
             duration_ms=1_000,
             overview_zh="未提取到可验证语义内容。",
-            key_points=(),
-            retrieval_text="无语义内容",
-            retrieval_hash=_digest("无语义内容"),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(

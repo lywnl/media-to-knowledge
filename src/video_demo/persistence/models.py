@@ -13,7 +13,6 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
-    Text,
     UniqueConstraint,
 )
 from sqlalchemy.engine.interfaces import Dialect
@@ -261,8 +260,6 @@ class VideoSegmentModel(ScopeColumns, TimestampColumns, Base):
     end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    retrieval_text: Mapped[str] = mapped_column(Text, nullable=False)
-    retrieval_hash: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
 class VideoSummaryModel(ScopeColumns, TimestampColumns, Base):
@@ -281,5 +278,3 @@ class VideoSummaryModel(ScopeColumns, TimestampColumns, Base):
     run_id: Mapped[str] = mapped_column(String(128), nullable=False)
     schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    retrieval_text: Mapped[str] = mapped_column(Text, nullable=False)
-    retrieval_hash: Mapped[str] = mapped_column(String(64), nullable=False)

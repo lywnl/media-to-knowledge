@@ -43,8 +43,8 @@ def prompt_for_compact_planning(request: ChapterPlanningRequest) -> tuple[str, s
         request.prompt_version,
         (
             "你只能根据输入的基础片段和转写证据规划连续章节。使用数组索引返回范围："
-            "start_segment_index 包含、end_segment_index 不包含，所有范围必须按顺序从 0 开始"
-            "完整覆盖 segments (最后一个 end_segment_index 必须等于 segments 长度)；"
+            "start_segment_index 包含、end_segment_index 不包含，所有范围必须按顺序从 0 开始；"
+            "普通章节 end_segment_index 不得超过 segments 长度，最后一个章节允许暂时使用 segments 长度加 1，程序会归一化为 segments 长度；"
             "end_segment_index 只能引用 segments 数组位置，不得使用毫秒时间或全片位置。"
             "segments 每项为 [segment_index, start_ms, end_ms, transcript_evidence_indexes]；"
             "segment_transcript_index_ranges 与 segments 一一对应，给出每个基础片段所拥有的"
@@ -83,7 +83,7 @@ def prompt_for_compact_plan_repair(request: ChapterPlanRepairRequest) -> tuple[s
     return _prompt(
         request.prompt_version,
         "只修复结构和索引；chapter_drafts 必须按顺序完整覆盖 request.segments，"
-        "所有 end_segment_index 不得超过 request.segments 长度，"
+        "普通章节 end_segment_index 不得超过 request.segments 长度，最后一个章节最多允许 request.segments 长度加 1，程序最终归一化，"
         "anchor_transcript_indexes 必须属于对应章节的 transcript_evidence_indexes；"
         "必须保留原请求的事实边界，不得添加新事实。只返回 JSON。",
         context,
@@ -324,7 +324,7 @@ def prompt_for_global_editing(request: GlobalWritingRequest) -> tuple[str, str, 
     return _prompt(
         request.prompt_version,
         "你只能整理已验证章节；不得新增章节、证据或关键帧 ID；"
-        "overview_zh 必须返回非空的中文核心概览，概括输入中的事实章节。",
+        "只返回 overview_zh；必须返回非空的中文核心概览，概括输入中的事实章节。",
         request.model_dump(mode="json"),
     )
 
@@ -333,7 +333,7 @@ def prompt_for_global_repair(request: GlobalWritingRepairRequest) -> tuple[str, 
     return _prompt(
         request.prompt_version,
         "只修复全局摘要结构；不得新增、遗漏、重复或重排章节；"
-        "overview_zh 必须返回非空的中文核心概览，概括输入中的事实章节。",
+        "只返回 overview_zh；必须返回非空的中文核心概览，概括输入中的事实章节。",
         request.model_dump(mode="json"),
     )
 

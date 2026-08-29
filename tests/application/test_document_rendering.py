@@ -16,7 +16,6 @@ from video_demo.domain.document import (
     PromptVersions,
     QuoteBlock,
     SemanticChapter,
-    SummaryPoint,
     TableBlock,
     VideoDocumentSummary,
     VideoUnderstandingResult,
@@ -99,7 +98,6 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
         relation_to_transcript="CONFLICTING",
         certainty=0.65,
     )
-    retrieval_text = "章节检索正文"
     chapter = SemanticChapter(
         chapter_id="chapter_001",
         start_ms=0,
@@ -153,10 +151,7 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
         evidence_refs=(speech.evidence_id, keyframe.evidence_id, observation.evidence_id),
         selected_keyframe_refs=(keyframe.evidence_id,),
         transcript_source="ASR",
-        retrieval_text=retrieval_text,
-        retrieval_hash=_sha256(retrieval_text),
     )
-    summary_retrieval = "视频检索摘要"
     result = VideoUnderstandingResult(
         run_id="run_document_rendering_001",
         asset_sha256=ASSET_SHA256,
@@ -164,11 +159,6 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
             title="faster-whisper <入门>",
             duration_ms=chapter.end_ms,
             overview_zh="介绍 faster-whisper 的安装和参数。",
-            key_points=(
-                SummaryPoint(text="掌握安装流程。", chapter_refs=(chapter.chapter_id,)),
-            ),
-            retrieval_text=summary_retrieval,
-            retrieval_hash=_sha256(summary_retrieval),
         ),
         chapters=(chapter,),
         generation=_metadata(),
@@ -203,7 +193,7 @@ def test_render_markdown_is_deterministic_utf8_and_has_fixed_structure() -> None
     )
     positions = tuple(markdown.index(marker) for marker in ordered_markers)
     assert positions == tuple(sorted(positions))
-    assert "## 全文关键结论" in markdown
+    assert "## 全文关键结论" not in markdown
     assert "关键画面与引用" not in markdown
     assert "video-demo-keyframe:keyframe_001" not in markdown
     assert markdown.count("安装 \\#1") == 2
@@ -291,8 +281,6 @@ def test_render_markdown_keeps_chapter_summary_when_section_has_multiple_chapter
             "evidence_refs": (),
             "selected_keyframe_refs": (),
             "transcript_source": "NONE",
-            "retrieval_text": "",
-            "retrieval_hash": _sha256(""),
         },
     )
     result = result.model_copy(update={"chapters": (first, second)})
@@ -340,12 +328,10 @@ def test_no_semantic_evidence_placeholder_is_rendered_without_information_bounda
         content_status="NO_SEMANTIC_EVIDENCE",
         evidence_refs=(),
         transcript_source="NONE",
-        retrieval_text="",
-        retrieval_hash=_sha256(""),
     )
     empty_result = result.model_copy(
         update={
-            "summary": result.summary.model_copy(update={"key_points": ()}),
+            "summary": result.summary,
             "chapters": (chapter,),
         },
     )

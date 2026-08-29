@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import re
 import unicodedata
 from collections.abc import Iterable
@@ -20,7 +19,7 @@ from video_demo.domain.evidence import (
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 
-RESULT_SCHEMA_VERSION: Literal["4.0.0"] = "4.0.0"
+RESULT_SCHEMA_VERSION: Literal["4.1.0"] = "4.1.0"
 TranscriptSource: TypeAlias = Literal["SUBTITLE", "ASR", "NONE"]
 _TITLE_MAX_LENGTH = 200
 _VISUAL_CAPTION_MAX_LENGTH = 2_000
@@ -68,24 +67,10 @@ class DocumentGenerationConfig(FrozenModel):
         return value
 
 
-class SummaryPoint(FrozenModel):
-    text: str = Field(min_length=1, max_length=1_000)
-    chapter_refs: tuple[StableId, ...] = Field(min_length=1, max_length=240)
-
-
 class VideoDocumentSummary(FrozenModel):
     title: str = Field(min_length=1, max_length=200)
     duration_ms: int = Field(gt=0, le=7_200_000)
     overview_zh: str = Field(max_length=8_000)
-    key_points: tuple[SummaryPoint, ...] = Field(max_length=64)
-    retrieval_text: str = Field(max_length=8_000)
-    retrieval_hash: Sha256
-
-    @model_validator(mode="after")
-    def validate_retrieval_hash(self) -> VideoDocumentSummary:
-        _validate_retrieval_hash(self.retrieval_text, self.retrieval_hash)
-        return self
-
 
 class GroundedClaim(FrozenModel):
     text: str = Field(min_length=1, max_length=2_000)
@@ -184,14 +169,11 @@ class SemanticChapter(TimeRange):
     evidence_refs: tuple[StableId, ...] = Field(max_length=256)
     selected_keyframe_refs: tuple[StableId, ...] = Field(default=(), max_length=3)
     transcript_source: TranscriptSource
-    retrieval_text: str = Field(max_length=32_000)
-    retrieval_hash: Sha256
 
     @model_validator(mode="after")
     def validate_content_boundary(self) -> SemanticChapter:
         if self.duration_ms > 300_000:
             raise ValueError("单章时长不得超过 5 分钟")
-        _validate_retrieval_hash(self.retrieval_text, self.retrieval_hash)
         if len(self.evidence_refs) != len(set(self.evidence_refs)):
             raise ValueError("章节 evidence_refs 不得重复")
         if len(self.title_evidence_refs) != len(set(self.title_evidence_refs)):
@@ -216,8 +198,6 @@ class SemanticChapter(TimeRange):
                 or self.selected_keyframe_refs
             ):
                 raise ValueError("NO_SEMANTIC_EVIDENCE 章节不得包含事实或证据")
-            if self.retrieval_text:
-                raise ValueError("NO_SEMANTIC_EVIDENCE 章节检索文本必须为空")
         else:
             if not self.evidence_refs:
                 raise ValueError("GROUNDED 章节至少需要一个证据引用")
@@ -245,7 +225,7 @@ class DocumentGenerationMetadata(FrozenModel):
 
 
 class VideoUnderstandingResult(FrozenModel):
-    schema_version: Literal["4.0.0"] = RESULT_SCHEMA_VERSION
+    schema_version: Literal["4.1.0"] = RESULT_SCHEMA_VERSION
     run_id: StableId
     asset_sha256: Sha256
     summary: VideoDocumentSummary
@@ -264,14 +244,6 @@ class VideoUnderstandingResult(FrozenModel):
         for previous, current in zip(self.chapters[:-1], self.chapters[1:], strict=True):
             if previous.end_ms != current.start_ms:
                 raise ValueError("章节必须连续且无重叠")
-        grounded = {
-            chapter.chapter_id
-            for chapter in self.chapters
-            if chapter.content_status == "GROUNDED"
-        }
-        for point in self.summary.key_points:
-            if any(ref not in grounded for ref in point.chapter_refs):
-                raise ValueError("SummaryPoint 只能引用已有的 GROUNDED 章节")
         return self
 
 
@@ -662,9 +634,3 @@ def _validate_document_keyframe(keyframe: KeyframeEvidence) -> None:
             "3.0 文档关键帧必须使用实际帧时间起始且最长 1ms 的半开区间",
             {"evidence_id": keyframe.evidence_id},
         )
-
-
-def _validate_retrieval_hash(text: str, digest: str) -> None:
-    expected = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    if digest != expected:
-        raise ValueError("retrieval_hash 必须等于 retrieval_text 的 SHA-256")

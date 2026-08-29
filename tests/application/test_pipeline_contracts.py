@@ -108,12 +108,12 @@ def test_pipeline_run_config_round_trips_document_configuration_and_schema() -> 
         {
             "language_hints": ["zh"],
             "document_config": {"document_title": "知识文档"},
-            "result_schema_version": "4.0.0",
+            "result_schema_version": "4.1.0",
         }
     )
 
     assert config.document_config.document_title == "知识文档"
-    assert config.result_schema_version == "4.0.0"
+    assert config.result_schema_version == "4.1.0"
     assert contracts.pipeline_run_config_from_snapshot(config.model_dump(mode="json")) == config
 
 

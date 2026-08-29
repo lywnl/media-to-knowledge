@@ -65,8 +65,6 @@ def _result() -> tuple[VideoUnderstandingResult, SpeechSegment]:
         ),
         evidence_refs=(speech.evidence_id,),
         transcript_source="ASR",
-        retrieval_text="faster-whisper 语音识别",
-        retrieval_hash=_digest("faster-whisper 语音识别"),
     )
     result = VideoUnderstandingResult(
         run_id="run_001",
@@ -75,9 +73,6 @@ def _result() -> tuple[VideoUnderstandingResult, SpeechSegment]:
             title="faster-whisper 教程",
             duration_ms=1_000,
             overview_zh="介绍模型用途。",
-            key_points=(),
-            retrieval_text="模型用途",
-            retrieval_hash=_digest("模型用途"),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(

@@ -132,7 +132,7 @@ class OpenAIDocumentClient(DocumentTextPort):
                 ),
                 on_provider_attempt=on_provider_attempt,
             )
-            compact = _trim_trailing_empty_drafts(compact)
+            compact = _normalize_compact_planning_response(compact, len(request.segments))
             return _expand_compact_planning_response(compact, request)
         return self._call(
             prompt_for_planning(request),
@@ -168,6 +168,10 @@ class OpenAIDocumentClient(DocumentTextPort):
                     request.request,
                 ),
                 on_provider_attempt=on_provider_attempt,
+            )
+            compact = _normalize_compact_planning_response(
+                compact,
+                len(request.request.segments),
             )
             return _expand_compact_planning_response(compact, request.request)
         return self._call(
@@ -543,12 +547,10 @@ def _validate_compact_planning_response(
     segment_count = len(request.segments)
     transcript_count = len(request.transcript_evidence)
     expected_start = 0
-    drafts = _trim_trailing_empty_drafts(response).chapter_drafts
+    drafts = _normalize_compact_planning_response(response, segment_count).chapter_drafts
     for draft in drafts:
         if draft.start_segment_index != expected_start:
             raise _ReferenceValidationError("chapter_drafts.segment_indexes:not_contiguous")
-        if draft.end_segment_index > segment_count:
-            raise _ReferenceValidationError("chapter_drafts.end_segment_index:out_of_range")
         if draft.end_segment_index <= draft.start_segment_index:
             raise _ReferenceValidationError("chapter_drafts.segment_indexes:empty")
         expected_start = draft.end_segment_index
@@ -567,6 +569,29 @@ def _validate_compact_planning_response(
             # 为可确定修复的单个目标再发起一次付费结构修复调用。
     if expected_start != segment_count:
         raise _ReferenceValidationError("chapter_drafts.segment_indexes:not_complete")
+
+
+def _normalize_compact_planning_response(
+    response: _CompactChapterPlanningResponse,
+    segment_count: int,
+) -> _CompactChapterPlanningResponse:
+    """只把最后一个章节的一位越界结束下标归一化为批次末端。"""
+
+    drafts = list(_trim_trailing_empty_drafts(response).chapter_drafts)
+    for index, draft in enumerate(drafts):
+        if draft.end_segment_index <= segment_count:
+            continue
+        if (
+            index == len(drafts) - 1
+            and draft.end_segment_index == segment_count + 1
+        ):
+            drafts[index] = draft.model_copy(update={"end_segment_index": segment_count})
+            continue
+        raise _ReferenceValidationError("chapter_drafts.end_segment_index:out_of_range")
+    normalized = tuple(drafts)
+    if normalized == response.chapter_drafts:
+        return response
+    return _CompactChapterPlanningResponse(chapter_drafts=normalized)
 
 
 def _trim_trailing_empty_drafts(
@@ -717,8 +742,8 @@ def _validate_global_response(
     *,
     allowed_chapter_ids: set[str],
 ) -> None:
-    for point in response.key_points:
-        _require_known_ids(point.chapter_refs, allowed_chapter_ids, "key_points.chapter_refs")
+    if not allowed_chapter_ids:
+        raise _ReferenceValidationError("chapters:empty")
 
 
 class _ReferenceValidationError(ValueError):

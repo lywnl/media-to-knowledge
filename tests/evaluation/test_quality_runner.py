@@ -87,8 +87,6 @@ def _write_prediction(
         ),
         evidence_refs=(speech.evidence_id,),
         transcript_source="ASR",
-        retrieval_text="你好",
-        retrieval_hash=_hash("你好"),
     )
     second_chapter = SemanticChapter(
         chapter_id="chapter_002",
@@ -103,8 +101,6 @@ def _write_prediction(
         content_status="NO_SEMANTIC_EVIDENCE",
         evidence_refs=(),
         transcript_source="NONE",
-        retrieval_text="",
-        retrieval_hash=_hash(""),
     )
     result = VideoUnderstandingResult(
         run_id="run_001",
@@ -113,9 +109,6 @@ def _write_prediction(
             title="视频",
             duration_ms=500,
             overview_zh="视频包含问候。",
-            key_points=(),
-            retrieval_text="视频问候",
-            retrieval_hash=_hash("视频问候"),
         ),
         chapters=(first_chapter, second_chapter),
         generation=DocumentGenerationMetadata(

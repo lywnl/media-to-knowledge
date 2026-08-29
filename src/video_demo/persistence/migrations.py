@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - 受支持平台均提供，分支用�
     fcntl = None  # type: ignore[assignment]
 
 _LEGACY_REVISION = "0001_video_demo"
-_HEAD_REVISION = "0002_document_artifact"
+_HEAD_REVISION = "0003_document_text_only"
 _SCOPE = {
     "tenant_id": ("VARCHAR(128)", False),
     "application_id": ("VARCHAR(128)", False),
@@ -98,6 +98,21 @@ _LEGACY_COLUMNS = {
         retrieval_hash=("VARCHAR(64)", False),
     ),
 }
+_DOCUMENT_COLUMNS = {
+    "video_segment": _columns(
+        run_id=("VARCHAR(128)", False),
+        segment_id=("VARCHAR(128)", False),
+        start_ms=("INTEGER", False),
+        end_ms=("INTEGER", False),
+        schema_version=("VARCHAR(32)", False),
+        payload_json=("JSON", False),
+    ),
+    "video_summary": _columns(
+        run_id=("VARCHAR(128)", False),
+        schema_version=("VARCHAR(32)", False),
+        payload_json=("JSON", False),
+    ),
+}
 _HEAD_COLUMNS = {
     **_LEGACY_COLUMNS,
     "video_understanding_run": {
@@ -107,6 +122,7 @@ _HEAD_COLUMNS = {
         "document_size_bytes": ("BIGINT", True),
     },
 }
+_HEAD_COLUMNS.update(_DOCUMENT_COLUMNS)
 _LEGACY_UNIQUES = {
     "video_object": {
         "uq_video_object_scope_ref": (

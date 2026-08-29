@@ -22,7 +22,6 @@ from video_demo.domain.document import (
     PromptVersions,
     QuoteBlock,
     SemanticChapter,
-    SummaryPoint,
     VisualBlock,
 )
 from video_demo.domain.document_plan import ChapterPlan
@@ -160,15 +159,7 @@ def _chapter_response(request: ChapterWritingRequest) -> ChapterWritingResponse:
 
 
 def _global_response(request: GlobalWritingRequest) -> GlobalWritingResponse:
-    grounded = tuple(
-        chapter.chapter_id
-        for chapter in request.chapters
-        if chapter.content_status == "GROUNDED"
-    )
-    return GlobalWritingResponse(
-        overview_zh="全局概览",
-        key_points=(SummaryPoint(text="关键点", chapter_refs=(grounded[0],)),) if grounded else (),
-    )
+    return GlobalWritingResponse(overview_zh="全局概览")
 
 
 class _TextPort:
@@ -502,8 +493,7 @@ def test_writer_scopes_evidence_refills_images_and_reuses_cache(tmp_path: Path) 
     ]
     assert first.result.chapters == second.result.chapters
     assert first.result.chapters[0].selected_keyframe_refs == ("keyframe_evidence_001",)
-    assert "小字号可能识别有误" not in first.result.chapters[0].retrieval_text
-    assert "visual_001" not in first.result.chapters[0].retrieval_text
+    assert "retrieval_text" not in first.result.model_dump(mode="json")
     assert first.metrics["chapter_writer_provider_attempts"] == 2
     assert second.metrics["chapter_writer_cache_hits"] == 2
     assert second.metrics["global_editor_cache_hits"] == 1
@@ -713,9 +703,8 @@ def test_empty_evidence_chapter_skips_all_models_and_stays_non_retrievable(
         chapter.content_status == "NO_SEMANTIC_EVIDENCE"
         for chapter in written.result.chapters
     )
-    assert all(chapter.retrieval_text == "" for chapter in written.result.chapters)
-    assert written.result.summary.retrieval_text == ""
-    assert written.result.summary.key_points == ()
+    assert "retrieval_text" not in written.result.model_dump(mode="json")
+    assert "key_points" not in written.result.model_dump(mode="json")
 
 
 def test_quote_policy_repairs_disabled_quotes_and_downgrades_unmatched_quotes(
@@ -877,7 +866,7 @@ def test_repair_programming_error_is_not_hidden_as_rule_fallback(tmp_path: Path)
 def test_global_editor_uses_chapter_facts_and_repairs_invalid_response(
     tmp_path: Path,
 ) -> None:
-    invalid = GlobalWritingResponse(overview_zh="", key_points=())
+    invalid = GlobalWritingResponse(overview_zh="")
     port = _TextPort(global_edit=lambda _request: invalid)
 
     written = _writer(port).write(
@@ -903,7 +892,7 @@ def test_writer_falls_back_to_chapter_summary_when_global_overview_is_empty(
     tmp_path: Path,
 ) -> None:
     def empty_overview(_request: GlobalWritingRequest) -> GlobalWritingResponse:
-        return GlobalWritingResponse(overview_zh="", key_points=())
+        return GlobalWritingResponse(overview_zh="")
 
     written = _writer(
         _TextPort(global_edit=empty_overview, global_repair=empty_overview),
@@ -1217,7 +1206,6 @@ def test_global_chapter_fact_trimming_reaches_a_non_empty_solution_below_one_per
             end_ms=chapter.end_ms,
             title=chapter.title,
             summary_zh=chapter.summary_zh[:20],
-            key_conclusions=(),
             content_status=chapter.content_status,
         )
         for chapter in chapters
@@ -1732,7 +1720,7 @@ def test_visual_policy_cannot_be_bypassed_by_title_or_summary(tmp_path: Path) ->
     assert written.metrics["chapter_writer_structure_repairs"] == 1
     assert first.title == safe.title
     assert first.summary_zh == safe.summary_zh
-    assert "秘密参数" not in first.retrieval_text
+    assert "retrieval_text" not in first.model_dump(mode="json")
     assert "秘密参数" not in port.global_requests[0].chapters[0].summary_zh
 
 
@@ -1964,7 +1952,6 @@ def test_global_chapter_input_retains_content_from_every_grounded_chapter() -> N
         update={
             "title": "首章",
             "summary_zh": "首章摘要",
-            "retrieval_text": "首" * 32_000,
         },
     )
     second = _empty_semantic_chapter_for_test(1, end_ms=20_000).model_copy(
@@ -1972,7 +1959,6 @@ def test_global_chapter_input_retains_content_from_every_grounded_chapter() -> N
             "start_ms": 10_000,
             "title": "末章唯一标题",
             "summary_zh": "末章唯一摘要",
-            "retrieval_text": "末章唯一正文",
         },
     )
 
@@ -1983,7 +1969,6 @@ def test_global_chapter_input_retains_content_from_every_grounded_chapter() -> N
             end_ms=chapter.end_ms,
             title=chapter.title,
             summary_zh=chapter.summary_zh,
-            key_conclusions=(),
             content_status=chapter.content_status,
         )
         for chapter in (first, second)
@@ -1996,7 +1981,6 @@ def test_global_chapter_input_retains_content_from_every_grounded_chapter() -> N
 
 
 def _empty_semantic_chapter_for_test(index: int, *, end_ms: int) -> SemanticChapter:
-    retrieval = "检" * 32_000
     return SemanticChapter.model_construct(
         chapter_id=f"chapter_global_{index:03d}",
         start_ms=index * 10_000,
@@ -2009,8 +1993,6 @@ def _empty_semantic_chapter_for_test(index: int, *, end_ms: int) -> SemanticChap
         evidence_refs=("asr",),
         selected_keyframe_refs=(),
         transcript_source="ASR",
-        retrieval_text=retrieval,
-        retrieval_hash="0" * 64,
     )
 
 

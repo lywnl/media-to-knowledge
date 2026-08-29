@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "video-understanding-demo"
 version = "0.1.0"
-description = "独立视频理解到 retrieval_text 的 FastAPI Demo"
+description = "独立视频理解文本的 FastAPI Demo"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 license = { text = "Proprietary" }

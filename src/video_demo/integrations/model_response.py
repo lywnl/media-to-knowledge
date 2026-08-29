@@ -12,7 +12,15 @@ import re
 from collections.abc import Iterator
 
 _REMOVED_DOCUMENT_FIELDS = frozenset(
-    {"sections", "quality_flags", "uncertainties", "uncertainty_policy"},
+    {
+        "sections",
+        "quality_flags",
+        "uncertainties",
+        "uncertainty_policy",
+        "key_points",
+        "retrieval_text",
+        "retrieval_hash",
+    },
 )
 
 
@@ -100,7 +108,7 @@ def parse_json_content(text: str) -> object:
 
 
 def strip_removed_document_fields(value: object) -> object:
-    """丢弃已从 4.0 契约删除的模型展示字段，保留其余结构校验。"""
+    """丢弃已从 4.1 契约删除的模型展示字段，保留其余结构校验。"""
 
     if isinstance(value, dict):
         return {

@@ -28,6 +28,11 @@ def test_alembic_upgrade_and_downgrade_round_trip(tmp_path: Path) -> None:
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
+    for table in ("video_segment", "video_summary"):
+        assert not {"retrieval_text", "retrieval_hash"}.intersection(
+            column["name"] for column in inspect(engine).get_columns(table)
+        )
+    engine = create_engine(database_url)
     assert EXPECTED_TABLES.issubset(set(inspect(engine).get_table_names()))
 
     command.downgrade(config, "base")

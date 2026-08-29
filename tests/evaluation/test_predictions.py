@@ -111,7 +111,6 @@ def _result() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenceItem, ...
         relation_to_transcript="SUPPORTING",
         certainty=0.9,
     )
-    retrieval = "你好"
     chapter = SemanticChapter(
         chapter_id="chapter_001",
         start_ms=0,
@@ -139,8 +138,6 @@ def _result() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenceItem, ...
         evidence_refs=(speech.evidence_id, keyframe.evidence_id, observation.evidence_id),
         selected_keyframe_refs=(keyframe.evidence_id,),
         transcript_source="ASR",
-        retrieval_text=retrieval,
-        retrieval_hash=_digest(retrieval),
     )
     result = VideoUnderstandingResult(
         run_id="run_001",
@@ -149,9 +146,6 @@ def _result() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenceItem, ...
             title="视频",
             duration_ms=500,
             overview_zh="视频包含问候。",
-            key_points=(),
-            retrieval_text="视频问候",
-            retrieval_hash=_digest("视频问候"),
         ),
         chapters=(chapter,),
         generation=DocumentGenerationMetadata(
@@ -281,7 +275,7 @@ def test_prediction_round_trip_uses_three_layer_versions_and_chapter_claims(
 
     assert prediction.index.schema_version == "1.2.0"
     assert prediction.result is not None
-    assert prediction.result.schema_version == "4.0.0"
+    assert prediction.result.schema_version == "4.1.0"
     assert prediction.claims[0].source_kind == "CHAPTER_CLAIM"
     assert prediction.claims[0].source_id == "chapter_001"
     assert prediction.claims[0].evidence_refs == ("asr_001",)
