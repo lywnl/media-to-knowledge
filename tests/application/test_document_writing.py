@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -830,6 +831,7 @@ def test_invalid_main_and_repair_fall_back_but_authentication_fails_closed(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="video_demo.application.document_writing")
     invalid = ModelResponseValidationError(
         ErrorCode.TEXT_LLM_RESPONSE_INVALID,
         "非法响应",
@@ -857,6 +859,11 @@ def test_invalid_main_and_repair_fall_back_but_authentication_fails_closed(
     assert "phase=main" in messages
     assert "phase=repair" in messages
     assert "root:invalid" in messages
+    assert "reason=MODEL_RESPONSE_INVALID_AFTER_REPAIR" in messages
+    assert "章节写作开始" in messages
+    assert "transcript_evidence_count=1" in messages
+    assert "visual_observation_count=0" in messages
+    assert "elapsed_ms=" in messages
 
     auth = VideoDemoError(ErrorCode.TEXT_LLM_AUTHENTICATION_FAILED, "鉴权失败")
     with pytest.raises(VideoDemoError) as raised:
@@ -933,9 +940,11 @@ def test_repair_programming_error_is_not_hidden_as_rule_fallback(tmp_path: Path)
 
 def test_global_editor_uses_chapter_facts_and_repairs_invalid_response(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     invalid = GlobalWritingResponse(overview_zh="")
     port = _TextPort(global_edit=lambda _request: invalid)
+    caplog.set_level(logging.WARNING, logger="video_demo.application.document_writing")
 
     written = _writer(port).write(
         _context(),
@@ -948,6 +957,9 @@ def test_global_editor_uses_chapter_facts_and_repairs_invalid_response(
     )
 
     assert written.metrics["global_editor_structure_repairs"] == 1
+    messages = "\n".join(caplog.messages)
+    assert "全局文章写作开始" in messages
+    assert "全局文章响应校验失败" in messages
     assert tuple(chapter.chapter_id for chapter in written.result.chapters) == (
         "chapter_000",
         "chapter_001",
@@ -958,6 +970,7 @@ def test_global_editor_uses_chapter_facts_and_repairs_invalid_response(
 
 def test_writer_falls_back_to_chapter_summary_when_global_overview_is_empty(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     def empty_overview(_request: GlobalWritingRequest) -> GlobalWritingResponse:
         return GlobalWritingResponse(overview_zh="")
@@ -975,6 +988,10 @@ def test_writer_falls_back_to_chapter_summary_when_global_overview_is_empty(
     )
 
     assert written.result.summary.overview_zh == "章节摘要；章节摘要"
+    messages = "\n".join(caplog.messages)
+    assert "全局文章响应校验失败" in messages
+    assert "全局文章降级" in messages
+    assert "reason=MODEL_RESPONSE_INVALID_AFTER_REPAIR" in messages
 
 
 def test_writer_adds_grounded_claim_when_model_omits_claims(tmp_path: Path) -> None:

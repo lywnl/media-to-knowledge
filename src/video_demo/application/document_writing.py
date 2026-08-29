@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import unicodedata
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -445,6 +446,8 @@ class DocumentWriter:
         is_cancel_requested: Callable[[], bool],
         commit_gate: _CacheCommitGate,
     ) -> _ChapterOutcome:
+        started_at = time.monotonic()
+        _log_chapter_writing_start(request)
         local = _Counters()
         response = self._chapter_logical_call(
             request,
@@ -456,13 +459,20 @@ class DocumentWriter:
         degraded = response is None
         if response is None:
             if not _fallback_header_evidence_refs(request):
-                return _ChapterOutcome(
+                outcome = _ChapterOutcome(
                     _empty_chapter(request.chapter),
                     True,
                     local.chapter_attempts,
                     local.chapter_repairs,
                     local.chapter_cache_hits,
                 )
+                _log_chapter_writing_finished(
+                    request,
+                    outcome,
+                    started_at=started_at,
+                    reason="NO_HEADER_EVIDENCE",
+                )
+                return outcome
             response = _fallback_chapter_response(request)
         response = normalize_optional_visual_blocks(
             response,
@@ -470,13 +480,20 @@ class DocumentWriter:
         )
         response = _normalize_response_blocks(response, request)
         chapter = _materialize_chapter(request, response, keyframes)
-        return _ChapterOutcome(
+        outcome = _ChapterOutcome(
             chapter,
             degraded,
             local.chapter_attempts,
             local.chapter_repairs,
             local.chapter_cache_hits,
         )
+        _log_chapter_writing_finished(
+            request,
+            outcome,
+            started_at=started_at,
+            reason="MODEL_OR_DEPENDENCY_FAILURE" if degraded else None,
+        )
+        return outcome
 
     def _chapter_logical_call(
         self,
@@ -486,6 +503,11 @@ class DocumentWriter:
         is_cancel_requested: Callable[[], bool],
         commit_gate: _CacheCommitGate,
     ) -> ChapterWritingResponse | None:
+        started_at = time.monotonic()
+
+        def elapsed_ms() -> int:
+            return max(0, round((time.monotonic() - started_at) * 1_000))
+
         def validate(response: ChapterWritingResponse) -> None:
             response = normalize_optional_visual_blocks(
                 response,
@@ -535,10 +557,19 @@ class DocumentWriter:
                     code=error.code,
                     invalid=invalid,
                     provider_attempts=counters.chapter_attempts,
+                    elapsed_ms=elapsed_ms(),
                 )
             except VideoDemoError as error:
                 _raise_if_cancelled(is_cancel_requested)
                 if _is_fallback_error(error):
+                    _log_chapter_degradation(
+                        chapter_id=request.chapter.chapter_id,
+                        reason="DEPENDENCY_OR_PROVIDER_FAILURE",
+                        phase="main",
+                        code=error.code,
+                        provider_attempts=counters.chapter_attempts,
+                        elapsed_ms=elapsed_ms(),
+                    )
                     return None
                 raise
             else:
@@ -553,6 +584,7 @@ class DocumentWriter:
                         code=ErrorCode.TEXT_LLM_RESPONSE_INVALID,
                         invalid=invalid,
                         provider_attempts=counters.chapter_attempts,
+                        elapsed_ms=elapsed_ms(),
                     )
             if invalid is None:
                 path: Literal["MAIN", "REPAIR"] = "MAIN"
@@ -584,11 +616,28 @@ class DocumentWriter:
                         code=error.code,
                         invalid=error.invalid_response,
                         provider_attempts=counters.chapter_attempts,
+                        elapsed_ms=elapsed_ms(),
+                    )
+                    _log_chapter_degradation(
+                        chapter_id=request.chapter.chapter_id,
+                        reason="MODEL_RESPONSE_INVALID_AFTER_REPAIR",
+                        phase="repair",
+                        code=error.code,
+                        provider_attempts=counters.chapter_attempts,
+                        elapsed_ms=elapsed_ms(),
                     )
                     return None
                 except VideoDemoError as error:
                     _raise_if_cancelled(is_cancel_requested)
                     if _is_fallback_error(error):
+                        _log_chapter_degradation(
+                            chapter_id=request.chapter.chapter_id,
+                            reason="DEPENDENCY_OR_PROVIDER_FAILURE_AFTER_REPAIR",
+                            phase="repair",
+                            code=error.code,
+                            provider_attempts=counters.chapter_attempts,
+                            elapsed_ms=elapsed_ms(),
+                        )
                         return None
                     raise
                 _raise_if_cancelled(is_cancel_requested)
@@ -601,6 +650,15 @@ class DocumentWriter:
                         code=ErrorCode.TEXT_LLM_RESPONSE_INVALID,
                         invalid=_invalid_local_response(response, error),
                         provider_attempts=counters.chapter_attempts,
+                        elapsed_ms=elapsed_ms(),
+                    )
+                    _log_chapter_degradation(
+                        chapter_id=request.chapter.chapter_id,
+                        reason="MODEL_RESPONSE_INVALID_AFTER_REPAIR",
+                        phase="repair",
+                        code=ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+                        provider_attempts=counters.chapter_attempts,
+                        elapsed_ms=elapsed_ms(),
                     )
                     return None
                 path = "REPAIR"
@@ -625,6 +683,10 @@ class DocumentWriter:
         is_cancel_requested: Callable[[], bool],
     ) -> tuple[GlobalWritingResponse, bool]:
         if not any(chapter.content_status == "GROUNDED" for chapter in chapters):
+            _LOGGER.warning(
+                "全局文章写作跳过 reason=NO_GROUNDED_CHAPTER chapter_count=%d",
+                len(chapters),
+            )
             return _fallback_global_response(chapters), False
         request = _global_request(
             context,
@@ -674,9 +736,15 @@ class DocumentWriter:
         is_cancel_requested: Callable[[], bool],
         commit_gate: _CacheCommitGate,
     ) -> tuple[GlobalWritingResponse, bool]:
+        started_at = time.monotonic()
+
+        def elapsed_ms() -> int:
+            return max(0, round((time.monotonic() - started_at) * 1_000))
+
         def validate(response: GlobalWritingResponse) -> None:
             _validate_global_response(response, request, chapters)
 
+        _log_global_writing_start(request, chapters)
         _raise_if_cancelled(is_cancel_requested)
         cached = cache.get(self._global_identity, request, GlobalWritingResponse, validate)
         if cached is not None:
@@ -707,10 +775,24 @@ class DocumentWriter:
             except ModelResponseValidationError as error:
                 _raise_if_cancelled(is_cancel_requested)
                 invalid = error.invalid_response
+                _log_global_validation_failure(
+                    phase="main",
+                    code=error.code,
+                    invalid=invalid,
+                    provider_attempts=counters.global_attempts,
+                    elapsed_ms=elapsed_ms(),
+                )
             except VideoDemoError as error:
                 _raise_if_cancelled(is_cancel_requested)
                 if _is_fallback_error(error):
                     counters.global_fallbacks += 1
+                    _log_global_degradation(
+                        reason="DEPENDENCY_OR_PROVIDER_FAILURE",
+                        phase="main",
+                        code=error.code,
+                        provider_attempts=counters.global_attempts,
+                        elapsed_ms=elapsed_ms(),
+                    )
                     return _fallback_global_response(chapters), True
                 raise
             else:
@@ -719,6 +801,13 @@ class DocumentWriter:
                     validate(response)
                 except (ValueError, TypeError) as error:
                     invalid = _invalid_local_response(response, error)
+                    _log_global_validation_failure(
+                        phase="main",
+                        code=ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+                        invalid=invalid,
+                        provider_attempts=counters.global_attempts,
+                        elapsed_ms=elapsed_ms(),
+                    )
             if invalid is None:
                 path: Literal["MAIN", "REPAIR"] = "MAIN"
             else:
@@ -737,21 +826,57 @@ class DocumentWriter:
                             is_cancel_requested,
                         ),
                     )
-                except ModelResponseValidationError:
+                except ModelResponseValidationError as error:
                     _raise_if_cancelled(is_cancel_requested)
                     counters.global_fallbacks += 1
+                    _log_global_validation_failure(
+                        phase="repair",
+                        code=error.code,
+                        invalid=error.invalid_response,
+                        provider_attempts=counters.global_attempts,
+                        elapsed_ms=elapsed_ms(),
+                    )
+                    _log_global_degradation(
+                        reason="MODEL_RESPONSE_INVALID_AFTER_REPAIR",
+                        phase="repair",
+                        code=error.code,
+                        provider_attempts=counters.global_attempts,
+                        elapsed_ms=elapsed_ms(),
+                    )
                     return _fallback_global_response(chapters), True
                 except VideoDemoError as error:
                     _raise_if_cancelled(is_cancel_requested)
                     if _is_fallback_error(error):
                         counters.global_fallbacks += 1
+                        _log_global_degradation(
+                            reason="DEPENDENCY_OR_PROVIDER_FAILURE_AFTER_REPAIR",
+                            phase="repair",
+                            code=error.code,
+                            provider_attempts=counters.global_attempts,
+                            elapsed_ms=elapsed_ms(),
+                        )
                         return _fallback_global_response(chapters), True
                     raise
                 _raise_if_cancelled(is_cancel_requested)
                 try:
                     validate(response)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as error:
                     counters.global_fallbacks += 1
+                    invalid = _invalid_local_response(response, error)
+                    _log_global_validation_failure(
+                        phase="repair",
+                        code=ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+                        invalid=invalid,
+                        provider_attempts=counters.global_attempts,
+                        elapsed_ms=elapsed_ms(),
+                    )
+                    _log_global_degradation(
+                        reason="MODEL_RESPONSE_INVALID_AFTER_REPAIR",
+                        phase="repair",
+                        code=ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+                        provider_attempts=counters.global_attempts,
+                        elapsed_ms=elapsed_ms(),
+                    )
                     return _fallback_global_response(chapters), True
                 path = "REPAIR"
             commit_gate.begin_commit(is_cancel_requested)
@@ -1640,15 +1765,128 @@ def _log_chapter_validation_failure(
     code: ErrorCode,
     invalid: InvalidModelResponse,
     provider_attempts: int,
+    elapsed_ms: int,
 ) -> None:
     _LOGGER.warning(
         "章节写作响应校验失败 chapter_id=%s phase=%s code=%s "
-        "provider_attempts=%d validation_errors=%s",
+        "provider_attempts=%d elapsed_ms=%d validation_errors=%s",
         chapter_id,
         phase,
         code,
         provider_attempts,
+        elapsed_ms,
         ",".join(invalid.validation_errors[:8]),
+    )
+
+
+def _log_chapter_writing_start(request: ChapterWritingRequest) -> None:
+    prompt = prompt_for_writing(request)[2]
+    _LOGGER.warning(
+        "章节写作开始 chapter_id=%s start_ms=%d end_ms=%d "
+        "transcript_evidence_count=%d visual_observation_count=%d "
+        "input_chars=%d input_bytes=%d",
+        request.chapter.chapter_id,
+        request.chapter.start_ms,
+        request.chapter.end_ms,
+        len(request.transcript_evidence),
+        len(request.visual_observations),
+        len(prompt),
+        len(prompt.encode("utf-8")),
+    )
+
+
+def _log_chapter_writing_finished(
+    request: ChapterWritingRequest,
+    outcome: _ChapterOutcome,
+    *,
+    started_at: float,
+    reason: str | None,
+) -> None:
+    _LOGGER.warning(
+        "章节写作完成 chapter_id=%s status=%s reason=%s "
+        "provider_attempts=%d structure_repairs=%d cache_hits=%d "
+        "elapsed_ms=%d body_block_count=%d claim_count=%d",
+        request.chapter.chapter_id,
+        "FALLBACK" if outcome.degraded else "SUCCEEDED",
+        reason or "NONE",
+        outcome.provider_attempts,
+        outcome.structure_repairs,
+        outcome.cache_hits,
+        max(0, round((time.monotonic() - started_at) * 1_000)),
+        len(outcome.chapter.body_blocks),
+        len(outcome.chapter.claims),
+    )
+
+
+def _log_chapter_degradation(
+    *,
+    chapter_id: str,
+    reason: str,
+    phase: Literal["main", "repair"],
+    code: ErrorCode,
+    provider_attempts: int,
+    elapsed_ms: int,
+) -> None:
+    _LOGGER.warning(
+        "章节写作降级 chapter_id=%s phase=%s reason=%s code=%s "
+        "provider_attempts=%d elapsed_ms=%d",
+        chapter_id,
+        phase,
+        reason,
+        code,
+        provider_attempts,
+        elapsed_ms,
+    )
+
+
+def _log_global_validation_failure(
+    *,
+    phase: Literal["main", "repair"],
+    code: ErrorCode,
+    invalid: InvalidModelResponse,
+    provider_attempts: int,
+    elapsed_ms: int,
+) -> None:
+    _LOGGER.warning(
+        "全局文章响应校验失败 phase=%s code=%s provider_attempts=%d "
+        "elapsed_ms=%d validation_errors=%s",
+        phase,
+        code,
+        provider_attempts,
+        elapsed_ms,
+        ",".join(invalid.validation_errors[:8]),
+    )
+
+
+def _log_global_writing_start(
+    request: GlobalWritingRequest,
+    chapters: tuple[SemanticChapter, ...],
+) -> None:
+    prompt = prompt_for_global_editing(request)[2]
+    _LOGGER.warning(
+        "全局文章写作开始 chapter_count=%d input_chars=%d input_bytes=%d",
+        len(chapters),
+        len(prompt),
+        len(prompt.encode("utf-8")),
+    )
+
+
+def _log_global_degradation(
+    *,
+    reason: str,
+    phase: Literal["main", "repair"],
+    code: ErrorCode,
+    provider_attempts: int,
+    elapsed_ms: int,
+) -> None:
+    _LOGGER.warning(
+        "全局文章降级 phase=%s reason=%s code=%s provider_attempts=%d "
+        "elapsed_ms=%d",
+        phase,
+        reason,
+        code,
+        provider_attempts,
+        elapsed_ms,
     )
 
 
