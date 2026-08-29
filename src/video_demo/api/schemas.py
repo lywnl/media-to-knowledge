@@ -5,8 +5,16 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from video_demo.domain.audio_document import (
+    AudioChapter,
+    AudioDocumentSummary,
+)
 from video_demo.domain.base import LanguageCode, Probability, StableId
 from video_demo.domain.document import DocumentGenerationConfig
+from video_demo.domain.image_document import (
+    ImageClaim,
+    ImageContentBlock,
+)
 from video_demo.domain.run import TimeRange
 from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
 
@@ -130,6 +138,41 @@ class MediaRunHistoryItem(MediaRunResponse):
 
 class MediaRunHistoryResponse(ApiModel):
     items: tuple[MediaRunHistoryItem, ...]
+
+
+class PublicAudioUnderstandingResult(ApiModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    run_id: StableId
+    asset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    summary: AudioDocumentSummary
+    chapters: tuple[AudioChapter, ...] = Field(min_length=1, max_length=240)
+
+
+class PublicImageSourceEvidence(ApiModel):
+    evidence_type: Literal["IMAGE_SOURCE"] = "IMAGE_SOURCE"
+    evidence_id: StableId
+    mime_type: Literal["image/jpeg", "image/png", "image/webp"]
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    width: int = Field(gt=0, le=20_000)
+    height: int = Field(gt=0, le=20_000)
+    size_bytes: int = Field(gt=0, le=8 * 1024 * 1024)
+
+
+class PublicImageDocument(ApiModel):
+    title: str = Field(min_length=1, max_length=200)
+    overview_zh: str = Field(max_length=8_000)
+    content_blocks: tuple[ImageContentBlock, ...] = Field(max_length=64)
+    claims: tuple[ImageClaim, ...] = Field(max_length=64)
+    evidence_refs: tuple[StableId, ...] = Field(max_length=128)
+    content_status: Literal["GROUNDED", "DEGRADED"] = "GROUNDED"
+
+
+class PublicImageUnderstandingResult(ApiModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    run_id: StableId
+    asset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    document: PublicImageDocument
+    source: PublicImageSourceEvidence
 
 
 class PublicTimedEvidence(TimeRange):

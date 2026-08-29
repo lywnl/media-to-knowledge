@@ -11,10 +11,10 @@ from video_demo.api.schemas import (
     MediaRunHistoryItem,
     MediaRunHistoryResponse,
     MediaRunResponse,
+    PublicAudioUnderstandingResult,
+    PublicImageUnderstandingResult,
 )
 from video_demo.application.media_runs import MediaRunService
-from video_demo.domain.audio_document import AudioUnderstandingResult
-from video_demo.domain.image_document import ImageUnderstandingResult
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.media_repositories import MediaObjectRepository
 from video_demo.persistence.models import AudioObjectModel, ImageObjectModel
@@ -28,7 +28,11 @@ MediaContainer = Annotated[AppContainer, Depends(get_container)]
 def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
     label = "音频" if kind == "AUDIO" else "图片"
     object_model = AudioObjectModel if kind == "AUDIO" else ImageObjectModel
-    result_model = AudioUnderstandingResult if kind == "AUDIO" else ImageUnderstandingResult
+    result_model = (
+        PublicAudioUnderstandingResult
+        if kind == "AUDIO"
+        else PublicImageUnderstandingResult
+    )
     object_prefix = kind.lower()
     router = APIRouter(
         prefix=f"/api/kb/knowledge-bases/{{kb_id}}/{object_prefix}",
@@ -130,7 +134,8 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
         scope: MediaScope,
         container: MediaContainer,
     ) -> object:
-        return container.media_query_services[kind].get_result(scope, run_id)
+        result = container.media_query_services[kind].get_result(scope, run_id)
+        return _public_media_result(result, kind)
 
     @router.get("-understanding-runs/{run_id}/document")
     def get_document(
@@ -156,3 +161,16 @@ def _run_response(view: object) -> MediaRunResponse:
         warning_codes=view.warning_codes,  # type: ignore[attr-defined]
         error_code=view.error_code,  # type: ignore[attr-defined]
     )
+
+
+def _public_media_result(result: object, kind: Literal["AUDIO", "IMAGE"]) -> object:
+    """将内部结果映射到不含运行目录路径的公开响应契约。"""
+
+    if not hasattr(result, "model_dump"):
+        raise TypeError("媒体结果必须是 Pydantic 模型")
+    payload = result.model_dump(mode="json", exclude_computed_fields=True)
+    if kind == "IMAGE":
+        source = payload.get("source")
+        if isinstance(source, dict):
+            source.pop("relative_path", None)
+    return payload
