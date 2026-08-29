@@ -659,6 +659,25 @@ def test_document_pipeline_treats_normal_no_frame_and_no_visual_as_succeeded(
     assert outcome.status == "SUCCEEDED"
 
 
+def test_visual_degradation_keeps_model_refined_asr_document(tmp_path: Path) -> None:
+    fixture = _PipelineFixture(
+        tmp_path,
+        visual_status="PARTIAL_SUCCEEDED",
+        writing_status="SUCCEEDED",
+    )
+
+    outcome = _pipeline(fixture).run(_context("run_001"))
+
+    assert outcome.status == "PARTIAL_SUCCEEDED"
+    assert outcome.result.chapters[0].body_blocks[0].text == "讲解知识文档流水线。"
+    assert "VISION_WARNING" in outcome.warnings
+    assert "WRITING_WARNING" in outcome.warnings
+    assert not any(
+        warning.startswith("CHAPTER_WRITING_DEGRADED:")
+        for warning in outcome.warnings
+    )
+
+
 @pytest.mark.parametrize(
     ("transcript_source", "warning"),
     [

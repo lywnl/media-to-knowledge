@@ -261,6 +261,8 @@ def test_writing_prompts_separate_observation_and_content_references() -> None:
             "source_keyframe_refs"
         ) in instruction
         assert "只有 VisualBlock.visual_content_refs 才能引用视觉内容 ID" in instruction
+        assert "视觉观察可能没有 content_blocks 或 visual_facts" in instruction
+        assert "视觉块引用错误时只删除视觉块" in instruction
 
 
 def test_writing_prompts_require_discriminated_body_block_type() -> None:

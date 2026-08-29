@@ -2,11 +2,133 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+
+from pydantic import TypeAdapter, ValidationError
 
 from video_demo.domain.base import stable_identifier
 from video_demo.domain.document_plan import FrameCandidateArtifact
-from video_demo.domain.evidence import ChapterVisualObservation
+from video_demo.domain.evidence import ChapterVisualObservation, VisualContentBlockDraft
 from video_demo.integrations.document_port import ChapterVisionRequest, ChapterVisionResponse
+
+_LOGGER = logging.getLogger(__name__)
+_VISUAL_CONTENT_BLOCK_ADAPTER = TypeAdapter(VisualContentBlockDraft)
+
+
+def normalize_chapter_vision_response_data(
+    value: object,
+    request: ChapterVisionRequest,
+) -> object:
+    """在领域模型校验前修正模型偶发的可派生引用偏差。
+
+    目标绑定和转写锚点都来自请求闭包，不能由模型新增。未知引用保留给
+    后续硬校验处理；这里只根据可信的所选帧派生目标，并补齐已有目标锚点
+    对应的转写引用。
+    """
+
+    if not isinstance(value, dict) or not isinstance(value.get("observations"), list):
+        return value
+    frame_by_id = {frame.frame_id: frame for frame in request.frames}
+    target_by_id = {target.target_id: target for target in request.targets}
+    normalized_observations: list[object] = []
+    for raw_observation in value["observations"]:
+        if not isinstance(raw_observation, dict):
+            normalized_observations.append(raw_observation)
+            continue
+        observation = dict(raw_observation)
+        observation["content_blocks"] = _normalize_content_blocks(
+            observation.get("content_blocks"),
+            selected_frame_ids=observation.get("selected_frame_ids"),
+        )
+        selected_ids = _string_tuple(observation.get("selected_frame_ids"))
+        claimed_ids = _string_tuple(observation.get("target_ids"))
+        if (
+            selected_ids is not None
+            and all(frame_id in frame_by_id for frame_id in selected_ids)
+            and (claimed_ids is None or all(target_id in target_by_id for target_id in claimed_ids))
+        ):
+            covered_targets = {
+                target_id
+                for frame_id in selected_ids
+                for target_id in frame_by_id[frame_id].target_ids
+            }
+            normalized_targets = tuple(
+                target_id for target_id in target_by_id if target_id in covered_targets
+            )
+            if not normalized_targets:
+                normalized_observations.append(observation)
+                continue
+            if claimed_ids is None or tuple(claimed_ids) != normalized_targets:
+                _LOGGER.warning(
+                    "VLM 视觉引用已归一化 chapter_id=%s selected_frame_ids=%s "
+                    "model_target_ids=%s derived_target_ids=%s",
+                    request.chapter_id,
+                    ",".join(selected_ids),
+                    ",".join(claimed_ids or ()),
+                    ",".join(normalized_targets),
+                )
+            observation["target_ids"] = list(normalized_targets)
+            relation = observation.get("relation_to_transcript")
+            transcript_value = observation.get("transcript_evidence_refs", ())
+            transcript_refs = _string_tuple(transcript_value)
+            if relation != "INDEPENDENT" and transcript_refs == ():
+                anchors = tuple(
+                    dict.fromkeys(
+                        anchor
+                        for target_id in normalized_targets
+                        for anchor in target_by_id[target_id].anchor_evidence_refs
+                    )
+                )
+                if anchors:
+                    observation["transcript_evidence_refs"] = list(anchors)
+                elif all(
+                    target_by_id[target_id].purpose == "BASE_COVERAGE"
+                    for target_id in normalized_targets
+                ):
+                    observation["relation_to_transcript"] = "INDEPENDENT"
+        normalized_observations.append(observation)
+    normalized = dict(value)
+    normalized["observations"] = normalized_observations
+    return normalized
+
+
+def _normalize_content_blocks(
+    value: object,
+    *,
+    selected_frame_ids: object,
+) -> list[object]:
+    """丢弃结构损坏的可选视觉块，但保留未知引用交给硬校验。"""
+
+    if not isinstance(value, (list, tuple)):
+        return []
+    selected_ids = set(_string_tuple(selected_frame_ids) or ())
+    normalized: list[object] = []
+    for block in value:
+        if not isinstance(block, dict):
+            continue
+        try:
+            _VISUAL_CONTENT_BLOCK_ADAPTER.validate_python(block)
+        except (TypeError, ValueError, ValidationError):
+            source_ids = block.get("source_frame_ids")
+            if _contains_unknown_frame_reference(source_ids, selected_ids):
+                normalized.append(block)
+                continue
+            _LOGGER.warning("VLM 可选视觉内容块结构无效，已丢弃")
+            continue
+        normalized.append(block)
+    return normalized
+
+
+def _contains_unknown_frame_reference(value: object, selected_ids: set[str]) -> bool:
+    if not isinstance(value, (list, tuple)):
+        return False
+    return any(not isinstance(frame_id, str) or frame_id not in selected_ids for frame_id in value)
+
+
+def _string_tuple(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, (list, tuple)) or any(not isinstance(item, str) for item in value):
+        return None
+    return tuple(value)
 
 
 def validate_chapter_vision_response(
@@ -54,10 +176,7 @@ def validate_chapter_vision_response(
             frame_by_id,
         )
         observation_targets = set(observation.target_ids)
-        if not observation_targets <= covered_targets or any(
-            not observation_targets.intersection(frame_by_id[frame_id].target_ids)
-            for frame_id in observation.selected_frame_ids
-        ):
+        if not observation_targets <= covered_targets:
             raise ValueError("observations.target_ids:frame_binding_mismatch")
         _validate_relations(observation, frame_by_id)
         observation_id = stable_identifier(

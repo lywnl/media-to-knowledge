@@ -115,6 +115,30 @@ def test_shared_validation_rejects_unknown_reference_and_wrong_frame_binding() -
         )
 
 
+def test_shared_validation_allows_context_frame_with_additional_target_binding() -> None:
+    request = _request()
+    second_target = VisualSearchTarget(
+        target_id="target_002",
+        purpose="SEMANTIC",
+        query_zh="辅助画面",
+        anchor_evidence_refs=("asr_001",),
+    )
+    context_frame = request.frames[1].model_copy(update={"target_ids": ("target_002",)})
+    request = request.model_copy(
+        update={
+            "targets": (*request.targets, second_target),
+            "frames": (request.frames[0], context_frame),
+        },
+    )
+
+    validate_chapter_vision_response(
+        ChapterVisionResponse(
+            observations=(_observation(selected_frame_ids=("frame_a", "frame_b")),),
+        ),
+        request,
+        max_selected_frames=2,
+    )
+
 def test_shared_validation_rejects_reverse_frame_relation_and_duplicate_observation() -> None:
     request = _request()
     relation = VisualFrameRelationDraft(

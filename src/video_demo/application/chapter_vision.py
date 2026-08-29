@@ -15,7 +15,12 @@ from video_demo.application.chapter_frames import ChapterFrameSearchBatch, Chapt
 from video_demo.domain.base import FrozenModel, Sha256, StableId, stable_identifier
 from video_demo.domain.document import DocumentGenerationConfig
 from video_demo.domain.document_artifact import MAX_METRIC_VALUE
-from video_demo.domain.document_plan import ChapterFrameSet, ChapterPlan, FrameCandidateArtifact
+from video_demo.domain.document_plan import (
+    ChapterFrameSet,
+    ChapterPlan,
+    FrameCandidateArtifact,
+    VisualSearchTarget,
+)
 from video_demo.domain.evidence import (
     ChapterVisualObservation,
     GroundedVisualFact,
@@ -175,7 +180,7 @@ class _ChapterAnalysis:
     frames: tuple[FrameCandidateArtifact, ...]
     response: ChapterVisionResponse | None
     status: ChapterVisionStatus
-    warning: str | None
+    warnings: tuple[str, ...]
     counters: _ChapterCounters
 
 
@@ -497,16 +502,41 @@ class ChapterVisionService:
             document_config,
         )
         if request_frames is None:
+            isolation_frames = tuple(
+                frame for frame in frames if frame.size_bytes <= self._max_image_bytes
+            )
+            isolated = self._analyze_chapter_with_frame_isolation(
+                chapter,
+                isolation_frames,
+                transcript_evidence,
+                document_config,
+                cache,
+                allowed_run_root,
+                is_cancel_requested,
+                counters,
+            )
+            if isolated is not None:
+                return isolated
             counters.fallback = 1
             return _ChapterAnalysis(
                 chapter,
                 (),
                 None,
                 "DEGRADED",
-                f"CHAPTER_VLM_INPUT_BUDGET_DEGRADED:{chapter.chapter_id}",
+                (f"CHAPTER_VLM_INPUT_BUDGET_DEGRADED:{chapter.chapter_id}",),
                 counters,
             )
-        request = _vision_request(chapter, request_frames, transcript_evidence, document_config)
+        request = _vision_request(
+            chapter,
+            request_frames,
+            transcript_evidence,
+            document_config,
+            max_selected_frames=_request_frame_limit(
+                chapter,
+                request_frames,
+                document_config,
+            ),
+        )
         canonical_input = _cache_input(
             chapter,
             request_frames,
@@ -532,20 +562,188 @@ class ChapterVisionService:
                 is_cancel_requested,
             )
             if logical_response is None:
+                isolated = self._analyze_chapter_with_frame_isolation(
+                    chapter,
+                    request_frames,
+                    transcript_evidence,
+                    document_config,
+                    cache,
+                    allowed_run_root,
+                    is_cancel_requested,
+                    counters,
+                )
+                if isolated is not None:
+                    return isolated
                 counters.fallback = 1
                 return _ChapterAnalysis(
                     chapter,
                     request_frames,
                     None,
                     "DEGRADED",
-                    f"CHAPTER_VLM_DEGRADED:{chapter.chapter_id}",
+                    (f"CHAPTER_VLM_DEGRADED:{chapter.chapter_id}",),
                     counters,
                 )
             response = logical_response
         if not response.observations:
             counters.no_value = 1
-            return _ChapterAnalysis(chapter, request_frames, response, "NO_VALUE", None, counters)
-        return _ChapterAnalysis(chapter, request_frames, response, "SUCCEEDED", None, counters)
+            return _ChapterAnalysis(chapter, request_frames, response, "NO_VALUE", (), counters)
+        return _ChapterAnalysis(chapter, request_frames, response, "SUCCEEDED", (), counters)
+
+    def _analyze_chapter_with_frame_isolation(
+        self,
+        chapter: ChapterPlan,
+        frames: tuple[FrameCandidateArtifact, ...],
+        transcript_evidence: tuple[TranscriptEvidence, ...],
+        document_config: DocumentGenerationConfig,
+        cache: DocumentModelCache,
+        allowed_run_root: Path,
+        is_cancel_requested: Callable[[], bool],
+        counters: _ChapterCounters,
+    ) -> _ChapterAnalysis | None:
+        requests = self._frame_isolation_requests(
+            chapter,
+            frames,
+            transcript_evidence,
+            document_config,
+        )
+        if not requests:
+            return None
+        successful: list[tuple[str, ChapterVisionResponse]] = []
+        failed_frame_ids: list[str] = []
+        for request in requests:
+            _raise_if_cancelled(is_cancel_requested)
+            isolated_request = request
+            canonical_input = _cache_input(
+                chapter,
+                request.frames,
+                request.transcript_evidence,
+                document_config,
+            )
+
+            def validate(
+                response: ChapterVisionResponse,
+                request_to_validate: ChapterVisionRequest = isolated_request,
+            ) -> None:
+                _validate_response(response, request_to_validate, chapter)
+
+            frame_id = isolated_request.frames[0].frame_id
+            if not self._isolated_request_fits(isolated_request):
+                failed_frame_ids.append(frame_id)
+                continue
+            try:
+                response = self._logical_call(
+                    cache,
+                    canonical_input,
+                    isolated_request,
+                    validate,
+                    counters,
+                    allowed_run_root,
+                    is_cancel_requested,
+                )
+            except VideoDemoError as error:
+                if error.code != ErrorCode.INPUT_BUDGET_EXCEEDED:
+                    raise
+                response = None
+            if response is None:
+                failed_frame_ids.append(frame_id)
+                continue
+            successful.append((frame_id, response))
+        if not successful:
+            return None
+        aggregate_request = _vision_request(
+            chapter,
+            frames,
+            transcript_evidence,
+            document_config,
+            max_selected_frames=min(
+                len(successful),
+                _request_frame_limit(chapter, frames, document_config),
+            ),
+        )
+        merged = self._merge_isolated_responses(
+            tuple(successful),
+            chapter=chapter,
+            request=aggregate_request,
+        )
+        try:
+            _validate_response(merged, aggregate_request, chapter)
+        except _VisionSemanticValidationError:
+            return None
+        if not merged.observations:
+            counters.no_value += 1
+            return _ChapterAnalysis(chapter, frames, merged, "NO_VALUE", (), counters)
+        warnings = tuple(
+            f"CHAPTER_VLM_FRAME_DEGRADED:{chapter.chapter_id}:{frame_id}"
+            for frame_id in failed_frame_ids
+        )
+        status: ChapterVisionStatus = "DEGRADED" if failed_frame_ids else "SUCCEEDED"
+        if failed_frame_ids:
+            counters.fallback = 1
+        return _ChapterAnalysis(chapter, frames, merged, status, warnings, counters)
+
+    def _frame_isolation_requests(
+        self,
+        chapter: ChapterPlan,
+        frames: tuple[FrameCandidateArtifact, ...],
+        transcript_evidence: tuple[TranscriptEvidence, ...],
+        document_config: DocumentGenerationConfig,
+    ) -> tuple[ChapterVisionRequest, ...]:
+        targets = _targets(chapter)
+        transcript_by_id = {item.evidence_id: item for item in transcript_evidence}
+        requests: list[ChapterVisionRequest] = []
+        for frame in frames:
+            frame_targets = tuple(
+                target for target in targets if target.target_id in frame.target_ids
+            )
+            if not frame_targets:
+                continue
+            anchor_ids = {
+                anchor
+                for target in frame_targets
+                for anchor in target.anchor_evidence_refs
+            }
+            frame_transcript = tuple(
+                transcript_by_id[item.evidence_id]
+                for item in transcript_evidence
+                if item.evidence_id in anchor_ids
+            )
+            requests.append(
+                _vision_request(
+                    chapter,
+                    (frame,),
+                    frame_transcript,
+                    document_config,
+                    max_selected_frames=1,
+                    targets=frame_targets,
+                ),
+            )
+        return tuple(requests)
+
+    def _isolated_request_fits(self, request: ChapterVisionRequest) -> bool:
+        frame = request.frames[0]
+        if frame.size_bytes > self._max_request_image_bytes:
+            return False
+        main_size, repair_size = self._request_pair_sizes(request)
+        return max(main_size, repair_size) <= self._max_encoded_request_bytes
+
+    @staticmethod
+    def _merge_isolated_responses(
+        responses: tuple[tuple[str, ChapterVisionResponse], ...],
+        *,
+        chapter: ChapterPlan,
+        request: ChapterVisionRequest,
+    ) -> ChapterVisionResponse:
+        del chapter
+        observations: list[ChapterVisualObservation] = []
+        selected_ids: set[str] = set()
+        for _frame_id, response in responses:
+            for observation in response.observations:
+                frame_ids = set(observation.selected_frame_ids)
+                if len(selected_ids | frame_ids) > request.max_selected_frames:
+                    continue
+                observations.append(observation)
+                selected_ids.update(frame_ids)
+        return ChapterVisionResponse(observations=observations)
 
     def _logical_call(
         self,
@@ -678,7 +876,13 @@ class ChapterVisionService:
             )
             return None
         while admitted:
-            request = _vision_request(chapter, admitted, transcript_evidence, document_config)
+            request = _vision_request(
+                chapter,
+                admitted,
+                transcript_evidence,
+                document_config,
+                max_selected_frames=max_selected_frames,
+            )
             encoded_main, encoded_repair = self._request_pair_sizes(request)
             raw_bytes = sum(frame.size_bytes for frame in admitted)
             covers_targets = _covers_targets(admitted, required_targets)
@@ -691,6 +895,14 @@ class ChapterVisionService:
                 return admitted
             removable = _lowest_removable_frame(admitted, required_targets)
             if removable is None:
+                if (
+                    chapter.visual_mode not in {"COMPARISON", "MULTI_STEP"}
+                    and document_config.max_visuals_per_chapter >= 2
+                    and max_selected_frames == 2
+                    and len(admitted) == 3
+                ):
+                    max_selected_frames = 3
+                    continue
                 _log_input_budget_rejection(
                     chapter,
                     reason="NO_REMOVABLE_FRAME",
@@ -917,7 +1129,7 @@ def _skipped_analysis(
             (),
             None,
             "DISABLED",
-            None,
+            (),
             _ChapterCounters(logical_analyses=0),
         )
     if not frames:
@@ -927,7 +1139,7 @@ def _skipped_analysis(
             (),
             None,
             status,
-            None,
+            (),
             _ChapterCounters(logical_analyses=0),
         )
     return None
@@ -944,7 +1156,7 @@ def _inherit_frame_status(
         frames=analysis.frames,
         response=analysis.response,
         status="DEGRADED",
-        warning=analysis.warning,
+        warnings=analysis.warnings,
         counters=analysis.counters,
     )
 
@@ -987,15 +1199,39 @@ def _vision_request(
     frames: tuple[FrameCandidateArtifact, ...],
     transcript_evidence: tuple[TranscriptEvidence, ...],
     config: DocumentGenerationConfig,
+    *,
+    max_selected_frames: int | None = None,
+    targets: tuple[VisualSearchTarget, ...] | None = None,
 ) -> ChapterVisionRequest:
     return ChapterVisionRequest(
         chapter_id=chapter.chapter_id,
-        targets=_targets(chapter),
+        targets=_targets(chapter) if targets is None else targets,
         frames=tuple(sorted(frames, key=lambda item: (item.timestamp_ms, item.frame_id))),
+        max_selected_frames=(
+            min(
+                config.max_visuals_per_chapter,
+                3 if chapter.visual_mode in {"COMPARISON", "MULTI_STEP"} else 2,
+            )
+            if max_selected_frames is None
+            else max_selected_frames
+        ),
         transcript_evidence=transcript_evidence,
         document_config=config,
         prompt_version="chapter-vlm-v1",
     )
+
+
+def _request_frame_limit(
+    chapter: ChapterPlan,
+    frames: tuple[FrameCandidateArtifact, ...],
+    config: DocumentGenerationConfig,
+) -> int:
+    mode_limit = 3 if chapter.visual_mode in {"COMPARISON", "MULTI_STEP"} else 2
+    if chapter.visual_mode not in {"COMPARISON", "MULTI_STEP"} and len(frames) == 3:
+        mode_limit = 3
+    if len(frames) == 3 and config.max_visuals_per_chapter >= 2:
+        return 3
+    return min(config.max_visuals_per_chapter, mode_limit)
 
 
 def _cache_input(
@@ -1054,10 +1290,7 @@ def _validate_response(
     request: ChapterVisionRequest,
     chapter: ChapterPlan,
 ) -> None:
-    cap = min(
-        request.document_config.max_visuals_per_chapter,
-        3 if chapter.visual_mode in {"COMPARISON", "MULTI_STEP"} else 2,
-    )
+    cap = request.max_selected_frames
     try:
         validate_chapter_vision_response(
             response,
@@ -1271,7 +1504,7 @@ def _materialize_batch(
         ),
     )
     status_by_id = {analysis.chapter.chapter_id: analysis.status for analysis in analyses}
-    warnings = [analysis.warning for analysis in analyses if analysis.warning is not None]
+    warnings = [warning for analysis in analyses for warning in analysis.warnings]
     for chapter_id in budget_chapters:
         status_by_id[chapter_id] = "DEGRADED"
         warnings.append(f"VISUAL_PUBLISHED_BUDGET_DEGRADED:{chapter_id}")

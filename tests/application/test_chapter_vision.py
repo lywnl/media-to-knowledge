@@ -98,6 +98,67 @@ class _VisionPort:
         raise AssertionError("合法主响应不应调用修复")
 
 
+class _IsolatingVisionPort(_VisionPort):
+    def __init__(self, failed_timestamps_ms: set[int]) -> None:
+        super().__init__(ChapterVisionResponse(observations=()))
+        self._failed_timestamps_ms = failed_timestamps_ms
+        self.invalid = InvalidModelResponse(
+            content_sha256="b" * 64,
+            validation_errors=("observations:invalid",),
+        )
+        self.repair_requests: list[ChapterVisionRepairRequest] = []
+
+    def analyze_chapter(
+        self,
+        request: ChapterVisionRequest,
+        *,
+        allowed_run_root: Path,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterVisionResponse:
+        del allowed_run_root
+        self.requests.append(request)
+        if on_provider_attempt is not None:
+            on_provider_attempt()
+        if len(request.frames) > 1 or request.frames[0].timestamp_ms in self._failed_timestamps_ms:
+            raise ModelResponseValidationError(
+                ErrorCode.QWEN_RESPONSE_INVALID,
+                "模拟视觉响应非法",
+                self.invalid,
+            )
+        relation = "COMPLEMENTARY"
+        observation = _response().observations[0].model_copy(
+            update={
+                "target_ids": tuple(target.target_id for target in request.targets),
+                "selected_frame_ids": (request.frames[0].frame_id,),
+                "content_blocks": (),
+                "relation_to_transcript": relation,
+                "transcript_evidence_refs": (
+                    (request.transcript_evidence[0].evidence_id,)
+                    if relation != "INDEPENDENT" and request.transcript_evidence
+                    else ()
+                ),
+            },
+        )
+        return ChapterVisionResponse(observations=(observation,))
+
+    def repair_chapter(
+        self,
+        request: ChapterVisionRepairRequest,
+        *,
+        allowed_run_root: Path,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterVisionResponse:
+        del allowed_run_root
+        self.repair_requests.append(request)
+        if on_provider_attempt is not None:
+            on_provider_attempt()
+        raise ModelResponseValidationError(
+            ErrorCode.QWEN_RESPONSE_INVALID,
+            "模拟视觉修复失败",
+            self.invalid,
+        )
+
+
 def _identity() -> ModelInvocationIdentity:
     return ModelInvocationIdentity(
         logical_operation="chapter_vision",
@@ -647,6 +708,191 @@ def test_same_sha_with_distinct_frame_ids_publishes_one_file_and_two_evidence_it
     assert len(result.keyframe_evidence) == 2
     assert len({item.relative_path for item in result.keyframe_evidence}) == 1
     assert len(tuple((run_root / "visual/keyframes").iterdir())) == 1
+
+
+def test_single_mode_admits_three_frames_when_three_targets_need_distinct_frames(
+    tmp_path: Path,
+) -> None:
+    run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
+    first = frame_batch.frame_sets[0].candidates[0]
+    second_target = VisualSearchTarget(
+        target_id="target_002",
+        purpose="SEMANTIC",
+        query_zh="第二处画面",
+        anchor_evidence_refs=(speech.evidence_id,),
+    )
+    base_target = VisualSearchTarget(
+        target_id="target_003",
+        purpose="BASE_COVERAGE",
+        query_zh="章节代表画面",
+        sample_timestamps_ms=(3_000,),
+    )
+    chapter = chapter.model_copy(
+        update={
+            "semantic_targets": (chapter.semantic_targets[0], second_target),
+            "base_coverage_targets": (base_target,),
+        },
+    )
+    second = _updated_frame(first, timestamp_ms=2_000, target_ids=(second_target.target_id,))
+    third = _updated_frame(first, timestamp_ms=3_000, target_ids=(base_target.target_id,))
+    frame_batch = _replace_frame_batch(
+        frame_batch,
+        chapter=chapter,
+        candidates=(first, second, third),
+    )
+    response = ChapterVisionResponse(
+        observations=(
+            _response().observations[0].model_copy(
+                update={
+                    "target_ids": tuple(
+                        target.target_id
+                        for target in (*chapter.semantic_targets, *chapter.base_coverage_targets)
+                    ),
+                    "selected_frame_ids": (first.frame_id, second.frame_id, third.frame_id),
+                },
+            ),
+        ),
+    )
+    port = _VisionPort(response)
+
+    result = _service(tmp_path, port).analyze_all(
+        (chapter,),
+        frame_batch,
+        (speech,),
+        DocumentGenerationConfig(),
+        cache=_cache(run_root),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert len(port.requests) == 1
+    assert len(port.requests[0].frames) == 3
+    assert result.chapter_status == ((chapter.chapter_id, "SUCCEEDED"),)
+    assert result.warnings == ()
+
+
+def test_aggregate_vlm_failure_isolated_to_one_frame(tmp_path: Path) -> None:
+    run_root, chapter, frame_batch, speech, payload = _fixture(tmp_path)
+    first = frame_batch.frame_sets[0].candidates[0]
+    speech_second = speech.model_copy(
+        update={"evidence_id": "asr_002", "start_ms": 3_000, "end_ms": 4_000},
+    )
+    speech_third = speech.model_copy(
+        update={"evidence_id": "asr_003", "start_ms": 5_000, "end_ms": 6_000},
+    )
+    target_second = VisualSearchTarget(
+        target_id="target_002",
+        purpose="SEMANTIC",
+        query_zh="第二处画面",
+        anchor_evidence_refs=(speech_second.evidence_id,),
+    )
+    target_third = VisualSearchTarget(
+        target_id="target_003",
+        purpose="SEMANTIC",
+        query_zh="第三处画面",
+        anchor_evidence_refs=(speech_third.evidence_id,),
+    )
+    chapter = chapter.model_copy(
+        update={
+            "visual_mode": "COMPARISON",
+            "semantic_targets": (
+                chapter.semantic_targets[0],
+                target_second,
+                target_third,
+            ),
+        },
+    )
+    second_payload = b"\xff\xd8\xffsecond-frame\xff\xd9"
+    second_digest = hashlib.sha256(second_payload).hexdigest()
+    second_path = run_root / f"visual/candidates/{second_digest}.jpg"
+    second_path.write_bytes(second_payload)
+    second_path.chmod(0o600)
+    second = _updated_frame(
+        first,
+        timestamp_ms=1_700,
+        sha256=second_digest,
+        size_bytes=len(second_payload),
+        relative_path=f"visual/candidates/{second_digest}.jpg",
+        target_ids=(target_second.target_id,),
+    )
+    third_payload = b"\xff\xd8\xffthird-frame\xff\xd9"
+    third_digest = hashlib.sha256(third_payload).hexdigest()
+    third_path = run_root / f"visual/candidates/{third_digest}.jpg"
+    third_path.write_bytes(third_payload)
+    third_path.chmod(0o600)
+    third = _updated_frame(
+        first,
+        timestamp_ms=1_900,
+        sha256=third_digest,
+        size_bytes=len(third_payload),
+        relative_path=f"visual/candidates/{third_digest}.jpg",
+        target_ids=(target_third.target_id,),
+    )
+    batch = _replace_frame_batch(frame_batch, chapter=chapter, candidates=(first, second, third))
+    port = _IsolatingVisionPort({second.timestamp_ms})
+
+    result = _service(tmp_path, port).analyze_all(
+        (chapter,),
+        batch,
+        (speech, speech_second, speech_third),
+        DocumentGenerationConfig(max_visuals_per_chapter=3),
+        cache=_cache(run_root),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert len(port.requests) == 4
+    assert len(result.observations) == 2
+    assert {item.keyframe_refs[0] for item in result.observations} == {
+        result.keyframe_evidence[0].evidence_id,
+        result.keyframe_evidence[1].evidence_id,
+    }
+    assert result.chapter_status == ((chapter.chapter_id, "DEGRADED"),)
+    assert result.status == "PARTIAL_SUCCEEDED"
+    assert result.warnings == (
+        f"CHAPTER_VLM_FRAME_DEGRADED:{chapter.chapter_id}:{second.frame_id}",
+    )
+    assert len(result.keyframe_evidence) == 2
+    assert payload != second_payload
+
+
+def test_aggregate_vlm_failure_all_isolated_frames_successful_recovers(tmp_path: Path) -> None:
+    run_root, chapter, frame_batch, speech, _payload = _fixture(tmp_path)
+    first = frame_batch.frame_sets[0].candidates[0]
+    speech_second = speech.model_copy(
+        update={"evidence_id": "asr_002", "start_ms": 3_000, "end_ms": 4_000},
+    )
+    target_second = VisualSearchTarget(
+        target_id="target_002",
+        purpose="SEMANTIC",
+        query_zh="第二处画面",
+        anchor_evidence_refs=(speech_second.evidence_id,),
+    )
+    chapter = chapter.model_copy(
+        update={
+            "visual_mode": "COMPARISON",
+            "semantic_targets": (chapter.semantic_targets[0], target_second),
+        },
+    )
+    second = _updated_frame(
+        first,
+        timestamp_ms=1_700,
+        target_ids=(target_second.target_id,),
+    )
+    batch = _replace_frame_batch(frame_batch, chapter=chapter, candidates=(first, second))
+    port = _IsolatingVisionPort(set())
+
+    result = _service(tmp_path, port).analyze_all(
+        (chapter,),
+        batch,
+        (speech, speech_second),
+        DocumentGenerationConfig(),
+        cache=_cache(run_root),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert len(result.observations) == 2
+    assert result.chapter_status == ((chapter.chapter_id, "SUCCEEDED"),)
+    assert result.status == "SUCCEEDED"
+    assert result.warnings == ()
 
 
 class _RepairingVisionPort(_VisionPort):

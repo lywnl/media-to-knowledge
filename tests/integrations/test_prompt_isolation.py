@@ -87,11 +87,31 @@ def test_vision_prompt_limits_selected_frames_and_allows_empty_observations(
     assert "返回 observations=[]" in instruction
 
 
+def test_vision_prompt_uses_three_frame_budget_when_request_expands_it(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path, "画面文字").model_copy(update={"max_selected_frames": 3})
+
+    _version, instruction, _data = prompt_for_vision(request)
+
+    assert "每个 observation 最多选择 3 张图片" in instruction
+    assert "整份响应最多使用 3 张不同图片" in instruction
+
+
 def test_vision_prompt_states_transcript_relation_contract(tmp_path: Path) -> None:
     _version, instruction, _data = prompt_for_vision(_request(tmp_path, "画面文字"))
 
     assert "INDEPENDENT 时 transcript_evidence_refs 必须为空" in instruction
     assert "其他音画关系必须至少引用 1 条当前转写证据" in instruction
+
+
+def test_vision_prompt_exposes_target_frame_bindings_as_data(tmp_path: Path) -> None:
+    _version, _instruction, data = prompt_for_vision(_request(tmp_path, "画面文字"))
+
+    document = json.loads(data)
+    assert document["target_frame_bindings"] == [
+        {"target_id": "target-001", "eligible_frame_ids": ["frame-001"]},
+    ]
 
 
 def test_vision_repair_prompt_repeats_transcript_relation_contract(tmp_path: Path) -> None:

@@ -39,6 +39,9 @@ from video_demo.integrations.document_prompts import (
     prompt_for_writing,
     prompt_for_writing_repair,
 )
+from video_demo.integrations.document_writing_normalization import (
+    normalize_optional_visual_blocks,
+)
 from video_demo.integrations.model_response import (
     extract_model_message_content,
     parse_json_content,
@@ -202,6 +205,10 @@ class OpenAIDocumentClient(DocumentTextPort):
                 allowed_evidence_ids=set(allowed_writing_evidence_ids(request)),
                 visual_observations=request.visual_observations,
             ),
+            normalize_response=lambda response: normalize_optional_visual_blocks(
+                response,
+                request.visual_observations,
+            ),
             on_provider_attempt=on_provider_attempt,
         )
 
@@ -220,6 +227,10 @@ class OpenAIDocumentClient(DocumentTextPort):
                 response,
                 allowed_evidence_ids=set(request.allowed_evidence_ids),
                 visual_observations=request.request.visual_observations,
+            ),
+            normalize_response=lambda response: normalize_optional_visual_blocks(
+                response,
+                request.request.visual_observations,
             ),
             on_provider_attempt=on_provider_attempt,
         )
@@ -269,6 +280,7 @@ class OpenAIDocumentClient(DocumentTextPort):
         max_output_tokens: int | None = None,
         extra_payload: dict[str, object] | None = None,
         validate_response: Callable[[ResponseModel], None],
+        normalize_response: Callable[[ResponseModel], ResponseModel] | None = None,
         on_provider_attempt: Callable[[], None] | None,
     ) -> ResponseModel:
         version, instruction, data = prompt
@@ -291,6 +303,7 @@ class OpenAIDocumentClient(DocumentTextPort):
         return _parse_and_validate_response(
             raw,
             response_type,
+            normalize_response=normalize_response,
             validate_response=validate_response,
         )
 
@@ -410,12 +423,15 @@ def _parse_and_validate_response(
     content: bytes,
     response_type: type[ResponseModel],
     *,
+    normalize_response: Callable[[ResponseModel], ResponseModel] | None = None,
     validate_response: Callable[[ResponseModel], None],
 ) -> ResponseModel:
     raw_message, parsed, finish_reason = _extract_model_message(content)
     parsed = strip_removed_document_fields(parsed)
     try:
         response = response_type.model_validate(parsed)
+        if normalize_response is not None:
+            response = normalize_response(response)
         validate_response(response)
         return response
     except ValidationError as error:

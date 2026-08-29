@@ -184,12 +184,15 @@ def prompt_for_plan_repair(request: ChapterPlanRepairRequest) -> tuple[str, str,
 
 
 def prompt_for_vision(request: ChapterVisionRequest) -> tuple[str, str, str]:
+    frame_limit = request.max_selected_frames
     return _prompt(
         request.prompt_version,
         (
             "你只能比较输入的本地图片，并且只能返回输入中的 frame_id、target_id 和 "
-            "evidence_id。每个 observation 最多选择 2 张图片；整份响应最多使用 2 张不同图片。"
+            f"evidence_id。每个 observation 最多选择 {frame_limit} 张图片；"
+            f"整份响应最多使用 {frame_limit} 张不同图片。"
             "如果图片无法确认目标，返回 observations=[]，不要猜测或选择额外图片。"
+            "先选择 selected_frame_ids，再从这些帧的 target_ids 交集表中复制 target_ids；"
             "selected_frame_ids 必须是实际最能支持该 observation 的最少图片。"
             "先逐字复制输入中的 evidence_id：INDEPENDENT 时 "
             "transcript_evidence_refs 必须为空；"
@@ -200,19 +203,24 @@ def prompt_for_vision(request: ChapterVisionRequest) -> tuple[str, str, str]:
 
 
 def prompt_for_vision_repair(request: ChapterVisionRepairRequest) -> tuple[str, str, str]:
+    frame_limit = request.request.max_selected_frames
     context = request.model_dump(mode="json", exclude={"request"})
     context["request"] = _vision_context(request.request)
     return _prompt(
         request.prompt_version,
         (
             "只修复结构和引用；图片顺序和原始取证问题不得改变，不得添加新事实。"
-            "每个 observation 最多选择 2 张图片，整份响应最多使用 2 张不同图片；"
+            f"每个 observation 最多选择 {frame_limit} 张图片，"
+            f"整份响应最多使用 {frame_limit} 张不同图片；"
+            "先选择 selected_frame_ids，再从这些帧的 target_ids 交集表中复制 target_ids；"
             "无法确认时返回 observations=[]。先逐字复制输入中的 evidence_id："
             "INDEPENDENT 时 transcript_evidence_refs 必须为空；"
             "其他音画关系必须至少引用 1 条当前转写证据。"
         ),
         context,
     )
+
+
 
 
 def build_vision_payload(
@@ -295,6 +303,11 @@ def prompt_for_writing(request: ChapterWritingRequest) -> tuple[str, str, str]:
             "visual_observation_ref。"
             "所有 evidence_id 必须从输入白名单逐字复制，不得自行编造、截断或替换；"
             "输出前逐项检查每个引用都在上述白名单中，无法确认时删除该引用或对应事实。"
+            "视觉观察可能没有 content_blocks 或 visual_facts；此时 "
+            "visual_content_refs 必须为空数组，不能编造 ID。"
+            "视觉观察缺失或不可用时，不要输出 VISUAL block，但必须继续根据 "
+            "ASR/字幕生成正常正文和 claims。"
+            "视觉块引用错误时只删除视觉块，不要删除同一响应中的 ASR 正文、摘要和 claims。"
             "只要本章存在可验证语义且 summary_zh 非空，必须返回 1-2 条 claims；"
             "每条 claim 都应是有证据支持的独立关键结论，不要只重复章节标题。"
         ),
@@ -317,6 +330,11 @@ def prompt_for_writing_repair(request: ChapterWritingRepairRequest) -> tuple[str
             "visual_observation_ref。"
             "所有 evidence_id 必须从输入白名单逐字复制，不得自行编造、截断或替换；"
             "输出前逐项检查每个引用都在上述白名单中，无法确认时删除该引用或对应事实。"
+            "视觉观察可能没有 content_blocks 或 visual_facts；此时 "
+            "visual_content_refs 必须为空数组，不能编造 ID。"
+            "视觉观察缺失或不可用时，不要输出 VISUAL block，但必须继续根据 "
+            "ASR/字幕生成正常正文和 claims。"
+            "视觉块引用错误时只删除视觉块，不要删除同一响应中的 ASR 正文、摘要和 claims。"
             "只要本章存在可验证语义且 summary_zh 非空，必须返回 1-2 条 claims；"
             "每条 claim 都应是有证据支持的独立关键结论，不要只重复章节标题。"
         ),
@@ -353,6 +371,17 @@ def _vision_context(request: ChapterVisionRequest) -> dict[str, object]:
     ]
     context = request.model_dump(mode="json", exclude={"frames"})
     context["frames"] = frame_descriptors
+    context["target_frame_bindings"] = [
+        {
+            "target_id": target.target_id,
+            "eligible_frame_ids": [
+                frame["frame_id"]
+                for frame in frame_descriptors
+                if target.target_id in frame["target_ids"]
+            ],
+        }
+        for target in request.targets
+    ]
     return context
 
 

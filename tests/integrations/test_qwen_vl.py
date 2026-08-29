@@ -160,6 +160,30 @@ def test_qwen_sends_sorted_jpeg_frames_in_one_request_without_local_metadata(
     assert payloads[0]["response_format"]["json_schema"]["name"] == "chapter_vlm_v2"  # type: ignore[index]
 
 
+def test_qwen_enforces_request_frame_budget_on_response(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs" / "scope_001" / "run_001"
+    run_root.mkdir(parents=True)
+    request = _request(run_root).model_copy(update={"max_selected_frames": 1})
+    first = _valid_observation("frame_a")["observations"][0]
+    second = _valid_observation("frame_b")["observations"][0]
+    assert isinstance(first, dict)
+    assert isinstance(second, dict)
+    body = {"observations": [first, second]}
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        return _provider_response(http_request, body)
+
+    with pytest.raises(ModelResponseValidationError) as raised:
+        _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+            request,
+            allowed_run_root=run_root,
+        )
+
+    assert raised.value.invalid_response.validation_errors == (
+        "observations.selected_frame_ids:budget_exceeded",
+    )
+
+
 def test_qwen_accepts_content_blocks_and_explanatory_text_before_json(tmp_path: Path) -> None:
     run_root = tmp_path / "runs" / "scope_001" / "run_001"
     run_root.mkdir(parents=True)
@@ -720,7 +744,32 @@ def test_qwen_validation_error_includes_safe_business_reason(tmp_path: Path) -> 
     )
 
 
-def test_qwen_requires_every_claimed_target_to_have_a_selected_frame(tmp_path: Path) -> None:
+def test_qwen_normalizes_target_ids_from_selected_frame_bindings(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    request = _request(run_root)
+    second_target = VisualSearchTarget(
+        target_id="target_002",
+        purpose="SEMANTIC",
+        query_zh="另一处画面",
+        anchor_evidence_refs=("asr_001",),
+    )
+    request = request.model_copy(update={"targets": (*request.targets, second_target)})
+    body = _valid_observation("frame_a")
+    body["observations"][0]["target_ids"] = ["target_001", "target_002"]  # type: ignore[index]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _provider_response(request, body)
+
+    result = _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+        request,
+        allowed_run_root=run_root,
+    )
+
+    assert result.observations[0].target_ids == ("target_001",)
+
+
+def test_qwen_normalizes_known_target_without_frame_intersection(tmp_path: Path) -> None:
     run_root = tmp_path / "runs/scope_001/run_001"
     run_root.mkdir(parents=True)
     request = _request(run_root)
@@ -731,20 +780,86 @@ def test_qwen_requires_every_claimed_target_to_have_a_selected_frame(tmp_path: P
         anchor_evidence_refs=("asr_001",),
     )
     body = _valid_observation()
-    body["observations"][0]["target_ids"] = ["target_001", "target_002"]  # type: ignore[index]
+    body["observations"][0]["target_ids"] = ["target_002"]  # type: ignore[index]
 
     def handler(http_request: httpx.Request) -> httpx.Response:
         return _provider_response(http_request, body)
 
-    with pytest.raises(ModelResponseValidationError) as raised:
-        _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
-            request.model_copy(update={"targets": (*request.targets, second_target)}),
-            allowed_run_root=run_root,
-        )
-
-    assert raised.value.invalid_response.validation_errors == (
-        "observations.target_ids:frame_binding_mismatch",
+    result = _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+        request.model_copy(update={"targets": (*request.targets, second_target)}),
+        allowed_run_root=run_root,
     )
+    assert result.observations[0].target_ids == ("target_001",)
+
+
+def test_qwen_fills_omitted_transcript_refs_from_target_anchors(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    body = _valid_observation()
+    del body["observations"][0]["transcript_evidence_refs"]  # type: ignore[index]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _provider_response(request, body)
+
+    result = _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+        _request(run_root),
+        allowed_run_root=run_root,
+    )
+
+    assert result.observations[0].transcript_evidence_refs == ("asr_001",)
+
+
+def test_qwen_fills_omitted_target_ids_from_selected_frame_bindings(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    body = _valid_observation()
+    del body["observations"][0]["target_ids"]  # type: ignore[index]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _provider_response(request, body)
+
+    result = _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+        _request(run_root),
+        allowed_run_root=run_root,
+    )
+
+    assert result.observations[0].target_ids == ("target_001",)
+
+
+def test_qwen_fills_missing_transcript_refs_from_target_anchors(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    body = _valid_observation()
+    body["observations"][0]["transcript_evidence_refs"] = []  # type: ignore[index]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _provider_response(request, body)
+
+    result = _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+        _request(run_root),
+        allowed_run_root=run_root,
+    )
+
+    assert result.observations[0].transcript_evidence_refs == ("asr_001",)
+
+
+def test_qwen_drops_malformed_optional_visual_content_block(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/scope_001/run_001"
+    run_root.mkdir(parents=True)
+    body = _valid_observation()
+    body["observations"][0]["content_blocks"] = [  # type: ignore[index]
+        {"text": "画面文字", "source_frame_ids": ["frame_a"]},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _provider_response(request, body)
+
+    result = _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+        _request(run_root),
+        allowed_run_root=run_root,
+    )
+
+    assert result.observations[0].content_blocks == ()
 
 
 def test_qwen_repair_resends_same_images_with_repair_prompt_and_schema(tmp_path: Path) -> None:

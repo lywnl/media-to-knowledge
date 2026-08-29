@@ -61,6 +61,9 @@ from video_demo.integrations.document_prompts import (
     prompt_for_writing,
     prompt_for_writing_repair,
 )
+from video_demo.integrations.document_writing_normalization import (
+    normalize_optional_visual_blocks,
+)
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
 
 _DETAIL_BODY_LIMITS = {"concise": 800, "standard": 2_000, "detailed": 4_000}
@@ -342,6 +345,10 @@ class DocumentWriter:
                 response: ChapterWritingResponse,
                 request_to_validate: ChapterWritingRequest = concrete_request,
             ) -> None:
+                response = normalize_optional_visual_blocks(
+                    response,
+                    request_to_validate.visual_observations,
+                )
                 _validate_chapter_response(response, request_to_validate)
 
             cached = cache.get(
@@ -351,7 +358,11 @@ class DocumentWriter:
                 validate,
             )
             if cached is not None:
-                normalized = _normalize_response_blocks(cached.response, concrete_request)
+                normalized = normalize_optional_visual_blocks(
+                    cached.response,
+                    concrete_request.visual_observations,
+                )
+                normalized = _normalize_response_blocks(normalized, concrete_request)
                 outcomes[index] = _ChapterOutcome(
                     _materialize_chapter(concrete_request, normalized, keyframes),
                     False,
@@ -453,6 +464,10 @@ class DocumentWriter:
                     local.chapter_cache_hits,
                 )
             response = _fallback_chapter_response(request)
+        response = normalize_optional_visual_blocks(
+            response,
+            request.visual_observations,
+        )
         response = _normalize_response_blocks(response, request)
         chapter = _materialize_chapter(request, response, keyframes)
         return _ChapterOutcome(
@@ -472,12 +487,19 @@ class DocumentWriter:
         commit_gate: _CacheCommitGate,
     ) -> ChapterWritingResponse | None:
         def validate(response: ChapterWritingResponse) -> None:
+            response = normalize_optional_visual_blocks(
+                response,
+                request.visual_observations,
+            )
             _validate_chapter_response(response, request)
 
         cached = cache.get(self._chapter_identity, request, ChapterWritingResponse, validate)
         if cached is not None:
             counters.chapter_cache_hits += 1
-            return cached.response
+            return normalize_optional_visual_blocks(
+                cached.response,
+                request.visual_observations,
+            )
         with cache.invocation_lock(
             self._chapter_identity,
             request,
@@ -487,7 +509,10 @@ class DocumentWriter:
             cached = cache.get(self._chapter_identity, request, ChapterWritingResponse, validate)
             if cached is not None:
                 counters.chapter_cache_hits += 1
-                return cached.response
+                return normalize_optional_visual_blocks(
+                    cached.response,
+                    request.visual_observations,
+                )
             invalid: InvalidModelResponse | None = None
             try:
                 response = self._text_port.write_chapter(
@@ -496,6 +521,10 @@ class DocumentWriter:
                         counters.chapter_attempt,
                         is_cancel_requested,
                     ),
+                )
+                response = normalize_optional_visual_blocks(
+                    response,
+                    request.visual_observations,
                 )
             except ModelResponseValidationError as error:
                 _raise_if_cancelled(is_cancel_requested)
@@ -542,6 +571,10 @@ class DocumentWriter:
                             counters.chapter_attempt,
                             is_cancel_requested,
                         ),
+                    )
+                    response = normalize_optional_visual_blocks(
+                        response,
+                        request.visual_observations,
                     )
                 except ModelResponseValidationError as error:
                     _raise_if_cancelled(is_cancel_requested)

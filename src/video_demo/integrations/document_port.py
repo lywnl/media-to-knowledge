@@ -136,6 +136,7 @@ class ChapterVisionRequest(FrozenModel):
     chapter_id: StableId
     targets: tuple[VisualSearchTarget, ...] = Field(min_length=1, max_length=6)
     frames: tuple[FrameCandidateArtifact, ...] = Field(min_length=1, max_length=6)
+    max_selected_frames: int = Field(default=2, ge=0, le=3)
     transcript_evidence: tuple[TranscriptEvidence, ...] = Field(max_length=20_000)
     document_config: DocumentGenerationConfig
     prompt_version: Literal["chapter-vlm-v1"]
@@ -152,6 +153,7 @@ class ChapterVisionRepairRequest(FrozenModel):
     allowed_target_ids: tuple[StableId, ...] = Field(min_length=1, max_length=6)
     allowed_transcript_evidence_ids: tuple[StableId, ...] = Field(max_length=20_000)
     prompt_version: Literal["chapter-vlm-repair-v1"]
+
 
     @model_validator(mode="after")
     def validate_allowed_ids(self) -> Self:

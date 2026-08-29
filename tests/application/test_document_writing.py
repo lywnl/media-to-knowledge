@@ -604,7 +604,9 @@ def test_visual_block_refills_only_selected_content_frame(tmp_path: Path) -> Non
     assert written.result.chapters[0].selected_keyframe_refs == (frames[1].evidence_id,)
 
 
-def test_unknown_or_cross_observation_visual_content_ref_is_rejected(tmp_path: Path) -> None:
+def test_unknown_or_cross_observation_visual_content_ref_does_not_drop_asr_writing(
+    tmp_path: Path,
+) -> None:
     observation = _observation()
     invalid = ChapterWritingResponse(
         title="非法",
@@ -612,6 +614,10 @@ def test_unknown_or_cross_observation_visual_content_ref_is_rejected(tmp_path: P
         summary_zh="非法引用",
         summary_evidence_refs=(observation.evidence_id,),
         body_blocks=(
+            ParagraphBlock(
+                text="模型细化后的 ASR 正文。",
+                evidence_refs=("asr_000",),
+            ),
             VisualBlock(
                 visual_observation_ref=observation.evidence_id,
                 visual_content_refs=("visual_content_other",),
@@ -621,16 +627,12 @@ def test_unknown_or_cross_observation_visual_content_ref_is_rejected(tmp_path: P
         ),
         claims=(),
     )
-    repaired = _chapter_response(
-        ChapterWritingRequest(
-            context=_context(),
-            chapter=_plan(0),
-            transcript_evidence=(_speech(0),),
-            visual_observations=(observation,),
-            prompt_version="chapter-writer-v1",
-        ),
-    )
-    port = _TextPort(chapter=lambda _request: invalid, repair=lambda _request: repaired)
+    def chapter(request: ChapterWritingRequest) -> ChapterWritingResponse:
+        if request.chapter.chapter_id == "chapter_000":
+            return invalid
+        return _chapter_response(request)
+
+    port = _TextPort(chapter=chapter)
 
     written = _writer(port).write(
         _context(),
@@ -642,7 +644,73 @@ def test_unknown_or_cross_observation_visual_content_ref_is_rejected(tmp_path: P
         is_cancel_requested=lambda: False,
     )
 
-    assert written.metrics["chapter_writer_structure_repairs"] == 2
+    assert written.metrics["chapter_writer_structure_repairs"] == 0
+    chapter = written.result.chapters[0]
+    assert any(
+        isinstance(block, ParagraphBlock)
+        and block.text == "模型细化后的 ASR 正文。"
+        for block in chapter.body_blocks
+    )
+    assert not any(
+        isinstance(block, VisualBlock)
+        and block.visual_content_refs == ("visual_content_other",)
+        for block in chapter.body_blocks
+    )
+
+
+def test_invalid_optional_visual_block_keeps_model_refined_asr_response(
+    tmp_path: Path,
+) -> None:
+    observation = _observation()
+    response = ChapterWritingResponse(
+        title="章节标题",
+        title_evidence_refs=("asr_000",),
+        summary_zh="模型细化摘要",
+        summary_evidence_refs=("asr_000",),
+        body_blocks=(
+            ParagraphBlock(text="模型细化后的 ASR 正文", evidence_refs=("asr_000",)),
+            VisualBlock(
+                visual_observation_ref=observation.evidence_id,
+                visual_content_refs=("visual_content_unknown",),
+                caption="可选画面",
+                evidence_refs=(observation.evidence_id,),
+            ),
+        ),
+        claims=(
+            GroundedClaim(
+                text="模型细化结论",
+                evidence_refs=("asr_000",),
+                certainty=0.9,
+            ),
+        ),
+    )
+
+    def chapter(request: ChapterWritingRequest) -> ChapterWritingResponse:
+        if request.chapter.chapter_id == "chapter_000":
+            return response
+        return _chapter_response(request)
+
+    written = _writer(_TextPort(chapter=chapter)).write(
+        _context(),
+        (_plan(0), _plan(1)),
+        (_speech(0), _speech(1)),
+        (observation,),
+        (_keyframe(),),
+        cache=_cache(tmp_path),
+        is_cancel_requested=lambda: False,
+    )
+
+    chapter = written.result.chapters[0]
+    assert written.status == "SUCCEEDED"
+    assert written.metrics["chapter_writer_fallback_chapters"] == 0
+    assert chapter.summary_zh == "模型细化摘要"
+    assert chapter.claims[0].text == "模型细化结论"
+    assert chapter.body_blocks[0].text == "模型细化后的 ASR 正文"
+    assert not any(
+        isinstance(block, VisualBlock)
+        and "visual_content_unknown" in block.visual_content_refs
+        for block in chapter.body_blocks
+    )
 
 
 def test_empty_visual_observation_content_falls_back_to_observation_frames(

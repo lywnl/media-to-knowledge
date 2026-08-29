@@ -31,6 +31,7 @@ from video_demo.integrations.document_prompts import (
     vision_payload_size_upper_bound,
 )
 from video_demo.integrations.document_validation import (
+    normalize_chapter_vision_response_data,
     validate_chapter_vision_response,
 )
 from video_demo.integrations.model_response import (
@@ -274,7 +275,7 @@ class QwenVisionClient(ChapterVisionPort):
         )
         assert provider_result.content is not None
         try:
-            response, raw_message, parsed = _parse_response(provider_result.content)
+            response, raw_message, parsed = _parse_response(provider_result.content, request)
         except ModelResponseValidationError as error:
             raise _ProviderBoundValidationError(error, provider_result) from error
         return response, raw_message, parsed, provider_result
@@ -534,7 +535,10 @@ def _raise_response_status(response: httpx.Response) -> None:
     raise VideoDemoError(ErrorCode.QWEN_REQUEST_REJECTED, "Qwen 视觉模型请求被拒绝")
 
 
-def _parse_response(content: bytes) -> tuple[ChapterVisionResponse, bytes, object]:
+def _parse_response(
+    content: bytes,
+    request: ChapterVisionRequest,
+) -> tuple[ChapterVisionResponse, bytes, object]:
     envelope: object | None = None
     raw_message: bytes | None = None
     try:
@@ -548,7 +552,10 @@ def _parse_response(content: bytes) -> tuple[ChapterVisionResponse, bytes, objec
         if not message:
             raise ValueError
         raw_message = message.encode("utf-8")
-        parsed = strip_removed_document_fields(parse_json_content(message))
+        parsed = normalize_chapter_vision_response_data(
+            strip_removed_document_fields(parse_json_content(message)),
+            request,
+        )
         return ChapterVisionResponse.model_validate(parsed), raw_message, parsed
     except ValidationError as error:
         summaries = tuple(_pydantic_error_summary(item) for item in error.errors())
@@ -583,7 +590,7 @@ def _validate_or_raise(
         validate_chapter_vision_response(
             response,
             request,
-            max_selected_frames=3,
+            max_selected_frames=request.max_selected_frames,
             allowed_frames=allowed_frames,
             allowed_targets=allowed_targets,
             allowed_transcripts=allowed_transcripts,
