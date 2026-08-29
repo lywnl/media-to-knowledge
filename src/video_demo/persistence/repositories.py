@@ -53,6 +53,27 @@ class RunRecord:
     error_code: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class MediaObjectRecord:
+    object_ref: str
+    original_filename: str
+    declared_mime: str
+    detected_mime: str
+    size_bytes: int
+    sha256: str
+    relative_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class MediaRunRecord:
+    run_id: str
+    object_ref: str
+    status: RunStatusValue
+    current_stage: str
+    warning_codes: tuple[str, ...]
+    error_code: str | None
+
+
 def reject_sensitive_json(value: object, path: str = "$") -> None:
     """阻止 Secret 以 JSON 正文形式持久化。"""
 
@@ -346,18 +367,64 @@ class JobRepository:
         self._session.flush()
         return model
 
+    def enqueue_media_run(
+        self,
+        *,
+        scope: Scope,
+        job_id: str,
+        resource_id: str,
+        job_type: str,
+        resource_type: str,
+        max_attempts: int = 3,
+        now: datetime | None = None,
+    ) -> JobModel:
+        """为音频或图片运行创建独立任务；视频继续使用专用方法。"""
+
+        if job_type not in {"AUDIO_UNDERSTANDING", "IMAGE_UNDERSTANDING"}:
+            raise ValueError("媒体任务类型非法")
+        if resource_type not in {"AUDIO_UNDERSTANDING_RUN", "IMAGE_UNDERSTANDING_RUN"}:
+            raise ValueError("媒体资源类型非法")
+        if not isinstance(max_attempts, int) or max_attempts < 1:
+            raise ValueError("任务最大尝试次数必须大于 0")
+        current_time = now or datetime.now(UTC)
+        model = JobModel(
+            tenant_id=scope.tenant_id,
+            application_id=scope.application_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            job_id=job_id,
+            job_type=job_type,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            status=JobStatus.PENDING,
+            attempt_count=0,
+            max_attempts=max_attempts,
+            next_attempt_at=current_time,
+            cancel_requested=False,
+        )
+        self._session.add(model)
+        self._session.flush()
+        return model
+
     def claim(
         self,
         worker_id: str,
         *,
         lease_seconds: int,
+        job_type: str = "VIDEO_UNDERSTANDING",
         now: datetime | None = None,
     ) -> ClaimedJob | None:
+        if job_type not in {
+            "VIDEO_UNDERSTANDING",
+            "AUDIO_UNDERSTANDING",
+            "IMAGE_UNDERSTANDING",
+        }:
+            raise ValueError("任务类型非法")
         current_time = now or datetime.now(UTC)
         self._cancel_pending_jobs()
         candidate = self._session.scalar(
             select(JobModel)
             .where(
+                JobModel.job_type == job_type,
                 JobModel.cancel_requested.is_(False),
                 JobModel.attempt_count < JobModel.max_attempts,
                 or_(
@@ -581,6 +648,46 @@ class JobRepository:
             raise VideoDemoError(ErrorCode.VIDEO_RUN_NOT_FOUND, "视频理解运行不存在")
         raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "任务租约已丢失")
 
+    def update_owned_media_run(
+        self,
+        job: ClaimedJob,
+        *,
+        values: dict[str, object],
+        run_model: type[object],
+        resource_type: str,
+    ) -> None:
+        """按 Worker 租约更新音频或图片运行，且拒绝跨资源类型写入。"""
+
+        current_time = datetime.now(UTC)
+        owned_job = select(JobModel.id).where(
+            JobModel.id == job.id,
+            JobModel.worker_id == job.worker_id,
+            JobModel.attempt_count == job.attempt_count,
+            JobModel.status == JobStatus.RUNNING,
+            JobModel.lease_expires_at > current_time,
+            JobModel.resource_type == resource_type,
+            JobModel.resource_id == job.resource_id,
+            JobModel.tenant_id == job.scope.tenant_id,
+            JobModel.application_id == job.scope.application_id,
+            JobModel.knowledge_base_id == job.scope.knowledge_base_id,
+            JobModel.cancel_requested.is_(False),
+        )
+        result = self._session.execute(
+            update(run_model)
+            .where(
+                run_model.tenant_id == job.scope.tenant_id,  # type: ignore[attr-defined]
+                run_model.application_id == job.scope.application_id,  # type: ignore[attr-defined]
+                run_model.knowledge_base_id == job.scope.knowledge_base_id,  # type: ignore[attr-defined]
+                run_model.run_id == job.resource_id,  # type: ignore[attr-defined]
+                exists(owned_job),
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False),
+        )
+        if result.rowcount == 1:  # type: ignore[attr-defined]
+            return
+        raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "任务租约已丢失")
+
     def mark_succeeded(
         self,
         job_pk: int,
@@ -729,12 +836,20 @@ class JobRepository:
         )
 
     def get_by_resource(self, scope: Scope, resource_id: str) -> JobModel | None:
+        return self.get_by_resource_type(scope, resource_id, "VIDEO_UNDERSTANDING_RUN")
+
+    def get_by_resource_type(
+        self,
+        scope: Scope,
+        resource_id: str,
+        resource_type: str,
+    ) -> JobModel | None:
         return self._session.scalar(
             select(JobModel).where(
                 JobModel.tenant_id == scope.tenant_id,
                 JobModel.application_id == scope.application_id,
                 JobModel.knowledge_base_id == scope.knowledge_base_id,
-                JobModel.resource_type == "VIDEO_UNDERSTANDING_RUN",
+                JobModel.resource_type == resource_type,
                 JobModel.resource_id == resource_id,
             ),
         )

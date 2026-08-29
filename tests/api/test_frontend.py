@@ -77,7 +77,7 @@ def test_create_app_upgrades_real_unversioned_0001_database(
     with create_engine(database_url).connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "0003_document_text_only"
+            == "0004_audio_image_media"
         )
     assert app.state.container.database is not None
 

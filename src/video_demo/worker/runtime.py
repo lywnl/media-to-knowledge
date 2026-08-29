@@ -26,6 +26,7 @@ class ReliableWorker:
         on_heartbeat: Callable[[], None] = lambda: None,
         clock: Clock | None = None,
         owned_resources: tuple[object, ...] = (),
+        job_type: str = "VIDEO_UNDERSTANDING",
     ) -> None:
         actual_interval = heartbeat_interval_seconds or max(0.1, lease_seconds / 3)
         if actual_interval <= 0 or actual_interval >= lease_seconds:
@@ -38,6 +39,13 @@ class ReliableWorker:
         self._on_heartbeat = on_heartbeat
         self._clock = clock or (lambda: datetime.now(UTC))
         self._owned_resources = owned_resources
+        if job_type not in {
+            "VIDEO_UNDERSTANDING",
+            "AUDIO_UNDERSTANDING",
+            "IMAGE_UNDERSTANDING",
+        }:
+            raise ValueError("Worker 任务类型非法")
+        self._job_type = job_type
         self._closed = False
 
     def close(self) -> None:
@@ -55,6 +63,7 @@ class ReliableWorker:
             job = JobRepository(session).claim(
                 self._worker_id,
                 lease_seconds=self._lease_seconds,
+                job_type=self._job_type,
                 now=now,
             )
         if job is None:

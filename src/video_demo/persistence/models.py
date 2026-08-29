@@ -195,6 +195,120 @@ class VideoUnderstandingRunModel(ScopeColumns, TimestampColumns, Base):
     document_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
 
 
+class AudioObjectModel(ScopeColumns, TimestampColumns, Base):
+    __tablename__ = "audio_object"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "application_id", "knowledge_base_id", "object_ref",
+            name="uq_audio_object_scope_ref",
+        ),
+        Index(
+            "ix_audio_object_scope_sha",
+            "tenant_id", "application_id", "knowledge_base_id", "sha256",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    object_ref: Mapped[str] = mapped_column(String(128), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    declared_mime: Mapped[str] = mapped_column(String(128), nullable=False)
+    detected_mime: Mapped[str] = mapped_column(String(128), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    relative_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    status: Mapped[VideoObjectStatus] = mapped_column(
+        Enum(VideoObjectStatus, native_enum=False, length=32), nullable=False,
+    )
+    scan_details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class ImageObjectModel(ScopeColumns, TimestampColumns, Base):
+    __tablename__ = "image_object"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "application_id", "knowledge_base_id", "object_ref",
+            name="uq_image_object_scope_ref",
+        ),
+        Index(
+            "ix_image_object_scope_sha",
+            "tenant_id", "application_id", "knowledge_base_id", "sha256",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    object_ref: Mapped[str] = mapped_column(String(128), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    declared_mime: Mapped[str] = mapped_column(String(128), nullable=False)
+    detected_mime: Mapped[str] = mapped_column(String(128), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    relative_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    status: Mapped[VideoObjectStatus] = mapped_column(
+        Enum(VideoObjectStatus, native_enum=False, length=32), nullable=False,
+    )
+    scan_details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class AudioUnderstandingRunModel(ScopeColumns, TimestampColumns, Base):
+    __tablename__ = "audio_understanding_run"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "application_id", "knowledge_base_id", "run_id",
+            name="uq_audio_run_scope_id",
+        ),
+        UniqueConstraint(
+            "tenant_id", "application_id", "knowledge_base_id", "idempotency_key",
+            name="uq_audio_run_scope_idempotency",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    object_ref: Mapped[str] = mapped_column(String(128), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[RunStatusValue] = mapped_column(
+        Enum(RunStatusValue, native_enum=False, length=32), nullable=False,
+        default=RunStatusValue.PENDING,
+    )
+    current_stage: Mapped[str] = mapped_column(String(64), nullable=False, default="REGISTER")
+    warning_codes: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    document_relative_path: Mapped[str | None] = mapped_column(String(1024))
+    document_sha256: Mapped[str | None] = mapped_column(String(64))
+    document_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class ImageUnderstandingRunModel(ScopeColumns, TimestampColumns, Base):
+    __tablename__ = "image_understanding_run"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "application_id", "knowledge_base_id", "run_id",
+            name="uq_image_run_scope_id",
+        ),
+        UniqueConstraint(
+            "tenant_id", "application_id", "knowledge_base_id", "idempotency_key",
+            name="uq_image_run_scope_idempotency",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    object_ref: Mapped[str] = mapped_column(String(128), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[RunStatusValue] = mapped_column(
+        Enum(RunStatusValue, native_enum=False, length=32), nullable=False,
+        default=RunStatusValue.PENDING,
+    )
+    current_stage: Mapped[str] = mapped_column(String(64), nullable=False, default="REGISTER")
+    warning_codes: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    document_relative_path: Mapped[str | None] = mapped_column(String(1024))
+    document_sha256: Mapped[str | None] = mapped_column(String(64))
+    document_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+
+
 class JobModel(ScopeColumns, TimestampColumns, Base):
     __tablename__ = "job"
     __table_args__ = (

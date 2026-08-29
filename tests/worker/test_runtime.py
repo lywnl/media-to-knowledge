@@ -185,7 +185,42 @@ def test_successful_worker_marks_job_succeeded(database: Database, scope: Scope)
     with database.session() as session:
         job = JobRepository(session).get(scope, "job_001")
         assert job is not None
-        assert job.status == JobStatus.SUCCEEDED
+    assert job.status == JobStatus.SUCCEEDED
+
+
+def test_claim_can_filter_by_job_type(database: Database, scope: Scope) -> None:
+    with database.session() as session:
+        repository = JobRepository(session)
+        repository.enqueue_video_run(scope=scope, job_id="video-job", run_id="video-run")
+        repository.enqueue_media_run(
+            scope=scope,
+            job_id="audio-job",
+            resource_id="audio-run",
+            job_type="AUDIO_UNDERSTANDING",
+            resource_type="AUDIO_UNDERSTANDING_RUN",
+        )
+
+    with database.session() as session:
+        claimed = JobRepository(session).claim(
+            "audio-worker",
+            lease_seconds=30,
+            job_type="AUDIO_UNDERSTANDING",
+        )
+    assert claimed is not None
+    assert claimed.job_id == "audio-job"
+
+
+def test_default_worker_claims_only_video_jobs(database: Database, scope: Scope) -> None:
+    with database.session() as session:
+        JobRepository(session).enqueue_media_run(
+            scope=scope,
+            job_id="audio-job",
+            resource_id="audio-run",
+            job_type="AUDIO_UNDERSTANDING",
+            resource_type="AUDIO_UNDERSTANDING_RUN",
+        )
+    with database.session() as session:
+        assert JobRepository(session).claim("video-worker", lease_seconds=30) is None
 
 
 def test_worker_completion_does_not_touch_same_job_id_in_another_scope(

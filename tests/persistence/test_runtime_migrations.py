@@ -14,7 +14,7 @@ from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
 
-HEAD_REVISION = "0003_document_text_only"
+HEAD_REVISION = "0004_audio_image_media"
 
 
 @pytest.fixture

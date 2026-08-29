@@ -91,6 +91,47 @@ class ErrorResponse(ApiModel):
     error: ErrorBody
 
 
+class MediaObjectResponse(ApiModel):
+    object_ref: str
+    original_filename: str
+    declared_mime: str
+    detected_mime: str
+    size_bytes: int
+    sha256: str
+    status: Literal["READY"] = "READY"
+
+
+class CreateMediaRunRequest(ApiModel):
+    object_ref: str = Field(pattern=r"^obj_[0-9a-f]{32}$")
+    idempotency_key: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    language_hints: tuple[Literal["zh", "en", "ja", "ko", "es"], ...] = ()
+    hotwords: tuple[str, ...] = Field(default=(), max_length=50)
+    core_context: str | None = Field(default=None, max_length=1000)
+    document_config: DocumentGenerationConfig = Field(default_factory=DocumentGenerationConfig)
+
+
+class MediaRunResponse(ApiModel):
+    run_id: str
+    job_id: str
+    status: str
+    current_stage: str
+    warning_codes: tuple[str, ...]
+    error_code: str | None
+
+
+class MediaRunHistoryItem(MediaRunResponse):
+    object_ref: str
+    original_filename: str
+    detected_mime: str
+    size_bytes: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class MediaRunHistoryResponse(ApiModel):
+    items: tuple[MediaRunHistoryItem, ...]
+
+
 class PublicTimedEvidence(TimeRange):
     evidence_id: StableId
 

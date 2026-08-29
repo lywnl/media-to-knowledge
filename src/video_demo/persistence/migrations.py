@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - 受支持平台均提供，分支用�
     fcntl = None  # type: ignore[assignment]
 
 _LEGACY_REVISION = "0001_video_demo"
-_HEAD_REVISION = "0003_document_text_only"
+_HEAD_REVISION = "0004_audio_image_media"
 _SCOPE = {
     "tenant_id": ("VARCHAR(128)", False),
     "application_id": ("VARCHAR(128)", False),
@@ -113,6 +113,47 @@ _DOCUMENT_COLUMNS = {
         payload_json=("JSON", False),
     ),
 }
+
+_MEDIA_OBJECT_COLUMNS = {
+    "audio_object": _columns(
+        object_ref=("VARCHAR(128)", False),
+        original_filename=("VARCHAR(512)", False),
+        declared_mime=("VARCHAR(128)", False),
+        detected_mime=("VARCHAR(128)", False),
+        size_bytes=("BIGINT", False),
+        sha256=("VARCHAR(64)", False),
+        relative_path=("VARCHAR(1024)", False),
+        status=("VARCHAR(32)", False),
+        scan_details=("JSON", False),
+    ),
+    "image_object": _columns(
+        object_ref=("VARCHAR(128)", False),
+        original_filename=("VARCHAR(512)", False),
+        declared_mime=("VARCHAR(128)", False),
+        detected_mime=("VARCHAR(128)", False),
+        size_bytes=("BIGINT", False),
+        sha256=("VARCHAR(64)", False),
+        relative_path=("VARCHAR(1024)", False),
+        status=("VARCHAR(32)", False),
+        scan_details=("JSON", False),
+    ),
+}
+_MEDIA_RUN_COLUMNS = {
+    kind: _columns(
+        run_id=("VARCHAR(128)", False),
+        object_ref=("VARCHAR(128)", False),
+        idempotency_key=("VARCHAR(128)", False),
+        status=("VARCHAR(32)", False),
+        current_stage=("VARCHAR(64)", False),
+        warning_codes=("JSON", False),
+        error_code=("VARCHAR(128)", True),
+        config_snapshot=("JSON", False),
+        document_relative_path=("VARCHAR(1024)", True),
+        document_sha256=("VARCHAR(64)", True),
+        document_size_bytes=("BIGINT", True),
+    )
+    for kind in ("audio_understanding_run", "image_understanding_run")
+}
 _HEAD_COLUMNS = {
     **_LEGACY_COLUMNS,
     "video_understanding_run": {
@@ -123,6 +164,8 @@ _HEAD_COLUMNS = {
     },
 }
 _HEAD_COLUMNS.update(_DOCUMENT_COLUMNS)
+_HEAD_COLUMNS.update(_MEDIA_OBJECT_COLUMNS)
+_HEAD_COLUMNS.update(_MEDIA_RUN_COLUMNS)
 _LEGACY_UNIQUES = {
     "video_object": {
         "uq_video_object_scope_ref": (
@@ -164,6 +207,32 @@ _LEGACY_UNIQUES = {
     "video_summary": {
         "uq_video_summary_scope_run": ("tenant_id", "application_id", "knowledge_base_id", "run_id")
     },
+    "audio_object": {
+        "uq_audio_object_scope_ref": (
+            "tenant_id", "application_id", "knowledge_base_id", "object_ref",
+        ),
+    },
+    "image_object": {
+        "uq_image_object_scope_ref": (
+            "tenant_id", "application_id", "knowledge_base_id", "object_ref",
+        ),
+    },
+    "audio_understanding_run": {
+        "uq_audio_run_scope_id": (
+            "tenant_id", "application_id", "knowledge_base_id", "run_id",
+        ),
+        "uq_audio_run_scope_idempotency": (
+            "tenant_id", "application_id", "knowledge_base_id", "idempotency_key",
+        ),
+    },
+    "image_understanding_run": {
+        "uq_image_run_scope_id": (
+            "tenant_id", "application_id", "knowledge_base_id", "run_id",
+        ),
+        "uq_image_run_scope_idempotency": (
+            "tenant_id", "application_id", "knowledge_base_id", "idempotency_key",
+        ),
+    },
 }
 _LEGACY_INDEXES = {
     "video_object": {
@@ -182,6 +251,18 @@ _LEGACY_INDEXES = {
         )
     },
     "video_summary": {},
+    "audio_object": {
+        "ix_audio_object_scope_sha": (
+            "tenant_id", "application_id", "knowledge_base_id", "sha256",
+        ),
+    },
+    "image_object": {
+        "ix_image_object_scope_sha": (
+            "tenant_id", "application_id", "knowledge_base_id", "sha256",
+        ),
+    },
+    "audio_understanding_run": {},
+    "image_understanding_run": {},
 }
 
 

@@ -8,9 +8,12 @@ from fastapi.staticfiles import StaticFiles
 
 from video_demo.api.dependencies import AppContainer
 from video_demo.api.jobs import router as jobs_router
+from video_demo.api.media_routes import build_media_router
 from video_demo.api.objects import router as objects_router
 from video_demo.api.runs import router as runs_router
 from video_demo.api.schemas import ErrorBody, ErrorResponse
+from video_demo.application.media_runs import MediaRunService
+from video_demo.application.media_uploads import MediaUploadService
 from video_demo.application.queries import ResultQueryService
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
@@ -18,12 +21,19 @@ from video_demo.config import ApiRuntimeConfig, ApiRuntimeSettings, Settings
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
+from video_demo.persistence.models import AudioObjectModel, ImageObjectModel
 from video_demo.storage.artifacts import AtomicArtifactStore
+from video_demo.storage.audio_object_store import AudioObjectStore
+from video_demo.storage.image_object_store import ImageObjectStore
 from video_demo.storage.object_store import LocalVideoObjectStore
 
 _NOT_FOUND_CODES = {
     ErrorCode.VIDEO_OBJECT_NOT_FOUND,
     ErrorCode.VIDEO_RUN_NOT_FOUND,
+    ErrorCode.AUDIO_OBJECT_NOT_FOUND,
+    ErrorCode.AUDIO_RUN_NOT_FOUND,
+    ErrorCode.IMAGE_OBJECT_NOT_FOUND,
+    ErrorCode.IMAGE_RUN_NOT_FOUND,
     ErrorCode.JOB_NOT_FOUND,
     ErrorCode.KEYFRAME_NOT_FOUND,
 }
@@ -92,6 +102,22 @@ def create_app(
             max_document_bytes=runtime.max_document_bytes,
             max_bundle_bytes=runtime.max_result_bundle_bytes,
         ),
+        media_upload_services={
+            "AUDIO": MediaUploadService(
+                database,
+                AudioObjectStore(runtime.runtime_root, max_bytes=runtime.max_video_bytes),
+                AudioObjectModel,
+            ),
+            "IMAGE": MediaUploadService(
+                database,
+                ImageObjectStore(runtime.runtime_root, max_bytes=8 * 1024 * 1024),
+                ImageObjectModel,
+            ),
+        },
+        media_run_services={
+            "AUDIO": MediaRunService(database, kind="AUDIO"),
+            "IMAGE": MediaRunService(database, kind="IMAGE"),
+        },
     )
 
     app = FastAPI(
@@ -108,6 +134,8 @@ def create_app(
         return FileResponse(web_root / "index.html", media_type="text/html")
 
     app.include_router(objects_router)
+    app.include_router(build_media_router("AUDIO"))
+    app.include_router(build_media_router("IMAGE"))
     app.include_router(runs_router)
     app.include_router(jobs_router)
     app.add_exception_handler(VideoDemoError, _handle_video_demo_error)
