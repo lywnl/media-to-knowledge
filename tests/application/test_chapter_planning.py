@@ -564,7 +564,7 @@ def test_chapter_planner_caps_thinking_batches_at_twenty_segments(
     assert batch.metrics["chapter_planner_logical_calls"] == 1
 
 
-def test_compact_planning_splits_sixty_segments_into_32_and_28(
+def test_compact_planning_splits_sixty_segments_into_24_24_and_12(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -596,14 +596,15 @@ def test_compact_planning_splits_sixty_segments_into_32_and_28(
         )
 
     # 两个批次并发执行，模型端口记录顺序取决于完成先后。
-    assert sorted(len(request.segments) for request in port.main_requests) == [28, 32]
-    assert batch.metrics["chapter_planner_logical_calls"] == 2
+    assert sorted(len(request.segments) for request in port.main_requests) == [12, 24, 24]
+    assert batch.metrics["chapter_planner_logical_calls"] == 3
     messages = "\n".join(caplog.messages)
-    assert "batch=1/2" in messages
-    assert "segments=32" in messages
-    assert "segments=28" in messages
+    assert "batch=1/3" in messages
+    assert "segments=24" in messages
+    assert "segments=12" in messages
     assert "segment_start_ms=0" in messages
-    assert "segment_start_ms=1920000" in messages
+    assert "segment_start_ms=1440000" in messages
+    assert "segment_start_ms=2880000" in messages
     assert "segment_end_ms=3600000" in messages
 
 

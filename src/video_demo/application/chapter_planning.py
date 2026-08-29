@@ -46,9 +46,9 @@ _MAX_CHAPTER_DURATION_MS = 300_000
 _MAX_TARGET_ANCHOR_SPAN_MS = 30_000
 _DEFAULT_MAX_PLANNING_BATCHES = 64
 _DEFAULT_PLANNING_CONCURRENCY = 2
-# 每批限制为 32 个基础片段，避免单次输出过长导致结构校验失败；批次之间
-# 由上层最多并发 2 个请求，失败时只影响当前批次。
-_MAX_PLANNING_SEGMENTS_PER_BATCH = 32
+# 每批限制为 24 个基础片段，避免单次输出过长导致结构校验失败；批次之间
+# 批次之间由上层最多并发 2 个请求，失败时只影响当前批次。
+_MAX_PLANNING_SEGMENTS_PER_BATCH = 24
 _GRANULARITY_TARGET_DURATION_MS = {
     "fine": 120_000,
     "standard": 180_000,
