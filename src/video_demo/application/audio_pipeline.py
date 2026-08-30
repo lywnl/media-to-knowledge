@@ -6,23 +6,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
+from video_demo.application.audio_chapter_planning import AudioChapterPlanner
+from video_demo.application.audio_contracts import (
+    AudioEvidencePreparationLimits,
+    AudioSpeechAnalysis,
+    AudioSpeechBoundaryCandidate,
+    AudioStageMetric,
+)
+from video_demo.application.audio_document_writing import AudioDocumentWriter, AudioWritingContext
 from video_demo.application.audio_rendering import RenderedAudioDocument, render_audio_markdown
-from video_demo.application.base_segments import build_base_segments
-from video_demo.application.chapter_planning import ChapterPlanner
-from video_demo.application.document_writing import DocumentWriter
-from video_demo.application.pipeline_contracts import (
-    DocumentWritingContext,
-    EvidencePreparationLimits,
-    PipelineRunConfig,
-    SpeechAnalysis,
-    SpeechBoundaryCandidate,
-    StageMetric,
-)
-from video_demo.domain.audio_document import (
-    AudioChapter,
-    AudioDocumentSummary,
-    AudioUnderstandingResult,
-)
+from video_demo.application.audio_run_config import AudioRunConfig
+from video_demo.application.audio_segments import build_audio_segments
+from video_demo.domain.audio_document import AudioUnderstandingResult
+from video_demo.domain.audio_plan import AudioDocumentConfig
 from video_demo.domain.base import Sha256, stable_identifier
 from video_demo.domain.evidence import SpeechSegment, SubtitleCue
 from video_demo.domain.run import TimeRange
@@ -61,10 +57,10 @@ class AudioSpeechPort:
         source: Path,
         *,
         duration_ms: int,
-        config: PipelineRunConfig,
+        config: AudioRunConfig,
         run_root: Path,
         is_cancel_requested: Callable[[], bool],
-    ) -> SpeechAnalysis:
+    ) -> AudioSpeechAnalysis:
         raise NotImplementedError
 
 
@@ -93,10 +89,10 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
         source: Path,
         *,
         duration_ms: int,
-        config: PipelineRunConfig,
+        config: AudioRunConfig,
         run_root: Path,
         is_cancel_requested: Callable[[], bool],
-    ) -> SpeechAnalysis:
+    ) -> AudioSpeechAnalysis:
         from video_demo.speech.asr import (
             build_cloud_asr_windows,
             project_cloud_asr_window,
@@ -111,7 +107,6 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
             overlap_ms=self._overlap_ms,
             max_upload_bytes=self._max_upload_bytes,
         )
-        language_spans = []
         transcript: list[SpeechSegment] = []
         warnings = list(vad_result.warnings)
         language_hint = config.language_hints[0] if len(config.language_hints) == 1 else None
@@ -145,7 +140,6 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
                         raw_segments=result.segments,
                         warnings=result.warnings,
                     )
-                    language_spans.append(projection.language_span)
                     transcript.extend(projection.segments)
                     warnings.extend(projection.warnings)
                 finally:
@@ -160,17 +154,17 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
         ordered = remove_adjacent_cloud_asr_duplicates(tuple(transcript))
         transcript_source: Literal["ASR", "NONE"] = "ASR" if ordered else "NONE"
         boundaries = tuple(
-            SpeechBoundaryCandidate(item.end_ms, "sentence_end", 1.0)
+            AudioSpeechBoundaryCandidate(item.end_ms, "sentence_end", 1.0)
             for item in ordered
             if 0 < item.end_ms < duration_ms
         )
-        return SpeechAnalysis(
+        return AudioSpeechAnalysis(
             transcript_source=transcript_source,
             evidence=ordered,
             warnings=tuple(dict.fromkeys(warnings)),
             boundary_candidates=boundaries,
             stage_metrics=(
-                StageMetric("SPEECH_ASR", round((time.monotonic() - started_at) * 1_000)),
+                AudioStageMetric("SPEECH_ASR", round((time.monotonic() - started_at) * 1_000)),
             ),
         )
 
@@ -181,10 +175,10 @@ class AudioPipeline:
     def __init__(
         self,
         speech: AudioSpeechPort,
-        planner: ChapterPlanner,
-        writer: DocumentWriter,
+        planner: AudioChapterPlanner,
+        writer: AudioDocumentWriter,
         *,
-        evidence_limits: EvidencePreparationLimits,
+        evidence_limits: AudioEvidencePreparationLimits,
     ) -> None:
         self._speech = speech
         self._planner = planner
@@ -199,7 +193,7 @@ class AudioPipeline:
         source: Path,
         duration_ms: int,
         title_hint: str,
-        config: PipelineRunConfig,
+        config: AudioRunConfig,
         run_root: Path,
         cache: DocumentModelCache,
         is_cancel_requested: Callable[[], bool],
@@ -213,14 +207,12 @@ class AudioPipeline:
         )
         if not speech.transcript_evidence:
             raise VideoDemoError(ErrorCode.AUDIO_ASR_UNAVAILABLE, "音频没有可验证的语音内容")
-        base_segments = build_base_segments(
+        base_segments = build_audio_segments(
             asset_sha256,
             duration_ms,
             speech.transcript_evidence,
-            (),
             speech.boundary_candidates,
             self._limits,
-            allow_empty_scenes=True,
         )
         planning = self._planner.plan(
             cache=cache,
@@ -229,12 +221,16 @@ class AudioPipeline:
             duration_ms=duration_ms,
             segments=base_segments,
             transcript_evidence=speech.transcript_evidence,
-            scenes=(),
-            document_config=config.document_config,
+            document_config=AudioDocumentConfig(
+                document_title=config.document_config.document_title,
+                detail_level=config.document_config.detail_level,
+                chapter_granularity=config.document_config.chapter_granularity,
+                include_verbatim_quotes=config.document_config.include_verbatim_quotes,
+            ),
             is_cancel_requested=is_cancel_requested,
         )
         writing = self._writer.write(
-            DocumentWritingContext(
+            AudioWritingContext(
                 run_id=run_id,
                 asset_sha256=asset_sha256,
                 title_hint=title_hint,
@@ -244,20 +240,13 @@ class AudioPipeline:
             ),
             planning.plans,
             speech.transcript_evidence,
-            (),
-            (),
             cache=cache,
             is_cancel_requested=is_cancel_requested,
         )
         warnings = tuple(
             dict.fromkeys((*speech.warnings, *planning.warnings, *writing.warnings))
         )
-        result = _audio_result(
-            run_id,
-            asset_sha256,
-            writing.result,
-            transcript_ids={item.evidence_id for item in speech.transcript_evidence},
-        )
+        result = writing.result
         return AudioPipelineOutcome(
             result=result,
             document=render_audio_markdown(result),
@@ -265,83 +254,3 @@ class AudioPipeline:
             warnings=warnings,
             status="PARTIAL_SUCCEEDED" if warnings else "SUCCEEDED",
         )
-
-
-def _audio_result(
-    run_id: str,
-    asset_sha256: Sha256,
-    result: object,
-    *,
-    transcript_ids: set[str],
-) -> AudioUnderstandingResult:
-    from video_demo.domain.document import VideoUnderstandingResult
-
-    assert isinstance(result, VideoUnderstandingResult)
-    chapters = tuple(_audio_chapter(chapter, transcript_ids) for chapter in result.chapters)
-    return AudioUnderstandingResult(
-        run_id=run_id,
-        asset_sha256=asset_sha256,
-        summary=AudioDocumentSummary(
-            title=result.summary.title,
-            duration_ms=result.summary.duration_ms,
-            overview_zh=result.summary.overview_zh,
-        ),
-        chapters=chapters,
-    )
-
-
-def _audio_chapter(chapter: object, transcript_ids: set[str]) -> AudioChapter:
-    from video_demo.domain.document import SemanticChapter
-
-    assert isinstance(chapter, SemanticChapter)
-    allowed = transcript_ids.intersection(chapter.evidence_refs)
-    title_refs = tuple(ref for ref in chapter.title_evidence_refs if ref in allowed)
-    summary_refs = tuple(ref for ref in chapter.summary_evidence_refs if ref in allowed)
-    body_blocks = tuple(
-        block.model_copy(
-            update={"evidence_refs": tuple(ref for ref in block.evidence_refs if ref in allowed)}
-        )
-        for block in chapter.body_blocks
-        if block.block_type != "VISUAL"
-        and any(ref in allowed for ref in block.evidence_refs)
-    )
-    claims = tuple(
-        claim.model_copy(
-            update={
-                "evidence_refs": tuple(
-                    ref for ref in claim.evidence_refs if ref in allowed
-                )
-            }
-        )
-        for claim in chapter.claims
-        if any(ref in allowed for ref in claim.evidence_refs)
-    )
-    if not title_refs or not summary_refs or not allowed:
-        return AudioChapter(
-            start_ms=chapter.start_ms,
-            end_ms=chapter.end_ms,
-            chapter_id=chapter.chapter_id,
-            title=chapter.title,
-            title_evidence_refs=(),
-            summary_zh="",
-            summary_evidence_refs=(),
-            body_blocks=(),
-            claims=(),
-            content_status="NO_SEMANTIC_EVIDENCE",
-            evidence_refs=(),
-            transcript_source="NONE",
-        )
-    return AudioChapter(
-        start_ms=chapter.start_ms,
-        end_ms=chapter.end_ms,
-        chapter_id=chapter.chapter_id,
-        title=chapter.title,
-        title_evidence_refs=title_refs,
-        summary_zh=chapter.summary_zh,
-        summary_evidence_refs=summary_refs,
-        body_blocks=body_blocks,
-        claims=claims,
-        content_status="GROUNDED",
-        evidence_refs=tuple(ref for ref in chapter.evidence_refs if ref in allowed),
-        transcript_source=chapter.transcript_source,
-    )

@@ -6,7 +6,7 @@ from video_demo.domain.audio_document import (
     AudioDocumentSummary,
     AudioUnderstandingResult,
 )
-from video_demo.domain.document import GroundedClaim, ParagraphBlock
+from video_demo.domain.audio_plan import AudioGroundedClaim, AudioParagraphBlock
 
 
 def _result() -> AudioUnderstandingResult:
@@ -29,10 +29,10 @@ def _result() -> AudioUnderstandingResult:
                 summary_zh="章节摘要",
                 summary_evidence_refs=(evidence_id,),
                 body_blocks=(
-                    ParagraphBlock(text="语音正文", evidence_refs=(evidence_id,)),
+                    AudioParagraphBlock(text="语音正文", evidence_refs=(evidence_id,)),
                 ),
                 claims=(
-                    GroundedClaim(
+                    AudioGroundedClaim(
                         text="关键结论",
                         evidence_refs=(evidence_id,),
                         certainty=0.9,
@@ -66,7 +66,8 @@ def test_audio_result_contract_has_no_visual_or_rag_fields() -> None:
 
 
 def test_media_worker_entrypoints_keep_video_job_type_isolated() -> None:
-    from video_demo.application.composition import build_audio_worker, build_image_worker
+    from video_demo.application.audio_composition import build_audio_worker
+    from video_demo.application.composition import build_image_worker
 
     assert callable(build_audio_worker)
     assert callable(build_image_worker)

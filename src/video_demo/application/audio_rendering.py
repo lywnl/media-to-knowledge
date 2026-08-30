@@ -7,15 +7,15 @@ import re
 from pydantic import Field
 
 from video_demo.domain.audio_document import AudioUnderstandingResult
-from video_demo.domain.base import FrozenModel, Sha256
-from video_demo.domain.document import (
-    BulletListBlock,
-    CodeBlock,
-    FormulaBlock,
-    ParagraphBlock,
-    QuoteBlock,
-    TableBlock,
+from video_demo.domain.audio_plan import (
+    AudioBulletListBlock,
+    AudioCodeBlock,
+    AudioFormulaBlock,
+    AudioParagraphBlock,
+    AudioQuoteBlock,
+    AudioTableBlock,
 )
+from video_demo.domain.base import FrozenModel, Sha256
 
 _MARKDOWN_SPECIAL_PATTERN = re.compile(r"([\\`*_\[\]{}()#|>!])")
 _LEADING_BLOCK_PATTERN = re.compile(r"^(\s*)([-+*]\s|\d+[.)]\s)")
@@ -67,25 +67,25 @@ def render_audio_markdown(result: AudioUnderstandingResult) -> RenderedAudioDocu
 
 
 def _render_block(lines: list[str], block: object) -> None:
-    if isinstance(block, ParagraphBlock):
+    if isinstance(block, AudioParagraphBlock):
         lines.extend((_escape(block.text), ""))
-    elif isinstance(block, BulletListBlock):
+    elif isinstance(block, AudioBulletListBlock):
         lines.extend(f"- {_escape(item)}" for item in block.items)
         lines.append("")
-    elif isinstance(block, QuoteBlock):
+    elif isinstance(block, AudioQuoteBlock):
         lines.extend(f"> {_escape(line)}" for line in block.text.splitlines())
         lines.append("")
-    elif isinstance(block, CodeBlock):
+    elif isinstance(block, AudioCodeBlock):
         language = re.sub(r"[^A-Za-z0-9_+.-]", "", block.language or "")
         lines.extend((f"```{language}", block.code, "```", ""))
-    elif isinstance(block, TableBlock):
+    elif isinstance(block, AudioTableBlock):
         columns = tuple(_escape(value) for value in block.columns)
         lines.append("| " + " | ".join(columns) + " |")
         lines.append("| " + " | ".join("---" for _ in columns) + " |")
         for row in block.rows:
             lines.append("| " + " | ".join(_escape(value) for value in row) + " |")
         lines.append("")
-    elif isinstance(block, FormulaBlock):
+    elif isinstance(block, AudioFormulaBlock):
         lines.extend(("$$", block.latex, "$$", ""))
 
 

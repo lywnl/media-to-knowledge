@@ -5,7 +5,7 @@ import socket
 import time
 import uuid
 
-from video_demo.application.composition import build_audio_worker
+from video_demo.application.audio_composition import build_audio_worker
 from video_demo.config import Settings
 
 
