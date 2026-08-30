@@ -120,6 +120,30 @@ def test_audio_worker_import_closure_excludes_video_and_visual_business_modules(
     assert closure.isdisjoint(forbidden)
 
 
+def test_image_worker_import_closure_excludes_video_and_audio_business_modules() -> None:
+    closure = set(
+        implementation_import_closure(
+            _WORKSPACE_ROOT,
+            (Path("src/video_demo/image_worker_main.py"),),
+            extra_files=(),
+        ),
+    )
+    forbidden = {
+        Path("src/video_demo/application/chapter_planning.py"),
+        Path("src/video_demo/application/chapter_frames.py"),
+        Path("src/video_demo/application/chapter_vision.py"),
+        Path("src/video_demo/application/document_pipeline.py"),
+        Path("src/video_demo/application/document_writing.py"),
+        Path("src/video_demo/application/audio_pipeline.py"),
+        Path("src/video_demo/application/audio_chapter_planning.py"),
+        Path("src/video_demo/application/audio_document_writing.py"),
+        Path("src/video_demo/application/composition.py"),
+        Path("src/video_demo/visual/keyframes.py"),
+        Path("src/video_demo/visual/scenes.py"),
+    }
+    assert closure.isdisjoint(forbidden)
+
+
 def test_audio_worker_uses_audio_publication_and_neutral_title_helper() -> None:
     source = Path("src/video_demo/application/audio_workers.py").read_text(encoding="utf-8")
     assert (

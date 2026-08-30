@@ -14,9 +14,6 @@ from video_demo.application.chapter_planning import ChapterPlanner
 from video_demo.application.chapter_vision import ChapterVisionService
 from video_demo.application.document_pipeline import VideoUnderstandingPipeline
 from video_demo.application.document_writing import DocumentWriter
-from video_demo.application.image_rendering import render_image_markdown
-from video_demo.application.media_publication import MediaPublicationService
-from video_demo.application.media_workers import ImageJobHandler
 from video_demo.application.pipeline import PipelineJobHandler
 from video_demo.application.pipeline_contracts import EvidencePreparationLimits
 from video_demo.application.production_media import (
@@ -33,18 +30,12 @@ from video_demo.application.visual_cleanup_recovery import PublishedVisualCleanu
 from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel, Sha256
 from video_demo.domain.document import PromptVersions
-from video_demo.domain.image_document import ImageUnderstandingResult
 from video_demo.domain.run import ModelIdentity
-from video_demo.errors import ErrorCode
-from video_demo.integrations.image_vlm import ImageVlmClient
 from video_demo.integrations.openai_document import OpenAIDocumentClient
 from video_demo.integrations.qwen_vl import QwenVisionClient
 from video_demo.media.probe import ProbeLimits
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
-from video_demo.persistence.models import (
-    ImageUnderstandingRunModel,
-)
 from video_demo.speech.isolated import IsolatedSpeechAnalyzer
 from video_demo.speech.snapshots import SpeechFingerprintInputs
 from video_demo.speech.subprocess_protocol import (
@@ -53,7 +44,6 @@ from video_demo.speech.subprocess_protocol import (
 )
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
-from video_demo.storage.image_object_store import ImageObjectStore
 from video_demo.storage.object_store import LocalVideoObjectStore
 from video_demo.storage.snapshots import SnapshotStore
 from video_demo.visual.keyframes import OpenCvFrameExtractor
@@ -390,51 +380,11 @@ def build_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
 
 
 def build_image_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
-    """构造只领取 IMAGE_UNDERSTANDING 的独立 Worker。"""
+    """兼容历史调用方，转发到图片独立装配入口。"""
 
-    assert settings.runtime_root is not None
-    runtime_root = settings.runtime_root
-    database_url = f"sqlite+pysqlite:///{runtime_root / 'video-demo.db'}"
-    upgrade_runtime_database(settings.workspace_root, runtime_root, database_url)
-    database = Database(database_url)
-    vision = settings.require_vlm_configuration()
-    http = httpx.Client()
-    analyzer = ImageVlmClient(
-        http,
-        base_url=vision.base_url,
-        api_key=vision.api_key.get_secret_value(),
-        model_id=vision.model_id,
-        timeout_seconds=vision.timeout_seconds,
-        max_attempts=vision.max_attempts,
-        max_response_bytes=settings.model_max_response_bytes,
-    )
-    publication = MediaPublicationService(
-        database,
-        AtomicArtifactStore(runtime_root),
-        run_model=ImageUnderstandingRunModel,
-        result_type=ImageUnderstandingResult,
-        render=render_image_markdown,
-        resource_type="IMAGE_UNDERSTANDING_RUN",
-        not_found_code=ErrorCode.IMAGE_RUN_NOT_FOUND,
-        artifact_prefix="image",
-        max_document_bytes=settings.max_document_bytes,
-        max_bundle_bytes=settings.max_result_bundle_bytes,
-    )
-    handler = ImageJobHandler(
-        database,
-        lambda: analyzer,
-        publication,
-        ImageObjectStore(runtime_root, max_bytes=settings.max_image_bytes),
-        runtime_root=runtime_root,
-        max_image_bytes=settings.max_image_bytes,
-    )
-    return ReliableWorker(
-        database,
-        worker_id,
-        handler,
-        job_type="IMAGE_UNDERSTANDING",
-        owned_resources=(http,),
-    )
+    from video_demo.application.image_composition import build_image_worker as build_image
+
+    return build_image(settings, worker_id=worker_id)
 
 
 def production_tool_path(settings: Settings, name: str) -> Path:
