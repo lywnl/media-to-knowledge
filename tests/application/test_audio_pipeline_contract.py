@@ -205,6 +205,73 @@ def test_audio_asr_isolates_a_failed_window_and_continues(tmp_path: Path) -> Non
     assert tuple(item.text for item in result.evidence) == ("第二窗口",)
     assert result.warnings == ("AUDIO_ASR_WINDOW_DEGRADED:1",)
 
+
+def test_audio_asr_keeps_vad_and_language_change_boundaries(tmp_path: Path) -> None:
+    from video_demo.application.audio_pipeline import AudioSpeechAnalyzer
+    from video_demo.application.audio_run_config import AudioRunConfig
+    from video_demo.speech.asr_contracts import RawAsrSegment, WindowTranscriptionResult
+    from video_demo.speech.vad import SpeechInterval, VadResult
+
+    class Vad:
+        def detect(self, _audio: Path, *, duration_ms: int) -> VadResult:
+            return VadResult(
+                speech=(
+                    SpeechInterval(
+                        evidence_id="speech_one",
+                        start_ms=0,
+                        end_ms=60_000,
+                        confidence=0.9,
+                    ),
+                    SpeechInterval(
+                        evidence_id="speech_two",
+                        start_ms=63_000,
+                        end_ms=duration_ms,
+                        confidence=0.9,
+                    ),
+                ),
+                silence=(),
+                long_silence_boundaries_ms=(60_000, 63_000),
+            )
+
+    class Slicer:
+        def create(self, _audio, _root, _slice_id, _range):
+            path = tmp_path / "audio-boundary-slice.wav"
+            path.write_bytes(b"slice")
+            return path
+
+    class Recognizer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def transcribe_window(self, _slice, *, language_hint, prompt):
+            self.calls += 1
+            language = "zh" if self.calls == 1 else "en"
+            return WindowTranscriptionResult(
+                language=language,
+                segments=(RawAsrSegment(0, 1_000, f"窗口 {self.calls}", 0.9),),
+            )
+
+    result = AudioSpeechAnalyzer(
+        Vad(),
+        Recognizer(),
+        Slicer(),
+        max_window_ms=60_000,
+        overlap_ms=0,
+        max_upload_bytes=2_000_000,
+    ).analyze(
+        tmp_path / "audio.wav",
+        duration_ms=120_000,
+        config=AudioRunConfig(),
+        run_root=Path("runs/scope_001/run_audio_boundary"),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert {(item.timestamp_ms, item.source) for item in result.boundary_candidates} >= {
+        (60_000, "silence"),
+        (63_000, "language_change"),
+    }
+
+
 def _result() -> AudioUnderstandingResult:
     evidence_id = "asr_evidence_001"
     return AudioUnderstandingResult(
@@ -224,9 +291,7 @@ def _result() -> AudioUnderstandingResult:
                 title_evidence_refs=(evidence_id,),
                 summary_zh="章节摘要",
                 summary_evidence_refs=(evidence_id,),
-                body_blocks=(
-                    AudioParagraphBlock(text="语音正文", evidence_refs=(evidence_id,)),
-                ),
+                body_blocks=(AudioParagraphBlock(text="语音正文", evidence_refs=(evidence_id,)),),
                 claims=(
                     AudioGroundedClaim(
                         text="关键结论",

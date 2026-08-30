@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from collections.abc import Callable
 from itertools import pairwise
 from typing import Literal, Protocol
@@ -22,6 +25,13 @@ from video_demo.domain.audio_plan import (
     AudioTranscriptSource,
 )
 from video_demo.domain.base import FrozenModel, Sha256, StableId
+from video_demo.errors import ErrorCode, VideoDemoError
+
+_SUSPICIOUS_VALUE = re.compile(
+    r"(?i)(?:https?://|data:|bearer\s+|"
+    r"(?:sk-(?:proj-)?|gh[pousr]_|github_pat_|xox[baprs]-|AKIA|AIza|hf_|glpat-|npm_|pypi_)"
+    r"[A-Za-z0-9_-]{16,})",
+)
 
 
 class AudioChapterPlanningRequest(FrozenModel):
@@ -41,6 +51,62 @@ class AudioInvalidModelResponse(FrozenModel):
     content_sha256: Sha256
     validation_errors: tuple[str, ...] = Field(min_length=1, max_length=32)
     safe_json_excerpt: str | None = Field(default=None, max_length=8_000)
+
+
+def audio_invalid_model_response(
+    raw_content: bytes,
+    validation_errors: tuple[str, ...],
+    *,
+    parsed_json: object | None = None,
+) -> AudioInvalidModelResponse:
+    """生成不回显原始模型内容的音频结构修复上下文。"""
+
+    normalized = tuple(
+        dict.fromkeys(_normalize_audio_validation_error(item) for item in validation_errors)
+    )[:32]
+    excerpt = None
+    if parsed_json is not None:
+        try:
+            serialized = json.dumps(
+                parsed_json,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if not _SUSPICIOUS_VALUE.search(serialized):
+                excerpt = serialized[:8_000]
+        except (TypeError, ValueError):
+            excerpt = None
+    return AudioInvalidModelResponse(
+        content_sha256=hashlib.sha256(raw_content).hexdigest(),
+        validation_errors=normalized or ("response:invalid",),
+        safe_json_excerpt=excerpt,
+    )
+
+
+def _normalize_audio_validation_error(value: object) -> str:
+    text = " ".join(str(value).split())
+    if not text or len(text) > 500 or any(ord(char) < 32 for char in text):
+        return "response:invalid"
+    if _SUSPICIOUS_VALUE.search(text):
+        return "response:invalid"
+    return text
+
+
+class AudioModelResponseValidationError(VideoDemoError):
+    """音频模型响应未通过适配器边界的解析或结构校验。"""
+
+    def __init__(
+        self,
+        message: str,
+        invalid_response: AudioInvalidModelResponse,
+    ) -> None:
+        super().__init__(ErrorCode.TEXT_LLM_RESPONSE_INVALID, message)
+        self._invalid_response = invalid_response
+
+    @property
+    def invalid_response(self) -> AudioInvalidModelResponse:
+        return self._invalid_response
 
 
 class AudioChapterPlanRepairRequest(FrozenModel):
@@ -125,9 +191,7 @@ class AudioGlobalWritingRequest(FrozenModel):
     def validate_timeline(self) -> AudioGlobalWritingRequest:
         if self.chapters[0].start_ms != 0 or self.chapters[-1].end_ms != self.duration_ms:
             raise ValueError("全局音频章节必须覆盖完整时长")
-        if any(
-            left.end_ms != right.start_ms for left, right in pairwise(self.chapters)
-        ):
+        if any(left.end_ms != right.start_ms for left, right in pairwise(self.chapters)):
             raise ValueError("全局音频章节必须连续")
         return self
 
@@ -178,3 +242,9 @@ class AudioDocumentTextPort(AudioTextPort, Protocol):
         *,
         on_provider_attempt: Callable[[], None] | None = None,
     ) -> AudioGlobalWritingResponse: ...
+
+
+def allowed_audio_evidence_ids(request: AudioChapterWritingRequest) -> tuple[str, ...]:
+    """按音频章节请求中的首次出现顺序返回证据白名单。"""
+
+    return tuple(dict.fromkeys(item.evidence_id for item in request.transcript_evidence))

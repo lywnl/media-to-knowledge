@@ -22,6 +22,8 @@ from video_demo.integrations.audio_document_port import (
     AudioGlobalWritingRepairRequest,
     AudioGlobalWritingRequest,
     AudioGlobalWritingResponse,
+    AudioModelResponseValidationError,
+    audio_invalid_model_response,
 )
 from video_demo.integrations.audio_document_prompts import (
     prompt_for_audio_global,
@@ -93,7 +95,17 @@ class AudioDocumentClient(AudioDocumentTextPort):
             max_output_tokens=_compact_planning_output_tokens(len(request.segments)),
             extra_payload={"thinking": {"type": "disabled"}},
         )
-        return _expand_planning_response(compact, request)
+        try:
+            return _expand_planning_response(compact, request)
+        except VideoDemoError as error:
+            raise AudioModelResponseValidationError(
+                str(error),
+                audio_invalid_model_response(
+                    _model_dump_bytes(compact),
+                    (str(error),),
+                    parsed_json=compact.model_dump(mode="json"),
+                ),
+            ) from None
 
     def repair_chapter_plan(
         self,
@@ -109,7 +121,17 @@ class AudioDocumentClient(AudioDocumentTextPort):
             max_output_tokens=_compact_planning_output_tokens(len(request.request.segments)),
             extra_payload={"thinking": {"type": "disabled"}},
         )
-        return _expand_planning_response(compact, request.request)
+        try:
+            return _expand_planning_response(compact, request.request)
+        except VideoDemoError as error:
+            raise AudioModelResponseValidationError(
+                str(error),
+                audio_invalid_model_response(
+                    _model_dump_bytes(compact),
+                    (str(error),),
+                    parsed_json=compact.model_dump(mode="json"),
+                ),
+            ) from None
 
     def write_chapter(
         self,
@@ -210,16 +232,7 @@ class AudioDocumentClient(AudioDocumentTextPort):
             )
             payload["response_format"] = {"type": "json_object"}
             raw = self._post(payload, callback)
-        try:
-            envelope = json.loads(raw)
-            message = extract_model_message_content(envelope)
-            return response_type.model_validate(
-                strip_removed_document_fields(parse_json_content(message)),
-            )
-        except (ValueError, TypeError, KeyError, ValidationError, json.JSONDecodeError) as error:
-            raise VideoDemoError(
-                ErrorCode.TEXT_LLM_RESPONSE_INVALID, "音频文本模型响应结构非法"
-            ) from error
+        return _parse_audio_response(raw, response_type)
 
     def _post(self, payload: dict[str, object], callback: Callable[[], None] | None) -> bytes:
         last_error: VideoDemoError | None = None
@@ -298,6 +311,55 @@ def _schema_name(payload: dict[str, object]) -> str:
         return "json_object"
     name = schema.get("name")
     return name if isinstance(name, str) and name else "unknown"
+
+
+def _parse_audio_response(raw: bytes, response_type: type[ResponseModel]) -> ResponseModel:
+    envelope: object | None = None
+    message = ""
+    try:
+        envelope = json.loads(raw)
+        message = extract_model_message_content(envelope)
+        if not message:
+            raise ValueError("response_envelope:invalid")
+        parsed = parse_json_content(message)
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        raise AudioModelResponseValidationError(
+            "音频文本模型响应结构非法",
+            audio_invalid_model_response(
+                message.encode("utf-8") if message else raw,
+                ("response_envelope:invalid",),
+                parsed_json=envelope,
+            ),
+        ) from error
+    try:
+        return response_type.model_validate(strip_removed_document_fields(parsed))
+    except ValidationError as error:
+        summaries = tuple(_pydantic_error_summary(item) for item in error.errors())
+        raise AudioModelResponseValidationError(
+            "音频文本模型响应结构非法",
+            audio_invalid_model_response(
+                message.encode("utf-8"),
+                summaries,
+                parsed_json=parsed,
+            ),
+        ) from None
+
+
+def _pydantic_error_summary(error: object) -> str:
+    if not isinstance(error, dict):
+        return "response:invalid"
+    location = ".".join(str(item) for item in error.get("loc", ())) or "response"
+    error_type = str(error.get("type", "invalid"))
+    return f"{location}:{error_type}"[:500]
+
+
+def _model_dump_bytes(model: BaseModel) -> bytes:
+    return json.dumps(
+        model.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _compact_planning_output_tokens(segment_count: int) -> int:

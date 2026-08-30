@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from itertools import pairwise
@@ -24,9 +26,14 @@ from video_demo.integrations.audio_document_port import (
     AudioChapterPlanningResponse,
     AudioChapterPlanRepairRequest,
     AudioInvalidModelResponse,
+    AudioModelResponseValidationError,
     AudioTextPort,
+    audio_invalid_model_response,
 )
+from video_demo.integrations.audio_document_prompts import prompt_for_audio_planning
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
+
+_LOGGER = logging.getLogger(__name__)
 
 _MAX_BATCH_SEGMENTS = 24
 _MAX_CHAPTER_DURATION_MS = 300_000
@@ -139,7 +146,7 @@ class AudioChapterPlanner:
         with ThreadPoolExecutor(
             max_workers=self._concurrency, thread_name_prefix="audio-planning"
         ) as executor:
-            futures: dict[Future[AudioChapterPlanningResponse | None], int] = {}
+            futures: dict[Future[AudioChapterPlanningResponse | None], tuple[int, float]] = {}
             next_index = 0
             while next_index < len(requests) or futures:
                 if is_cancel_requested():
@@ -155,15 +162,24 @@ class AudioChapterPlanner:
                         counters,
                         is_cancel_requested,
                     )
-                    futures[future] = next_index
+                    request = requests[next_index]
+                    _log_planning_batch_start(request, next_index, len(requests))
+                    futures[future] = (next_index, time.monotonic())
                     next_index += 1
                 done, _ = wait(tuple(futures), timeout=0.05, return_when=FIRST_COMPLETED)
                 for future in done:
-                    index = futures.pop(future)
+                    index, started_at = futures.pop(future)
                     result = future.result()
                     results[index] = result
                     if result is None:
                         fallback.add(index)
+                    _log_planning_batch_finished(
+                        requests[index],
+                        index,
+                        len(requests),
+                        result is not None,
+                        started_at,
+                    )
         drafts: list[AudioChapterDraft] = []
         for index, request in enumerate(requests):
             response = results[index]
@@ -228,61 +244,54 @@ class AudioChapterPlanner:
                     counters.cache_hit()
                     return cached.response
                 repaired = False
+                invalid: AudioInvalidModelResponse | None = None
                 try:
                     response = self._port.plan_chapters(
                         request, on_provider_attempt=counters.attempt
                     )
                     validate(response)
+                except AudioModelResponseValidationError as error:
+                    if error.code == ErrorCode.JOB_CANCELLED:
+                        raise
+                    invalid = error.invalid_response
+                    _log_planning_validation_failure(request, invalid.validation_errors)
                 except VideoDemoError as error:
                     if error.code == ErrorCode.JOB_CANCELLED:
                         raise
+                    if error.code in {
+                        ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
+                    }:
+                        return None
+                    if error.code == ErrorCode.TEXT_LLM_CAPABILITY_UNAVAILABLE:
+                        return None
+                    if error.code != ErrorCode.TEXT_LLM_RESPONSE_INVALID:
+                        raise
+                    invalid = _invalid_planning_provider_error(error)
+                    _log_planning_validation_failure(request, invalid.validation_errors)
+                except (ValueError, TypeError) as error:
+                    invalid = _invalid_planning_local_error(error)
+                    _log_planning_validation_failure(request, invalid.validation_errors)
+                if invalid is not None:
                     counters.repair()
                     try:
                         response = self._port.repair_chapter_plan(
-                            AudioChapterPlanRepairRequest(
-                                request=request,
-                                invalid_response=AudioInvalidModelResponse(
-                                    content_sha256="f" * 64,
-                                    validation_errors=("audio_response:invalid",),
-                                ),
-                                allowed_segment_ids=tuple(
-                                    item.segment_id for item in request.segments
-                                ),
-                                prompt_version="audio-chapter-planner-repair-v1",
-                            ),
+                            _plan_repair_request(request, invalid),
                             on_provider_attempt=counters.attempt,
                         )
                         validate(response)
                         repaired = True
+                    except AudioModelResponseValidationError:
+                        return None
                     except VideoDemoError as repair_error:
                         if repair_error.code == ErrorCode.JOB_CANCELLED:
                             raise
-                        return None
-                    except (ValueError, TypeError):
-                        return None
-                except (ValueError, TypeError):
-                    counters.repair()
-                    try:
-                        response = self._port.repair_chapter_plan(
-                            AudioChapterPlanRepairRequest(
-                                request=request,
-                                invalid_response=AudioInvalidModelResponse(
-                                    content_sha256="f" * 64,
-                                    validation_errors=("audio_response:invalid",),
-                                ),
-                                allowed_segment_ids=tuple(
-                                    item.segment_id for item in request.segments
-                                ),
-                                prompt_version="audio-chapter-planner-repair-v1",
-                            ),
-                            on_provider_attempt=counters.attempt,
-                        )
-                        validate(response)
-                        repaired = True
-                    except VideoDemoError as error:
-                        if error.code == ErrorCode.JOB_CANCELLED:
-                            raise
-                        return None
+                        if repair_error.code in {
+                            ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
+                            ErrorCode.TEXT_LLM_CAPABILITY_UNAVAILABLE,
+                            ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+                        }:
+                            return None
+                        raise
                     except (ValueError, TypeError):
                         return None
                 return cache.put(
@@ -300,6 +309,102 @@ class AudioChapterPlanner:
             }:
                 return None
             raise
+
+
+def _plan_repair_request(
+    request: AudioChapterPlanningRequest,
+    invalid: AudioInvalidModelResponse,
+) -> AudioChapterPlanRepairRequest:
+    return AudioChapterPlanRepairRequest(
+        request=request,
+        invalid_response=invalid,
+        allowed_segment_ids=tuple(item.segment_id for item in request.segments),
+        prompt_version="audio-chapter-planner-repair-v1",
+    )
+
+
+def _invalid_planning_provider_error(error: VideoDemoError) -> AudioInvalidModelResponse:
+    return audio_invalid_model_response(
+        error.code.value.encode("utf-8"),
+        ("provider_response:invalid", f"provider_code:{error.code.value}"),
+    )
+
+
+def _invalid_planning_local_error(error: BaseException | None = None) -> AudioInvalidModelResponse:
+    reason = _planning_validation_reason(error) if error is not None else "audio_response:invalid"
+    return AudioInvalidModelResponse(
+        content_sha256="f" * 64,
+        validation_errors=(reason,),
+    )
+
+
+def _planning_validation_reason(error: BaseException) -> str:
+    message = str(error)
+    if "越界" in message:
+        return "segment_range:out_of_bounds"
+    if "不连续" in message:
+        return "segment_range:not_contiguous"
+    if "为空" in message:
+        return "segment_range:empty"
+    if "重叠" in message or "重复" in message:
+        return "segment_range:overlap"
+    if "完整覆盖" in message or "完整分区" in message:
+        return "segment_range:incomplete_coverage"
+    return "audio_response:invalid"
+
+
+def _log_planning_batch_start(
+    request: AudioChapterPlanningRequest,
+    index: int,
+    total: int,
+) -> None:
+    data = prompt_for_audio_planning(request)[2]
+    _LOGGER.info(
+        "音频章节规划批次开始 batch=%d/%d segments=%d segment_start_ms=%d "
+        "segment_end_ms=%d chars=%d bytes=%d",
+        index + 1,
+        total,
+        len(request.segments),
+        request.segments[0].start_ms,
+        request.segments[-1].end_ms,
+        len(data),
+        len(data.encode("utf-8")),
+    )
+
+
+def _log_planning_validation_failure(
+    request: AudioChapterPlanningRequest,
+    validation_errors: tuple[str, ...],
+) -> None:
+    _LOGGER.warning(
+        "音频章节规划响应校验失败 segment_start_ms=%d segment_end_ms=%d validation_errors=%s",
+        request.segments[0].start_ms,
+        request.segments[-1].end_ms,
+        ",".join(validation_errors[:8]),
+    )
+
+
+def _log_planning_batch_finished(
+    request: AudioChapterPlanningRequest,
+    index: int,
+    total: int,
+    succeeded: bool,
+    started_at: float,
+) -> None:
+    data = prompt_for_audio_planning(request)[2]
+    _LOGGER.info(
+        "音频章节规划批次完成 batch=%d/%d segments=%d segment_start_ms=%d "
+        "segment_end_ms=%d chars=%d bytes=%d elapsed_ms=%d status=%s",
+        index + 1,
+        total,
+        len(request.segments),
+        request.segments[0].start_ms,
+        request.segments[-1].end_ms,
+        len(data),
+        len(data.encode("utf-8")),
+        max(0, round((time.monotonic() - started_at) * 1_000)),
+        "SUCCEEDED" if succeeded else "FALLBACK",
+    )
 
 
 def _validate_inputs(
@@ -327,24 +432,65 @@ def _requests(
 ) -> tuple[AudioChapterPlanningRequest, ...]:
     by_id = {item.evidence_id: item for item in transcript}
     requests: list[AudioChapterPlanningRequest] = []
-    for start in range(0, len(segments), _MAX_BATCH_SEGMENTS):
-        batch = segments[start : start + _MAX_BATCH_SEGMENTS]
-        evidence = tuple(by_id[ref] for item in batch for ref in item.evidence_refs)
-        request = AudioChapterPlanningRequest(
-            title_hint=title,
-            duration_ms=duration,
-            segments=batch,
-            transcript_evidence=evidence,
-            document_config=config,
-            prompt_version="audio-chapter-planner-v1",
+    batch: list[AudioBaseSegment] = []
+    for segment in segments:
+        if len(batch) >= _MAX_BATCH_SEGMENTS:
+            requests.append(
+                _build_request(title, duration, tuple(batch), by_id, config),
+            )
+            batch = []
+        candidate = (*batch, segment)
+        request = _build_request(title, duration, candidate, by_id, config)
+        if _request_fits(request, max_chars, max_bytes):
+            batch.append(segment)
+            continue
+        if not batch:
+            raise VideoDemoError(
+                ErrorCode.INPUT_BUDGET_EXCEEDED,
+                "单个音频基础片段超过章节规划输入预算",
+            )
+        requests.append(
+            _build_request(title, duration, tuple(batch), by_id, config),
         )
-        if (
-            len(str(request.model_dump(mode="json"))) > max_chars
-            or len(str(request.model_dump(mode="json")).encode()) > max_bytes
-        ):
-            raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "音频章节规划输入超过预算")
-        requests.append(request)
+        batch = [segment]
+        single = _build_request(title, duration, (segment,), by_id, config)
+        if not _request_fits(single, max_chars, max_bytes):
+            raise VideoDemoError(
+                ErrorCode.INPUT_BUDGET_EXCEEDED,
+                "单个音频基础片段超过章节规划输入预算",
+            )
+    if batch:
+        requests.append(
+            _build_request(title, duration, tuple(batch), by_id, config),
+        )
     return tuple(requests)
+
+
+def _build_request(
+    title: str,
+    duration: int,
+    segments: tuple[AudioBaseSegment, ...],
+    evidence_by_id: dict[str, AudioTranscriptEvidence],
+    config: AudioDocumentConfig,
+) -> AudioChapterPlanningRequest:
+    evidence = tuple(evidence_by_id[ref] for item in segments for ref in item.evidence_refs)
+    return AudioChapterPlanningRequest(
+        title_hint=title,
+        duration_ms=duration,
+        segments=segments,
+        transcript_evidence=evidence,
+        document_config=config,
+        prompt_version="audio-chapter-planner-v1",
+    )
+
+
+def _request_fits(
+    request: AudioChapterPlanningRequest,
+    max_chars: int,
+    max_bytes: int,
+) -> bool:
+    data = prompt_for_audio_planning(request)[2]
+    return len(data) <= max_chars and len(data.encode("utf-8")) <= max_bytes
 
 
 def _rule_drafts(

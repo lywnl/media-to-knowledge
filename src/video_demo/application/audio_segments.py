@@ -11,7 +11,7 @@ from video_demo.application.audio_contracts import (
 )
 from video_demo.domain.audio_plan import AudioBaseSegment, AudioTranscriptEvidence
 from video_demo.domain.base import Sha256, stable_identifier
-from video_demo.domain.evidence import SpeechSegment
+from video_demo.domain.evidence import SpeechSegment, SubtitleCue
 from video_demo.errors import ErrorCode, VideoDemoError
 
 _GRID_INTERVAL_MS = 30_000
@@ -98,11 +98,15 @@ def _safe_boundaries(
         },
     )
     candidates_set.update(selected_sentence_ends)
-    ordered_candidates = tuple(
-        value for value in sorted(candidates_set) if 0 < value < duration_ms
-    )
+    ordered_candidates = _ordered_candidates(candidates_set, duration_ms)
     safe = _exclude_transcript_interiors(ordered_candidates, transcript)
     safe = _snap_dense_grid_boundaries(safe, ordered_candidates, transcript)
+    safe = _add_blocking_transcript_boundaries(
+        safe,
+        ordered_candidates,
+        duration_ms,
+        transcript,
+    )
     safe = _add_required_transcript_boundaries(safe, duration_ms, transcript)
     if any(
         end_ms - start_ms > _MAX_SEGMENT_DURATION_MS
@@ -140,14 +144,19 @@ def _exclude_transcript_interiors(
     maximum_open_end = 0
     for candidate in candidates:
         while (
-            transcript_index < len(transcript)
-            and transcript[transcript_index].start_ms < candidate
+            transcript_index < len(transcript) and transcript[transcript_index].start_ms < candidate
         ):
             maximum_open_end = max(maximum_open_end, transcript[transcript_index].end_ms)
             transcript_index += 1
         if maximum_open_end <= candidate:
             safe.append(candidate)
     return tuple(safe)
+
+
+def _ordered_candidates(candidates: set[int], duration_ms: int) -> tuple[int, ...]:
+    """只保留时间轴内部的有序候选边界。"""
+
+    return tuple(timestamp for timestamp in sorted(candidates) if 0 < timestamp < duration_ms)
 
 
 def _snap_dense_grid_boundaries(
@@ -194,8 +203,11 @@ def _add_required_transcript_boundaries(
     while True:
         ranges = tuple(pairwise((0, *boundaries, duration_ms)))
         oversized = next(
-            ((start_ms, end_ms) for start_ms, end_ms in ranges
-             if end_ms - start_ms > _MAX_SEGMENT_DURATION_MS),
+            (
+                (start_ms, end_ms)
+                for start_ms, end_ms in ranges
+                if end_ms - start_ms > _MAX_SEGMENT_DURATION_MS
+            ),
             None,
         )
         if oversized is None:
@@ -214,6 +226,30 @@ def _add_required_transcript_boundaries(
             return tuple(boundaries)
         boundaries.append(endpoint)
         boundaries.sort()
+
+
+def _add_blocking_transcript_boundaries(
+    safe: tuple[int, ...],
+    candidates: Sequence[int],
+    duration_ms: int,
+    transcript: Sequence[AudioTranscriptEvidence],
+) -> tuple[int, ...]:
+    """字幕被候选边界穿过时，补齐字幕首尾以保证证据只有一个归属片段。
+
+    ASR 证据保持稀疏网格策略，只有字幕 cue 需要精确首尾边界；这与视频纯文本
+    分段算法一致，避免密集 ASR 退化为逐句分段。
+    """
+
+    boundaries = set(safe)
+    for item in transcript:
+        if not isinstance(item, SubtitleCue):
+            continue
+        if not any(item.start_ms < candidate < item.end_ms for candidate in candidates):
+            continue
+        for endpoint in (item.start_ms, item.end_ms):
+            if 0 < endpoint < duration_ms and _is_safe_transcript_endpoint(endpoint, transcript):
+                boundaries.add(endpoint)
+    return tuple(sorted(boundaries))
 
 
 def _is_safe_transcript_endpoint(

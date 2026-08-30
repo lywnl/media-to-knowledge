@@ -4,6 +4,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
@@ -124,6 +125,7 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
             time.monotonic() - vad_started_at,
         )
         transcript: list[SpeechSegment] = []
+        language_spans = []
         warnings = list(vad_result.warnings)
         language_hint = config.language_hints[0] if len(config.language_hints) == 1 else None
         prompt = _audio_asr_prompt(config)
@@ -164,6 +166,7 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
                     else None
                 )
                 if cached is not None:
+                    language_spans.append(cached[0].language_span)
                     transcript.extend(cached[0].segments)
                     warnings.extend(cached[0].warnings)
                     _LOGGER.info(
@@ -206,6 +209,7 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
                                 warnings=projection.warnings,
                             ),
                         )
+                    language_spans.append(projection.language_span)
                     transcript.extend(projection.segments)
                     warnings.extend(projection.warnings)
                     _LOGGER.info(
@@ -231,11 +235,22 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
                 )
                 warnings.append(f"AUDIO_ASR_WINDOW_DEGRADED:{index}")
         ordered = remove_adjacent_cloud_asr_duplicates(tuple(transcript))
+        ordered_language_spans = tuple(
+            sorted(
+                language_spans,
+                key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),
+            ),
+        )
         transcript_source: Literal["ASR", "NONE"] = "ASR" if ordered else "NONE"
-        boundaries = tuple(
-            AudioSpeechBoundaryCandidate(item.end_ms, "sentence_end", 0.8)
-            for item in ordered
-            if 0 < item.end_ms < duration_ms
+        boundaries = _boundary_candidates(
+            duration_ms,
+            silence=vad_result.long_silence_boundaries_ms,
+            sentence_ends=tuple(item.end_ms for item in ordered),
+            language_changes=tuple(
+                current.start_ms
+                for previous, current in pairwise(ordered_language_spans)
+                if previous.language != current.language
+            ),
         )
         return AudioSpeechAnalysis(
             transcript_source=transcript_source,
@@ -255,6 +270,32 @@ def _audio_asr_prompt(config: AudioRunConfig) -> str | None:
     if config.hotwords:
         parts.append(" ".join(config.hotwords))
     return "\n".join(parts) or None
+
+
+def _boundary_candidates(
+    duration_ms: int,
+    *,
+    silence: tuple[int, ...],
+    sentence_ends: tuple[int, ...],
+    language_changes: tuple[int, ...],
+) -> tuple[AudioSpeechBoundaryCandidate, ...]:
+    candidates: set[tuple[int, Literal["silence", "sentence_end", "language_change"], float]] = {
+        (timestamp_ms, "silence", 1.0) for timestamp_ms in silence if 0 < timestamp_ms < duration_ms
+    }
+    candidates.update(
+        (timestamp_ms, "sentence_end", 0.8)
+        for timestamp_ms in sentence_ends
+        if 0 < timestamp_ms < duration_ms
+    )
+    candidates.update(
+        (timestamp_ms, "language_change", 1.0)
+        for timestamp_ms in language_changes
+        if 0 < timestamp_ms < duration_ms
+    )
+    return tuple(
+        AudioSpeechBoundaryCandidate(timestamp, source, score)
+        for timestamp, source, score in sorted(candidates)
+    )
 
 
 class AudioPipeline:
@@ -331,9 +372,7 @@ class AudioPipeline:
             cache=cache,
             is_cancel_requested=is_cancel_requested,
         )
-        warnings = tuple(
-            dict.fromkeys((*speech.warnings, *planning.warnings, *writing.warnings))
-        )
+        warnings = tuple(dict.fromkeys((*speech.warnings, *planning.warnings, *writing.warnings)))
         result = writing.result
         return AudioPipelineOutcome(
             result=result,
