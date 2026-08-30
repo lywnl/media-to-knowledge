@@ -5,6 +5,7 @@ import math
 from typing import Any
 
 from video_demo.integrations.document_port import (
+    ChapterBoundaryCoordinationRequest,
     ChapterPlanningRequest,
     ChapterPlanRepairRequest,
     ChapterVisionRepairRequest,
@@ -91,6 +92,20 @@ def prompt_for_compact_plan_repair(request: ChapterPlanRepairRequest) -> tuple[s
         "anchor_transcript_indexes 必须属于对应章节的 transcript_evidence_indexes；"
         "必须保留原请求的事实边界，不得添加新事实。只返回 JSON。",
         context,
+    )
+
+
+def prompt_for_boundary_coordination(
+    request: ChapterBoundaryCoordinationRequest,
+) -> tuple[str, str, str]:
+    return _prompt(
+        request.prompt_version,
+        (
+            "只判断相邻批次边界是否属于同一主题。每个 boundary_index 只能返回 KEEP 或 MERGE；"
+            "不得创建章节，不得返回时间或片段范围。只有明确连续且主题相同才返回 MERGE，"
+            "否则返回 KEEP。只返回 JSON。"
+        ),
+        request.model_dump(mode="json"),
     )
 
 

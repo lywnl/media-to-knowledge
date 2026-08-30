@@ -14,6 +14,8 @@ from video_demo.domain.document_plan import ChapterDraft, VisualTargetDraft
 from video_demo.domain.evidence import SpeechSegment, SubtitleCue, VisualObservationEvidence
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.document_port import (
+    ChapterBoundaryCoordinationRequest,
+    ChapterBoundaryCoordinationResponse,
     ChapterPlanningRequest,
     ChapterPlanningResponse,
     ChapterPlanRepairRequest,
@@ -30,6 +32,7 @@ from video_demo.integrations.document_port import (
     invalid_model_response,
 )
 from video_demo.integrations.document_prompts import (
+    prompt_for_boundary_coordination,
     prompt_for_compact_plan_repair,
     prompt_for_compact_planning,
     prompt_for_global_editing,
@@ -46,6 +49,7 @@ from video_demo.integrations.model_response import (
     extract_model_message_content,
     parse_json_content,
     strip_removed_document_fields,
+    unwrap_single_response_envelope,
 )
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
@@ -188,6 +192,22 @@ class OpenAIDocumentClient(DocumentTextPort):
             ),
             on_provider_attempt=on_provider_attempt,
         )
+
+    def coordinate_chapter_boundaries(
+        self,
+        request: ChapterBoundaryCoordinationRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterBoundaryCoordinationResponse:
+        result = self._call(
+            prompt_for_boundary_coordination(request),
+            response_type=ChapterBoundaryCoordinationResponse,
+            schema_name="chapter_boundary_coordination_v1",
+            extra_payload={"thinking": {"type": "disabled"}},
+            validate_response=lambda _response: None,
+            on_provider_attempt=on_provider_attempt,
+        )
+        return result
 
     def write_chapter(
         self,
@@ -427,7 +447,10 @@ def _parse_and_validate_response(
     validate_response: Callable[[ResponseModel], None],
 ) -> ResponseModel:
     raw_message, parsed, finish_reason = _extract_model_message(content)
-    parsed = strip_removed_document_fields(parsed)
+    parsed = _normalize_response_payload(
+        unwrap_single_response_envelope(strip_removed_document_fields(parsed)),
+        response_type,
+    )
     try:
         response = response_type.model_validate(parsed)
         if normalize_response is not None:
@@ -453,6 +476,161 @@ def _parse_and_validate_response(
             parsed_json=parsed,
         ),
     ) from None
+
+
+def _normalize_response_payload(value: object, response_type: type[BaseModel]) -> object:
+    """在适配器边界收敛供应商常见的轻微格式偏差。"""
+
+    if isinstance(value, list):
+        if response_type in {_CompactChapterPlanningResponse, ChapterPlanningResponse}:
+            return {"chapter_drafts": value}
+        if response_type is ChapterBoundaryCoordinationResponse:
+            return {"decisions": value}
+        return value
+    if not isinstance(value, dict):
+        return value
+    if response_type is _CompactChapterPlanningResponse:
+        return _normalize_compact_payload(value)
+    if response_type is ChapterPlanningResponse:
+        return _normalize_planning_payload(value)
+    if response_type is ChapterBoundaryCoordinationResponse:
+        return _normalize_boundary_payload(value)
+    if response_type is ChapterWritingResponse:
+        return _normalize_writing_payload(value)
+    return value
+
+
+def _normalize_planning_payload(value: dict[str, object]) -> dict[str, object]:
+    raw_drafts = value.get("chapter_drafts")
+    if not isinstance(raw_drafts, list):
+        return value
+    drafts: list[object] = []
+    for raw_draft in raw_drafts:
+        if not isinstance(raw_draft, dict):
+            drafts.append(raw_draft)
+            continue
+        draft = {
+            key: raw_draft[key]
+            for key in ("segment_refs", "title_hint", "visual_mode", "semantic_targets")
+            if key in raw_draft
+        }
+        if "title_hint" not in draft and isinstance(raw_draft.get("title"), str):
+            draft["title_hint"] = raw_draft["title"]
+        draft.setdefault("visual_mode", "NONE")
+        draft.setdefault("semantic_targets", [])
+        targets = draft.get("semantic_targets")
+        if isinstance(targets, list):
+            draft["semantic_targets"] = [
+                _normalize_planning_target(target) for target in targets
+            ]
+        drafts.append(draft)
+    return {"chapter_drafts": drafts}
+
+
+def _normalize_planning_target(value: object) -> object:
+    if not isinstance(value, dict):
+        return value
+    target = {
+        key: value[key]
+        for key in ("query_zh", "anchor_evidence_refs")
+        if key in value
+    }
+    if "query_zh" not in target and isinstance(value.get("query"), str):
+        target["query_zh"] = value["query"]
+    if "anchor_evidence_refs" not in target:
+        refs = value.get("anchor_refs")
+        if isinstance(refs, list):
+            target["anchor_evidence_refs"] = refs
+    return target
+
+
+def _normalize_compact_payload(value: dict[str, object]) -> dict[str, object]:
+    raw_drafts = value.get("chapter_drafts")
+    if not isinstance(raw_drafts, list):
+        return value
+    drafts: list[object] = []
+    for raw_draft in raw_drafts:
+        if not isinstance(raw_draft, dict):
+            drafts.append(raw_draft)
+            continue
+        draft = {
+            key: raw_draft[key]
+            for key in (
+                "start_segment_index",
+                "end_segment_index",
+                "title_hint",
+                "visual_mode",
+                "semantic_targets",
+            )
+            if key in raw_draft
+        }
+        if "title_hint" not in draft and isinstance(raw_draft.get("title"), str):
+            draft["title_hint"] = raw_draft["title"]
+        draft.setdefault("visual_mode", "NONE")
+        draft.setdefault("semantic_targets", [])
+        for key in ("start_segment_index", "end_segment_index"):
+            if isinstance(draft.get(key), str) and draft[key].strip().lstrip("-").isdigit():
+                draft[key] = int(draft[key])
+        targets = draft.get("semantic_targets")
+        if isinstance(targets, list):
+            draft["semantic_targets"] = [
+                _normalize_compact_target(target) for target in targets
+            ]
+        drafts.append(draft)
+    return {"chapter_drafts": drafts}
+
+
+def _normalize_compact_target(value: object) -> object:
+    if not isinstance(value, dict):
+        return value
+    target = {
+        key: value[key]
+        for key in ("query_zh", "anchor_transcript_indexes")
+        if key in value
+    }
+    if "query_zh" not in target and isinstance(value.get("query"), str):
+        target["query_zh"] = value["query"]
+    if "anchor_transcript_indexes" not in target:
+        indexes = value.get("anchor_indexes")
+        if isinstance(indexes, list):
+            target["anchor_transcript_indexes"] = indexes
+    indexes = target.get("anchor_transcript_indexes")
+    if isinstance(indexes, list):
+        target["anchor_transcript_indexes"] = [
+            int(item) if isinstance(item, str) and item.strip().lstrip("-").isdigit() else item
+            for item in indexes
+        ]
+    return target
+
+
+def _normalize_writing_payload(value: dict[str, object]) -> dict[str, object]:
+    normalized = dict(value)
+    normalized.setdefault("body_blocks", [])
+    normalized.setdefault("claims", [])
+    return normalized
+
+
+def _normalize_boundary_payload(value: dict[str, object]) -> dict[str, object]:
+    decisions = value.get("decisions")
+    if not isinstance(decisions, list):
+        return value
+    normalized: list[object] = []
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            normalized.append(decision)
+            continue
+        item = {
+            key: decision[key]
+            for key in ("boundary_index", "decision", "merged_title_hint")
+            if key in decision
+        }
+        if (
+            isinstance(item.get("boundary_index"), str)
+            and item["boundary_index"].strip().isdigit()
+        ):
+            item["boundary_index"] = int(item["boundary_index"])
+        normalized.append(item)
+    return {"decisions": normalized}
 
 
 def _extract_model_message(content: bytes) -> tuple[bytes, object | None, str]:
@@ -575,7 +753,7 @@ def _validate_compact_planning_response(
                 index < 0 or index >= transcript_count
                 for index in target.anchor_transcript_indexes
             ):
-                raise _ReferenceValidationError("semantic_targets.anchor_indexes:out_of_range")
+                continue
             if len(set(target.anchor_transcript_indexes)) != len(
                 target.anchor_transcript_indexes
             ):
@@ -677,6 +855,7 @@ def _compact_target_is_valid(
     if (
         not indexes
         or len(indexes) != len(set(indexes))
+        or any(index < 0 or index >= len(evidence) for index in indexes)
         or not set(indexes) <= allowed_indexes
     ):
         return False

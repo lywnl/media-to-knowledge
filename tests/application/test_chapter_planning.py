@@ -12,12 +12,20 @@ from typing import cast
 
 import pytest
 
-from video_demo.application.chapter_planning import ChapterPlanner, ChapterPlanningBatch
+from video_demo.application.chapter_planning import (
+    ChapterPlanner,
+    ChapterPlanningBatch,
+    _apply_boundary_decisions,
+    _boundary_request,
+    _PlanningBatchResult,
+)
 from video_demo.domain.document import DocumentGenerationConfig
 from video_demo.domain.document_plan import BaseSegment, ChapterDraft, VisualTargetDraft
 from video_demo.domain.evidence import SceneBoundary, SpeechSegment
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.document_port import (
+    ChapterBoundaryCoordinationResponse,
+    ChapterBoundaryDecision,
     ChapterPlanningRequest,
     ChapterPlanningResponse,
     DocumentTextPort,
@@ -60,11 +68,15 @@ class _PlanningTextPort:
         self,
         main: Callable[[ChapterPlanningRequest], ChapterPlanningResponse | BaseException],
         repair: Callable[[ChapterPlanningRequest], ChapterPlanningResponse | BaseException],
+        boundary: Callable[[object], ChapterBoundaryCoordinationResponse | BaseException]
+        | None = None,
     ) -> None:
         self._main = main
         self._repair = repair
         self.main_requests: list[ChapterPlanningRequest] = []
         self.repair_requests: list[ChapterPlanningRequest] = []
+        self._boundary = boundary
+        self.boundary_requests: list[object] = []
 
     def plan_chapters(
         self,
@@ -88,6 +100,22 @@ class _PlanningTextPort:
         if on_provider_attempt is not None:
             on_provider_attempt()
         return _raise_or_return(self._repair(original))
+
+    def coordinate_chapter_boundaries(
+        self,
+        request: object,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterBoundaryCoordinationResponse:
+        self.boundary_requests.append(request)
+        if on_provider_attempt is not None:
+            on_provider_attempt()
+        if self._boundary is None:
+            return ChapterBoundaryCoordinationResponse(decisions=())
+        value = self._boundary(request)
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
 
 def _raise_or_return(
@@ -606,6 +634,501 @@ def test_compact_planning_splits_sixty_segments_into_24_24_and_12(
     assert "segment_start_ms=1440000" in messages
     assert "segment_start_ms=2880000" in messages
     assert "segment_end_ms=3600000" in messages
+
+
+def test_chapter_planner_coordinates_suspicious_cross_batch_boundary_once(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(48, interval_ms=10_000)
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        first = tuple(item.segment_id for item in request.segments)
+        if request.segments[0].segment_id == "segment_000":
+            groups = (first[:-1], first[-1:])
+        else:
+            groups = (first[:1], first[1:])
+        return ChapterPlanningResponse(
+            chapter_drafts=tuple(
+                ChapterDraft(
+                    segment_refs=group,
+                    title_hint="边界章节" if len(group) == 1 else "主体章节",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                )
+                for group in groups
+            ),
+        )
+
+    def coordinate(_request: object) -> ChapterBoundaryCoordinationResponse:
+        return ChapterBoundaryCoordinationResponse(
+            decisions=(
+                {
+                    "boundary_index": 0,
+                    "decision": "MERGE",
+                    "merged_title_hint": "统一边界主题",
+                },
+            ),
+        )
+
+    port = _PlanningTextPort(response, response, coordinate)
+    batch = _plan(
+        _planner(port, compact_planning=False),
+        tmp_path,
+        segments,
+        transcript,
+        scenes,
+    )
+
+    assert len(port.boundary_requests) == 1
+    request = port.boundary_requests[0]
+    assert request.boundaries[0].boundary_index == 0  # type: ignore[attr-defined]
+    assert batch.status == "SUCCEEDED"
+    assert batch.warnings == ()
+    assert [(plan.start_ms, plan.end_ms) for plan in batch.plans] == [
+        (0, 250_000),
+        (250_000, 480_000),
+    ]
+    assert batch.plans[0].title_hint == "主体章节"
+
+
+def test_chapter_planner_does_not_coordinate_normal_cross_batch_boundary(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(48, interval_ms=10_000)
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        return ChapterPlanningResponse(
+            chapter_drafts=(
+                ChapterDraft(
+                    segment_refs=tuple(item.segment_id for item in request.segments),
+                    title_hint=(
+                        "第一部分"
+                        if request.segments[0].segment_id == "segment_000"
+                        else "第二部分"
+                    ),
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                ),
+            ),
+        )
+
+    port = _PlanningTextPort(
+        response,
+        response,
+        lambda _request: pytest.fail("正常边界不应调用协调器"),
+    )
+    batch = _plan(_planner(port), tmp_path, segments, transcript, scenes)
+
+    assert len(batch.plans) == 2
+    assert not port.boundary_requests
+
+
+def test_chapter_planner_does_not_coordinate_when_titles_have_no_searchable_text(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(4, text="长文本" * 200)
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        return ChapterPlanningResponse(
+            chapter_drafts=(
+                ChapterDraft(
+                    segment_refs=tuple(item.segment_id for item in request.segments),
+                    title_hint="!!!",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                ),
+            ),
+        )
+
+    single_sizes = []
+    for segment, evidence in zip(segments, transcript, strict=True):
+        request = ChapterPlanningRequest(
+            title_hint="测试视频",
+            duration_ms=segments[-1].end_ms,
+            segments=(segment,),
+            transcript_evidence=(evidence,),
+            document_config=DocumentGenerationConfig(),
+            prompt_version="chapter-planner-v1",
+        )
+        single_sizes.append(len(prompt_for_planning(request)[2]))
+
+    port = _PlanningTextPort(
+        response,
+        response,
+        lambda _request: pytest.fail("不可搜索标题不应触发边界协调"),
+    )
+    batch = _plan(
+        _planner(port, max_input_chars=max(single_sizes)),
+        tmp_path,
+        segments,
+        transcript,
+        scenes,
+    )
+
+    assert len(batch.plans) == 4
+    assert not port.boundary_requests
+
+
+def test_cached_repair_batch_still_triggers_boundary_coordination(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(48, interval_ms=10_000)
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        return ChapterPlanningResponse(
+            chapter_drafts=(
+                ChapterDraft(
+                    segment_refs=tuple(item.segment_id for item in request.segments),
+                    title_hint=(
+                        "Alpha"
+                        if request.segments[0].segment_id == "segment_000"
+                        else "Beta"
+                    ),
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                ),
+            ),
+        )
+
+    port = _PlanningTextPort(
+        response,
+        response,
+        lambda _request: ChapterBoundaryCoordinationResponse(decisions=()),
+    )
+    planner = _planner(port)
+    cache = DocumentModelCache(
+        tmp_path,
+        max_entry_bytes=1_048_576,
+        max_run_bytes=4_194_304,
+    )
+    requests = planner._planning_requests(
+        "测试视频",
+        segments[-1].end_ms,
+        segments,
+        transcript,
+        DocumentGenerationConfig(),
+    )
+    cached_response = response(requests[0])
+    cache.put(
+        _planning_identity(),
+        requests[0],
+        cached_response,
+        successful_path="REPAIR",
+        validate=lambda _response: None,
+    )
+
+    batch = _plan(planner, tmp_path, segments, transcript, scenes)
+
+    assert batch.status == "SUCCEEDED"
+    assert len(port.boundary_requests) == 1
+
+
+def test_chapter_planner_keeps_original_plan_when_boundary_coordination_fails(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(48, interval_ms=10_000)
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        first = tuple(item.segment_id for item in request.segments)
+        groups = (first[:-1], first[-1:]) if first[0] == "segment_000" else (first[:1], first[1:])
+        return ChapterPlanningResponse(
+            chapter_drafts=tuple(
+                ChapterDraft(
+                    segment_refs=group,
+                    title_hint="边界章节" if len(group) == 1 else "主体章节",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                )
+                for group in groups
+            ),
+        )
+
+    port = _PlanningTextPort(
+        response,
+        response,
+        lambda _request: VideoDemoError(
+            ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
+            "协调器超时",
+        ),
+    )
+    batch = _plan(_planner(port), tmp_path, segments, transcript, scenes)
+
+    assert len(port.boundary_requests) == 1
+    assert batch.status == "SUCCEEDED"
+    assert batch.warnings == ()
+
+
+def test_boundary_merge_keeps_chapters_when_combined_duration_exceeds_five_minutes(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(48, interval_ms=15_000)
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        first = tuple(item.segment_id for item in request.segments)
+        groups = (
+            (first[:8], first[8:])
+            if first[0] == "segment_000"
+            else (first[:5], first[5:])
+        )
+        return ChapterPlanningResponse(
+            chapter_drafts=tuple(
+                ChapterDraft(
+                    segment_refs=group,
+                    title_hint=f"章节 {len(group)}",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                )
+                for group in groups
+            ),
+        )
+
+    def coordinate(_request: object) -> ChapterBoundaryCoordinationResponse:
+        return ChapterBoundaryCoordinationResponse(
+            decisions=(ChapterBoundaryDecision(boundary_index=0, decision="MERGE"),),
+        )
+
+    batch = _plan(
+        _planner(_PlanningTextPort(response, response, coordinate)),
+        tmp_path,
+        segments,
+        transcript,
+        scenes,
+    )
+
+    assert [(plan.start_ms, plan.end_ms) for plan in batch.plans] == [
+        (0, 120_000),
+        (120_000, 360_000),
+        (360_000, 435_000),
+        (435_000, 720_000),
+    ]
+
+
+def test_boundary_merge_keeps_chapters_when_visual_targets_conflict(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(48, interval_ms=10_000)
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        first = tuple(item.segment_id for item in request.segments)
+        groups = (
+            (first[:18], first[18:])
+            if first[0] == "segment_000"
+            else (first[:6], first[6:])
+        )
+
+        def targets(group: tuple[str, ...]) -> tuple[VisualTargetDraft, ...]:
+            return tuple(
+                VisualTargetDraft(
+                    query_zh=f"画面目标 {index}",
+                    anchor_evidence_refs=(f"asr_{int(segment_id[-3:]):03d}",),
+                )
+                for index, segment_id in enumerate(group[-2:])
+            )
+
+        return ChapterPlanningResponse(
+            chapter_drafts=tuple(
+                ChapterDraft(
+                    segment_refs=group,
+                    title_hint="重复主题",
+                    visual_mode="COMPARISON",
+                    semantic_targets=targets(group),
+                )
+                for group in groups
+            ),
+        )
+
+    def coordinate(_request: object) -> ChapterBoundaryCoordinationResponse:
+        return ChapterBoundaryCoordinationResponse(
+            decisions=(ChapterBoundaryDecision(boundary_index=0, decision="MERGE"),),
+        )
+
+    batch = _plan(
+        _planner(_PlanningTextPort(response, response, coordinate)),
+        tmp_path,
+        segments,
+        transcript,
+        scenes,
+    )
+
+    assert len(batch.plans) == 4
+    assert [(plan.start_ms, plan.end_ms) for plan in batch.plans] == [
+        (0, 180_000),
+        (180_000, 240_000),
+        (240_000, 300_000),
+        (300_000, 480_000),
+    ]
+    assert [len(plan.semantic_targets) for plan in batch.plans] == [2, 2, 2, 2]
+
+
+def test_boundary_decision_with_unknown_index_keeps_original_drafts(
+    tmp_path: Path,
+) -> None:
+    segments, transcript, scenes = _planning_fixture(48, interval_ms=15_000)
+
+    def response(request: ChapterPlanningRequest) -> ChapterPlanningResponse:
+        first = tuple(item.segment_id for item in request.segments)
+        groups = (first[:18], first[18:]) if first[0] == "segment_000" else (first[:6], first[6:])
+        return ChapterPlanningResponse(
+            chapter_drafts=tuple(
+                ChapterDraft(
+                    segment_refs=group,
+                    title_hint="边界章节" if len(group) == 1 else "主体章节",
+                    visual_mode="NONE",
+                    semantic_targets=(),
+                )
+                for group in groups
+            ),
+        )
+
+    def coordinate(_request: object) -> ChapterBoundaryCoordinationResponse:
+        return ChapterBoundaryCoordinationResponse(
+            decisions=(ChapterBoundaryDecision(boundary_index=99, decision="MERGE"),),
+        )
+
+    port = _PlanningTextPort(response, response, coordinate)
+    batch = _plan(_planner(port), tmp_path, segments, transcript, scenes)
+
+    assert len(batch.plans) == 4
+    assert batch.warnings == ()
+
+
+def test_boundary_decisions_cannot_consume_adjacent_boundary_twice() -> None:
+    segments, _transcript, _scenes = _planning_fixture(4, interval_ms=10_000)
+    drafts = [
+        [
+            ChapterDraft(
+                segment_refs=("segment_000",),
+                title_hint="左一",
+                visual_mode="NONE",
+                semantic_targets=(),
+            ),
+            ChapterDraft(
+                segment_refs=("segment_001",),
+                title_hint="左二",
+                visual_mode="NONE",
+                semantic_targets=(),
+            ),
+        ],
+        [
+            ChapterDraft(
+                segment_refs=("segment_002",),
+                title_hint="右一",
+                visual_mode="NONE",
+                semantic_targets=(),
+            ),
+            ChapterDraft(
+                segment_refs=("segment_003",),
+                title_hint="右二",
+                visual_mode="NONE",
+                semantic_targets=(),
+            ),
+        ],
+        [
+            ChapterDraft(
+                segment_refs=("segment_003",),
+                title_hint="尾部",
+                visual_mode="NONE",
+                semantic_targets=(),
+            ),
+        ],
+    ]
+
+    _apply_boundary_decisions(
+        ChapterBoundaryCoordinationResponse(
+            decisions=(
+                ChapterBoundaryDecision(boundary_index=0, decision="MERGE"),
+                ChapterBoundaryDecision(boundary_index=1, decision="MERGE"),
+            ),
+        ),
+        (0, 1),
+        drafts,
+        segments,
+    )
+
+    assert drafts[0][-1].segment_refs == ("segment_001", "segment_002")
+    assert drafts[1][0].segment_refs == ("segment_003",)
+
+
+def test_boundary_merge_rejects_non_contiguous_segments() -> None:
+    segments, _transcript, _scenes = _planning_fixture(2, interval_ms=10_000)
+    segments = (
+        segments[0],
+        segments[1].model_copy(update={"start_ms": 20_000, "end_ms": 30_000}),
+    )
+    drafts = [
+        [
+            ChapterDraft(
+                segment_refs=("segment_000",),
+                title_hint="左",
+                visual_mode="NONE",
+                semantic_targets=(),
+            ),
+        ],
+        [
+            ChapterDraft(
+                segment_refs=("segment_001",),
+                title_hint="右",
+                visual_mode="NONE",
+                semantic_targets=(),
+            ),
+        ],
+    ]
+
+    _apply_boundary_decisions(
+        ChapterBoundaryCoordinationResponse(
+            decisions=(ChapterBoundaryDecision(boundary_index=0, decision="MERGE"),),
+        ),
+        (0,),
+        drafts,
+        segments,
+    )
+
+    assert drafts[0][0].segment_refs == ("segment_000",)
+    assert drafts[1][0].segment_refs == ("segment_001",)
+
+
+def test_boundary_request_stays_within_64_kibibytes_for_many_boundaries() -> None:
+    segments, transcript, _scenes = _planning_fixture(65, interval_ms=10_000)
+    results = tuple(
+        _PlanningBatchResult(
+            response=None,
+            request=ChapterPlanningRequest(
+                title_hint="测试视频",
+                duration_ms=segments[-1].end_ms,
+                segments=(segment,),
+                transcript_evidence=(transcript[index],),
+                document_config=DocumentGenerationConfig(),
+                prompt_version="chapter-planner-v1",
+            ),
+        )
+        for index, segment in enumerate(segments)
+    )
+    drafts = [
+        [
+            ChapterDraft(
+                segment_refs=(segment.segment_id,),
+                title_hint="边界主题" * 50,
+                visual_mode="NONE",
+                semantic_targets=(),
+            ),
+        ]
+        for segment in segments
+    ]
+
+    request = _boundary_request(
+        tuple(range(64)),
+        drafts,
+        results,
+        transcript,
+        segments,
+    )
+
+    encoded = json.dumps(
+        request.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert len(encoded) <= 64 * 1024
 
 
 def test_chapter_planning_prompt_uses_compact_fact_projection() -> None:

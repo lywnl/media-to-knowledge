@@ -57,6 +57,52 @@ class ChapterPlanningResponse(FrozenModel):
     chapter_drafts: tuple[ChapterDraft, ...] = Field(min_length=1, max_length=240)
 
 
+class ChapterBoundaryInput(FrozenModel):
+    """跨批次边界协调所需的最小事实投影。"""
+
+    boundary_index: int = Field(ge=0)
+    left_title_hint: str = Field(min_length=1, max_length=200)
+    right_title_hint: str = Field(min_length=1, max_length=200)
+    left_duration_ms: int = Field(gt=0, le=300_000)
+    right_duration_ms: int = Field(gt=0, le=300_000)
+    left_tail_evidence: tuple[TranscriptEvidence, ...] = Field(max_length=2)
+    right_head_evidence: tuple[TranscriptEvidence, ...] = Field(max_length=2)
+
+
+class ChapterBoundaryCoordinationRequest(FrozenModel):
+    boundaries: tuple[ChapterBoundaryInput, ...] = Field(min_length=1, max_length=63)
+    prompt_version: Literal["chapter-boundary-coordinator-v1"]
+
+    @model_validator(mode="after")
+    def validate_request_size(self) -> Self:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > 64 * 1024:
+            raise ValueError("章节边界协调请求超过 64 KiB")
+        return self
+
+
+class ChapterBoundaryDecision(FrozenModel):
+    boundary_index: int = Field(ge=0)
+    decision: Literal["KEEP", "MERGE"]
+    merged_title_hint: str | None = Field(default=None, max_length=200)
+
+
+class ChapterBoundaryCoordinationResponse(FrozenModel):
+    decisions: tuple[ChapterBoundaryDecision, ...] = Field(max_length=63)
+
+    @model_validator(mode="after")
+    def reject_duplicate_boundaries(self) -> Self:
+        _reject_duplicate_ids(
+            tuple(str(item.boundary_index) for item in self.decisions),
+            "decisions.boundary_index",
+        )
+        return self
+
+
 class InvalidModelResponse(FrozenModel):
     """不含原始响应的有界结构修复上下文。"""
 
@@ -290,6 +336,13 @@ class DocumentTextPort(Protocol):
         *,
         on_provider_attempt: Callable[[], None] | None = None,
     ) -> ChapterPlanningResponse: ...
+
+    def coordinate_chapter_boundaries(
+        self,
+        request: ChapterBoundaryCoordinationRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> ChapterBoundaryCoordinationResponse: ...
 
     def write_chapter(
         self,

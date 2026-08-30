@@ -108,6 +108,17 @@ def parse_json_content(text: str) -> object:
     raise ValueError("模型消息中没有可解析的 JSON")
 
 
+def unwrap_single_response_envelope(value: object) -> object:
+    """解包一层供应商常见的 result/data/response 外壳。"""
+
+    if isinstance(value, dict) and len(value) == 1:
+        for key in ("result", "data", "response"):
+            nested = value.get(key)
+            if isinstance(nested, (dict, list)):
+                return nested
+    return value
+
+
 def strip_removed_document_fields(value: object) -> object:
     """丢弃已从 4.1 契约删除的模型展示字段，保留其余结构校验。"""
 

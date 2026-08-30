@@ -722,7 +722,7 @@ def test_unknown_frame_returns_repairable_validation_error(tmp_path: Path) -> No
     )
 
 
-def test_qwen_validation_error_includes_safe_business_reason(tmp_path: Path) -> None:
+def test_qwen_drops_single_invalid_observation_without_repair(tmp_path: Path) -> None:
     run_root = tmp_path / "runs" / "scope_001" / "run_001"
     run_root.mkdir(parents=True)
     body = _valid_observation()
@@ -733,15 +733,37 @@ def test_qwen_validation_error_includes_safe_business_reason(tmp_path: Path) -> 
     def handler(request: httpx.Request) -> httpx.Response:
         return _provider_response(request, body)
 
-    with pytest.raises(ModelResponseValidationError) as raised:
-        _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
-            _request(run_root),
-            allowed_run_root=run_root,
+    result = _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+        _request(run_root),
+        allowed_run_root=run_root,
+    )
+
+    assert result.observations == ()
+
+
+def test_qwen_keeps_valid_observation_when_another_observation_is_invalid(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs" / "scope_001" / "run_001"
+    run_root.mkdir(parents=True)
+    valid = _valid_observation()["observations"][0]
+    assert isinstance(valid, dict)
+    invalid = dict(valid)
+    invalid["caption"] = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _provider_response(
+            request,
+            {"observations": [invalid, valid]},
         )
 
-    assert raised.value.invalid_response.validation_errors == (
-        "observations.0:value_error:INDEPENDENT 草稿不得引用转写证据",
+    result = _client(tmp_path, httpx.MockTransport(handler)).analyze_chapter(
+        _request(run_root),
+        allowed_run_root=run_root,
     )
+
+    assert len(result.observations) == 1
+    assert result.observations[0].caption == "画面文字"
 
 
 def test_qwen_normalizes_target_ids_from_selected_frame_bindings(tmp_path: Path) -> None:

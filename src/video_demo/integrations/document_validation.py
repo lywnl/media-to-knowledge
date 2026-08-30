@@ -33,14 +33,20 @@ def normalize_chapter_vision_response_data(
     frame_by_id = {frame.frame_id: frame for frame in request.frames}
     target_by_id = {target.target_id: target for target in request.targets}
     normalized_observations: list[object] = []
-    for raw_observation in value["observations"]:
+    for observation_index, raw_observation in enumerate(value["observations"]):
         if not isinstance(raw_observation, dict):
-            normalized_observations.append(raw_observation)
+            _log_dropped_observation(observation_index, "not_an_object")
             continue
         observation = dict(raw_observation)
         observation["content_blocks"] = _normalize_content_blocks(
             observation.get("content_blocks"),
-            selected_frame_ids=observation.get("selected_frame_ids"),
+            available_frame_ids=set(frame_by_id),
+        )
+        has_unknown_reference = _observation_contains_unknown_reference(
+            observation,
+            frame_ids=set(frame_by_id),
+            target_ids=set(target_by_id),
+            transcript_ids={item.evidence_id for item in request.transcript_evidence},
         )
         selected_ids = _string_tuple(observation.get("selected_frame_ids"))
         claimed_ids = _string_tuple(observation.get("target_ids"))
@@ -88,6 +94,16 @@ def normalize_chapter_vision_response_data(
                     for target_id in normalized_targets
                 ):
                     observation["relation_to_transcript"] = "INDEPENDENT"
+        try:
+            ChapterVisualObservation.model_validate(observation)
+        except ValidationError as error:
+            if has_unknown_reference:
+                # 引用闭包或跨字段契约错误交给统一响应校验，保留原始位置，
+                # 这样未知帧/目标/证据仍会按硬失败处理，而不是被静默丢弃。
+                normalized_observations.append(observation)
+                continue
+            _log_dropped_observation(observation_index, _validation_reason(error))
+            continue
         normalized_observations.append(observation)
     normalized = dict(value)
     normalized["observations"] = normalized_observations
@@ -97,13 +113,12 @@ def normalize_chapter_vision_response_data(
 def _normalize_content_blocks(
     value: object,
     *,
-    selected_frame_ids: object,
+    available_frame_ids: set[str],
 ) -> list[object]:
     """丢弃结构损坏的可选视觉块，但保留未知引用交给硬校验。"""
 
     if not isinstance(value, (list, tuple)):
         return []
-    selected_ids = set(_string_tuple(selected_frame_ids) or ())
     normalized: list[object] = []
     for block in value:
         if not isinstance(block, dict):
@@ -112,7 +127,7 @@ def _normalize_content_blocks(
             _VISUAL_CONTENT_BLOCK_ADAPTER.validate_python(block)
         except (TypeError, ValueError, ValidationError):
             source_ids = block.get("source_frame_ids")
-            if _contains_unknown_frame_reference(source_ids, selected_ids):
+            if _contains_unknown_frame_reference(source_ids, available_frame_ids):
                 normalized.append(block)
                 continue
             _LOGGER.warning("VLM 可选视觉内容块结构无效，已丢弃")
@@ -125,6 +140,66 @@ def _contains_unknown_frame_reference(value: object, selected_ids: set[str]) -> 
     if not isinstance(value, (list, tuple)):
         return False
     return any(not isinstance(frame_id, str) or frame_id not in selected_ids for frame_id in value)
+
+
+def _observation_contains_unknown_reference(
+    observation: dict[str, object],
+    *,
+    frame_ids: set[str],
+    target_ids: set[str],
+    transcript_ids: set[str],
+) -> bool:
+    if _has_unknown_id_values(observation.get("selected_frame_ids"), frame_ids):
+        return True
+    if _has_unknown_id_values(observation.get("target_ids"), target_ids):
+        return True
+    if _has_unknown_id_values(
+        observation.get("transcript_evidence_refs"),
+        transcript_ids,
+    ):
+        return True
+    for field in ("content_blocks", "visual_facts"):
+        blocks = observation.get(field)
+        if not isinstance(blocks, (list, tuple)):
+            continue
+        if any(
+            isinstance(block, dict)
+            and _has_unknown_id_values(block.get("source_frame_ids"), frame_ids)
+            for block in blocks
+        ):
+            return True
+    relations = observation.get("frame_relations")
+    if isinstance(relations, (list, tuple)):
+        for relation in relations:
+            if not isinstance(relation, dict):
+                continue
+            if any(
+                isinstance(relation.get(field), str)
+                and relation[field] not in frame_ids
+                for field in ("from_frame_id", "to_frame_id")
+            ):
+                return True
+    return False
+
+
+def _has_unknown_id_values(value: object, allowed: set[str]) -> bool:
+    if not isinstance(value, (list, tuple)):
+        return False
+    return any(isinstance(item, str) and item not in allowed for item in value)
+
+
+def _validation_reason(error: ValidationError) -> str:
+    first = error.errors()[0]
+    location = ".".join(str(item) for item in first.get("loc", ())) or "observation"
+    return f"{location}:{first.get('type', 'invalid')}"
+
+
+def _log_dropped_observation(observation_index: int, reason: str) -> None:
+    _LOGGER.warning(
+        "VLM 视觉观察已丢弃 observation_index=%d reason=%s",
+        observation_index,
+        reason,
+    )
 
 
 def _string_tuple(value: object) -> tuple[str, ...] | None:
