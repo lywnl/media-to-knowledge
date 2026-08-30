@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Literal, TypeVar
 
 from pydantic import ValidationError
 
 from video_demo.domain.base import FrozenModel, Sha256
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.speech.snapshots import AsrWindowSnapshotPayload
+from video_demo.storage.artifact_inspection import inspect_artifact
 from video_demo.storage.artifacts import (
     ArtifactReceipt,
     AtomicArtifactStore,
@@ -32,6 +33,13 @@ _CACHE_MISS_ERROR_CODES = frozenset(
         "ARTIFACT_UPSTREAM_MISMATCH",
     }
 )
+
+__all__ = [
+    "AsrWindowSnapshotStore",
+    "SnapshotPointer",
+    "SnapshotStore",
+    "inspect_artifact",
+]
 
 
 class SnapshotPointer(FrozenModel):
@@ -249,45 +257,6 @@ class SnapshotStore:
             ErrorCode.WORKSPACE_PATH_ESCAPE,
             "语音快照必须位于当前运行目录内",
         )
-
-
-def inspect_artifact(
-    store: AtomicArtifactStore,
-    relative_path: Path,
-    *,
-    schema_version: str,
-    upstream_sha256: str,
-    max_bytes: int,
-) -> tuple[ArtifactReceipt, dict[str, Any] | list[Any]]:
-    """按稳定路径读取规范 envelope，并为当前字节重建严格回执。"""
-
-    candidate = reject_symlink_components(
-        store.runtime_root,
-        store.runtime_root / relative_path,
-        message="快照产物路径非法",
-    )
-    if not candidate.is_file():
-        raise FileNotFoundError(candidate)
-    if max_bytes < 1:
-        raise ValueError("快照读取上限必须大于 0")
-    with candidate.open("rb") as stream:
-        encoded = stream.read(max_bytes + 1)
-    if len(encoded) > max_bytes:
-        raise ValueError("快照产物超过读取上限")
-    receipt = ArtifactReceipt(
-        relative_path=relative_path.as_posix(),
-        schema_version=schema_version,
-        sha256=hashlib.sha256(encoded).hexdigest(),
-        upstream_sha256=upstream_sha256,
-    )
-    payload = store.read_verified_json_limited(receipt, max_bytes=max_bytes)
-    if encoded != canonical_artifact_envelope_bytes(
-        payload,
-        schema_version,
-        upstream_sha256,
-    ):
-        raise ValueError("快照 envelope 不是规范编码")
-    return receipt, payload
 
 
 def _payload_schema_version(payload: FrozenModel) -> str:

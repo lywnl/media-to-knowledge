@@ -159,6 +159,18 @@ def test_audio_pipeline_does_not_name_video_cancellation_code() -> None:
     assert "VIDEO_PROCESS_CANCELLED" not in source
 
 
+def test_audio_asr_uses_audio_owned_algorithm_module() -> None:
+    pipeline_source = Path("src/video_demo/application/audio_pipeline.py").read_text(
+        encoding="utf-8",
+    )
+    whisper_source = Path("src/video_demo/integrations/cloud_whisper.py").read_text(
+        encoding="utf-8",
+    )
+    assert "video_demo.speech.asr import" not in pipeline_source
+    assert "video_demo.speech.audio_asr" in pipeline_source
+    assert "video_demo.speech.asr import" not in whisper_source
+
+
 def test_audio_query_uses_published_audio_consistency_path() -> None:
     source = Path("src/video_demo/application/audio_queries.py").read_text(encoding="utf-8")
     assert "self.publication.get(scope, run_id)" in source

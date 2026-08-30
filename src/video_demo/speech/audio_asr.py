@@ -12,8 +12,6 @@ from video_demo.speech.asr_contracts import (
     CloudAsrWindow,
     CloudAsrWindowProjection,
     RawAsrSegment,
-    WindowRecognizerPort,
-    WindowTranscriptionResult,
 )
 from video_demo.speech.language import LanguageSpan
 from video_demo.speech.vad import SpeechInterval
@@ -24,8 +22,6 @@ __all__ = [
     "CloudAsrWindow",
     "CloudAsrWindowProjection",
     "RawAsrSegment",
-    "WindowRecognizerPort",
-    "WindowTranscriptionResult",
     "build_cloud_asr_windows",
     "build_speech_segments",
     "project_cloud_asr_window",

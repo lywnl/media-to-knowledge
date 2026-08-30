@@ -14,7 +14,7 @@ import httpx
 
 from video_demo.config import CloudAsrConfiguration
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.speech.asr import RawAsrSegment, WindowTranscriptionResult
+from video_demo.speech.asr_contracts import RawAsrSegment, WindowTranscriptionResult
 from video_demo.storage.workspace import reject_symlink_components
 
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024

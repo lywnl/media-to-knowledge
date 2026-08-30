@@ -26,6 +26,7 @@ from video_demo.persistence.migrations import upgrade_runtime_database
 from video_demo.speech.vad import NativeSileroBackend, SileroVadAdapter
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.audio_object_store import AudioObjectStore
+from video_demo.storage.audio_snapshots import AudioAsrWindowSnapshotStore
 from video_demo.storage.document_cache import ModelInvocationIdentity
 from video_demo.worker.runtime import ReliableWorker
 
@@ -119,6 +120,9 @@ def build_audio_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
                 max_window_ms=cloud.max_window_ms,
                 overlap_ms=cloud.overlap_ms,
                 max_upload_bytes=cloud.max_upload_bytes,
+                window_store=AudioAsrWindowSnapshotStore(
+                    AtomicArtifactStore(runtime_root),
+                ),
             ),
             planner,
             writer,

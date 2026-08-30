@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,9 +24,21 @@ from video_demo.domain.base import Sha256, stable_identifier
 from video_demo.domain.evidence import SpeechSegment, SubtitleCue
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError, is_cancelled_error_code
-from video_demo.speech.asr import WindowRecognizerPort
+from video_demo.speech.asr_contracts import WindowRecognizerPort
+from video_demo.speech.audio_asr import (
+    build_cloud_asr_windows,
+    project_cloud_asr_window,
+    remove_adjacent_cloud_asr_duplicates,
+)
+from video_demo.speech.audio_snapshots import (
+    AudioAsrWindowSnapshotPayload,
+    audio_asr_window_fingerprint,
+)
 from video_demo.speech.vad import VadResult
+from video_demo.storage.audio_snapshots import AudioAsrWindowSnapshotStore
 from video_demo.storage.document_cache import DocumentModelCache
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class VadPort(Protocol):
@@ -76,6 +89,7 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
         max_window_ms: int,
         overlap_ms: int,
         max_upload_bytes: int,
+        window_store: AudioAsrWindowSnapshotStore | None = None,
     ) -> None:
         self._vad = cast(VadPort, vad)
         self._recognizer = cast(WindowRecognizerPort, recognizer)
@@ -83,6 +97,7 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
         self._max_window_ms = max_window_ms
         self._overlap_ms = overlap_ms
         self._max_upload_bytes = max_upload_bytes
+        self._window_store = window_store
 
     def analyze(
         self,
@@ -93,19 +108,20 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
         run_root: Path,
         is_cancel_requested: Callable[[], bool],
     ) -> AudioSpeechAnalysis:
-        from video_demo.speech.asr import (
-            build_cloud_asr_windows,
-            project_cloud_asr_window,
-            remove_adjacent_cloud_asr_duplicates,
-        )
-
         started_at = time.monotonic()
+        vad_started_at = time.monotonic()
         vad_result = self._vad.detect(source, duration_ms=duration_ms)
         windows = build_cloud_asr_windows(
             vad_result.speech,
             max_window_ms=self._max_window_ms,
             overlap_ms=self._overlap_ms,
             max_upload_bytes=self._max_upload_bytes,
+        )
+        _LOGGER.info(
+            "音频 ASR 分窗完成: windows=%d duration_ms=%d vad_elapsed=%.3fs",
+            len(windows),
+            duration_ms,
+            time.monotonic() - vad_started_at,
         )
         transcript: list[SpeechSegment] = []
         warnings = list(vad_result.warnings)
@@ -114,6 +130,16 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
         for index, window in enumerate(windows, start=1):
             if is_cancel_requested():
                 raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
+            window_started_at = time.monotonic()
+            _LOGGER.info(
+                "音频 ASR 窗口开始: index=%d/%d upload=%d-%dms owned=%d-%dms",
+                index,
+                len(windows),
+                window.upload_range.start_ms,
+                window.upload_range.end_ms,
+                window.owned_range.start_ms,
+                window.owned_range.end_ms,
+            )
             slice_id = stable_identifier(
                 "audio-slice",
                 {
@@ -123,6 +149,31 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
                 },
             )
             try:
+                fingerprint = audio_asr_window_fingerprint(
+                    run_root=run_root.as_posix(),
+                    window=window,
+                    language_hint=language_hint,
+                    prompt=prompt,
+                    max_window_ms=self._max_window_ms,
+                    overlap_ms=self._overlap_ms,
+                    max_upload_bytes=self._max_upload_bytes,
+                )
+                cached = (
+                    self._window_store.load(run_root, fingerprint)
+                    if self._window_store is not None
+                    else None
+                )
+                if cached is not None:
+                    transcript.extend(cached[0].segments)
+                    warnings.extend(cached[0].warnings)
+                    _LOGGER.info(
+                        "音频 ASR 窗口命中快照: index=%d/%d segments=%d elapsed=%.3fs",
+                        index,
+                        len(windows),
+                        len(cached[0].segments),
+                        time.monotonic() - window_started_at,
+                    )
+                    continue
                 audio_slice = self._slicer.create(
                     source,
                     run_root,
@@ -141,8 +192,29 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
                         raw_segments=result.segments,
                         warnings=result.warnings,
                     )
+                    if self._window_store is not None:
+                        self._window_store.publish(
+                            run_root,
+                            fingerprint,
+                            AudioAsrWindowSnapshotPayload(
+                                upload_range=window.upload_range,
+                                owned_range=window.owned_range,
+                                speech_interval=window.speech_interval,
+                                source_intervals=window.source_intervals,
+                                language_span=projection.language_span,
+                                segments=projection.segments,
+                                warnings=projection.warnings,
+                            ),
+                        )
                     transcript.extend(projection.segments)
                     warnings.extend(projection.warnings)
+                    _LOGGER.info(
+                        "音频 ASR 窗口完成: index=%d/%d segments=%d elapsed=%.3fs",
+                        index,
+                        len(windows),
+                        len(projection.segments),
+                        time.monotonic() - window_started_at,
+                    )
                 finally:
                     audio_slice.unlink(missing_ok=True)
             except VideoDemoError as error:
@@ -150,6 +222,13 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
                     if error.code == ErrorCode.JOB_CANCELLED:
                         raise
                     raise VideoDemoError(ErrorCode.JOB_CANCELLED, "音频分析已取消") from error
+                _LOGGER.warning(
+                    "音频 ASR 窗口降级: index=%d/%d code=%s elapsed=%.3fs",
+                    index,
+                    len(windows),
+                    error.code.value,
+                    time.monotonic() - window_started_at,
+                )
                 warnings.append(f"AUDIO_ASR_WINDOW_DEGRADED:{index}")
         ordered = remove_adjacent_cloud_asr_duplicates(tuple(transcript))
         transcript_source: Literal["ASR", "NONE"] = "ASR" if ordered else "NONE"
