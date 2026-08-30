@@ -18,7 +18,10 @@ def render_image_markdown(result: ImageUnderstandingResult) -> RenderedDocument:
         "",
     ]
     for block in result.document.content_blocks:
-        lines.extend((f"### {block.content_type}", "", block.text, ""))
+        if block.content_type == "DESCRIPTION":
+            lines.extend((block.text, ""))
+        else:
+            lines.extend((f"### {block.content_type}", "", block.text, ""))
     lines.extend(("## 关键结论", ""))
     for claim in result.document.claims:
         lines.append(f"- {claim.text}")
