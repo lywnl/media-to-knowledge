@@ -253,6 +253,50 @@ def test_audio_markdown_is_text_only_and_keeps_chapter_claim_heading() -> None:
     assert "retrieval_text" not in text
 
 
+def test_audio_markdown_deduplicates_summary_and_hides_evidence_ids() -> None:
+    evidence_id = "asr_evidence_001"
+    result = AudioUnderstandingResult(
+        run_id="run_audio_002",
+        asset_sha256="b" * 64,
+        summary=AudioDocumentSummary(
+            title="音频标题",
+            duration_ms=1_000,
+            overview_zh="音频概览",
+        ),
+        chapters=(
+            AudioChapter(
+                start_ms=0,
+                end_ms=1_000,
+                chapter_id="audio_chapter_002",
+                title="第一章",
+                title_evidence_refs=(evidence_id,),
+                summary_zh="同一段内容 [asr_evidence_001]",
+                summary_evidence_refs=(evidence_id,),
+                body_blocks=(
+                    AudioParagraphBlock(
+                        text="同一段内容 [asr_evidence_001]",
+                        evidence_refs=(evidence_id,),
+                    ),
+                ),
+                claims=(
+                    AudioGroundedClaim(
+                        text="结论 [asr_evidence_001]",
+                        evidence_refs=(evidence_id,),
+                        certainty=0.9,
+                    ),
+                ),
+                evidence_refs=(evidence_id,),
+                transcript_source="ASR",
+            ),
+        ),
+    )
+
+    text = render_audio_markdown(result).content.decode("utf-8")
+
+    assert "asr_evidence_001" not in text
+    assert text.count("同一段内容") == 1
+
+
 def test_audio_result_contract_has_no_visual_or_rag_fields() -> None:
     payload = _result().model_dump(mode="json")
     serialized = str(payload)

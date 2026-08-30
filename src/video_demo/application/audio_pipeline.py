@@ -233,7 +233,7 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
         ordered = remove_adjacent_cloud_asr_duplicates(tuple(transcript))
         transcript_source: Literal["ASR", "NONE"] = "ASR" if ordered else "NONE"
         boundaries = tuple(
-            AudioSpeechBoundaryCandidate(item.end_ms, "sentence_end", 1.0)
+            AudioSpeechBoundaryCandidate(item.end_ms, "sentence_end", 0.8)
             for item in ordered
             if 0 < item.end_ms < duration_ms
         )

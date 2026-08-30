@@ -172,8 +172,10 @@ class AudioChapterPlanner:
                 if response is not None
                 else _rule_drafts(request.segments, request.transcript_evidence, document_config)
             )
-        normalized = _merge_short_drafts(
-            tuple(drafts), segments, document_config.chapter_granularity
+        normalized = _normalize_draft_count(
+            _merge_short_drafts(tuple(drafts), segments, document_config.chapter_granularity),
+            segments,
+            self._max_chapters,
         )
         if len(normalized) > self._max_chapters:
             raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "音频章节数量超过上限")
@@ -350,19 +352,16 @@ def _rule_drafts(
     transcript: tuple[AudioTranscriptEvidence, ...],
     config: AudioDocumentConfig,
 ) -> tuple[AudioChapterDraft, ...]:
-    groups: list[list[AudioBaseSegment]] = []
-    target = _TARGET_DURATION_MS[config.chapter_granularity]
-    start = 0
-    while start < len(segments):
-        end = start + 1
-        while (
-            end < len(segments)
-            and segments[end].end_ms - segments[start].start_ms < target
-            and segments[end].end_ms - segments[start].start_ms <= _MAX_CHAPTER_DURATION_MS
-        ):
-            end += 1
-        groups.append(list(segments[start:end]))
-        start = end
+    groups = _group_segments_near_target(
+        segments,
+        _TARGET_DURATION_MS[config.chapter_granularity],
+    )
+    minimum = 120_000 if config.chapter_granularity == "coarse" else _MIN_CHAPTER_DURATION_MS
+    if len(groups) > 1 and (
+        groups[-1][-1].end_ms - groups[-1][0].start_ms < minimum
+        and groups[-1][-1].end_ms - groups[-2][0].start_ms <= _MAX_CHAPTER_DURATION_MS
+    ):
+        groups[-2].extend(groups.pop())
     evidence_by_id = {item.evidence_id: item for item in transcript}
     return tuple(
         AudioChapterDraft(
@@ -379,6 +378,32 @@ def _rule_drafts(
         )
         for index, group in enumerate(groups, 1)
     )
+
+
+def _group_segments_near_target(
+    segments: tuple[AudioBaseSegment, ...],
+    target_duration_ms: int,
+) -> list[list[AudioBaseSegment]]:
+    groups: list[list[AudioBaseSegment]] = []
+    start = 0
+    while start < len(segments):
+        best_end = start + 1
+        best_distance = abs(segments[start].duration_ms - target_duration_ms)
+        cursor = start + 1
+        while cursor < len(segments):
+            duration_ms = segments[cursor].end_ms - segments[start].start_ms
+            if duration_ms > _MAX_CHAPTER_DURATION_MS:
+                break
+            distance = abs(duration_ms - target_duration_ms)
+            if distance < best_distance:
+                best_end = cursor + 1
+                best_distance = distance
+            if duration_ms >= target_duration_ms:
+                break
+            cursor += 1
+        groups.append(list(segments[start:best_end]))
+        start = best_end
+    return groups
 
 
 def _merge_short_drafts(
@@ -403,6 +428,48 @@ def _merge_short_drafts(
                 continue
         index += 1
     return tuple(normalized)
+
+
+def _normalize_draft_count(
+    drafts: tuple[AudioChapterDraft, ...],
+    segments: tuple[AudioBaseSegment, ...],
+    maximum: int,
+) -> tuple[AudioChapterDraft, ...]:
+    if len(drafts) <= maximum:
+        return drafts
+    by_id = {item.segment_id: item for item in segments}
+    normalized = list(drafts)
+    while len(normalized) > maximum:
+        merge_at = next(
+            (
+                index
+                for index in range(len(normalized) - 1)
+                if _draft_duration(normalized[index], normalized[index + 1], by_id)
+                <= _MAX_CHAPTER_DURATION_MS
+            ),
+            None,
+        )
+        if merge_at is None:
+            raise VideoDemoError(
+                ErrorCode.INPUT_BUDGET_EXCEEDED,
+                "音频章节数量超过上限且无法安全合并",
+            )
+        left, right = normalized[merge_at : merge_at + 2]
+        normalized[merge_at : merge_at + 2] = [
+            AudioChapterDraft(
+                segment_refs=(*left.segment_refs, *right.segment_refs),
+                title_hint=left.title_hint,
+            ),
+        ]
+    return tuple(normalized)
+
+
+def _draft_duration(
+    left: AudioChapterDraft,
+    right: AudioChapterDraft,
+    by_id: dict[str, AudioBaseSegment],
+) -> int:
+    return by_id[right.segment_refs[-1]].end_ms - by_id[left.segment_refs[0]].start_ms
 
 
 def _materialize(

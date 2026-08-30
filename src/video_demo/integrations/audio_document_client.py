@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable
 from typing import TypeVar
@@ -37,6 +38,9 @@ from video_demo.integrations.model_response import (
 )
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
+_LOGGER = logging.getLogger(__name__)
+_DEFAULT_MAX_OUTPUT_TOKENS = 8_192
+_COMPACT_PLANNING_MIN_OUTPUT_TOKENS = 1_024
 
 
 class _CompactDraft(BaseModel):
@@ -86,6 +90,8 @@ class AudioDocumentClient(AudioDocumentTextPort):
             _CompactResponse,
             "audio_chapter_planning_v1",
             on_provider_attempt,
+            max_output_tokens=_compact_planning_output_tokens(len(request.segments)),
+            extra_payload={"thinking": {"type": "disabled"}},
         )
         return _expand_planning_response(compact, request)
 
@@ -100,6 +106,8 @@ class AudioDocumentClient(AudioDocumentTextPort):
             _CompactResponse,
             "audio_chapter_planning_repair_v1",
             on_provider_attempt,
+            max_output_tokens=_compact_planning_output_tokens(len(request.request.segments)),
+            extra_payload={"thinking": {"type": "disabled"}},
         )
         return _expand_planning_response(compact, request.request)
 
@@ -114,6 +122,7 @@ class AudioDocumentClient(AudioDocumentTextPort):
             AudioChapterWritingResponse,
             "audio_chapter_writing_v1",
             on_provider_attempt,
+            extra_payload={"thinking": {"type": "disabled"}},
         )
 
     def repair_chapter_writing(
@@ -127,6 +136,7 @@ class AudioDocumentClient(AudioDocumentTextPort):
             AudioChapterWritingResponse,
             "audio_chapter_writing_repair_v1",
             on_provider_attempt,
+            extra_payload={"thinking": {"type": "disabled"}},
         )
 
     def organize_document(
@@ -140,6 +150,7 @@ class AudioDocumentClient(AudioDocumentTextPort):
             AudioGlobalWritingResponse,
             "audio_global_writing_v1",
             on_provider_attempt,
+            extra_payload={"thinking": {"type": "disabled"}},
         )
 
     def repair_global_writing(
@@ -153,6 +164,7 @@ class AudioDocumentClient(AudioDocumentTextPort):
             AudioGlobalWritingResponse,
             "audio_global_writing_repair_v1",
             on_provider_attempt,
+            extra_payload={"thinking": {"type": "disabled"}},
         )
 
     def _call(
@@ -161,12 +173,15 @@ class AudioDocumentClient(AudioDocumentTextPort):
         response_type: type[ResponseModel],
         schema_name: str,
         callback: Callable[[], None] | None,
+        *,
+        max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
+        extra_payload: dict[str, object] | None = None,
     ) -> ResponseModel:
         version, instruction, data = prompt
         payload = {
             "model": self._model_id,
             "temperature": 0,
-            "max_tokens": 8192,
+            "max_tokens": max_output_tokens,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -180,7 +195,21 @@ class AudioDocumentClient(AudioDocumentTextPort):
                 {"role": "user", "content": "UNTRUSTED_AUDIO_CONTEXT_JSON\n" + data},
             ],
         }
-        raw = self._post(payload, callback)
+        if extra_payload:
+            payload.update(extra_payload)
+        try:
+            raw = self._post(payload, callback)
+        except VideoDemoError as error:
+            if error.code != ErrorCode.TEXT_LLM_CAPABILITY_UNAVAILABLE:
+                raise
+            # 部分 OpenAI 兼容代理不接受 json_schema；退到 json_object 后仍由
+            # 本地宽松 JSON 解析和音频业务校验收口，不把一次能力差异变成章节兜底。
+            _LOGGER.warning(
+                "音频文本模型不支持 json_schema，改用 json_object: schema=%s",
+                schema_name,
+            )
+            payload["response_format"] = {"type": "json_object"}
+            raw = self._post(payload, callback)
         try:
             envelope = json.loads(raw)
             message = extract_model_message_content(envelope)
@@ -195,36 +224,61 @@ class AudioDocumentClient(AudioDocumentTextPort):
     def _post(self, payload: dict[str, object], callback: Callable[[], None] | None) -> bytes:
         last_error: VideoDemoError | None = None
         for attempt in range(1, self._attempts + 1):
+            started_at = time.monotonic()
+            status_code: int | None = None
             try:
                 if callback:
                     callback()
-                response = self._http.post(
+                with self._http.stream(
+                    "POST",
                     self._endpoint,
                     headers={"Authorization": f"Bearer {self._api_key}"},
                     json=payload,
                     timeout=self._timeout,
+                ) as response:
+                    status_code = response.status_code
+                    _raise_response_status(response)
+                    chunks: list[bytes] = []
+                    size = 0
+                    for chunk in response.iter_bytes():
+                        size += len(chunk)
+                        if size > self._max_response_bytes:
+                            raise VideoDemoError(
+                                ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+                                "音频文本模型响应超过大小上限",
+                            )
+                        chunks.append(chunk)
+                    content = b"".join(chunks)
+                _LOGGER.info(
+                    "音频文本模型请求成功: schema=%s attempt=%d status=%s "
+                    "response_bytes=%d elapsed=%.3fs",
+                    _schema_name(payload),
+                    attempt,
+                    status_code,
+                    len(content),
+                    time.monotonic() - started_at,
                 )
-                if response.status_code >= 400:
-                    if response.status_code in {401, 403}:
-                        raise VideoDemoError(
-                            ErrorCode.TEXT_LLM_AUTHENTICATION_FAILED, "文本模型鉴权失败"
-                        )
-                    raise VideoDemoError(
-                        ErrorCode.DEPENDENCY_TEMPORARY_FAILURE, "文本模型暂时不可用"
-                    )
-                content = response.content
-                if len(content) > self._max_response_bytes:
-                    raise VideoDemoError(
-                        ErrorCode.TEXT_LLM_RESPONSE_INVALID, "音频文本模型响应超过大小上限"
-                    )
                 return content
             except (httpx.RequestError, TimeoutError) as error:
+                _LOGGER.warning(
+                    "音频文本模型请求失败: attempt=%d status=%s category=network elapsed=%.3fs",
+                    attempt,
+                    status_code,
+                    time.monotonic() - started_at,
+                )
                 last_error = VideoDemoError(
                     ErrorCode.DEPENDENCY_TEMPORARY_FAILURE, "文本模型暂时不可用"
                 )
                 if attempt == self._attempts:
                     raise last_error from error
             except VideoDemoError as error:
+                _LOGGER.warning(
+                    "音频文本模型请求失败: attempt=%d status=%s code=%s elapsed=%.3fs",
+                    attempt,
+                    status_code,
+                    error.code.value,
+                    time.monotonic() - started_at,
+                )
                 if (
                     error.code != ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
                     or attempt == self._attempts
@@ -233,6 +287,41 @@ class AudioDocumentClient(AudioDocumentTextPort):
                 last_error = error
             self._sleeper(min(2 ** (attempt - 1), 4))
         raise last_error or RuntimeError("音频模型调用状态非法")
+
+
+def _schema_name(payload: dict[str, object]) -> str:
+    response_format = payload.get("response_format")
+    if not isinstance(response_format, dict):
+        return "unknown"
+    schema = response_format.get("json_schema")
+    if not isinstance(schema, dict):
+        return "json_object"
+    name = schema.get("name")
+    return name if isinstance(name, str) and name else "unknown"
+
+
+def _compact_planning_output_tokens(segment_count: int) -> int:
+    if segment_count < 1:
+        raise ValueError("音频章节规划批次至少包含一个片段")
+    return min(
+        _DEFAULT_MAX_OUTPUT_TOKENS,
+        max(_COMPACT_PLANNING_MIN_OUTPUT_TOKENS, segment_count * 192),
+    )
+
+
+def _raise_response_status(response: httpx.Response) -> None:
+    if response.status_code < 400:
+        return
+    if response.status_code in {401, 403}:
+        raise VideoDemoError(ErrorCode.TEXT_LLM_AUTHENTICATION_FAILED, "文本模型鉴权失败")
+    if response.status_code in {408, 429} or response.status_code >= 500:
+        raise VideoDemoError(ErrorCode.DEPENDENCY_TEMPORARY_FAILURE, "文本模型暂时不可用")
+    if response.status_code in {404, 415, 422}:
+        raise VideoDemoError(
+            ErrorCode.TEXT_LLM_CAPABILITY_UNAVAILABLE,
+            "文本模型或结构化输出能力不可用",
+        )
+    raise VideoDemoError(ErrorCode.TEXT_LLM_RESPONSE_INVALID, "文本模型请求被拒绝")
 
 
 def _expand_planning_response(

@@ -82,6 +82,50 @@ def test_audio_client_expands_compact_ranges_and_uses_audio_schema() -> None:
     assert "keyframe" not in encoded.lower()
 
 
+def test_audio_client_copies_video_latency_payload_settings() -> None:
+    captured: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "chapter_drafts": [
+                                        {
+                                            "start_segment_index": 0,
+                                            "end_segment_index": 3,
+                                            "title_hint": "主题",
+                                        },
+                                    ],
+                                },
+                            ),
+                        },
+                    },
+                ],
+            },
+            request=request,
+        )
+
+    client = AudioDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="secret",
+        model_id="text-model",
+        max_attempts=1,
+        sleeper=lambda _delay: None,
+    )
+    client.plan_chapters(_planning_request())
+
+    assert captured[0]["thinking"] == {"type": "disabled"}
+    assert captured[0]["max_tokens"] == 1_024
+
+
 def _client_for_body(body: dict[str, object]) -> AudioDocumentClient:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

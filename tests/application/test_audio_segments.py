@@ -55,3 +55,29 @@ def test_audio_segments_cover_timeline_without_scene_references() -> None:
         "asr_001",
         "asr_002",
     }
+
+
+def test_audio_segments_keep_dense_asr_boundaries_sparse() -> None:
+    transcript = tuple(
+        _speech(f"asr_{index:03d}", index * 1_000, (index + 1) * 1_000)
+        for index in range(120)
+    )
+    boundaries = tuple(
+        SpeechBoundaryCandidate((index + 1) * 1_000, "sentence_end", 0.8)
+        for index in range(119)
+    )
+
+    segments = build_audio_segments(
+        "a" * 64,
+        120_000,
+        transcript,
+        boundaries,
+        _limits(),
+    )
+
+    assert len(segments) <= 6
+    assert segments[0].start_ms == 0
+    assert segments[-1].end_ms == 120_000
+    assert tuple(
+        ref for segment in segments for ref in segment.evidence_refs
+    ) == tuple(item.evidence_id for item in transcript)

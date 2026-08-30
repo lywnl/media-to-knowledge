@@ -13,17 +13,23 @@ from typing import Literal
 
 from pydantic import Field
 
-from video_demo.application.audio_rendering import RenderedAudioDocument, render_audio_markdown
+from video_demo.application.audio_rendering import (
+    RenderedAudioDocument,
+    clean_audio_text,
+    render_audio_markdown,
+)
 from video_demo.domain.audio_document import (
     AudioChapter,
     AudioDocumentSummary,
     AudioUnderstandingResult,
 )
 from video_demo.domain.audio_plan import (
+    AudioBulletListBlock,
     AudioChapterPlan,
     AudioDocumentConfig,
     AudioGroundedClaim,
     AudioParagraphBlock,
+    AudioQuoteBlock,
     AudioTranscriptEvidence,
 )
 from video_demo.domain.base import FrozenModel, Sha256, StableId
@@ -40,6 +46,9 @@ from video_demo.integrations.audio_document_port import (
     AudioInvalidModelResponse,
 )
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
+
+_DETAIL_BODY_LIMITS = {"concise": 800, "standard": 2_000, "detailed": 4_000}
+_DETAIL_SUMMARY_LIMITS = {"concise": 160, "standard": 300, "detailed": 500}
 
 
 class AudioWritingContext(FrozenModel):
@@ -190,7 +199,10 @@ class AudioDocumentWriter:
             ):
                 repaired = False
                 try:
-                    response = self._port.write_chapter(request, on_provider_attempt=None)
+                    response = self._port.write_chapter(
+                        request,
+                        on_provider_attempt=None,
+                    )
                     _validate_response(response, request)
                 except (ValueError, TypeError, VideoDemoError) as error:
                     if isinstance(error, VideoDemoError) and not _is_response_invalid(error):
@@ -339,6 +351,24 @@ def _validate_response(
     )
     if not set(refs) <= allowed:
         raise ValueError("音频写作响应引用未知证据")
+    if response.body_blocks and _response_body_characters(response) > _DETAIL_BODY_LIMITS[
+        request.document_config.detail_level
+    ]:
+        raise ValueError("音频章节正文超过配置字符预算")
+    if len(response.summary_zh) > _DETAIL_SUMMARY_LIMITS[request.document_config.detail_level]:
+        raise ValueError("音频章节摘要超过配置字符预算")
+
+
+def _response_body_characters(response: AudioChapterWritingResponse) -> int:
+    body = 0
+    for block in response.body_blocks:
+        if isinstance(block, (AudioParagraphBlock, AudioQuoteBlock)):
+            body += len(block.text)
+        elif isinstance(block, AudioBulletListBlock):
+            body += sum(len(item) for item in block.items)
+        else:
+            body += len(str(block))
+    return body + sum(len(claim.text) for claim in response.claims)
 
 
 def _validate_global_response(response: AudioGlobalWritingResponse) -> None:
@@ -353,6 +383,8 @@ def _is_response_invalid(error: VideoDemoError) -> bool:
 def _materialize_chapter(
     plan: AudioChapterPlan, response: AudioChapterWritingResponse, source: str
 ) -> AudioChapter:
+    response = _normalize_audio_response(response)
+    response = _ensure_audio_chapter_claims(response)
     refs = tuple(
         dict.fromkeys(
             (
@@ -383,24 +415,93 @@ def _fallback_chapter(
     plan: AudioChapterPlan, evidence: tuple[AudioTranscriptEvidence, ...], source: str
 ) -> AudioChapter:
     refs = tuple(item.evidence_id for item in evidence)
-    text = " ".join(item.text for item in evidence)[:4_000] or plan.title_hint
-    paragraph = AudioParagraphBlock(text=text, evidence_refs=refs[:32]) if refs else None
-    return AudioChapter(
-        chapter_id=plan.chapter_id,
-        start_ms=plan.start_ms,
-        end_ms=plan.end_ms,
+    body_limit = _DETAIL_BODY_LIMITS["standard"]
+    blocks: list[AudioParagraphBlock] = []
+    for start in range(0, len(evidence), 32):
+        remaining = body_limit - sum(len(item.text) for item in blocks)
+        if remaining < 1:
+            break
+        batch = evidence[start : start + 32]
+        text = " ".join(item.text for item in batch)[:remaining]
+        if text:
+            blocks.append(
+                AudioParagraphBlock(
+                    text=clean_audio_text(text),
+                    evidence_refs=tuple(item.evidence_id for item in batch),
+                ),
+            )
+    summary = (
+        _first_audio_summary_sentence(blocks[0].text)
+        if blocks
+        else plan.title_hint
+    )[: _DETAIL_SUMMARY_LIMITS["standard"]]
+    response = AudioChapterWritingResponse(
         title=plan.title_hint,
         title_evidence_refs=refs[:1],
-        summary_zh=text[:4_000],
+        summary_zh=summary,
         summary_evidence_refs=refs[:1],
-        body_blocks=(paragraph,) if paragraph else (),
-        claims=(AudioGroundedClaim(text=text[:2_000], evidence_refs=refs[:1], certainty=0.6),)
-        if refs
-        else (),
-        evidence_refs=refs,
-        transcript_source=source if refs else "NONE",
-        content_status="GROUNDED" if refs else "NO_SEMANTIC_EVIDENCE",
+        body_blocks=tuple(blocks),
+        claims=(),
     )
+    return _materialize_chapter(plan, response, source)
+
+
+def _normalize_audio_response(
+    response: AudioChapterWritingResponse,
+) -> AudioChapterWritingResponse:
+    blocks = tuple(_normalize_audio_block(block) for block in response.body_blocks)
+    claims = tuple(
+        claim.model_copy(update={"text": clean_audio_text(claim.text)})
+        for claim in response.claims
+    )
+    return response.model_copy(
+        update={
+            "title": clean_audio_text(response.title),
+            "summary_zh": clean_audio_text(response.summary_zh),
+            "body_blocks": blocks,
+            "claims": claims,
+        },
+    )
+
+
+def _normalize_audio_block(block: object) -> object:
+    if isinstance(block, (AudioParagraphBlock, AudioQuoteBlock)):
+        return block.model_copy(update={"text": clean_audio_text(block.text)})
+    if isinstance(block, AudioBulletListBlock):
+        return block.model_copy(
+            update={"items": tuple(clean_audio_text(item) for item in block.items)},
+        )
+    return block
+
+
+def _ensure_audio_chapter_claims(
+    response: AudioChapterWritingResponse,
+) -> AudioChapterWritingResponse:
+    """模型漏返结论时，沿用章节摘要补出最小可验证结论。"""
+
+    if response.claims or not response.summary_zh.strip():
+        return response
+    evidence_refs = response.summary_evidence_refs or response.title_evidence_refs
+    if not evidence_refs:
+        return response
+    return response.model_copy(
+        update={
+            "claims": (
+                AudioGroundedClaim(
+                    text=_first_audio_summary_sentence(response.summary_zh),
+                    evidence_refs=evidence_refs,
+                    certainty=0.7,
+                ),
+            ),
+        },
+    )
+
+
+def _first_audio_summary_sentence(summary: str) -> str:
+    for index, character in enumerate(summary):
+        if character in "。!?\uFF01\uFF1F":
+            return summary[: index + 1]
+    return summary[:2_000]
 
 
 def _fallback_overview(chapters: tuple[AudioChapter, ...]) -> str:

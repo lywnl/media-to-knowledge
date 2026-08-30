@@ -6,7 +6,7 @@ import re
 
 from pydantic import Field
 
-from video_demo.domain.audio_document import AudioUnderstandingResult
+from video_demo.domain.audio_document import AudioChapter, AudioUnderstandingResult
 from video_demo.domain.audio_plan import (
     AudioBulletListBlock,
     AudioCodeBlock,
@@ -19,6 +19,11 @@ from video_demo.domain.base import FrozenModel, Sha256
 
 _MARKDOWN_SPECIAL_PATTERN = re.compile(r"([\\`*_\[\]{}()#|>!])")
 _LEADING_BLOCK_PATTERN = re.compile(r"^(\s*)([-+*]\s|\d+[.)]\s)")
+_EVIDENCE_MARKER_PATTERN = re.compile(
+    r"(?:\\?\[\s*(?:asr|subtitle)_[A-Za-z0-9_-]{3,}\s*\\?\]"
+    r"|(?:asr|subtitle)_[A-Za-z0-9_-]{3,})",
+    re.IGNORECASE,
+)
 
 
 class RenderedAudioDocument(FrozenModel):
@@ -50,7 +55,7 @@ def render_audio_markdown(result: AudioUnderstandingResult) -> RenderedAudioDocu
         lines.extend(
             (f"时间：{_format_time(chapter.start_ms)} - {_format_time(chapter.end_ms)}", ""),
         )
-        if chapter.summary_zh:
+        if chapter.summary_zh and not _summary_repeats_body(chapter):
             lines.extend((_escape(chapter.summary_zh), ""))
         for block in chapter.body_blocks:
             _render_block(lines, block)
@@ -90,8 +95,31 @@ def _render_block(lines: list[str], block: object) -> None:
 
 
 def _escape(value: str) -> str:
-    escaped = _MARKDOWN_SPECIAL_PATTERN.sub(r"\\\1", html.escape(value, quote=True))
+    cleaned = clean_audio_text(value)
+    escaped = _MARKDOWN_SPECIAL_PATTERN.sub(r"\\\1", html.escape(cleaned, quote=True))
     return "\n".join(_LEADING_BLOCK_PATTERN.sub(r"\1\\\2", line) for line in escaped.splitlines())
+
+
+def clean_audio_text(value: str) -> str:
+    """清除模型误写进自然语言的内部证据标识。"""
+
+    cleaned = _EVIDENCE_MARKER_PATTERN.sub("", value)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r" +([，。；：、,.!?\uFF01\uFF1F])", r"\1", cleaned)
+    return cleaned.strip()
+
+
+def _summary_repeats_body(chapter: AudioChapter) -> bool:
+    body_text = " ".join(
+        block.text
+        for block in chapter.body_blocks
+        if isinstance(block, (AudioParagraphBlock, AudioQuoteBlock))
+    )
+    return bool(body_text) and _normalize_text(chapter.summary_zh) == _normalize_text(body_text)
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join(clean_audio_text(value).split())
 
 
 def _format_time(milliseconds: int) -> str:
