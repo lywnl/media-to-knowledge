@@ -8,6 +8,7 @@ from video_demo.integrations.audio_document_port import (
     AudioChapterPlanRepairRequest,
     AudioChapterWritingRepairRequest,
     AudioChapterWritingRequest,
+    AudioGlobalWritingRepairRequest,
     AudioGlobalWritingRequest,
 )
 
@@ -78,6 +79,26 @@ def prompt_for_audio_global(request: AudioGlobalWritingRequest) -> tuple[str, st
             "title_hint": request.title_hint,
             "duration_ms": request.duration_ms,
             "chapters": [item.model_dump(mode="json") for item in request.chapters],
+        },
+    )
+
+
+def prompt_for_audio_global_repair(
+    request: AudioGlobalWritingRepairRequest,
+) -> tuple[str, str, str]:
+    return _prompt(
+        request.prompt_version,
+        (
+            "只修复音频核心概览的文字结构；只能依据已验证的章节标题和摘要，"
+            "不得添加事实。只返回 overview_zh。"
+        ),
+        {
+            "title_hint": request.request.title_hint,
+            "duration_ms": request.request.duration_ms,
+            "chapters": [
+                item.model_dump(mode="json") for item in request.request.chapters
+            ],
+            "invalid_response": request.invalid_response.model_dump(mode="json"),
         },
     )
 

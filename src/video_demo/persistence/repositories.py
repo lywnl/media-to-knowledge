@@ -2,14 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from importlib import import_module
 from typing import Any, cast
 
 from sqlalchemy import Select, and_, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
+import video_demo.domain as _domain_package
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.persistence.document_repository import ResultRepository, Scope
 from video_demo.persistence.models import (
     JobModel,
     JobStatus,
@@ -20,8 +21,20 @@ from video_demo.persistence.models import (
     VideoSummaryModel,
     VideoUnderstandingRunModel,
 )
+from video_demo.persistence.scope import Scope
 
 _SENSITIVE_KEY_PARTS = ("secret", "token", "api_key", "apikey", "authorization", "password")
+
+# 保持生产导入闭包对领域包的历史可见性；不触发任何视频契约加载。
+_ = _domain_package
+
+
+def __getattr__(name: str) -> object:
+    if name == "ResultRepository":
+        value = getattr(import_module("video_demo.persistence.document_repository"), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1095,7 +1108,6 @@ __all__ = [
     "ClaimedJob",
     "JobRepository",
     "PublishedRunCleanupRecord",
-    "ResultRepository",
     "RunRecord",
     "Scope",
     "VideoObjectRepository",

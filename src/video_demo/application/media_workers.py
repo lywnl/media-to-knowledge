@@ -19,7 +19,8 @@ from video_demo.persistence.models import (
     ImageUnderstandingRunModel,
     RunStatusValue,
 )
-from video_demo.persistence.repositories import ClaimedJob, JobRepository, Scope
+from video_demo.persistence.repositories import ClaimedJob, JobRepository
+from video_demo.persistence.scope import Scope
 from video_demo.storage.image_object_store import ImageObjectStore
 from video_demo.storage.media_object_store import MediaObjectRecord
 

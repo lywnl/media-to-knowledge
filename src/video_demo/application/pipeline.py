@@ -22,7 +22,7 @@ from video_demo.application.pipeline_contracts import (
     pipeline_run_config_from_snapshot as pipeline_run_config_from_snapshot,
 )
 from video_demo.application.queries import ResultQueryService
-from video_demo.domain.document import sanitize_document_title
+from video_demo.domain.title import sanitize_document_title
 from video_demo.errors import ErrorCode, VideoDemoError, is_retryable_error_code
 from video_demo.persistence.database import Database
 from video_demo.persistence.models import RunStatusValue

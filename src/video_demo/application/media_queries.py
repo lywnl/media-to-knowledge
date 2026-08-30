@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from video_demo.application.media_publication import MediaPublicationService
-from video_demo.persistence.repositories import Scope
+from video_demo.persistence.scope import Scope
 
 
 @dataclass(frozen=True, slots=True)

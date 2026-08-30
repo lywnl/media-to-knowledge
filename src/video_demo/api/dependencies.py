@@ -14,7 +14,7 @@ from video_demo.application.queries import ResultQueryService
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
 from video_demo.persistence.database import Database
-from video_demo.persistence.repositories import Scope
+from video_demo.persistence.scope import Scope
 from video_demo.storage.object_store import LocalVideoObjectStore
 
 

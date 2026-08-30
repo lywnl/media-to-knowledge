@@ -13,7 +13,7 @@ from video_demo.persistence.models import (
     RunStatusValue,
     VideoObjectStatus,
 )
-from video_demo.persistence.repositories import Scope
+from video_demo.persistence.scope import Scope
 
 
 def _scope_where(statement: Select[Any], model: type[Any], scope: Scope) -> Select[Any]:

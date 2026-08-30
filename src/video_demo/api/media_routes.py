@@ -7,42 +7,38 @@ from fastapi import APIRouter, Depends, File, Response, UploadFile, status
 
 from video_demo.api.dependencies import AppContainer, get_container, get_scope
 from video_demo.api.schemas import (
-    CreateAudioRunRequest,
     CreateMediaRunRequest,
     MediaObjectResponse,
     MediaRunHistoryItem,
     MediaRunHistoryResponse,
     MediaRunResponse,
-    PublicAudioUnderstandingResult,
     PublicImageUnderstandingResult,
 )
 from video_demo.application.media_runs import MediaRunService
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.media_repositories import MediaObjectRepository
-from video_demo.persistence.models import AudioObjectModel, ImageObjectModel
-from video_demo.persistence.repositories import Scope
+from video_demo.persistence.models import ImageObjectModel
+from video_demo.persistence.scope import Scope
 
 MediaUploadFile = Annotated[UploadFile, File()]
 MediaScope = Annotated[Scope, Depends(get_scope)]
 MediaContainer = Annotated[AppContainer, Depends(get_container)]
 
 
-def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
-    label = "音频" if kind == "AUDIO" else "图片"
-    object_model = AudioObjectModel if kind == "AUDIO" else ImageObjectModel
-    result_model = (
-        PublicAudioUnderstandingResult
-        if kind == "AUDIO"
-        else PublicImageUnderstandingResult
-    )
-    object_prefix = kind.lower()
+def build_media_router(kind: Literal["IMAGE"] = "IMAGE") -> APIRouter:
+    """构造图片路由；音频路由位于独立的 audio_routes 模块。"""
+
+    if kind != "IMAGE":
+        raise ValueError("媒体路由只接受 IMAGE")
+    label = "图片"
+    object_model = ImageObjectModel
     router = APIRouter(
-        prefix=f"/api/kb/knowledge-bases/{{kb_id}}/{object_prefix}",
+        prefix="/api/kb/knowledge-bases/{kb_id}/image",
         tags=[f"{label}理解"],
     )
 
     def service(container: AppContainer) -> MediaRunService:
-        return container.media_run_services[kind]
+        return container.media_run_services["IMAGE"]
 
     @router.post(
         "-objects",
@@ -54,7 +50,7 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
         scope: MediaScope,
         container: MediaContainer,
     ) -> MediaObjectResponse:
-        upload = container.media_upload_services[kind]
+        upload = container.media_upload_services["IMAGE"]
         record = upload.upload(file.file, file.filename or "", file.content_type or "", scope)
         return MediaObjectResponse(
             object_ref=record.object_ref,
@@ -74,12 +70,7 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
         with container.database.session() as session:
             model = MediaObjectRepository(session, object_model).get(scope, object_ref)
             if model is None:
-                code = (
-                    ErrorCode.AUDIO_OBJECT_NOT_FOUND
-                    if kind == "AUDIO"
-                    else ErrorCode.IMAGE_OBJECT_NOT_FOUND
-                )
-                raise VideoDemoError(code, f"{label}对象不存在")
+                raise VideoDemoError(ErrorCode.IMAGE_OBJECT_NOT_FOUND, f"{label}对象不存在")
             return MediaObjectResponse(
                 object_ref=model.object_ref,
                 original_filename=model.original_filename,
@@ -89,30 +80,17 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
                 sha256=model.sha256,
             )
 
-    if kind == "AUDIO":
-        @router.post(
-            "-understanding-runs",
-            response_model=MediaRunResponse,
-            status_code=status.HTTP_202_ACCEPTED,
-        )
-        def create_audio_run(
-            payload: CreateAudioRunRequest,
-            scope: MediaScope,
-            container: MediaContainer,
-        ) -> MediaRunResponse:
-            return _create_media_run(payload, scope, container, service)
-    else:
-        @router.post(
-            "-understanding-runs",
-            response_model=MediaRunResponse,
-            status_code=status.HTTP_202_ACCEPTED,
-        )
-        def create_image_run(
-            payload: CreateMediaRunRequest,
-            scope: MediaScope,
-            container: MediaContainer,
-        ) -> MediaRunResponse:
-            return _create_media_run(payload, scope, container, service)
+    @router.post(
+        "-understanding-runs",
+        response_model=MediaRunResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def create_image_run(
+        payload: CreateMediaRunRequest,
+        scope: MediaScope,
+        container: MediaContainer,
+    ) -> MediaRunResponse:
+        return _create_media_run(payload, scope, container, service)
 
     @router.get("-understanding-runs", response_model=MediaRunHistoryResponse)
     def list_runs(
@@ -134,14 +112,17 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
     ) -> MediaRunResponse:
         return _run_response(service(container).get(scope, run_id))
 
-    @router.get("-understanding-runs/{run_id}/result", response_model=result_model)
+    @router.get(
+        "-understanding-runs/{run_id}/result",
+        response_model=PublicImageUnderstandingResult,
+    )
     def get_result(
         run_id: str,
         scope: MediaScope,
         container: MediaContainer,
     ) -> object:
-        result = container.media_query_services[kind].get_result(scope, run_id)
-        return _public_media_result(result, kind)
+        result = container.media_query_services["IMAGE"].get_result(scope, run_id)
+        return _public_media_result(result)
 
     @router.get("-understanding-runs/{run_id}/document")
     def get_document(
@@ -150,7 +131,7 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
         container: MediaContainer,
     ) -> Response:
         return Response(
-            content=container.media_query_services[kind].get_document(scope, run_id),
+            content=container.media_query_services["IMAGE"].get_document(scope, run_id),
             media_type="text/markdown; charset=utf-8",
             headers={"Content-Disposition": 'inline; filename="knowledge-note.md"'},
         )
@@ -159,7 +140,7 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
 
 
 def _create_media_run(
-    payload: CreateAudioRunRequest | CreateMediaRunRequest,
+    payload: CreateMediaRunRequest,
     scope: Scope,
     container: AppContainer,
     service: object,
@@ -188,14 +169,13 @@ def _run_response(view: object) -> MediaRunResponse:
     )
 
 
-def _public_media_result(result: object, kind: Literal["AUDIO", "IMAGE"]) -> object:
+def _public_media_result(result: object) -> object:
     """将内部结果映射到不含运行目录路径的公开响应契约。"""
 
     if not hasattr(result, "model_dump"):
         raise TypeError("媒体结果必须是 Pydantic 模型")
     payload = result.model_dump(mode="json", exclude_computed_fields=True)
-    if kind == "IMAGE":
-        source = payload.get("source")
-        if isinstance(source, dict):
-            source.pop("relative_path", None)
+    source = payload.get("source")
+    if isinstance(source, dict):
+        source.pop("relative_path", None)
     return payload

@@ -225,6 +225,7 @@ class AudioChapterPlanner:
                 if cached is not None:
                     counters.cache_hit()
                     return cached.response
+                repaired = False
                 try:
                     response = self._port.plan_chapters(
                         request, on_provider_attempt=counters.attempt
@@ -250,6 +251,7 @@ class AudioChapterPlanner:
                             on_provider_attempt=counters.attempt,
                         )
                         validate(response)
+                        repaired = True
                     except VideoDemoError as repair_error:
                         if repair_error.code == ErrorCode.JOB_CANCELLED:
                             raise
@@ -274,6 +276,7 @@ class AudioChapterPlanner:
                             on_provider_attempt=counters.attempt,
                         )
                         validate(response)
+                        repaired = True
                     except VideoDemoError as error:
                         if error.code == ErrorCode.JOB_CANCELLED:
                             raise
@@ -281,7 +284,11 @@ class AudioChapterPlanner:
                     except (ValueError, TypeError):
                         return None
                 return cache.put(
-                    self._identity, request, response, successful_path="MAIN", validate=validate
+                    self._identity,
+                    request,
+                    response,
+                    successful_path="REPAIR" if repaired else "MAIN",
+                    validate=validate,
                 ).response
         except VideoDemoError as error:
             if error.code in {

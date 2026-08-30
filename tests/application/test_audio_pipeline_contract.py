@@ -9,6 +9,55 @@ from video_demo.domain.audio_document import (
 from video_demo.domain.audio_plan import AudioGroundedClaim, AudioParagraphBlock
 
 
+def test_audio_asr_receives_core_context_and_hotwords(tmp_path: Path) -> None:
+    from video_demo.application.audio_pipeline import AudioSpeechAnalyzer
+    from video_demo.application.audio_run_config import AudioRunConfig
+    from video_demo.speech.asr import WindowTranscriptionResult
+    from video_demo.speech.vad import SpeechInterval, VadResult
+
+    class Vad:
+        def detect(self, _audio: Path, *, duration_ms: int) -> VadResult:
+            return VadResult(
+                speech=(
+                    SpeechInterval(
+                        evidence_id="speech_001",
+                        start_ms=0,
+                        end_ms=duration_ms,
+                        confidence=0.9,
+                    ),
+                ),
+                silence=(),
+                long_silence_boundaries_ms=(),
+            )
+
+    class Slicer:
+        def create(self, _audio, _root, _slice_id, _range):
+            path = tmp_path / "audio-test-slice.wav"
+            path.write_bytes(b"slice")
+            return path
+
+    class Recognizer:
+        def __init__(self) -> None:
+            self.prompt = None
+
+        def transcribe_window(self, _slice, *, language_hint, prompt):
+            self.prompt = prompt
+            return WindowTranscriptionResult(language="zh", segments=())
+
+    recognizer = Recognizer()
+    analyzer = AudioSpeechAnalyzer(
+        Vad(), recognizer, Slicer(), max_window_ms=60_000, overlap_ms=0, max_upload_bytes=2_000_000
+    )
+    analyzer.analyze(
+        tmp_path / "audio.wav",
+        duration_ms=1_000,
+        config=AudioRunConfig(hotwords=("Qwen",), core_context="课程"),
+        run_root=Path("runs/audio"),
+        is_cancel_requested=lambda: False,
+    )
+    assert recognizer.prompt == "课程\nQwen"
+
+
 def _result() -> AudioUnderstandingResult:
     evidence_id = "asr_evidence_001"
     return AudioUnderstandingResult(

@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from video_demo.api.audio_routes import router as audio_router
 from video_demo.api.dependencies import AppContainer
 from video_demo.api.jobs import router as jobs_router
 from video_demo.api.media_routes import build_media_router
@@ -14,7 +15,6 @@ from video_demo.api.runs import router as runs_router
 from video_demo.api.schemas import ErrorBody, ErrorResponse
 from video_demo.application.audio_publication import AudioPublicationService
 from video_demo.application.audio_queries import AudioQueryService
-from video_demo.application.audio_rendering import render_audio_markdown
 from video_demo.application.image_rendering import render_image_markdown
 from video_demo.application.media_publication import MediaPublicationService
 from video_demo.application.media_queries import MediaQueryService
@@ -24,14 +24,12 @@ from video_demo.application.queries import ResultQueryService
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
 from video_demo.config import ApiRuntimeConfig, ApiRuntimeSettings, Settings
-from video_demo.domain.audio_document import AudioUnderstandingResult
 from video_demo.domain.image_document import ImageUnderstandingResult
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
 from video_demo.persistence.models import (
     AudioObjectModel,
-    AudioUnderstandingRunModel,
     ImageObjectModel,
     ImageUnderstandingRunModel,
 )
@@ -137,11 +135,6 @@ def create_app(
                 AudioPublicationService(
                     database,
                     AtomicArtifactStore(runtime.runtime_root),
-                    run_model=AudioUnderstandingRunModel,
-                    result_type=AudioUnderstandingResult,
-                    render=render_audio_markdown,
-                    resource_type="AUDIO_UNDERSTANDING_RUN",
-                    not_found_code=ErrorCode.AUDIO_RUN_NOT_FOUND,
                     max_document_bytes=runtime.max_document_bytes,
                     max_bundle_bytes=runtime.max_result_bundle_bytes,
                 ),
@@ -155,6 +148,7 @@ def create_app(
                     render=render_image_markdown,
                     resource_type="IMAGE_UNDERSTANDING_RUN",
                     not_found_code=ErrorCode.IMAGE_RUN_NOT_FOUND,
+                    artifact_prefix="image",
                     max_document_bytes=runtime.max_document_bytes,
                     max_bundle_bytes=runtime.max_result_bundle_bytes,
                 ),
@@ -180,8 +174,8 @@ def create_app(
         )
 
     app.include_router(objects_router)
-    app.include_router(build_media_router("AUDIO"))
-    app.include_router(build_media_router("IMAGE"))
+    app.include_router(audio_router)
+    app.include_router(build_media_router())
     app.include_router(runs_router)
     app.include_router(jobs_router)
     app.add_exception_handler(VideoDemoError, _handle_video_demo_error)

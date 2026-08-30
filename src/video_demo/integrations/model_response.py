@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterator
+from typing import Any, cast
 
 _REMOVED_DOCUMENT_FIELDS = frozenset(
     {
@@ -133,7 +134,12 @@ def _strip_markdown_fence(text: str) -> str:
 def _try_load_json(value: str) -> object | None:
     for strict in (True, False):
         try:
-            return json.loads(value, strict=strict, parse_constant=_reject_json_constant)
+            parsed: Any = json.loads(
+                value,
+                strict=strict,
+                parse_constant=_reject_json_constant,
+            )
+            return cast(object, parsed)
         except (json.JSONDecodeError, ValueError):
             continue
     return None

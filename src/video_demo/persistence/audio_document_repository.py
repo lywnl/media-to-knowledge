@@ -16,11 +16,11 @@ from video_demo.domain.audio_document import (
 )
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.models import AudioAssetModel, AudioSegmentModel, AudioSummaryModel
-from video_demo.persistence.repositories import Scope
+from video_demo.persistence.scope import Scope
 
 
 class AudioResultRepository:
-    """仅读写 audio_summary/audio_segment，不触碰视频结果表。"""
+    """仅读写音频结果表。"""
 
     def __init__(self, session: Session) -> None:
         self._session = session

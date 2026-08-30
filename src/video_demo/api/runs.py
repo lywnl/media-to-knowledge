@@ -17,7 +17,7 @@ from video_demo.api.schemas import (
 from video_demo.application.runs import RunView
 from video_demo.domain.evidence import DocumentEvidenceItem
 from video_demo.domain.result import VideoUnderstandingResult
-from video_demo.persistence.repositories import Scope
+from video_demo.persistence.scope import Scope
 
 router = APIRouter(
     prefix="/api/kb/knowledge-bases/{kb_id}/video-understanding-runs",

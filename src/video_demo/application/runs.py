@@ -22,10 +22,10 @@ from video_demo.persistence.models import (
 )
 from video_demo.persistence.repositories import (
     JobRepository,
-    Scope,
     VideoObjectRepository,
     VideoRunRepository,
 )
+from video_demo.persistence.scope import Scope
 
 
 @dataclass(frozen=True, slots=True)

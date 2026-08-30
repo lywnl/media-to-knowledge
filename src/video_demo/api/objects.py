@@ -7,7 +7,8 @@ from fastapi import APIRouter, Depends, File, UploadFile, status
 from video_demo.api.dependencies import AppContainer, get_container, get_scope
 from video_demo.api.schemas import VideoObjectResponse
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.persistence.repositories import Scope, VideoObjectRepository
+from video_demo.persistence.repositories import VideoObjectRepository
+from video_demo.persistence.scope import Scope
 
 router = APIRouter(prefix="/api/kb/knowledge-bases/{kb_id}/video-objects", tags=["视频对象"])
 

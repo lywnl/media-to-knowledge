@@ -120,3 +120,46 @@ def test_audio_planner_accepts_boundary_candidates_without_visual_inputs(tmp_pat
     )
 
     assert result.plans[0].end_ms == 60_000
+
+
+def test_audio_planner_marks_repaired_response_in_cache(tmp_path: Path) -> None:
+    from video_demo.domain.audio_plan import AudioChapterDraft
+    from video_demo.integrations.audio_document_port import AudioChapterPlanningResponse
+
+    class RepairPort(_Port):
+        def plan_chapters(self, request, *, on_provider_attempt=None):
+            return AudioChapterPlanningResponse(
+                chapter_drafts=(
+                    AudioChapterDraft(
+                        segment_refs=(request.segments[0].segment_id,) * 2,
+                        title_hint="非法范围",
+                    ),
+                ),
+            )
+
+        def repair_chapter_plan(self, request, *, on_provider_attempt=None):
+            return super().plan_chapters(request.request, on_provider_attempt=on_provider_attempt)
+
+    planner = AudioChapterPlanner(
+        RepairPort(),
+        _identity(),
+        max_input_chars=60_000,
+        max_input_bytes=1_048_576,
+        max_chapters=240,
+        invocation_wait_timeout_seconds=2,
+        concurrency=1,
+    )
+    cache = DocumentModelCache(tmp_path, max_entry_bytes=1_000_000, max_run_bytes=2_000_000)
+
+    result = planner.plan(
+        cache=cache,
+        asset_sha256="b" * 64,
+        title_hint="音频",
+        duration_ms=60_000,
+        segments=_segments(),
+        transcript_evidence=_evidence(),
+        document_config=AudioDocumentConfig(),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert result.plans

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import NoReturn
 
 from pydantic import ValidationError
@@ -16,6 +15,7 @@ from video_demo.domain.document import (
 )
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.models import VideoSegmentModel, VideoSummaryModel
+from video_demo.persistence.scope import Scope
 
 _SENSITIVE_KEY_PARTS = (
     "secret",
@@ -25,13 +25,6 @@ _SENSITIVE_KEY_PARTS = (
     "authorization",
     "password",
 )
-
-
-@dataclass(frozen=True, slots=True)
-class Scope:
-    tenant_id: str
-    application_id: str
-    knowledge_base_id: str
 
 
 def _reject_sensitive_json(value: object, path: str = "$") -> None:

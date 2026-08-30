@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import Protocol
 
-from video_demo.application.composition import build_worker
+from video_demo.application.video_composition import build_worker
 from video_demo.config import Settings
 
 

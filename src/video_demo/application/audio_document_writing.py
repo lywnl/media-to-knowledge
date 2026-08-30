@@ -13,7 +13,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from video_demo.application.audio_rendering import RenderedAudioDocument
+from video_demo.application.audio_rendering import RenderedAudioDocument, render_audio_markdown
 from video_demo.domain.audio_document import (
     AudioChapter,
     AudioDocumentSummary,
@@ -34,6 +34,7 @@ from video_demo.integrations.audio_document_port import (
     AudioChapterWritingResponse,
     AudioDocumentTextPort,
     AudioGlobalChapterInput,
+    AudioGlobalWritingRepairRequest,
     AudioGlobalWritingRequest,
     AudioGlobalWritingResponse,
     AudioInvalidModelResponse,
@@ -126,7 +127,12 @@ class AudioDocumentWriter:
                     if degraded:
                         warnings.append(f"AUDIO_CHAPTER_WRITING_FALLBACK:{chapter.chapter_id}")
         complete = tuple(item for item in chapters if item is not None)
-        overview = self._write_global(context, complete, cache, is_cancel_requested)
+        overview, global_degraded = self._write_global(
+            context,
+            complete,
+            cache,
+            is_cancel_requested,
+        )
         result = AudioUnderstandingResult(
             run_id=context.run_id,
             asset_sha256=context.asset_sha256,
@@ -137,9 +143,9 @@ class AudioDocumentWriter:
             ),
             chapters=complete,
         )
-        from video_demo.application.audio_rendering import render_audio_markdown
-
         rendered = render_audio_markdown(result)
+        if global_degraded:
+            warnings.append("AUDIO_GLOBAL_WRITING_FALLBACK")
         unique_warnings = tuple(dict.fromkeys(warnings))
         return AudioWrittenDocument(
             result=result,
@@ -182,10 +188,13 @@ class AudioDocumentWriter:
                 wait_timeout_seconds=self._wait_timeout,
                 is_cancel_requested=is_cancel_requested,
             ):
-                response = self._port.write_chapter(request, on_provider_attempt=None)
+                repaired = False
                 try:
+                    response = self._port.write_chapter(request, on_provider_attempt=None)
                     _validate_response(response, request)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, VideoDemoError) as error:
+                    if isinstance(error, VideoDemoError) and not _is_response_invalid(error):
+                        raise
                     response = self._port.repair_chapter_writing(
                         AudioChapterWritingRepairRequest(
                             request=request,
@@ -199,11 +208,12 @@ class AudioDocumentWriter:
                         on_provider_attempt=None,
                     )
                     _validate_response(response, request)
+                    repaired = True
                 cache.put(
                     self._chapter_identity,
                     request,
                     response,
-                    successful_path="MAIN",
+                    successful_path="REPAIR" if repaired else "MAIN",
                     validate=lambda item: _validate_response(item, request),
                 )
                 return _materialize_chapter(plan, response, context.transcript_source), False
@@ -220,7 +230,7 @@ class AudioDocumentWriter:
         chapters: tuple[AudioChapter, ...],
         cache: DocumentModelCache,
         is_cancel_requested: Callable[[], bool],
-    ) -> str:
+    ) -> tuple[str, bool]:
         request = AudioGlobalWritingRequest(
             title_hint=context.title_hint,
             duration_ms=context.duration_ms,
@@ -244,7 +254,7 @@ class AudioDocumentWriter:
                 lambda item: _validate_global_response(item),
             )
             if cached is not None:
-                return cached.response.overview_zh.strip() or _fallback_overview(chapters)
+                return cached.response.overview_zh.strip() or _fallback_overview(chapters), False
             with cache.invocation_lock(
                 self._global_identity,
                 request,
@@ -258,23 +268,47 @@ class AudioDocumentWriter:
                     lambda item: _validate_global_response(item),
                 )
                 if cached is not None:
-                    return cached.response.overview_zh.strip() or _fallback_overview(chapters)
-                response = self._port.organize_document(request, on_provider_attempt=None)
-                _validate_global_response(response)
+                    return (
+                        cached.response.overview_zh.strip() or _fallback_overview(chapters),
+                        False,
+                    )
+                try:
+                    response = self._port.organize_document(request, on_provider_attempt=None)
+                    _validate_global_response(response)
+                    successful_path: Literal["MAIN", "REPAIR"] = "MAIN"
+                except (ValueError, TypeError, VideoDemoError) as error:
+                    if isinstance(error, VideoDemoError) and not _is_response_invalid(error):
+                        raise
+                    response = self._port.repair_global_writing(
+                        AudioGlobalWritingRepairRequest(
+                            request=request,
+                            invalid_response=AudioInvalidModelResponse(
+                                content_sha256="f" * 64,
+                                validation_errors=("audio_global_response:invalid",),
+                            ),
+                            allowed_chapter_ids=tuple(
+                                chapter.chapter_id for chapter in chapters
+                            ),
+                            prompt_version="audio-global-editor-repair-v1",
+                        ),
+                        on_provider_attempt=None,
+                    )
+                    _validate_global_response(response)
+                    successful_path = "REPAIR"
                 cache.put(
                     self._global_identity,
                     request,
                     response,
-                    successful_path="MAIN",
+                    successful_path=successful_path,
                     validate=lambda item: _validate_global_response(item),
                 )
-            return response.overview_zh.strip() or _fallback_overview(chapters)
+            return response.overview_zh.strip() or _fallback_overview(chapters), False
         except VideoDemoError as error:
             if error.code == ErrorCode.JOB_CANCELLED:
                 raise
-            return _fallback_overview(chapters)
+            return _fallback_overview(chapters), True
         except (ValueError, TypeError, AttributeError):
-            return _fallback_overview(chapters)
+            return _fallback_overview(chapters), True
 
 
 def _validate_inputs(
@@ -310,6 +344,10 @@ def _validate_response(
 def _validate_global_response(response: AudioGlobalWritingResponse) -> None:
     if not response.overview_zh.strip():
         raise ValueError("音频核心概览不能为空")
+
+
+def _is_response_invalid(error: VideoDemoError) -> bool:
+    return error.code == ErrorCode.TEXT_LLM_RESPONSE_INVALID
 
 
 def _materialize_chapter(

@@ -26,7 +26,7 @@ from video_demo.domain.evidence import DocumentEvidenceItem, KeyframeEvidence
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.document_repository import ResultRepository
-from video_demo.persistence.repositories import Scope
+from video_demo.persistence.scope import Scope
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.workspace import safe_runtime_path
 

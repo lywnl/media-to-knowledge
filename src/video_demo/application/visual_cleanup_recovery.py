@@ -15,9 +15,9 @@ from video_demo.persistence.database import Database
 from video_demo.persistence.repositories import (
     JobRepository,
     PublishedRunCleanupRecord,
-    Scope,
     VideoRunRepository,
 )
+from video_demo.persistence.scope import Scope
 
 _LOGGER = logging.getLogger(__name__)
 

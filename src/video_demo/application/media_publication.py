@@ -8,24 +8,21 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError
+from sqlalchemy.orm import Session
 
-from video_demo.application.document_publication import ResultWriteFence, scope_key
+from video_demo.application.publication_contracts import ResultWriteFence, scope_key
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.persistence.audio_document_repository import AudioResultRepository
 from video_demo.persistence.database import Database
 from video_demo.persistence.media_repositories import MediaRunRepository
-from video_demo.persistence.models import (
-    AudioUnderstandingRunModel,
-    ImageUnderstandingRunModel,
-    RunStatusValue,
-)
-from video_demo.persistence.repositories import JobRepository, Scope
+from video_demo.persistence.models import RunStatusValue
+from video_demo.persistence.repositories import JobRepository
+from video_demo.persistence.scope import Scope
 from video_demo.storage.artifacts import (
     ArtifactBytesReceipt,
     AtomicArtifactStore,
 )
 
-MediaRunModel = type[AudioUnderstandingRunModel] | type[ImageUnderstandingRunModel]
+MediaRunModel = type[Any]
 
 
 MediaResult = BaseModel
@@ -38,7 +35,7 @@ class MediaResultPublication:
 
 
 class MediaPublicationService:
-    """音频/图片独立结果的原子双制品发布与读取。"""
+    """图片结果的中性原子双制品发布与读取基类。"""
 
     def __init__(
         self,
@@ -48,8 +45,9 @@ class MediaPublicationService:
         run_model: MediaRunModel,
         result_type: type[BaseModel],
         render: Callable[[Any], Any],
-        resource_type: Literal["AUDIO_UNDERSTANDING_RUN", "IMAGE_UNDERSTANDING_RUN"],
+        resource_type: str,
         not_found_code: ErrorCode,
+        artifact_prefix: str = "image",
         max_document_bytes: int = 16 * 1024 * 1024,
         max_bundle_bytes: int = 64 * 1024 * 1024,
     ) -> None:
@@ -60,8 +58,22 @@ class MediaPublicationService:
         self._render = render
         self._resource_type = resource_type
         self._not_found_code = not_found_code
+        self._artifact_prefix = artifact_prefix
         self._max_document_bytes = max_document_bytes
         self._max_bundle_bytes = max_bundle_bytes
+
+    def _not_ready_code(self) -> ErrorCode:
+        return ErrorCode.VIDEO_RESULT_NOT_READY
+
+    def _persist_result_rows(
+        self,
+        session: Session,
+        scope: Scope,
+        result: BaseModel,
+    ) -> None:
+        """给媒体专用发布器留下结果行写入扩展点。"""
+
+        _ = session, scope, result
 
     @property
     def database(self) -> Database:
@@ -85,9 +97,8 @@ class MediaPublicationService:
             raise ValueError("媒体 Markdown 必须由同一结果确定性渲染")
         run_root = Path("runs") / scope_key(scope) / validated.run_id
         result_root = run_root / "result"
-        prefix = "audio" if self._resource_type.startswith("AUDIO") else "image"
-        document_path = result_root / f"{prefix}-document-{uuid.uuid4().hex}.md"
-        payload_path = result_root / f"{prefix}-result-{uuid.uuid4().hex}.json"
+        document_path = result_root / f"{self._artifact_prefix}-document-{uuid.uuid4().hex}.md"
+        payload_path = result_root / f"{self._artifact_prefix}-result-{uuid.uuid4().hex}.json"
         payload = {
             "result": validated.model_dump(mode="json", exclude_computed_fields=True),
             "status": status,
@@ -133,8 +144,7 @@ class MediaPublicationService:
                 run.document_relative_path = document_receipt.relative_path
                 run.document_sha256 = document_receipt.sha256
                 run.document_size_bytes = document_receipt.size_bytes
-                if self._resource_type == "AUDIO_UNDERSTANDING_RUN":
-                    AudioResultRepository(session).replace(scope, validated)
+                self._persist_result_rows(session, scope, validated)
         except BaseException:
             self._store.discard_artifact(bundle_receipt, max_bytes=self._max_bundle_bytes)
             self._store.discard_bytes(document_receipt)
@@ -146,12 +156,7 @@ class MediaPublicationService:
             if run is None:
                 raise VideoDemoError(self._not_found_code, "媒体运行不存在")
             if run.status not in {RunStatusValue.SUCCEEDED, RunStatusValue.PARTIAL_SUCCEEDED}:
-                code = (
-                    ErrorCode.AUDIO_RESULT_NOT_READY
-                    if self._resource_type == "AUDIO_UNDERSTANDING_RUN"
-                    else ErrorCode.VIDEO_RESULT_NOT_READY
-                )
-                raise VideoDemoError(code, "媒体理解结果尚未就绪")
+                raise VideoDemoError(self._not_ready_code(), "媒体理解结果尚未就绪")
             if not all(
                 (
                     run.artifact_relative_path,

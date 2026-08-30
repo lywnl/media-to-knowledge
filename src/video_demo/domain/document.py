@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import unicodedata
 from collections.abc import Iterable
 from typing import Annotated, Literal, TypeAlias
 
@@ -17,39 +16,14 @@ from video_demo.domain.evidence import (
     VisualObservationEvidence,
 )
 from video_demo.domain.run import TimeRange
+from video_demo.domain.title import TITLE_MAX_LENGTH, sanitize_document_title
 from video_demo.errors import ErrorCode, VideoDemoError
 
 RESULT_SCHEMA_VERSION: Literal["4.1.0"] = "4.1.0"
 TranscriptSource: TypeAlias = Literal["SUBTITLE", "ASR", "NONE"]
-_TITLE_MAX_LENGTH = 200
+_TITLE_MAX_LENGTH = TITLE_MAX_LENGTH
 _VISUAL_CAPTION_MAX_LENGTH = 2_000
-_TITLE_WHITESPACE_PATTERN = re.compile(r"\s+")
 _DOCUMENT_KEYFRAME_PATH_PATTERN = re.compile(r"^visual/keyframes/([0-9a-f]{64})\.jpg$")
-
-
-def sanitize_document_title(
-    explicit_title: str | None,
-    original_filename: str | None = None,
-) -> str | None:
-    """生成唯一的安全标题；仅文件名回退分支移除扩展名。"""
-
-    candidate = explicit_title
-    if candidate is None or not candidate.strip():
-        if original_filename is None:
-            return None
-        filename = original_filename.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
-        extension_separator = filename.rfind(".")
-        candidate = (
-            filename[:extension_separator]
-            if extension_separator > 0
-            else filename
-        )
-    cleaned = "".join(
-        " " if character in "/\\" or unicodedata.category(character).startswith("C") else character
-        for character in candidate
-    )
-    normalized = _TITLE_WHITESPACE_PATTERN.sub(" ", cleaned).strip()
-    return normalized[:_TITLE_MAX_LENGTH] or None
 
 
 class DocumentGenerationConfig(FrozenModel):

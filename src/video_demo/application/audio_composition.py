@@ -13,20 +13,16 @@ from video_demo.application.audio_chapter_planning import AudioChapterPlanner
 from video_demo.application.audio_contracts import AudioEvidencePreparationLimits
 from video_demo.application.audio_document_writing import AudioDocumentWriter
 from video_demo.application.audio_pipeline import AudioPipeline, AudioSpeechAnalyzer
-from video_demo.application.audio_rendering import render_audio_markdown
+from video_demo.application.audio_publication import AudioPublicationService
+from video_demo.application.audio_speech import AudioSliceClient, VerifiedAudioSlicer
+from video_demo.application.audio_transcode import build_audio_ffmpeg_factory
 from video_demo.application.audio_workers import AudioJobHandler
-from video_demo.application.media_publication import MediaPublicationService
-from video_demo.application.production_media import build_ffmpeg_factory
-from video_demo.application.production_speech import AudioSliceClient, VerifiedAudioSlicer
 from video_demo.config import Settings
-from video_demo.domain.audio_document import AudioUnderstandingResult
-from video_demo.errors import ErrorCode
 from video_demo.integrations.audio_document_client import AudioDocumentClient
 from video_demo.integrations.cloud_whisper import CloudWhisperClient
 from video_demo.media.audio_probe import FFprobeAudioClient
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
-from video_demo.persistence.models import AudioUnderstandingRunModel
 from video_demo.speech.vad import NativeSileroBackend, SileroVadAdapter
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.audio_object_store import AudioObjectStore
@@ -47,7 +43,7 @@ def build_audio_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
     text = settings.require_text_llm_configuration()
     http = httpx.Client()
     ffmpeg = _production_tool_path(settings, "ffmpeg")
-    ffmpeg_factory = build_ffmpeg_factory(
+    ffmpeg_factory = build_audio_ffmpeg_factory(
         settings.workspace_root,
         runtime_root,
         ffmpeg,
@@ -129,14 +125,9 @@ def build_audio_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
             evidence_limits=_evidence_limits(settings),
         )
 
-    publication = MediaPublicationService(
+    publication = AudioPublicationService(
         database,
         AtomicArtifactStore(runtime_root),
-        run_model=AudioUnderstandingRunModel,
-        result_type=AudioUnderstandingResult,
-        render=render_audio_markdown,
-        resource_type="AUDIO_UNDERSTANDING_RUN",
-        not_found_code=ErrorCode.AUDIO_RUN_NOT_FOUND,
         max_document_bytes=settings.max_document_bytes,
         max_bundle_bytes=settings.max_result_bundle_bytes,
     )

@@ -18,17 +18,23 @@ from video_demo.integrations.audio_document_port import (
     AudioChapterWritingRequest,
     AudioChapterWritingResponse,
     AudioDocumentTextPort,
+    AudioGlobalWritingRepairRequest,
     AudioGlobalWritingRequest,
     AudioGlobalWritingResponse,
 )
 from video_demo.integrations.audio_document_prompts import (
     prompt_for_audio_global,
+    prompt_for_audio_global_repair,
     prompt_for_audio_plan_repair,
     prompt_for_audio_planning,
     prompt_for_audio_writing,
     prompt_for_audio_writing_repair,
 )
-from video_demo.integrations.model_response import extract_model_message_content, parse_json_content
+from video_demo.integrations.model_response import (
+    extract_model_message_content,
+    parse_json_content,
+    strip_removed_document_fields,
+)
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 
@@ -136,6 +142,19 @@ class AudioDocumentClient(AudioDocumentTextPort):
             on_provider_attempt,
         )
 
+    def repair_global_writing(
+        self,
+        request: AudioGlobalWritingRepairRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> AudioGlobalWritingResponse:
+        return self._call(
+            prompt_for_audio_global_repair(request),
+            AudioGlobalWritingResponse,
+            "audio_global_writing_repair_v1",
+            on_provider_attempt,
+        )
+
     def _call(
         self,
         prompt: tuple[str, str, str],
@@ -165,7 +184,9 @@ class AudioDocumentClient(AudioDocumentTextPort):
         try:
             envelope = json.loads(raw)
             message = extract_model_message_content(envelope)
-            return response_type.model_validate(parse_json_content(message))
+            return response_type.model_validate(
+                strip_removed_document_fields(parse_json_content(message)),
+            )
         except (ValueError, TypeError, KeyError, ValidationError, json.JSONDecodeError) as error:
             raise VideoDemoError(
                 ErrorCode.TEXT_LLM_RESPONSE_INVALID, "音频文本模型响应结构非法"

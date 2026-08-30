@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import BinaryIO
 
 from video_demo.persistence.database import Database
-from video_demo.persistence.repositories import Scope, VideoObjectRepository
+from video_demo.persistence.repositories import VideoObjectRepository
+from video_demo.persistence.scope import Scope
 from video_demo.storage.object_store import LocalVideoObjectStore, VideoObjectRecord
 
 

@@ -56,6 +56,29 @@ def build_base_segments(
     return segments
 
 
+def build_text_only_base_segments(
+    asset_sha256: Sha256,
+    duration_ms: int,
+    transcript_evidence: Sequence[SpeechSegment | SubtitleCue],
+    speech_boundaries: Sequence[SpeechBoundaryCandidate],
+    limits: EvidencePreparationLimits,
+) -> tuple[BaseSegment, ...]:
+    """视频视觉证据不可用时，构建不含场景引用的纯文字片段。"""
+
+    if duration_ms <= 0:
+        raise ValueError("duration_ms 必须大于 0")
+    transcript = _validate_transcript_budget(transcript_evidence, duration_ms, limits)
+    boundaries = _safe_boundaries(duration_ms, transcript, (), speech_boundaries)
+    ranges = _merge_empty_transcript_ranges(
+        tuple(pairwise((0, *boundaries, duration_ms))),
+        transcript,
+    )
+    segments = _assemble_segments(asset_sha256, ranges, transcript, ())
+    if len(segments) > limits.max_base_segments:
+        raise _budget_error("基础片段数量超过上限")
+    return segments
+
+
 def _validate_transcript_budget(
     evidence: Sequence[SpeechSegment | SubtitleCue],
     duration_ms: int,

@@ -12,7 +12,9 @@ from video_demo.domain.evidence import ChapterVisualObservation, VisualContentBl
 from video_demo.integrations.document_port import ChapterVisionRequest, ChapterVisionResponse
 
 _LOGGER = logging.getLogger(__name__)
-_VISUAL_CONTENT_BLOCK_ADAPTER = TypeAdapter(VisualContentBlockDraft)
+_VISUAL_CONTENT_BLOCK_ADAPTER: TypeAdapter[VisualContentBlockDraft] = TypeAdapter(
+    VisualContentBlockDraft,
+)
 
 
 def normalize_chapter_vision_response_data(

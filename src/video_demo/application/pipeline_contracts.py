@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from video_demo.application.document_rendering import RenderedDocument
     from video_demo.domain.document import VideoUnderstandingResult
     from video_demo.media.subtitles import ParsedSubtitle
-    from video_demo.persistence.repositories import Scope
+    from video_demo.persistence.scope import Scope
 
 
 @dataclass(frozen=True, slots=True)

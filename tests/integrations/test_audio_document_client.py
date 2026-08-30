@@ -24,6 +24,7 @@ def test_audio_client_expands_compact_ranges_and_uses_audio_schema() -> None:
                     "title_hint": "主题",
                 },
             ],
+            "key_points": ["旧版本字段"],
         }
         return httpx.Response(
             200,

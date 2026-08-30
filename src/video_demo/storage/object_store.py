@@ -11,7 +11,7 @@ from typing import BinaryIO
 
 from video_demo.config import resolve_workspace_path
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.persistence.repositories import Scope
+from video_demo.persistence.scope import Scope
 from video_demo.storage.workspace import atomic_replace, safe_runtime_path, validate_path_component
 
 _MIME_BY_EXTENSION = {

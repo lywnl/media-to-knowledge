@@ -144,3 +144,9 @@ _RETRYABLE_ERROR_CODES = frozenset(
 
 def is_retryable_error_code(code: ErrorCode) -> bool:
     return code in _RETRYABLE_ERROR_CODES
+
+
+def is_cancelled_error_code(code: ErrorCode) -> bool:
+    """判断任务取消，不让业务层依赖底层媒体进程错误命名。"""
+
+    return code in {ErrorCode.JOB_CANCELLED, ErrorCode.VIDEO_PROCESS_CANCELLED}

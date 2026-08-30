@@ -136,6 +136,20 @@ class AudioGlobalWritingResponse(FrozenModel):
     overview_zh: str = Field(max_length=8_000)
 
 
+class AudioGlobalWritingRepairRequest(FrozenModel):
+    request: AudioGlobalWritingRequest
+    invalid_response: AudioInvalidModelResponse
+    allowed_chapter_ids: tuple[StableId, ...] = Field(min_length=1, max_length=240)
+    prompt_version: Literal["audio-global-editor-repair-v1"]
+
+    @model_validator(mode="after")
+    def validate_allowed_chapter_ids(self) -> AudioGlobalWritingRepairRequest:
+        expected = tuple(item.chapter_id for item in self.request.chapters)
+        if self.allowed_chapter_ids != expected:
+            raise ValueError("allowed_chapter_ids 必须与请求章节一致")
+        return self
+
+
 class AudioDocumentTextPort(AudioTextPort, Protocol):
     def write_chapter(
         self,
@@ -154,6 +168,13 @@ class AudioDocumentTextPort(AudioTextPort, Protocol):
     def organize_document(
         self,
         request: AudioGlobalWritingRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> AudioGlobalWritingResponse: ...
+
+    def repair_global_writing(
+        self,
+        request: AudioGlobalWritingRepairRequest,
         *,
         on_provider_attempt: Callable[[], None] | None = None,
     ) -> AudioGlobalWritingResponse: ...

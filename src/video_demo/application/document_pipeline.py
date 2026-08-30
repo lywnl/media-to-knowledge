@@ -9,7 +9,10 @@ from pathlib import Path
 from threading import Event
 from typing import Protocol, TypeVar, cast
 
-from video_demo.application.base_segments import build_base_segments
+from video_demo.application.base_segments import (
+    build_base_segments,
+    build_text_only_base_segments,
+)
 from video_demo.application.chapter_frames import ChapterFrameSearchBatch
 from video_demo.application.chapter_planning import ChapterPlanningBatch
 from video_demo.application.chapter_vision import ChapterVisionBatch
@@ -504,15 +507,23 @@ class VideoUnderstandingPipeline:
                 scene_failure.code if scene_failure is not None else "UNKNOWN",
             )
         self._check_cancelled(context)
-        base_segments = build_base_segments(
-            registered.source_sha256,
-            prepared.source.duration_ms,
-            speech.transcript_evidence,
-            scene_index.scenes,
-            speech.boundary_candidates,
-            self._evidence_preparation_limits,
-            allow_empty_scenes=not scene_index.scenes,
-        )
+        if scene_index.scenes:
+            base_segments = build_base_segments(
+                registered.source_sha256,
+                prepared.source.duration_ms,
+                speech.transcript_evidence,
+                scene_index.scenes,
+                speech.boundary_candidates,
+                self._evidence_preparation_limits,
+            )
+        else:
+            base_segments = build_text_only_base_segments(
+                registered.source_sha256,
+                prepared.source.duration_ms,
+                speech.transcript_evidence,
+                speech.boundary_candidates,
+                self._evidence_preparation_limits,
+            )
         self._check_cancelled(context)
         stage_metrics.add("SPEECH", speech_duration)
         stage_metrics.add_many(speech.stage_metrics)

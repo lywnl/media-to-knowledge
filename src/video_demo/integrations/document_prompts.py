@@ -377,7 +377,7 @@ def _vision_context(request: ChapterVisionRequest) -> dict[str, object]:
             "eligible_frame_ids": [
                 frame["frame_id"]
                 for frame in frame_descriptors
-                if target.target_id in frame["target_ids"]
+                if target.target_id in frame["target_ids"]  # type: ignore[operator]
             ],
         }
         for target in request.targets

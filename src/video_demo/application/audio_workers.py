@@ -1,24 +1,24 @@
-"""音频任务 Worker。
-
-本模块只负责领取音频任务、准备音频输入和调用音频流水线；不导入图片或视频业务。
-"""
+"""音频任务 Worker。"""
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
 from video_demo.application.audio_pipeline import AudioPipeline
+from video_demo.application.audio_publication import AudioPublicationService
 from video_demo.application.audio_run_config import AudioRunConfig
-from video_demo.application.document_publication import ResultWriteFence
-from video_demo.application.media_publication import MediaPublicationService
-from video_demo.application.production_media import TranscodeClient
-from video_demo.domain.document import sanitize_document_title
-from video_demo.errors import ErrorCode, VideoDemoError, is_retryable_error_code
+from video_demo.application.audio_transcode import AudioTranscodeClient, NoAudioArtifact
+from video_demo.application.publication_contracts import ResultWriteFence, scope_key
+from video_demo.domain.title import sanitize_document_title
+from video_demo.errors import (
+    ErrorCode,
+    VideoDemoError,
+    is_cancelled_error_code,
+    is_retryable_error_code,
+)
 from video_demo.media.audio_probe import AudioProbeClient
-from video_demo.media.transcode import NoAudioArtifact
 from video_demo.persistence.database import Database
 from video_demo.persistence.media_repositories import MediaObjectRepository, MediaRunRepository
 from video_demo.persistence.models import (
@@ -26,7 +26,7 @@ from video_demo.persistence.models import (
     AudioUnderstandingRunModel,
     RunStatusValue,
 )
-from video_demo.persistence.repositories import ClaimedJob, JobRepository, Scope
+from video_demo.persistence.repositories import ClaimedJob, JobRepository
 from video_demo.storage.audio_object_store import AudioObjectStore
 from video_demo.storage.document_cache import DocumentModelCache
 from video_demo.storage.media_object_store import MediaObjectRecord
@@ -37,7 +37,7 @@ class AudioPipelineFactory(Protocol):
 
 
 class AudioTranscoderFactory(Protocol):
-    def __call__(self, is_cancel_requested: Callable[[], bool]) -> TranscodeClient: ...
+    def __call__(self, is_cancel_requested: Callable[[], bool]) -> AudioTranscodeClient: ...
 
 
 class AudioJobHandler:
@@ -48,7 +48,7 @@ class AudioJobHandler:
         database: Database,
         probe: AudioProbeClient,
         pipeline_factory: AudioPipelineFactory,
-        publication: MediaPublicationService,
+        publication: AudioPublicationService,
         object_store: AudioObjectStore,
         transcoder_factory: AudioTranscoderFactory,
         *,
@@ -73,7 +73,7 @@ class AudioJobHandler:
         try:
             source, config, filename, asset_sha = self._load_input(job)
             probe = self._probe.probe(source, max_duration_ms=self._max_duration_ms)
-            run_relative_root = Path("runs") / _scope_key(job.scope) / job.resource_id
+            run_relative_root = Path("runs") / scope_key(job.scope) / job.resource_id
             run_root = self._runtime_root / run_relative_root
             run_root.mkdir(parents=True, exist_ok=True)
             self._mark_stage(job, "SPEECH")
@@ -183,7 +183,7 @@ class AudioJobHandler:
     def _mark_unsuccessful(self, job: ClaimedJob, error: VideoDemoError) -> None:
         with self._database.session() as session:
             repository = JobRepository(session)
-            if error.code == ErrorCode.JOB_CANCELLED:
+            if is_cancelled_error_code(error.code):
                 repository.mark_cancelled(job.id, job.worker_id, attempt_count=job.attempt_count)
                 return
             repository.update_owned_media_run(
@@ -203,8 +203,3 @@ class AudioJobHandler:
 
 def _fence(job: ClaimedJob) -> ResultWriteFence:
     return ResultWriteFence(job_pk=job.id, worker_id=job.worker_id, attempt_count=job.attempt_count)
-
-
-def _scope_key(scope: Scope) -> str:
-    encoded = "\x00".join((scope.tenant_id, scope.application_id, scope.knowledge_base_id)).encode()
-    return hashlib.sha256(encoded).hexdigest()[:24]

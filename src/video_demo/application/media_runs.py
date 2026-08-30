@@ -17,7 +17,8 @@ from video_demo.persistence.models import (
     ImageObjectModel,
     ImageUnderstandingRunModel,
 )
-from video_demo.persistence.repositories import JobRepository, Scope
+from video_demo.persistence.repositories import JobRepository
+from video_demo.persistence.scope import Scope
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,7 +5,7 @@ from typing import BinaryIO
 from video_demo.persistence.database import Database
 from video_demo.persistence.media_repositories import MediaObjectRepository
 from video_demo.persistence.models import AudioObjectModel, ImageObjectModel
-from video_demo.persistence.repositories import Scope
+from video_demo.persistence.scope import Scope
 from video_demo.storage.media_object_store import BinaryMediaObjectStore, MediaObjectRecord
 
 

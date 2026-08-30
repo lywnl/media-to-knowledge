@@ -5,7 +5,6 @@ import json
 import re
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, NoReturn, Protocol
@@ -15,6 +14,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from video_demo.application.document_rendering import RenderedDocument, render_markdown
+from video_demo.application.publication_contracts import (
+    ResultWriteFence as ResultWriteFence,
+)
+from video_demo.application.publication_contracts import (
+    scope_key as scope_key,
+)
 from video_demo.domain.document import (
     TranscriptSource,
     VideoUnderstandingResult,
@@ -37,7 +42,8 @@ from video_demo.persistence.models import (
     VideoAssetModel,
     VideoUnderstandingRunModel,
 )
-from video_demo.persistence.repositories import JobRepository, Scope, VideoRunRepository
+from video_demo.persistence.repositories import JobRepository, VideoRunRepository
+from video_demo.persistence.scope import Scope
 from video_demo.storage.artifacts import (
     RESULT_BUNDLE_ENVELOPE_SCHEMA_VERSION,
     ArtifactBytesReceipt,
@@ -53,13 +59,6 @@ _PUBLICATION_NAME = re.compile(
 )
 
 
-@dataclass(frozen=True, slots=True)
-class ResultWriteFence:
-    job_pk: int
-    worker_id: str
-    attempt_count: int
-
-
 class VisualCleaner(Protocol):
     def cleanup(
         self,
@@ -68,13 +67,6 @@ class VisualCleaner(Protocol):
     ) -> bool: ...
 
     def mark_pending(self, run_relative_root: Path) -> None: ...
-
-
-def scope_key(scope: Scope) -> str:
-    encoded = "\x00".join(
-        (scope.tenant_id, scope.application_id, scope.knowledge_base_id),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()[:24]
 
 
 class DocumentPublicationService:

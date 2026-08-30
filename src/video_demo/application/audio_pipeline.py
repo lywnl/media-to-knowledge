@@ -22,7 +22,7 @@ from video_demo.domain.audio_plan import AudioDocumentConfig
 from video_demo.domain.base import Sha256, stable_identifier
 from video_demo.domain.evidence import SpeechSegment, SubtitleCue
 from video_demo.domain.run import TimeRange
-from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.errors import ErrorCode, VideoDemoError, is_cancelled_error_code
 from video_demo.speech.asr import WindowRecognizerPort
 from video_demo.speech.vad import VadResult
 from video_demo.storage.document_cache import DocumentModelCache
@@ -110,6 +110,7 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
         transcript: list[SpeechSegment] = []
         warnings = list(vad_result.warnings)
         language_hint = config.language_hints[0] if len(config.language_hints) == 1 else None
+        prompt = _audio_asr_prompt(config)
         for index, window in enumerate(windows, start=1):
             if is_cancel_requested():
                 raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
@@ -132,7 +133,7 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
                     result = self._recognizer.transcribe_window(
                         audio_slice,
                         language_hint=language_hint,
-                        prompt=None,
+                        prompt=prompt,
                     )
                     projection = project_cloud_asr_window(
                         window,
@@ -145,11 +146,10 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
                 finally:
                     audio_slice.unlink(missing_ok=True)
             except VideoDemoError as error:
-                if error.code in {
-                    ErrorCode.JOB_CANCELLED,
-                    ErrorCode.VIDEO_PROCESS_CANCELLED,
-                }:
-                    raise
+                if is_cancelled_error_code(error.code):
+                    if error.code == ErrorCode.JOB_CANCELLED:
+                        raise
+                    raise VideoDemoError(ErrorCode.JOB_CANCELLED, "音频分析已取消") from error
                 warnings.append(f"AUDIO_ASR_WINDOW_DEGRADED:{index}")
         ordered = remove_adjacent_cloud_asr_duplicates(tuple(transcript))
         transcript_source: Literal["ASR", "NONE"] = "ASR" if ordered else "NONE"
@@ -169,8 +169,17 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
         )
 
 
+def _audio_asr_prompt(config: AudioRunConfig) -> str | None:
+    parts: list[str] = []
+    if config.core_context:
+        parts.append(config.core_context)
+    if config.hotwords:
+        parts.append(" ".join(config.hotwords))
+    return "\n".join(parts) or None
+
+
 class AudioPipeline:
-    """独立音频文字流水线：ASR、章节规划、章节写作，不包含任何视觉阶段。"""
+    """独立音频文字流水线：ASR、章节规划和章节写作。"""
 
     def __init__(
         self,

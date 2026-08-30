@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, Header, Query
 from video_demo.api.dependencies import AppContainer, get_container
 from video_demo.api.schemas import JobResponse
 from video_demo.application.runs import JobView
-from video_demo.persistence.repositories import Scope
+from video_demo.persistence.scope import Scope
 
 router = APIRouter(prefix="/api/kb/jobs", tags=["可靠任务"])
 
