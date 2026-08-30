@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from itertools import pairwise
 
-from video_demo.application.pipeline_contracts import (
-    EvidencePreparationLimits,
-    SpeechBoundaryCandidate,
+from video_demo.application.audio_contracts import (
+    AudioEvidencePreparationLimits,
+    AudioSpeechBoundaryCandidate,
 )
 from video_demo.domain.audio_plan import AudioBaseSegment, AudioTranscriptEvidence
 from video_demo.domain.base import Sha256, stable_identifier
@@ -24,8 +24,8 @@ def build_audio_segments(
     asset_sha256: Sha256,
     duration_ms: int,
     transcript_evidence: Sequence[AudioTranscriptEvidence],
-    speech_boundaries: Sequence[SpeechBoundaryCandidate],
-    limits: EvidencePreparationLimits,
+    speech_boundaries: Sequence[AudioSpeechBoundaryCandidate],
+    limits: AudioEvidencePreparationLimits,
 ) -> tuple[AudioBaseSegment, ...]:
     if duration_ms <= 0:
         raise ValueError("duration_ms 必须大于 0")
@@ -41,13 +41,15 @@ def build_audio_segments(
 def _validate_transcript(
     evidence: Sequence[AudioTranscriptEvidence],
     duration_ms: int,
-    limits: EvidencePreparationLimits,
+    limits: AudioEvidencePreparationLimits,
 ) -> tuple[AudioTranscriptEvidence, ...]:
     if len(evidence) > limits.max_transcript_evidence_items:
         raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "转写证据数量超过上限")
     if sum(len(item.text) for item in evidence) > limits.max_transcript_chars:
         raise VideoDemoError(ErrorCode.INPUT_BUDGET_EXCEEDED, "转写证据字符数超过上限")
-    ordered = tuple(sorted(evidence, key=lambda item: (item.start_ms, item.end_ms, item.evidence_id)))
+    ordered = tuple(
+        sorted(evidence, key=lambda item: (item.start_ms, item.end_ms, item.evidence_id))
+    )
     ids = tuple(item.evidence_id for item in ordered)
     if len(ids) != len(set(ids)):
         raise VideoDemoError(ErrorCode.DUPLICATE_EVIDENCE_ID, "转写证据标识不得重复")
@@ -61,7 +63,7 @@ def _validate_transcript(
 def _safe_boundaries(
     duration_ms: int,
     transcript: Sequence[AudioTranscriptEvidence],
-    candidates: Sequence[SpeechBoundaryCandidate],
+    candidates: Sequence[AudioSpeechBoundaryCandidate],
 ) -> tuple[int, ...]:
     values = set(range(_GRID_INTERVAL_MS, duration_ms, _GRID_INTERVAL_MS))
     values.update(
@@ -77,7 +79,9 @@ def _safe_boundaries(
     boundaries = list(safe)
     while True:
         ranges = tuple(pairwise((0, *boundaries, duration_ms)))
-        oversized = next(((start, end) for start, end in ranges if end - start > _MAX_SEGMENT_DURATION_MS), None)
+        oversized = next(
+            ((start, end) for start, end in ranges if end - start > _MAX_SEGMENT_DURATION_MS), None
+        )
         if oversized is None:
             return tuple(boundaries)
         start_ms, end_ms = oversized
@@ -146,7 +150,12 @@ def _assemble_segments(
             AudioBaseSegment(
                 segment_id=stable_identifier(
                     "audio_segment",
-                    {"asset_sha256": asset_sha256, "start_ms": start_ms, "end_ms": end_ms, "evidence_refs": refs},
+                    {
+                        "asset_sha256": asset_sha256,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                        "evidence_refs": refs,
+                    },
                 ),
                 start_ms=start_ms,
                 end_ms=end_ms,

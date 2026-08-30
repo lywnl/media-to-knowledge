@@ -10,7 +10,7 @@ from typing import Annotated, Literal, TypeAlias
 
 from pydantic import Field, model_validator
 
-from video_demo.domain.base import FrozenModel, Probability, Sha256, StableId
+from video_demo.domain.base import FrozenModel, Probability, StableId
 from video_demo.domain.evidence import SpeechSegment, SubtitleCue
 from video_demo.domain.run import TimeRange
 

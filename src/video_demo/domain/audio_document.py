@@ -4,12 +4,12 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.domain.audio_plan import (
     AudioBodyBlock,
     AudioGroundedClaim,
     AudioTranscriptSource,
 )
+from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.domain.run import TimeRange
 
 

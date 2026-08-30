@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from video_demo.domain.audio_document import AudioChapter
 from video_demo.domain.audio_plan import (
     AudioBodyBlock,
     AudioChapterPlan,
@@ -9,7 +10,6 @@ from video_demo.domain.audio_plan import (
     AudioGroundedClaim,
     AudioParagraphBlock,
 )
-from video_demo.domain.audio_document import AudioChapter
 
 
 def test_audio_document_config_has_no_visual_configuration() -> None:
