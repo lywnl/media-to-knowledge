@@ -220,6 +220,7 @@ class AudioPipeline:
             (),
             speech.boundary_candidates,
             self._limits,
+            allow_empty_scenes=True,
         )
         planning = self._planner.plan(
             cache=cache,
