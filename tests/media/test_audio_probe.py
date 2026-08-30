@@ -5,7 +5,7 @@ import json
 import pytest
 
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.media.audio_probe import parse_audio_probe_payload
+from video_demo.media.audio_probe import FFprobeAudioClient, parse_audio_probe_payload
 from video_demo.media.process import ProcessResult
 
 
@@ -40,3 +40,13 @@ def test_parse_audio_probe_payload_rejects_missing_audio_stream() -> None:
             max_duration_ms=7_200_000,
         )
     assert raised.value.code == ErrorCode.AUDIO_PROBE_INVALID
+
+
+def test_audio_ffprobe_rejects_missing_binary_with_audio_error(tmp_path) -> None:
+    with pytest.raises(VideoDemoError) as raised:
+        FFprobeAudioClient.from_path(
+            tmp_path / "missing-ffprobe",
+            workspace_root=tmp_path,
+        )
+
+    assert raised.value.code == ErrorCode.AUDIO_FFPROBE_UNAVAILABLE

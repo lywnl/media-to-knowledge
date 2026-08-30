@@ -21,6 +21,10 @@ def test_audio_business_modules_do_not_import_visual_or_video_core() -> None:
         Path("src/video_demo/application/audio_queries.py"),
         Path("src/video_demo/application/audio_speech.py"),
         Path("src/video_demo/application/audio_transcode.py"),
+        Path("src/video_demo/application/audio_runs.py"),
+        Path("src/video_demo/application/audio_uploads.py"),
+        Path("src/video_demo/media/audio_transcode.py"),
+        Path("src/video_demo/media/audio_probe.py"),
         Path("src/video_demo/application/publication_contracts.py"),
         Path("src/video_demo/application/audio_run_config.py"),
         Path("src/video_demo/domain/audio_plan.py"),
@@ -67,6 +71,31 @@ def test_audio_worker_does_not_import_video_or_visual_assembly_modules() -> None
         "video_demo.media.transcode",
     )
     assert not any(module in source for module in forbidden_modules)
+
+
+def test_audio_transcode_uses_audio_kernel_without_video_transcode_import() -> None:
+    source = Path("src/video_demo/application/audio_transcode.py").read_text(encoding="utf-8")
+    assert "video_demo.media.transcode" not in source
+    assert "video_demo.media.audio_transcode" in source
+
+
+def test_audio_routes_use_audio_specific_services() -> None:
+    source = Path("src/video_demo/api/audio_routes.py").read_text(encoding="utf-8")
+    assert "MediaRunService" not in source
+    assert "media_run_services" not in source
+    assert "media_upload_services" not in source
+    assert "audio_run_service" in source
+    assert "audio_upload_service" in source
+
+
+def test_generic_image_services_do_not_keep_audio_dispatch_branches() -> None:
+    run_source = Path("src/video_demo/application/media_runs.py").read_text(encoding="utf-8")
+    upload_source = Path("src/video_demo/application/media_uploads.py").read_text(encoding="utf-8")
+    assert "AudioRunConfig" not in run_source
+    assert "AudioDocumentConfig" not in run_source
+    assert "AudioUnderstandingRunModel" not in run_source
+    assert 'kind == "AUDIO"' not in run_source
+    assert "AudioObjectModel" not in upload_source
 
 
 def test_audio_worker_import_closure_excludes_video_and_visual_business_modules() -> None:

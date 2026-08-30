@@ -7,12 +7,12 @@ from pathlib import Path
 from typing import Protocol
 
 from video_demo.domain.run import TimeRange
-from video_demo.media.transcode import (
+from video_demo.media.audio_transcode import (
     AudioArtifact,
     AudioSliceArtifact,
-    FFmpegTranscoder,
+    AudioTranscodeLimits,
+    AudioTranscoder,
     NoAudioArtifact,
-    TranscodeLimits,
 )
 
 __all__ = [
@@ -53,12 +53,12 @@ def build_audio_ffmpeg_factory(
     max_output_bytes: int,
     timeout_seconds: int,
 ) -> Callable[[Callable[[], bool]], AudioTranscodeClient]:
-    return lambda is_cancel_requested: FFmpegTranscoder.from_path(
+    return lambda is_cancel_requested: AudioTranscoder.from_path(
         executable,
         runtime_root,
         workspace_root=workspace_root,
         is_cancel_requested=is_cancel_requested,
-        limits=TranscodeLimits(
+        limits=AudioTranscodeLimits(
             max_output_bytes=max_output_bytes,
             timeout_seconds=timeout_seconds,
         ),

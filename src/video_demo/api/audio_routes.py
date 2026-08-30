@@ -8,14 +8,13 @@ from fastapi import APIRouter, Depends, File, Response, UploadFile, status
 
 from video_demo.api.dependencies import AppContainer, get_container, get_scope
 from video_demo.api.schemas import (
+    AudioObjectResponse,
+    AudioRunHistoryItem,
+    AudioRunHistoryResponse,
+    AudioRunResponse,
     CreateAudioRunRequest,
-    MediaObjectResponse,
-    MediaRunHistoryItem,
-    MediaRunHistoryResponse,
-    MediaRunResponse,
     PublicAudioUnderstandingResult,
 )
-from video_demo.application.media_runs import MediaRunService
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.media_repositories import MediaObjectRepository
 from video_demo.persistence.models import AudioObjectModel
@@ -31,13 +30,13 @@ router = APIRouter(
 )
 
 
-@router.post("-objects", response_model=MediaObjectResponse, status_code=status.HTTP_201_CREATED)
+@router.post("-objects", response_model=AudioObjectResponse, status_code=status.HTTP_201_CREATED)
 def upload_audio_object(
     file: AudioUploadFile,
     scope: AudioScope,
     container: AudioContainer,
-) -> MediaObjectResponse:
-    record = container.media_upload_services["AUDIO"].upload(
+) -> AudioObjectResponse:
+    record = container.audio_upload_service.upload(
         file.file,
         file.filename or "",
         file.content_type or "",
@@ -46,12 +45,12 @@ def upload_audio_object(
     return _object_response(record)
 
 
-@router.get("-objects/{object_ref}", response_model=MediaObjectResponse)
+@router.get("-objects/{object_ref}", response_model=AudioObjectResponse)
 def get_audio_object(
     object_ref: str,
     scope: AudioScope,
     container: AudioContainer,
-) -> MediaObjectResponse:
+) -> AudioObjectResponse:
     with container.database.session() as session:
         model = MediaObjectRepository(session, AudioObjectModel).get(scope, object_ref)
         if model is None:
@@ -61,15 +60,15 @@ def get_audio_object(
 
 @router.post(
     "-understanding-runs",
-    response_model=MediaRunResponse,
+    response_model=AudioRunResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
 def create_audio_run(
     payload: CreateAudioRunRequest,
     scope: AudioScope,
     container: AudioContainer,
-) -> MediaRunResponse:
-    view = _audio_runs(container).create(
+) -> AudioRunResponse:
+    view = container.audio_run_service.create(
         scope=scope,
         object_ref=payload.object_ref,
         idempotency_key=payload.idempotency_key,
@@ -81,26 +80,26 @@ def create_audio_run(
     return _run_response(view)
 
 
-@router.get("-understanding-runs", response_model=MediaRunHistoryResponse)
+@router.get("-understanding-runs", response_model=AudioRunHistoryResponse)
 def list_audio_runs(
     scope: AudioScope,
     container: AudioContainer,
-) -> MediaRunHistoryResponse:
-    return MediaRunHistoryResponse(
+) -> AudioRunHistoryResponse:
+    return AudioRunHistoryResponse(
         items=tuple(
-            MediaRunHistoryItem.model_validate(item)
-            for item in _audio_runs(container).list_history(scope)
+            AudioRunHistoryItem.model_validate(item)
+            for item in container.audio_run_service.list_history(scope)
         ),
     )
 
 
-@router.get("-understanding-runs/{run_id}", response_model=MediaRunResponse)
+@router.get("-understanding-runs/{run_id}", response_model=AudioRunResponse)
 def get_audio_run(
     run_id: str,
     scope: AudioScope,
     container: AudioContainer,
-) -> MediaRunResponse:
-    return _run_response(_audio_runs(container).get(scope, run_id))
+) -> AudioRunResponse:
+    return _run_response(container.audio_run_service.get(scope, run_id))
 
 
 @router.get(
@@ -112,7 +111,7 @@ def get_audio_result(
     scope: AudioScope,
     container: AudioContainer,
 ) -> PublicAudioUnderstandingResult:
-    result = container.media_query_services["AUDIO"].get_result(scope, run_id)
+    result = container.audio_query_service.get_result(scope, run_id)
     return PublicAudioUnderstandingResult.model_validate(
         result.model_dump(mode="json", exclude_computed_fields=True),
     )
@@ -125,18 +124,14 @@ def get_audio_document(
     container: AudioContainer,
 ) -> Response:
     return Response(
-        content=container.media_query_services["AUDIO"].get_document(scope, run_id),
+        content=container.audio_query_service.get_document(scope, run_id),
         media_type="text/markdown; charset=utf-8",
         headers={"Content-Disposition": 'inline; filename="knowledge-note.md"'},
     )
 
 
-def _audio_runs(container: AppContainer) -> MediaRunService:
-    return container.media_run_services["AUDIO"]
-
-
-def _object_response(model: object) -> MediaObjectResponse:
-    return MediaObjectResponse(
+def _object_response(model: object) -> AudioObjectResponse:
+    return AudioObjectResponse(
         object_ref=model.object_ref,  # type: ignore[attr-defined]
         original_filename=model.original_filename,  # type: ignore[attr-defined]
         declared_mime=model.declared_mime,  # type: ignore[attr-defined]
@@ -146,8 +141,8 @@ def _object_response(model: object) -> MediaObjectResponse:
     )
 
 
-def _run_response(view: object) -> MediaRunResponse:
-    return MediaRunResponse(
+def _run_response(view: object) -> AudioRunResponse:
+    return AudioRunResponse(
         run_id=view.run_id,  # type: ignore[attr-defined]
         job_id=view.job_id,  # type: ignore[attr-defined]
         status=view.status,  # type: ignore[attr-defined]

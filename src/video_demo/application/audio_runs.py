@@ -1,23 +1,23 @@
+"""音频运行创建、查询和历史服务。"""
+
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from video_demo.domain.document import DocumentGenerationConfig
+from video_demo.application.audio_run_config import AudioRunConfig
+from video_demo.domain.audio_plan import AudioDocumentConfig
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.media_repositories import MediaObjectRepository, MediaRunRepository
-from video_demo.persistence.models import (
-    ImageObjectModel,
-    ImageUnderstandingRunModel,
-)
+from video_demo.persistence.models import AudioObjectModel, AudioUnderstandingRunModel
 from video_demo.persistence.repositories import JobRepository
 from video_demo.persistence.scope import Scope
 
 
 @dataclass(frozen=True, slots=True)
-class MediaRunView:
+class AudioRunView:
     run_id: str
     job_id: str
     status: str
@@ -26,8 +26,8 @@ class MediaRunView:
     error_code: str | None
 
 
-class MediaRunService:
-    """图片运行服务；音频运行由 AudioRunService 独立处理。"""
+class AudioRunService:
+    """只操作 audio_object 与 audio_understanding_run。"""
 
     def __init__(self, database: Database) -> None:
         self._database = database
@@ -41,38 +41,36 @@ class MediaRunService:
         language_hints: tuple[str, ...] = (),
         hotwords: tuple[str, ...] = (),
         core_context: str | None = None,
-        document_config: DocumentGenerationConfig | None = None,
-    ) -> MediaRunView:
-        from video_demo.application.pipeline_contracts import PipelineRunConfig
-
-        config = PipelineRunConfig(
+        document_config: AudioDocumentConfig | None = None,
+    ) -> AudioRunView:
+        config = AudioRunConfig(
             language_hints=language_hints,
             hotwords=hotwords,
             core_context=core_context,
-            document_config=document_config or DocumentGenerationConfig(),
+            document_config=document_config or AudioDocumentConfig(),
         )
+        config_snapshot = config.model_dump(mode="json")
         with self._database.session() as session:
-            objects = MediaObjectRepository(session, ImageObjectModel)
+            objects = MediaObjectRepository(session, AudioObjectModel)
             if objects.get_ready(scope, object_ref) is None:
-                raise VideoDemoError(self._object_not_found_code(), "媒体对象不存在")
-            runs = MediaRunRepository(session, ImageUnderstandingRunModel)
+                raise VideoDemoError(ErrorCode.AUDIO_OBJECT_NOT_FOUND, "音频对象不存在")
+            runs = MediaRunRepository(session, AudioUnderstandingRunModel)
             existing = runs.get_by_idempotency(scope, idempotency_key)
             if existing is not None:
-                config_snapshot = config.model_dump(mode="json")
-                if existing.object_ref != object_ref or existing.config_snapshot != config_snapshot:
+                if (
+                    existing.object_ref != object_ref
+                    or existing.config_snapshot != config_snapshot
+                ):
                     raise VideoDemoError(
                         ErrorCode.IDEMPOTENCY_CONFLICT,
-                        "幂等键已用于另一个媒体运行",
+                        "幂等键已用于另一个音频运行",
                     )
                 job = JobRepository(session).get_by_resource_type(
-                    scope,
-                    existing.run_id,
-                    "IMAGE_UNDERSTANDING_RUN",
+                    scope, existing.run_id, "AUDIO_UNDERSTANDING_RUN"
                 )
                 if job is None:
-                    raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "媒体运行任务不存在")
+                    raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "音频运行任务不存在")
                 return _view(existing, job.job_id)
-            config_snapshot = config.model_dump(mode="json")
             run_id = f"run_{uuid.uuid4().hex}"
             job_id = f"job_{uuid.uuid4().hex}"
             run = runs.add(
@@ -86,40 +84,36 @@ class MediaRunService:
                 scope=scope,
                 job_id=job_id,
                 resource_id=run_id,
-                job_type="IMAGE_UNDERSTANDING",
-                resource_type="IMAGE_UNDERSTANDING_RUN",
+                job_type="AUDIO_UNDERSTANDING",
+                resource_type="AUDIO_UNDERSTANDING_RUN",
             )
             return _view(run, job_id)
 
-    def get(self, scope: Scope, run_id: str) -> MediaRunView:
+    def get(self, scope: Scope, run_id: str) -> AudioRunView:
         with self._database.session() as session:
-            run = MediaRunRepository(session, ImageUnderstandingRunModel).get(scope, run_id)
+            run = MediaRunRepository(session, AudioUnderstandingRunModel).get(scope, run_id)
             if run is None:
-                raise VideoDemoError(self._run_not_found_code(), "媒体运行不存在")
+                raise VideoDemoError(ErrorCode.AUDIO_RUN_NOT_FOUND, "音频运行不存在")
             job = JobRepository(session).get_by_resource_type(
-                scope,
-                run_id,
-                "IMAGE_UNDERSTANDING_RUN",
+                scope, run_id, "AUDIO_UNDERSTANDING_RUN"
             )
             if job is None:
-                raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "媒体运行任务不存在")
+                raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "音频运行任务不存在")
             return _view(run, job.job_id)
 
     def list_history(self, scope: Scope) -> tuple[dict[str, Any], ...]:
         with self._database.session() as session:
-            objects = MediaObjectRepository(session, ImageObjectModel)
-            result = []
-            runs = MediaRunRepository(session, ImageUnderstandingRunModel)
+            objects = MediaObjectRepository(session, AudioObjectModel)
+            history: list[dict[str, Any]] = []
+            runs = MediaRunRepository(session, AudioUnderstandingRunModel)
             for run in runs.list_with_objects(scope):
-                obj = objects.get(scope, run.object_ref)
+                audio = objects.get(scope, run.object_ref)
                 job = JobRepository(session).get_by_resource_type(
-                    scope,
-                    run.run_id,
-                    "IMAGE_UNDERSTANDING_RUN",
+                    scope, run.run_id, "AUDIO_UNDERSTANDING_RUN"
                 )
-                if obj is None or job is None:
+                if audio is None or job is None:
                     continue
-                result.append(
+                history.append(
                     {
                         "run_id": run.run_id,
                         "job_id": job.job_id,
@@ -128,33 +122,18 @@ class MediaRunService:
                         "warning_codes": tuple(run.warning_codes),
                         "error_code": run.error_code,
                         "object_ref": run.object_ref,
-                        "original_filename": obj.original_filename,
-                        "detected_mime": obj.detected_mime,
-                        "size_bytes": obj.size_bytes,
+                        "original_filename": audio.original_filename,
+                        "detected_mime": audio.detected_mime,
+                        "size_bytes": audio.size_bytes,
                         "created_at": run.created_at,
                         "updated_at": run.updated_at,
                     },
                 )
-            return tuple(result)
-
-    def require_result_ready(self, scope: Scope, run_id: str) -> MediaRunView:
-        view = self.get(scope, run_id)
-        if view.status not in {"SUCCEEDED", "PARTIAL_SUCCEEDED"}:
-            raise VideoDemoError(
-                ErrorCode.VIDEO_RESULT_NOT_READY,
-                "媒体理解结果尚未就绪",
-            )
-        return view
-
-    def _object_not_found_code(self) -> ErrorCode:
-        return ErrorCode.IMAGE_OBJECT_NOT_FOUND
-
-    def _run_not_found_code(self) -> ErrorCode:
-        return ErrorCode.IMAGE_RUN_NOT_FOUND
+            return tuple(history)
 
 
-def _view(run: Any, job_id: str) -> MediaRunView:
-    return MediaRunView(
+def _view(run: Any, job_id: str) -> AudioRunView:
+    return AudioRunView(
         run_id=run.run_id,
         job_id=job_id,
         status=run.status.value,

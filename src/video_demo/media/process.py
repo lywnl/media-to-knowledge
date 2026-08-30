@@ -21,6 +21,16 @@ class ProcessResult:
     stderr: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessErrorCodes:
+    """子进程执行器的错误码策略；默认值保持既有视频兼容契约。"""
+
+    invalid: ErrorCode = ErrorCode.VIDEO_PROCESS_FAILED
+    cancelled: ErrorCode = ErrorCode.VIDEO_PROCESS_CANCELLED
+    timeout: ErrorCode = ErrorCode.VIDEO_PROCESS_TIMEOUT
+    output_too_large: ErrorCode = ErrorCode.VIDEO_PROCESS_OUTPUT_TOO_LARGE
+
+
 class SafeProcessRunner:
     """不启用 shell 的受限子进程执行器。"""
 
@@ -30,6 +40,7 @@ class SafeProcessRunner:
         max_output_bytes: int = 16 * 1024 * 1024,
         is_cancel_requested: Callable[[], bool] = lambda: False,
         workspace_root: Path | None = None,
+        error_codes: ProcessErrorCodes | None = None,
     ) -> None:
         if max_output_bytes < 1:
             raise ValueError("max_output_bytes 必须大于 0")
@@ -38,6 +49,7 @@ class SafeProcessRunner:
         self._workspace_root = (
             workspace_root.resolve(strict=True) if workspace_root is not None else None
         )
+        self._error_codes = error_codes or ProcessErrorCodes()
 
     def run(
         self,
@@ -70,12 +82,12 @@ class SafeProcessRunner:
                 )
             )
         ):
-            raise VideoDemoError(ErrorCode.VIDEO_PROCESS_FAILED, "子进程参数必须是非空字符串数组")
+            raise VideoDemoError(self._error_codes.invalid, "子进程参数必须是非空字符串数组")
         self._verify_output_paths(output_paths)
         if pass_fds:
             if os.name != "posix":
                 raise VideoDemoError(
-                    ErrorCode.VIDEO_PROCESS_FAILED,
+                    self._error_codes.invalid,
                     "当前平台不支持安全继承文件描述符",
                 )
             try:
@@ -83,11 +95,11 @@ class SafeProcessRunner:
                     os.fstat(descriptor)
             except OSError:
                 raise VideoDemoError(
-                    ErrorCode.VIDEO_PROCESS_FAILED,
+                    self._error_codes.invalid,
                     "继承文件描述符非法",
                 ) from None
         if self._is_cancel_requested():
-            raise VideoDemoError(ErrorCode.VIDEO_PROCESS_CANCELLED, "媒体处理已取消")
+            raise VideoDemoError(self._error_codes.cancelled, "媒体处理已取消")
         try:
             if pass_fds:
                 process = subprocess.Popen(
@@ -113,7 +125,7 @@ class SafeProcessRunner:
                     env=dict(env) if env is not None else None,
                 )
         except OSError as error:
-            raise VideoDemoError(ErrorCode.VIDEO_PROCESS_FAILED, "媒体子进程无法启动") from error
+            raise VideoDemoError(self._error_codes.invalid, "媒体子进程无法启动") from error
         try:
             stdout, stderr = self._collect_output(process, timeout_seconds)
             return ProcessResult(process.wait(), stdout, stderr)
@@ -176,7 +188,7 @@ class SafeProcessRunner:
                     outputs[cast(str, key.data)].extend(chunk)
                     if sum(len(value) for value in outputs.values()) > self._max_output_bytes:
                         raise VideoDemoError(
-                            ErrorCode.VIDEO_PROCESS_OUTPUT_TOO_LARGE,
+                            self._error_codes.output_too_large,
                             "媒体子进程输出超过安全上限",
                         )
         finally:
@@ -185,9 +197,9 @@ class SafeProcessRunner:
 
     def _check_process_state(self, deadline: float) -> None:
         if self._is_cancel_requested():
-            raise VideoDemoError(ErrorCode.VIDEO_PROCESS_CANCELLED, "媒体处理已取消")
+            raise VideoDemoError(self._error_codes.cancelled, "媒体处理已取消")
         if time.monotonic() >= deadline:
-            raise VideoDemoError(ErrorCode.VIDEO_PROCESS_TIMEOUT, "媒体子进程执行超时")
+            raise VideoDemoError(self._error_codes.timeout, "媒体子进程执行超时")
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:

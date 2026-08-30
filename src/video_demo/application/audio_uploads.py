@@ -1,26 +1,23 @@
+"""音频对象上传与登记服务。"""
+
 from __future__ import annotations
 
 from typing import BinaryIO
 
 from video_demo.persistence.database import Database
 from video_demo.persistence.media_repositories import MediaObjectRepository
-from video_demo.persistence.models import ImageObjectModel
+from video_demo.persistence.models import AudioObjectModel
 from video_demo.persistence.scope import Scope
-from video_demo.storage.media_object_store import BinaryMediaObjectStore, MediaObjectRecord
+from video_demo.storage.audio_object_store import AudioObjectStore
+from video_demo.storage.media_object_store import MediaObjectRecord
 
 
-class MediaUploadService:
-    """登记图片对象；视频和音频上传分别由各自服务处理。"""
+class AudioUploadService:
+    """只登记音频对象，不通过其他媒体类型分派。"""
 
-    def __init__(
-        self,
-        database: Database,
-        object_store: BinaryMediaObjectStore,
-        model: type[ImageObjectModel],
-    ) -> None:
+    def __init__(self, database: Database, object_store: AudioObjectStore) -> None:
         self._database = database
         self._object_store = object_store
-        self._model = model
 
     def upload(
         self,
@@ -31,7 +28,7 @@ class MediaUploadService:
     ) -> MediaObjectRecord:
         record = self._object_store.ingest(stream, filename, declared_mime, scope)
         with self._database.session() as session:
-            MediaObjectRepository(session, self._model).add_ready(
+            MediaObjectRepository(session, AudioObjectModel).add_ready(
                 scope=scope,
                 object_ref=record.object_ref,
                 original_filename=record.original_filename,

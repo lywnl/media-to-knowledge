@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from video_demo.capabilities import resolve_workspace_binary
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.media.process import ProcessResult, SafeProcessRunner
+from video_demo.media.process import ProcessErrorCodes, ProcessResult, SafeProcessRunner
 from video_demo.storage.workspace import reject_symlink_components
 
 
@@ -40,6 +41,34 @@ class FFprobeAudioClient:
         self._workspace_root = workspace_root.resolve(strict=False)
         self._timeout_seconds = timeout_seconds
 
+    @classmethod
+    def from_path(
+        cls,
+        executable: Path,
+        *,
+        workspace_root: Path,
+        timeout_seconds: int = 60,
+    ) -> FFprobeAudioClient:
+        executable = resolve_workspace_binary(
+            executable,
+            workspace_root=workspace_root,
+            unavailable_code=ErrorCode.AUDIO_FFPROBE_UNAVAILABLE,
+        )
+        runner = SafeProcessRunner(
+            max_output_bytes=64 * 1024,
+            workspace_root=workspace_root,
+            error_codes=ProcessErrorCodes(
+                invalid=ErrorCode.AUDIO_PROBE_INVALID,
+                cancelled=ErrorCode.AUDIO_PROCESS_CANCELLED,
+                timeout=ErrorCode.AUDIO_PROCESS_TIMEOUT,
+                output_too_large=ErrorCode.AUDIO_PROCESS_OUTPUT_TOO_LARGE,
+            ),
+        )
+        version = runner.run([str(executable), "-version"], timeout_seconds=10)
+        if version.returncode != 0:
+            raise VideoDemoError(ErrorCode.AUDIO_BINARY_PROBE_FAILED, "音频 ffprobe 版本探测失败")
+        return cls(executable, workspace_root=workspace_root, timeout_seconds=timeout_seconds)
+
     def probe(self, source: Path, *, max_duration_ms: int) -> AudioProbeResult:
         source = reject_symlink_components(
             self._workspace_root,
@@ -51,6 +80,12 @@ class FFprobeAudioClient:
         runner = SafeProcessRunner(
             max_output_bytes=4 * 1024 * 1024,
             workspace_root=self._workspace_root,
+            error_codes=ProcessErrorCodes(
+                invalid=ErrorCode.AUDIO_PROBE_INVALID,
+                cancelled=ErrorCode.AUDIO_PROCESS_CANCELLED,
+                timeout=ErrorCode.AUDIO_PROCESS_TIMEOUT,
+                output_too_large=ErrorCode.AUDIO_PROCESS_OUTPUT_TOO_LARGE,
+            ),
         )
         result = runner.run(
             [

@@ -51,7 +51,7 @@ def test_audio_repository_round_trips_audio_tables_only(tmp_path) -> None:
     scope = Scope("tenant", "app", "kb")
     with database.session() as session:
         repository = AudioResultRepository(session)
-        repository.replace(scope, _result())
+        repository.replace(scope, _result(), object_ref="obj_audio_001")
         loaded = repository.get(scope, "run_audio_001", "a" * 64)
 
     assert loaded == _result()
@@ -66,8 +66,8 @@ def test_audio_repository_writes_only_audio_rows_and_replaces_idempotently(tmp_p
     scope = Scope("tenant", "app", "kb")
     with database.session() as session:
         repository = AudioResultRepository(session)
-        repository.replace(scope, _result())
-        repository.replace(scope, _result())
+        repository.replace(scope, _result(), object_ref="obj_audio_001")
+        repository.replace(scope, _result(), object_ref="obj_audio_001")
 
         assert session.scalar(
             select(AudioAssetModel).where(AudioAssetModel.run_id == "run_audio_001"),
@@ -91,3 +91,17 @@ def test_audio_repository_reports_missing_rows_as_not_ready(tmp_path) -> None:
         AudioResultRepository(session).get(scope, "run_audio_missing", "a" * 64)
 
     assert raised.value.code == ErrorCode.AUDIO_RESULT_NOT_READY
+
+
+def test_audio_repository_rejects_requested_digest_different_from_asset_row(tmp_path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'audio-digest.db'}"
+    database = Database(database_url)
+    database.create_schema()
+    scope = Scope("tenant", "app", "kb")
+    with database.session() as session:
+        repository = AudioResultRepository(session)
+        repository.replace(scope, _result(), object_ref="obj_audio_001")
+        with pytest.raises(VideoDemoError) as raised:
+            repository.get(scope, "run_audio_001", "b" * 64)
+
+    assert raised.value.code == ErrorCode.AUDIO_DIGEST_MISMATCH

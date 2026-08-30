@@ -25,7 +25,13 @@ class AudioResultRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def replace(self, scope: Scope, result: AudioUnderstandingResult) -> None:
+    def replace(
+        self,
+        scope: Scope,
+        result: AudioUnderstandingResult,
+        *,
+        object_ref: str,
+    ) -> None:
         validated = AudioUnderstandingResult.model_validate(
             result.model_dump(mode="json", exclude_computed_fields=True),
         )
@@ -45,7 +51,7 @@ class AudioResultRepository:
                 knowledge_base_id=scope.knowledge_base_id,
                 run_id=validated.run_id,
                 asset_id=validated.asset_sha256,
-                object_ref=validated.run_id,
+                object_ref=object_ref,
                 source_sha256=validated.asset_sha256,
                 schema_version=validated.schema_version,
             ),
@@ -83,6 +89,18 @@ class AudioResultRepository:
         self._session.flush()
 
     def get(self, scope: Scope, run_id: str, asset_sha256: str) -> AudioUnderstandingResult:
+        asset = self._session.scalar(
+            select(AudioAssetModel).where(
+                AudioAssetModel.tenant_id == scope.tenant_id,
+                AudioAssetModel.application_id == scope.application_id,
+                AudioAssetModel.knowledge_base_id == scope.knowledge_base_id,
+                AudioAssetModel.run_id == run_id,
+            ),
+        )
+        if asset is None:
+            raise VideoDemoError(ErrorCode.AUDIO_RESULT_NOT_READY, "音频资产结果行尚未就绪")
+        if asset.source_sha256 != asset_sha256:
+            raise VideoDemoError(ErrorCode.AUDIO_DIGEST_MISMATCH, "音频结果摘要与资产不一致")
         segments = self._session.scalars(
             select(AudioSegmentModel)
             .where(

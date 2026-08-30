@@ -6,7 +6,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import ValidationError
 
@@ -19,8 +19,12 @@ from video_demo.domain.audio_document import AudioUnderstandingResult
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.audio_document_repository import AudioResultRepository
 from video_demo.persistence.database import Database
-from video_demo.persistence.media_repositories import MediaRunRepository
-from video_demo.persistence.models import AudioUnderstandingRunModel, RunStatusValue
+from video_demo.persistence.media_repositories import MediaObjectRepository, MediaRunRepository
+from video_demo.persistence.models import (
+    AudioObjectModel,
+    AudioUnderstandingRunModel,
+    RunStatusValue,
+)
 from video_demo.persistence.repositories import JobRepository
 from video_demo.persistence.scope import Scope
 from video_demo.storage.artifacts import (
@@ -74,6 +78,7 @@ class AudioPublicationService:
             raise ValueError("音频 Markdown 必须由同一结果确定性渲染")
         if len(warnings) != len(set(warnings)):
             raise ValueError("音频 warnings 不得重复")
+        object_ref = self._validate_run_asset(scope, validated)
         result_root = Path("runs") / scope_key(scope) / validated.run_id / "result"
         document_receipt: ArtifactBytesReceipt | None = None
         bundle_receipt: ArtifactReceipt | None = None
@@ -104,7 +109,11 @@ class AudioPublicationService:
                 )
                 if run is None:
                     raise VideoDemoError(ErrorCode.AUDIO_RUN_NOT_FOUND, "音频运行不存在")
-                AudioResultRepository(session).replace(scope, validated)
+                AudioResultRepository(session).replace(
+                    scope,
+                    validated,
+                    object_ref=object_ref,
+                )
                 run.status = RunStatusValue(status)
                 run.current_stage = "RESULT"
                 run.warning_codes = list(warnings)
@@ -130,6 +139,31 @@ class AudioPublicationService:
             if document_receipt is not None:
                 self._store.discard_bytes(document_receipt)
             raise
+
+    def _validate_run_asset(
+        self,
+        scope: Scope,
+        result: AudioUnderstandingResult,
+    ) -> str:
+        with self._database.session() as session:
+            run = MediaRunRepository(session, AudioUnderstandingRunModel).get(
+                scope,
+                result.run_id,
+            )
+            if run is None:
+                raise VideoDemoError(ErrorCode.AUDIO_RUN_NOT_FOUND, "音频运行不存在")
+            audio = MediaObjectRepository(session, AudioObjectModel).get_ready(
+                scope,
+                run.object_ref,
+            )
+            if audio is None:
+                raise VideoDemoError(ErrorCode.AUDIO_OBJECT_NOT_FOUND, "音频对象不存在")
+            if audio.sha256 != result.asset_sha256:
+                raise VideoDemoError(
+                    ErrorCode.AUDIO_DIGEST_MISMATCH,
+                    "音频结果目标与运行资产不匹配",
+                )
+            return cast(str, audio.object_ref)
 
     def get(self, scope: Scope, run_id: str) -> AudioResultPublication:
         with self._database.session() as session:

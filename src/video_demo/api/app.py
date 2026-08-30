@@ -15,6 +15,8 @@ from video_demo.api.runs import router as runs_router
 from video_demo.api.schemas import ErrorBody, ErrorResponse
 from video_demo.application.audio_publication import AudioPublicationService
 from video_demo.application.audio_queries import AudioQueryService
+from video_demo.application.audio_runs import AudioRunService
+from video_demo.application.audio_uploads import AudioUploadService
 from video_demo.application.image_rendering import render_image_markdown
 from video_demo.application.media_publication import MediaPublicationService
 from video_demo.application.media_queries import MediaQueryService
@@ -29,7 +31,6 @@ from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
 from video_demo.persistence.models import (
-    AudioObjectModel,
     ImageObjectModel,
     ImageUnderstandingRunModel,
 )
@@ -58,6 +59,9 @@ _CONFLICT_CODES = {
 _UNAVAILABLE_CODES = {
     ErrorCode.VIDEO_FFMPEG_UNAVAILABLE,
     ErrorCode.VIDEO_FFPROBE_UNAVAILABLE,
+    ErrorCode.AUDIO_FFMPEG_UNAVAILABLE,
+    ErrorCode.AUDIO_FFPROBE_UNAVAILABLE,
+    ErrorCode.AUDIO_BINARY_PROBE_FAILED,
     ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
     ErrorCode.SPEECH_SUBPROCESS_TIMEOUT,
     ErrorCode.SPEECH_SUBPROCESS_CRASHED,
@@ -115,11 +119,6 @@ def create_app(
             max_bundle_bytes=runtime.max_result_bundle_bytes,
         ),
         media_upload_services={
-            "AUDIO": MediaUploadService(
-                database,
-                AudioObjectStore(runtime.runtime_root, max_bytes=runtime.max_audio_bytes),
-                AudioObjectModel,
-            ),
             "IMAGE": MediaUploadService(
                 database,
                 ImageObjectStore(runtime.runtime_root, max_bytes=runtime.max_image_bytes),
@@ -127,18 +126,9 @@ def create_app(
             ),
         },
         media_run_services={
-            "AUDIO": MediaRunService(database, kind="AUDIO"),
-            "IMAGE": MediaRunService(database, kind="IMAGE"),
+            "IMAGE": MediaRunService(database),
         },
         media_query_services={
-            "AUDIO": AudioQueryService(
-                AudioPublicationService(
-                    database,
-                    AtomicArtifactStore(runtime.runtime_root),
-                    max_document_bytes=runtime.max_document_bytes,
-                    max_bundle_bytes=runtime.max_result_bundle_bytes,
-                ),
-            ),
             "IMAGE": MediaQueryService(
                 MediaPublicationService(
                     database,
@@ -154,6 +144,19 @@ def create_app(
                 ),
             ),
         },
+        audio_upload_service=AudioUploadService(
+            database,
+            AudioObjectStore(runtime.runtime_root, max_bytes=runtime.max_audio_bytes),
+        ),
+        audio_run_service=AudioRunService(database),
+        audio_query_service=AudioQueryService(
+            AudioPublicationService(
+                database,
+                AtomicArtifactStore(runtime.runtime_root),
+                max_document_bytes=runtime.max_document_bytes,
+                max_bundle_bytes=runtime.max_result_bundle_bytes,
+            ),
+        ),
     )
 
     app = FastAPI(

@@ -7,6 +7,8 @@ from typing import Annotated
 from fastapi import Header, Path, Request
 
 from video_demo.application.audio_queries import AudioQueryService
+from video_demo.application.audio_runs import AudioRunService
+from video_demo.application.audio_uploads import AudioUploadService
 from video_demo.application.media_queries import MediaQueryService
 from video_demo.application.media_runs import MediaRunService
 from video_demo.application.media_uploads import MediaUploadService
@@ -29,6 +31,9 @@ class AppContainer:
     media_upload_services: dict[str, MediaUploadService]
     media_run_services: dict[str, MediaRunService]
     media_query_services: dict[str, MediaQueryService | AudioQueryService]
+    audio_upload_service: AudioUploadService
+    audio_run_service: AudioRunService
+    audio_query_service: AudioQueryService
 
 
 def get_container(request: Request) -> AppContainer:

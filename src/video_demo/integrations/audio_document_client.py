@@ -253,10 +253,10 @@ def _expand_planning_response(
                 raise VideoDemoError(ErrorCode.TEXT_LLM_RESPONSE_INVALID, "音频章节片段范围越界")
         else:
             end = draft.end_segment_index
-        if draft.start_segment_index != expected_start:
-            raise VideoDemoError(ErrorCode.TEXT_LLM_RESPONSE_INVALID, "音频章节片段范围不连续")
         if draft.start_segment_index >= end:
             raise VideoDemoError(ErrorCode.TEXT_LLM_RESPONSE_INVALID, "音频章节片段范围为空")
+        if draft.start_segment_index != expected_start:
+            raise VideoDemoError(ErrorCode.TEXT_LLM_RESPONSE_INVALID, "音频章节片段范围不连续")
         drafts.append(
             AudioChapterDraft(
                 segment_refs=segment_ids[draft.start_segment_index : end],
