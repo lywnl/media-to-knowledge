@@ -77,33 +77,6 @@ def verified_run_file(
     return path
 
 
-def verified_mp4_file(
-    runtime_root: Path,
-    allowed_relative_root: Path,
-    candidate: Path,
-    *,
-    expected_sha256: str,
-    expected_size_bytes: int,
-    max_size_bytes: int,
-    message: str,
-) -> Path:
-    """流式验证当前运行目录内、受限且具有 ISO BMFF ftyp 的 MP4。"""
-    path = verified_visual_file(
-        runtime_root,
-        allowed_relative_root,
-        candidate,
-        message=message,
-        expected_sha256=expected_sha256,
-        expected_size_bytes=expected_size_bytes,
-        max_size_bytes=max_size_bytes,
-    )
-    with path.open("rb") as stream:
-        header = stream.read(32)
-    if not _has_iso_bmff_ftyp(header, expected_size_bytes):
-        raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "MP4 缺少合法 ISO BMFF ftyp")
-    return path
-
-
 def verified_visual_file(
     runtime_root: Path,
     allowed_relative_root: Path,
@@ -133,7 +106,7 @@ def verified_visual_file(
         while chunk := stream.read(1024 * 1024):
             actual_size += len(chunk)
             if actual_size > max_size_bytes:
-                raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "MP4 大小超过限制")
+                raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "视觉输入大小超过限制")
             digest.update(chunk)
             if len(header) < 32:
                 header += chunk[: 32 - len(header)]
@@ -142,21 +115,3 @@ def verified_visual_file(
     if digest.hexdigest() != expected_sha256:
         raise VideoDemoError(ErrorCode.VIDEO_DIGEST_MISMATCH, "视觉输入摘要校验失败")
     return path
-
-
-def _has_iso_bmff_ftyp(header: bytes, actual_size: int) -> bool:
-    if len(header) < 8 or header[4:8] != b"ftyp":
-        return False
-    size32 = int.from_bytes(header[:4], byteorder="big")
-    if size32 == 0:
-        return False
-    if size32 == 1:
-        if len(header) < 24:
-            return False
-        large_size = int.from_bytes(header[8:16], byteorder="big")
-        return (
-            large_size >= 24
-            and (large_size - 24) % 4 == 0
-            and large_size <= actual_size
-        )
-    return size32 >= 16 and (size32 - 16) % 4 == 0 and size32 <= actual_size

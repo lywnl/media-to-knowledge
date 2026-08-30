@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from collections.abc import Callable
 from itertools import pairwise
 from pathlib import Path
@@ -24,12 +25,11 @@ from video_demo.evaluation.annotations import (
 )
 from video_demo.evaluation.dataset import EvaluationSample
 from video_demo.media.probe import FFprobeClient, ProbeLimits, SupportedMime
-from video_demo.media.transcode import FFmpegTranscoder
 from video_demo.storage.workspace import (
     atomic_replace,
     reject_symlink_components,
     safe_runtime_path,
-    verified_mp4_file,
+    verified_visual_file,
 )
 from video_demo.visual.candidate_artifacts import (
     CandidateArtifactSession,
@@ -108,7 +108,7 @@ class ChapterVlmInputManifest(FrozenModel):
     proxy_frame_rate: Rational
     proxy_is_variable_frame_rate: StrictBool
     proxy_duration_ms: StrictInt = Field(gt=0, le=7_200_000)
-    proxy_relative_path: Literal["media/proxy.mp4"]
+    proxy_relative_path: Literal["media/source.mp4"]
     duration_tolerance_ms: StrictInt = Field(ge=0, le=1_000)
     jpeg_quality: StrictInt = Field(ge=1, le=100)
     proxy_sha256: Sha256
@@ -247,7 +247,7 @@ class ValidatedChapterVlmInputContext(FrozenModel):
     source_display_width: StrictInt = Field(gt=0)
     source_display_height: StrictInt = Field(gt=0)
     allowed_run_root: Path
-    proxy_relative_path: Literal["media/proxy.mp4"]
+    proxy_relative_path: Literal["media/source.mp4"]
     proxy_sha256: Sha256
     proxy_size_bytes: StrictInt = Field(gt=0)
     proxy_max_edge: StrictInt = Field(ge=1_280, le=2_560)
@@ -359,14 +359,14 @@ def validate_chapter_vlm_input_manifest(
     if relative_run.parts[:1] != ("runs",) or len(relative_run.parts) != 3:
         raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "评测 Run 根层级非法")
     proxy = safe_runtime_path(run_root, Path(manifest.proxy_relative_path))
-    verified_mp4_file(
+    verified_visual_file(
         runtime_root,
         relative_run,
         proxy,
         expected_sha256=manifest.proxy_sha256,
         expected_size_bytes=manifest.proxy_size_bytes,
         max_size_bytes=manifest.proxy_size_bytes,
-        message="评测代理必须是当前 Run 内安全 MP4",
+        message="评测视觉输入必须是当前 Run 内安全普通文件",
     )
     seen_paths: set[str] = set()
     seen_sha: set[str] = set()
@@ -533,14 +533,13 @@ def prepare_chapter_vlm_input(
     max_candidate_frame_bytes_per_run: int,
     max_candidate_frame_files_per_run: int,
     ffprobe: FFprobeClient,
-    transcoder: FFmpegTranscoder,
     frame_extractor: OpenCvFrameExtractor,
     runtime_root: Path,
     sample_id: StableId | None = None,
     requested_reference_frame_ids: tuple[StableId, ...] | None = None,
     is_cancel_requested: Callable[[], bool] = lambda: False,
 ) -> ChapterVlmInputPreparation:
-    """同一排他租约内完成探测、代理、抽帧和 Manifest 发布。"""
+    """同一排他租约内完成探测、原视频抽帧和 Manifest 发布。"""
     started = False
     proxy_identity: tuple[Path, tuple[int, int]] | None = None
     try:
@@ -618,7 +617,7 @@ def prepare_chapter_vlm_input(
         ) as lease:
             if manifest_path.exists() or manifest_path.is_symlink():
                 existing = _read_manifest(manifest_path)
-                proxy_path = safe_runtime_path(run_root, Path("media/proxy.mp4"))
+                proxy_path = safe_runtime_path(run_root, Path("media/source.mp4"))
                 proxy_sha, proxy_size = _file_digest(proxy_path, max_bytes=max_video_bytes)
                 proxy_probe = ffprobe.probe(
                     proxy_path,
@@ -661,23 +660,16 @@ def prepare_chapter_vlm_input(
                     manifest_sha256=chapter_vlm_input_manifest_sha256(existing),
                     context=context,
                 )
-            proxy_path = safe_runtime_path(run_root, Path("media/proxy.mp4"))
+            proxy_path = safe_runtime_path(run_root, Path("media/source.mp4"))
             if proxy_path.exists() or proxy_path.is_symlink():
-                raise VideoDemoError(ErrorCode.IDEMPOTENCY_CONFLICT, "代理存在但 Manifest 缺失")
-            proxy = transcoder.create_proxy(
-                source_path, run_relative_root, duration_ms=source_probe.manifest.duration_ms
-            )
-            if proxy.max_edge != proxy_max_edge:
-                raise VideoDemoError(
-                    ErrorCode.INVALID_CONFIGURATION,
-                    "转码器代理长边配置与评测请求不一致",
-                )
-            proxy_path = safe_runtime_path(runtime, Path(proxy.relative_path))
+                raise VideoDemoError(ErrorCode.IDEMPOTENCY_CONFLICT, "视觉输入存在但 Manifest 缺失")
+            proxy_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_path, proxy_path)
             status = proxy_path.stat()
             proxy_identity = (proxy_path, (status.st_dev, status.st_ino))
             proxy_sha, proxy_size = _file_digest(proxy_path, max_bytes=max_video_bytes)
-            if proxy_sha != proxy.sha256 or proxy_size != proxy.size_bytes:
-                raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "代理摘要或大小不一致")
+            if proxy_sha != sample.media_sha256 or proxy_size != source_size:
+                raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "视觉输入摘要或大小不一致")
             proxy_probe = ffprobe.probe(
                 proxy_path,
                 object_ref=sample.sample_id,
@@ -759,7 +751,7 @@ def prepare_chapter_vlm_input(
                     proxy_frame_rate=proxy_probe.manifest.video_stream.average_frame_rate,
                     proxy_is_variable_frame_rate=proxy_probe.manifest.video_stream.is_variable_frame_rate,
                     proxy_duration_ms=proxy_probe.manifest.duration_ms,
-                    proxy_relative_path="media/proxy.mp4",
+                    proxy_relative_path="media/source.mp4",
                     duration_tolerance_ms=_DEFAULT_DURATION_TOLERANCE_MS,
                     jpeg_quality=jpeg_quality,
                     proxy_sha256=proxy_sha,

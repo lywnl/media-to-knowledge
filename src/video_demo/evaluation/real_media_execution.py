@@ -63,12 +63,11 @@ def _load_scenedetect() -> tuple[object, object]:
     return scenedetect, detectors
 
 
-MediaRole = Literal["SOURCE", "PROXY", "AUDIO", "KEYFRAME"]
+MediaRole = Literal["SOURCE", "AUDIO", "KEYFRAME"]
 MediaFormat = Literal["MP4", "WAV", "JPEG"]
 MediaPhase = Literal[
     "generate",
     "probe",
-    "proxy",
     "audio",
     "opencv_decode",
     "scene_detect",
@@ -331,14 +330,9 @@ def _execute_case(
         registered = _registered_asset(source, run_root, facts.files[0])
         probed = _probe_phase(case_id, registered, probe, journal, facts, session)
         session.assert_registered_leaves(facts.registered_paths)
-        proxy = _proxy_phase(
-            case_id, probed, transcoder, store, journal, facts, max_bytes, session
-        )
-        session.assert_registered_leaves(facts.registered_paths)
         prepared = _audio_phase(
             case_id,
             probed,
-            proxy,
             transcoder,
             store,
             journal,
@@ -501,74 +495,9 @@ def _probe_phase(
     return probed
 
 
-def _proxy_phase(
-    case_id: str,
-    probed: ProbedAsset,
-    client: FFmpegTranscoder,
-    store: EvidenceStore,
-    journal: MediaJournal,
-    facts: _CaseFacts,
-    max_bytes: int,
-    session: CaseExecutionSession,
-) -> TransferredMedia:
-    session.assert_registered_leaves(facts.registered_paths)
-    source = facts.files[0].relative_path
-    output = _runtime_file_relative(store, probed.asset.run_relative_root / "media/proxy.mp4")
-    journal.begin_phase(
-        case_id=case_id,
-        phase="proxy",
-        executable="FFmpegTranscoder",
-        arguments=("normalize_video",),
-        input_relative_paths=(source,),
-        output_relative_paths=(output,),
-    )
-    source_descriptor = session.open_registered_leaf(Path("source.mp4"))
-    staged = None
-    try:
-        staged = session.stage_output(Path("media/proxy.mp4"))
-        proxy = client.create_proxy(
-            probed.asset.source_path,
-            probed.asset.run_relative_root,
-            input_fd=source_descriptor,
-            output_fd=staged.descriptor,
-        )
-        session.publish_output(staged, max_bytes)
-    finally:
-        try:
-            if staged is not None:
-                session.discard_output(staged)
-        finally:
-            os.close(source_descriptor)
-    proxy_path = store.runtime_root / proxy.relative_path
-    transferred = _transfer_to_journal(
-        case_id=case_id,
-        path=proxy_path,
-        role="PROXY",
-        format_name="MP4",
-        store=store,
-        journal=journal,
-        max_bytes=max_bytes,
-        facts=facts,
-        session=session,
-    )
-    _accept_transfer(transferred, facts)
-    session.assert_registered_leaves(facts.registered_paths)
-    _complete_phase(
-        journal,
-        facts,
-        phase="proxy",
-        executable="FFmpegTranscoder",
-        arguments=("normalize_video",),
-        inputs=(source,),
-        outputs=(output,),
-    )
-    return transferred
-
-
 def _audio_phase(
     case_id: str,
     probed: ProbedAsset,
-    proxy: TransferredMedia,
     client: FFmpegTranscoder,
     store: EvidenceStore,
     journal: MediaJournal,
@@ -643,9 +572,9 @@ def _audio_phase(
     )
     return PreparedMedia(
         source=probed,
-        proxy_path=store.workspace_root / proxy.media_file.relative_path,
-        proxy_sha256=proxy.media_file.sha256,
-        proxy_size_bytes=proxy.media_file.size_bytes,
+        proxy_path=store.workspace_root / facts.files[0].relative_path,
+        proxy_sha256=facts.files[0].sha256,
+        proxy_size_bytes=facts.files[0].size_bytes,
         audio_path=audio_path,
         audio_sha256=audio_sha256,
         warnings=tuple(dict.fromkeys(warnings)),
@@ -661,13 +590,13 @@ def _opencv_phase(
     session: CaseExecutionSession,
 ) -> tuple[FrameCandidate, ...]:
     session.assert_registered_leaves(facts.registered_paths)
-    proxy = _proxy_relative(facts)
+    source = _source_relative(facts)
     journal.begin_phase(
         case_id=case_id,
         phase="opencv_decode",
         executable="OpenCvFrameExtractor",
         arguments=("full_duration",),
-        input_relative_paths=(proxy,),
+        input_relative_paths=(source,),
     )
     window = TimeRange(start_ms=0, end_ms=prepared.source.duration_ms)
     tolerance = frame_tolerance_ms_for_rate(
@@ -684,7 +613,7 @@ def _opencv_phase(
             limit,
         )
 
-    proxy_descriptor = session.open_registered_leaf(Path("media/proxy.mp4"))
+    source_descriptor = session.open_registered_leaf(Path("source.mp4"))
     try:
         groups = extractor.extract(
             prepared.proxy_path,
@@ -692,11 +621,11 @@ def _opencv_phase(
             (window,),
             is_cancel_requested=lambda: False,
             frame_tolerance_ms=tolerance,
-            input_fd=proxy_descriptor,
+            input_fd=source_descriptor,
             write_jpeg=write_jpeg,
         )
     finally:
-        os.close(proxy_descriptor)
+        os.close(source_descriptor)
     candidates = tuple(candidate for group in groups for candidate in group.candidates)
     if not candidates:
         raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "OpenCV 未产生候选帧")
@@ -707,7 +636,7 @@ def _opencv_phase(
         phase="opencv_decode",
         executable="OpenCvFrameExtractor",
         arguments=("full_duration",),
-        inputs=(proxy,),
+        inputs=(source,),
         outputs=(),
     )
     return candidates
@@ -722,13 +651,13 @@ def _scene_phase(
     session: CaseExecutionSession,
 ) -> tuple[object, ...]:
     session.assert_registered_leaves(facts.registered_paths)
-    proxy = _proxy_relative(facts)
+    source = _source_relative(facts)
     journal.begin_phase(
         case_id=case_id,
         phase="scene_detect",
         executable="PySceneDetectAdapter",
         arguments=("full_duration",),
-        input_relative_paths=(proxy,),
+        input_relative_paths=(source,),
     )
     tolerance = frame_tolerance_ms_for_rate(
         prepared.source.manifest.video_stream.average_frame_rate,
@@ -736,17 +665,17 @@ def _scene_phase(
             prepared.source.manifest.video_stream.is_variable_frame_rate
         ),
     )
-    proxy_descriptor = session.open_registered_leaf(Path("media/proxy.mp4"))
+    source_descriptor = session.open_registered_leaf(Path("source.mp4"))
     try:
         scenes = detector.detect(
             prepared.proxy_path,
             duration_ms=prepared.source.duration_ms,
             source_sha256=prepared.proxy_sha256,
             frame_tolerance_ms=tolerance,
-            input_fd=proxy_descriptor,
+            input_fd=source_descriptor,
         )
     finally:
-        os.close(proxy_descriptor)
+        os.close(source_descriptor)
     if not scenes:
         raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "镜头检测未产生结果")
     session.assert_registered_leaves(facts.registered_paths)
@@ -756,7 +685,7 @@ def _scene_phase(
         phase="scene_detect",
         executable="PySceneDetectAdapter",
         arguments=("full_duration",),
-        inputs=(proxy,),
+        inputs=(source,),
         outputs=(),
     )
     return scenes
@@ -783,7 +712,7 @@ def _keyframe_phase(
     for candidate in candidates:
         if candidate.relative_path not in selected_paths:
             session.remove_leaf(candidate.relative_path.relative_to(run_root))
-    proxy = _proxy_relative(facts)
+    source = _source_relative(facts)
     outputs = tuple(
         _runtime_file_relative(store, frame.relative_path) for frame in selected
     )
@@ -792,7 +721,7 @@ def _keyframe_phase(
         phase="keyframe_select",
         executable="KeyframeSelector",
         arguments=("select_nonempty",),
-        input_relative_paths=(proxy,),
+        input_relative_paths=(source,),
         output_relative_paths=outputs,
     )
     for frame in selected:
@@ -815,7 +744,7 @@ def _keyframe_phase(
         phase="keyframe_select",
         executable="KeyframeSelector",
         arguments=("select_nonempty",),
-        inputs=(proxy,),
+        inputs=(source,),
         outputs=outputs,
     )
     return selected
@@ -938,8 +867,8 @@ def _workspace_relative(workspace_root: Path, path: Path) -> Path:
     return path.relative_to(workspace_root)
 
 
-def _proxy_relative(facts: _CaseFacts) -> str:
-    return next(media.relative_path for media in facts.files if media.role == "PROXY")
+def _source_relative(facts: _CaseFacts) -> str:
+    return next(media.relative_path for media in facts.files if media.role == "SOURCE")
 
 
 def _generation_label(case_id: str) -> str:

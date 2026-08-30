@@ -293,12 +293,9 @@ class ProductionMediaTranscoder:
         self,
         runtime_root: Path,
         client_factory: Callable[[Callable[[], bool]], TranscodeClient],
-        *,
-        max_proxy_bytes: int = 4 * 1024 * 1024 * 1024,
     ) -> None:
         self._runtime_root = runtime_root.expanduser().resolve(strict=False)
         self._client_factory = client_factory
-        self._max_proxy_bytes = max_proxy_bytes
 
     def transcode(
         self,
@@ -444,7 +441,6 @@ def build_ffmpeg_factory(
     max_output_bytes: int = 4 * 1024 * 1024 * 1024,
     required_free_bytes: int = 512 * 1024 * 1024,
     timeout_seconds: int = 1_800,
-    visual_proxy_max_edge: int = 1_280,
 ) -> Callable[[Callable[[], bool]], TranscodeClient]:
     return lambda is_cancel_requested: FFmpegTranscoder.from_path(
         executable,
@@ -456,7 +452,6 @@ def build_ffmpeg_factory(
             required_free_bytes=required_free_bytes,
             timeout_seconds=timeout_seconds,
         ),
-        proxy_max_edge=visual_proxy_max_edge,
     )
 
 

@@ -25,7 +25,6 @@ from video_demo.evaluation.chapter_vlm_input import (
 )
 from video_demo.evaluation.dataset import EvaluationDataset, EvaluationSample
 from video_demo.media.probe import ProbeResult
-from video_demo.media.transcode import ProxyVideoArtifact
 from video_demo.visual.keyframes import ExactFrameSampleResult, FrameCandidate
 
 
@@ -107,7 +106,7 @@ def _manifest() -> ChapterVlmInputManifest:
         proxy_frame_rate=Rational(numerator=30, denominator=1),
         proxy_is_variable_frame_rate=False,
         proxy_duration_ms=10_000,
-        proxy_relative_path="media/proxy.mp4",
+        proxy_relative_path="media/source.mp4",
         duration_tolerance_ms=100,
         jpeg_quality=90,
         proxy_sha256=_sha("proxy"),
@@ -271,37 +270,8 @@ class _PreparationProbe:
     def probe(self, path: Path, **_kwargs: object) -> ProbeResult:
         self.calls.append(path)
         return ProbeResult(
-            manifest=self.proxy_manifest if path.name == "proxy.mp4" else self.source_manifest,
+            manifest=self.proxy_manifest if path.name == "source.mp4" else self.source_manifest,
             warnings=(),
-        )
-
-
-class _PreparationTranscoder:
-    def __init__(self, runtime: Path, payload: bytes, max_edge: int):
-        self.runtime = runtime
-        self.payload = payload
-        self.max_edge = max_edge
-        self.calls = 0
-
-    def create_proxy(
-        self,
-        _source: Path,
-        run_relative_root: Path,
-        *,
-        duration_ms: int | None = None,
-    ) -> ProxyVideoArtifact:
-        del duration_ms
-        self.calls += 1
-        relative = run_relative_root / "media/proxy.mp4"
-        destination = self.runtime / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(self.payload)
-        return ProxyVideoArtifact(
-            relative_path=relative.as_posix(),
-            sha256=hashlib.sha256(self.payload).hexdigest(),
-            size_bytes=len(self.payload),
-            max_edge=self.max_edge,
-            normalized_start_ms=0,
         )
 
 
@@ -365,17 +335,14 @@ def _prepare(
     frame_count: int,
     payloads: tuple[bytes, ...] | None = None,
     max_candidate_frame_bytes_per_run: int = 1024 * 1024,
-) -> tuple[object, object, _PreparationProbe, _PreparationTranscoder, _PreparationExtractor]:
+) -> tuple[object, object, _PreparationProbe, object, _PreparationExtractor]:
     package, _media_path = _evaluation_package(tmp_path, frame_count)
     runtime = tmp_path / ".codex" / "video-rag-demo"
     source = package.dataset.samples[0]
     media_sha = source.media_sha256
     source_manifest = _video_manifest(sha256=media_sha)
-    proxy_payload = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2"
-    proxy_sha = hashlib.sha256(proxy_payload).hexdigest()
-    proxy_manifest = _video_manifest(sha256=proxy_sha, width=1280, height=720)
-    probe = _PreparationProbe(source_manifest, proxy_manifest)
-    transcoder = _PreparationTranscoder(runtime, proxy_payload, 1280)
+    probe = _PreparationProbe(source_manifest, source_manifest)
+    transcoder = object()
     extracted_payloads = payloads or tuple(
         b"\xff\xd8\xff" + bytes([index]) + b"\xff\xd9" for index in range(4)
     )
@@ -386,7 +353,7 @@ def _prepare(
 def test_preparation_selects_four_evenly_from_five_reference_frames(
     tmp_path: Path,
 ) -> None:
-    package, runtime, probe, transcoder, extractor = _prepare(tmp_path, frame_count=5)
+    package, runtime, probe, _transcoder, extractor = _prepare(tmp_path, frame_count=5)
 
     result = prepare_chapter_vlm_input(
         package,
@@ -398,7 +365,6 @@ def test_preparation_selects_four_evenly_from_five_reference_frames(
         max_candidate_frame_bytes_per_run=1024 * 1024,
         max_candidate_frame_files_per_run=10,
         ffprobe=probe,
-        transcoder=transcoder,
         frame_extractor=extractor,
         runtime_root=runtime,
     )
@@ -412,14 +378,13 @@ def test_preparation_selects_four_evenly_from_five_reference_frames(
         "reference_04",
     )
     assert len(extractor.calls) == 1
-    assert transcoder.calls == 1
     assert len(probe.calls) == 2
 
 
 def test_preparation_rejects_budget_without_leaving_proxy_or_candidates(
     tmp_path: Path,
 ) -> None:
-    package, runtime, probe, transcoder, extractor = _prepare(
+    package, runtime, probe, _transcoder, extractor = _prepare(
         tmp_path,
         frame_count=4,
         payloads=(b"\xff\xd8\xfflarge\xff\xd9",) * 4,
@@ -436,7 +401,6 @@ def test_preparation_rejects_budget_without_leaving_proxy_or_candidates(
         max_candidate_frame_bytes_per_run=5,
         max_candidate_frame_files_per_run=10,
         ffprobe=probe,
-        transcoder=transcoder,
         frame_extractor=extractor,
         runtime_root=runtime,
     )
@@ -444,14 +408,14 @@ def test_preparation_rejects_budget_without_leaving_proxy_or_candidates(
     assert result.status == "FAIL"
     assert result.error_code == "INPUT_BUDGET_EXCEEDED"
     run_root = runtime / "runs" / "evaluation"
-    assert not list(run_root.rglob("proxy.mp4"))
+    assert not list(run_root.rglob("source.mp4"))
     assert not list(run_root.rglob("*.jpg"))
 
 
 def test_preparation_maps_unlisted_dependency_error_to_stable_failure_code(
     tmp_path: Path,
 ) -> None:
-    package, runtime, _probe, transcoder, extractor = _prepare(tmp_path, frame_count=2)
+    package, runtime, _probe, _transcoder, extractor = _prepare(tmp_path, frame_count=2)
 
     class FailedProbe:
         def probe(self, *_args: object, **_kwargs: object) -> object:
@@ -467,7 +431,6 @@ def test_preparation_maps_unlisted_dependency_error_to_stable_failure_code(
         max_candidate_frame_bytes_per_run=1024 * 1024,
         max_candidate_frame_files_per_run=10,
         ffprobe=FailedProbe(),  # type: ignore[arg-type]
-        transcoder=transcoder,
         frame_extractor=extractor,
         runtime_root=runtime,
     )

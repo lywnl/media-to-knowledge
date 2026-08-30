@@ -159,7 +159,6 @@ def build_production_pipeline(
         max_output_bytes=settings.max_video_bytes,
         required_free_bytes=settings.min_free_disk_reserve_bytes,
         timeout_seconds=settings.process_timeout_seconds,
-        visual_proxy_max_edge=settings.visual_proxy_max_edge,
     )
     prompt_versions = _prompt_versions()
     text_fingerprint = _component_fingerprint(
@@ -223,7 +222,6 @@ def build_production_pipeline(
             ProductionMediaTranscoder(
                 runtime_root,
                 ffmpeg_factory,
-                max_proxy_bytes=settings.max_video_bytes,
             ),
             IsolatedSpeechAnalyzer(
                 workspace_root=settings.workspace_root,

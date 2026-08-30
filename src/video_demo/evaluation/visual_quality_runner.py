@@ -187,7 +187,6 @@ class VisualQualityRunner:
                 max_candidate_frame_bytes_per_run=self._settings.max_candidate_frame_bytes_per_run,
                 max_candidate_frame_files_per_run=self._settings.max_candidate_frame_files_per_run,
                 ffprobe=self._ffprobe(),
-                transcoder=self._transcoder(),
                 frame_extractor=self._extractor(),
                 runtime_root=self._settings.runtime_root,
                 sample_id=sample_id,
@@ -294,16 +293,6 @@ class VisualQualityRunner:
         assert self._settings.runtime_root is not None
         return FFprobeClient.from_path(
             production_tool_path(self._settings, "ffprobe"),
-            workspace_root=self._settings.workspace_root,
-        )
-
-    def _transcoder(self) -> Any:
-        from video_demo.media.transcode import FFmpegTranscoder
-
-        assert self._settings.runtime_root is not None
-        return FFmpegTranscoder.from_path(
-            production_tool_path(self._settings, "ffmpeg"),
-            self._settings.runtime_root,
             workspace_root=self._settings.workspace_root,
         )
 

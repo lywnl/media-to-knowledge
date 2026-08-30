@@ -542,13 +542,6 @@ class LiveValidationRunner:
             production_tool_path(self._settings, "ffprobe"),
             workspace_root=self._settings.workspace_root,
         )
-        from video_demo.media.transcode import FFmpegTranscoder
-
-        transcoder = FFmpegTranscoder.from_path(
-            production_tool_path(self._settings, "ffmpeg"),
-            self._settings.runtime_root,
-            workspace_root=self._settings.workspace_root,
-        )
         from video_demo.visual.keyframes import OpenCvFrameExtractor
 
         extractor = OpenCvFrameExtractor(
@@ -569,7 +562,6 @@ class LiveValidationRunner:
                 max_candidate_frame_bytes_per_run=self._settings.max_candidate_frame_bytes_per_run,
                 max_candidate_frame_files_per_run=self._settings.max_candidate_frame_files_per_run,
                 ffprobe=ffprobe,
-                transcoder=transcoder,
                 frame_extractor=extractor,
                 runtime_root=self._settings.runtime_root,
             )

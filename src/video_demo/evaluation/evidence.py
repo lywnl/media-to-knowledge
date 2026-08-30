@@ -670,7 +670,6 @@ _DURABILITY_PREFLIGHT_CODES: tuple[ErrorCode, ...] = (
 _REAL_MEDIA_PHASES: tuple[str, ...] = (
     "generate",
     "probe",
-    "proxy",
     "audio",
     "opencv_decode",
     "scene_detect",
@@ -679,7 +678,6 @@ _REAL_MEDIA_PHASES: tuple[str, ...] = (
 _REAL_MEDIA_PHASE_EXECUTABLES: dict[str, str] = {
     "generate": "ffmpeg",
     "probe": "ffprobe",
-    "proxy": "FFmpegTranscoder",
     "audio": "FFmpegTranscoder",
     "opencv_decode": "OpenCvFrameExtractor",
     "scene_detect": "PySceneDetectAdapter",
@@ -1212,7 +1210,7 @@ class FiveLanguageModelsRawReport(_LiveRawReport):
 
 
 class RealMediaFile(FrozenModel):
-    role: Literal["SOURCE", "PROXY", "AUDIO", "KEYFRAME"]
+    role: Literal["SOURCE", "AUDIO", "KEYFRAME"]
     format: Literal["MP4", "WAV", "JPEG"]
     relative_path: str = Field(min_length=1, max_length=1024)
     sha256: Sha256
@@ -1230,7 +1228,6 @@ class RealMediaCommand(FrozenModel):
     phase: Literal[
         "generate",
         "probe",
-        "proxy",
         "audio",
         "opencv_decode",
         "scene_detect",
@@ -1547,7 +1544,7 @@ class RealMediaRawReport(FrozenModel):
         files_by_role: dict[str, list[RealMediaFile]] = {}
         for media_file in sample.files:
             files_by_role.setdefault(media_file.role, []).append(media_file)
-        expected_roles = {"SOURCE", "PROXY", "KEYFRAME"}
+        expected_roles = {"SOURCE", "KEYFRAME"}
         if sample.case_id != "no_audio":
             expected_roles.add("AUDIO")
         if (
@@ -1556,7 +1553,7 @@ class RealMediaRawReport(FrozenModel):
             or len(files_by_role["KEYFRAME"]) != sample.selected_keyframe_count
         ):
             raise ValueError("成功媒体样本文件角色与数量不符合 case 语义")
-        expected_formats = {"SOURCE": "MP4", "PROXY": "MP4", "KEYFRAME": "JPEG"}
+        expected_formats = {"SOURCE": "MP4", "KEYFRAME": "JPEG"}
         if "AUDIO" in expected_roles:
             expected_formats["AUDIO"] = "WAV"
         if any(
@@ -1571,11 +1568,10 @@ class RealMediaRawReport(FrozenModel):
         expected_flows = (
             ("generate", (), paths_by_role["SOURCE"]),
             ("probe", paths_by_role["SOURCE"], ()),
-            ("proxy", paths_by_role["SOURCE"], paths_by_role["PROXY"]),
             ("audio", paths_by_role["SOURCE"], paths_by_role.get("AUDIO", ())),
-            ("opencv_decode", paths_by_role["PROXY"], ()),
-            ("scene_detect", paths_by_role["PROXY"], ()),
-            ("keyframe_select", paths_by_role["PROXY"], paths_by_role["KEYFRAME"]),
+            ("opencv_decode", paths_by_role["SOURCE"], ()),
+            ("scene_detect", paths_by_role["SOURCE"], ()),
+            ("keyframe_select", paths_by_role["SOURCE"], paths_by_role["KEYFRAME"]),
         )
         if any(
             command.phase != phase

@@ -46,7 +46,7 @@ def _input_fixture(
     candidate_root.mkdir(parents=True)
     (run_root / "visual").chmod(0o700)
     candidate_root.chmod(0o700)
-    proxy_path = run_root / "media/proxy.mp4"
+    proxy_path = run_root / "media/source.mp4"
     proxy_path.parent.mkdir(parents=True)
     proxy_path.write_bytes(_MP4)
     proxy_path.chmod(0o600)
@@ -78,7 +78,7 @@ def _input_fixture(
         proxy_frame_rate=Rational(numerator=30, denominator=1),
         proxy_is_variable_frame_rate=False,
         proxy_duration_ms=10_000,
-        proxy_relative_path="media/proxy.mp4",
+        proxy_relative_path="media/source.mp4",
         duration_tolerance_ms=100,
         jpeg_quality=90,
         proxy_sha256=_sha(_MP4),

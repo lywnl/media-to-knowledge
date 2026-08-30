@@ -181,7 +181,6 @@ def _write_command(
 _EXECUTABLES = (
     ("generate", "ffmpeg"),
     ("probe", "ffprobe"),
-    ("proxy", "FFmpegTranscoder"),
     ("audio", "FFmpegTranscoder"),
     ("opencv_decode", "OpenCvFrameExtractor"),
     ("scene_detect", "PySceneDetectAdapter"),
@@ -200,30 +199,26 @@ def _record_successful_case(
     root = f".codex/video-rag-demo/eval/generated/run-1/{case_id}"
     definitions = [
         ("SOURCE", "MP4", f"{root}/source.mp4"),
-        ("PROXY", "MP4", f"{root}/media/proxy.mp4"),
         ("KEYFRAME", "JPEG", f"{root}/visual/keyframes/000001.jpg"),
     ]
     if case_id != "no_audio":
         definitions.append(("AUDIO", "WAV", f"{root}/media/audio.wav"))
     media_by_phase = {
         "generate": definitions[0],
-        "proxy": definitions[1],
-        "keyframe_select": definitions[2],
+        "keyframe_select": definitions[1],
     }
     if case_id != "no_audio":
-        media_by_phase["audio"] = definitions[3]
+        media_by_phase["audio"] = definitions[2]
     files: list[RealMediaFile] = []
     artifacts: list[TraceArtifact] = []
     source = f"{root}/source.mp4"
-    proxy = f"{root}/media/proxy.mp4"
     flows = (
         ((), (source,)),
         ((source,), ()),
-        ((source,), (proxy,)),
         ((source,), (() if case_id == "no_audio" else (f"{root}/media/audio.wav",))),
-        ((proxy,), ()),
-        ((proxy,), ()),
-        ((proxy,), (f"{root}/visual/keyframes/000001.jpg",)),
+        ((source,), ()),
+        ((source,), ()),
+        ((source,), (f"{root}/visual/keyframes/000001.jpg",)),
     )
     commands: list[RealMediaCommand] = []
     for (phase, executable), (inputs, outputs) in zip(_EXECUTABLES, flows, strict=True):
@@ -1607,12 +1602,7 @@ def test_media_port_sample_finalization_preserves_registered_media_set(
     )
     failed = raw.samples[0]
     assert failed.execution_status == "FAILED"
-    assert tuple(media.role for media in failed.files) == (
-        "SOURCE",
-        "PROXY",
-        "AUDIO",
-        "KEYFRAME",
-    )
+    assert tuple(media.role for media in failed.files) == ("SOURCE", "AUDIO", "KEYFRAME")
     report_path = runtime / "eval/reports/run-1/real-media.json"
     report = load_machine_evidence(report_path, workspace_root=tmp_path)
     declared_media = {
@@ -1659,7 +1649,7 @@ def test_media_port_exception_after_all_samples_preserves_four_case_facts(
     )
     failed = raw.samples[-1]
     assert failed.case_id == "vfr"
-    assert len(failed.files) == 4
+    assert len(failed.files) == 3
     assert len(failed.commands) == len(_EXECUTABLES)
     assert failed.duration_ms == 1_000
     assert failed.is_variable_frame_rate is True
@@ -2025,7 +2015,7 @@ def _install_controlled_media_chain(
                 ancestor_race_hook("opencv_decode", (proxy,), ())
             if opened_payloads is not None:
                 opened_payloads.append(("opencv_decode", proxy.read_bytes()))
-            assert path.startswith("/dev/fd/") or path.endswith("/media/proxy.mp4")
+            assert path.startswith("/dev/fd/") or path.endswith("/source.mp4")
             self._timestamp = 0
 
         def isOpened(self) -> bool:
@@ -2087,7 +2077,7 @@ def _install_controlled_media_chain(
                 ancestor_race_hook("scene_detect", (proxy,), ())
             if opened_payloads is not None:
                 opened_payloads.append(("scene_detect", proxy.read_bytes()))
-            assert path.startswith("/dev/fd/") or path.endswith("/media/proxy.mp4")
+            assert path.startswith("/dev/fd/") or path.endswith("/source.mp4")
             return "controlled-video"
 
     SceneModule.SceneManager = SceneManager
@@ -2138,8 +2128,6 @@ def _install_controlled_media_chain(
         adapter_phase = (
             "audio"
             if len(pass_fds) == 2 and "pcm_s16le" in argv
-            else "proxy"
-            if len(pass_fds) == 2 and "libx264" in argv
             else None
         )
         if adapter_phase is not None and ancestor_race_hook is not None:
@@ -2153,9 +2141,6 @@ def _install_controlled_media_chain(
         if adapter_phase == "audio" or output.suffix == ".wav":
             adapter_calls.append("FFmpegTranscoder.audio")
             output.write_bytes(_media_bytes("WAV"))
-        elif adapter_phase == "proxy" or ".proxy." in output.name:
-            adapter_calls.append("FFmpegTranscoder.proxy")
-            output.write_bytes(_media_bytes("MP4"))
         else:
             case_id = _case_id_for_output(runtime, output, pass_fds)
             if process_failure == f"{case_id}:generate":
@@ -2270,7 +2255,6 @@ def test_task4_controlled_chain_produces_four_case_internal_execution_facts(
     assert all(type(arguments) is list for arguments in argv)
     assert sum("-show_format" in arguments for arguments in argv) == 4
     assert adapters.count("FFprobeClient") == 4
-    assert adapters.count("FFmpegTranscoder.proxy") == 4
     assert adapters.count("FFmpegTranscoder.audio") == 3
     assert adapters.count("OpenCvFrameExtractor") == 4
     assert adapters.count("PySceneDetectAdapter") == 4
@@ -2312,7 +2296,7 @@ def test_task4_controlled_chain_produces_four_case_internal_execution_facts(
         for arguments in argv
         if arguments[-1].startswith("/dev/fd/") and arguments not in source_argv
     ]
-    assert len(adapter_fd_argv) == 11
+    assert len(adapter_fd_argv) == 7
     declared = {media.relative_path for sample in facts.samples for media in sample.files}
     generated = {
         path.relative_to(tmp_path).as_posix()
@@ -2411,10 +2395,9 @@ def test_task4_adapter_descriptors_close_after_probe_failure(
 @pytest.mark.parametrize(
     ("failed_output", "expected_prior_stages"),
     (
-        (Path("media/proxy.mp4"), (Path("media/proxy.mp4"),)),
         (
             Path("media/audio.wav"),
-            (Path("media/proxy.mp4"), Path("media/audio.wav")),
+            (Path("media/audio.wav"),),
         ),
     ),
 )
@@ -2486,7 +2469,7 @@ def _descriptor_is_closed(descriptor: int) -> bool:
 
 @pytest.mark.parametrize(
     "phase",
-    ("probe", "proxy", "audio", "opencv_decode", "scene_detect", "keyframe_select"),
+    ("probe", "audio", "opencv_decode", "scene_detect", "keyframe_select"),
 )
 @pytest.mark.parametrize("replaced_level", ("case", "run", "generated"))
 def test_task4_production_adapters_keep_io_bound_to_held_case_when_ancestor_moves(
@@ -3070,7 +3053,7 @@ def test_task4_opencv_failure_removes_unregistered_candidates_but_keeps_owned_me
         (runtime / "eval/reports/run-1/raw.json").read_bytes()
     )
     failed = raw.samples[0]
-    assert tuple(media.role for media in failed.files) == ("SOURCE", "PROXY", "AUDIO")
+    assert tuple(media.role for media in failed.files) == ("SOURCE", "AUDIO")
     case_root = runtime / "eval/generated/run-1/normal_audio"
     kept = {
         path.relative_to(tmp_path).as_posix()
@@ -3917,7 +3900,7 @@ def test_task4_media_transfer_failure_never_deletes_previously_registered_file(
     runtime = tmp_path / ".codex/video-rag-demo"
     runtime.mkdir(parents=True)
     first_relative = Path("eval/generated/run-1/normal_audio/source.mp4")
-    second_relative = Path("eval/generated/run-1/normal_audio/media/proxy.mp4")
+    second_relative = Path("eval/generated/run-1/normal_audio/media/audio.wav")
     first = runtime / first_relative
     second = runtime / second_relative
     first.parent.mkdir(parents=True)
@@ -3959,8 +3942,8 @@ def test_task4_media_transfer_failure_never_deletes_previously_registered_file(
         transfer_media_file(
             case_id="normal_audio",
             path=second,
-            role="PROXY",
-            format_name="MP4",
+            role="AUDIO",
+            format_name="WAV",
             store=store,
             journal=journal,
             max_bytes=1_024,

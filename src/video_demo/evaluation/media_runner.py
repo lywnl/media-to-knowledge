@@ -43,7 +43,6 @@ _VERSION_TOKEN = re.compile(r"^[A-Za-z0-9._+-]{1,128}$")
 _MediaPhase = Literal[
     "generate",
     "probe",
-    "proxy",
     "audio",
     "opencv_decode",
     "scene_detect",
@@ -60,7 +59,6 @@ _MediaExecutable = Literal[
 _MEDIA_PHASE_SEQUENCE: tuple[_MediaPhase, ...] = (
     "generate",
     "probe",
-    "proxy",
     "audio",
     "opencv_decode",
     "scene_detect",
@@ -69,7 +67,6 @@ _MEDIA_PHASE_SEQUENCE: tuple[_MediaPhase, ...] = (
 _MEDIA_PHASE_EXECUTABLES: dict[_MediaPhase, _MediaExecutable] = {
     "generate": "ffmpeg",
     "probe": "ffprobe",
-    "proxy": "FFmpegTranscoder",
     "audio": "FFmpegTranscoder",
     "opencv_decode": "OpenCvFrameExtractor",
     "scene_detect": "PySceneDetectAdapter",
@@ -207,7 +204,6 @@ class _MediaExecutionJournal:
         expected_file: dict[_MediaPhase, tuple[str, str] | None] = {
             "generate": ("SOURCE", "MP4"),
             "probe": None,
-            "proxy": ("PROXY", "MP4"),
             "audio": ("AUDIO", "WAV"),
             "opencv_decode": None,
             "scene_detect": None,

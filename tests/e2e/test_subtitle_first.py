@@ -18,7 +18,6 @@ from video_demo.media.probe import ProbeLimits, parse_ffprobe_payload
 from video_demo.media.process import ProcessResult
 from video_demo.media.transcode import (
     AudioArtifact,
-    ProxyVideoArtifact,
     SubtitleArtifact,
 )
 from video_demo.speech.isolated import IsolatedSpeechAnalyzer
@@ -334,26 +333,6 @@ class _RecordingTranscoder:
         self.subtitle_payloads = subtitle_payloads
         self.extract_subtitle_calls: list[int] = []
         self.extract_audio_calls: list[tuple[bool, int]] = []
-
-    def create_proxy(
-        self,
-        _source: Path,
-        root: Path,
-        *,
-        duration_ms: int | None = None,
-    ) -> ProxyVideoArtifact:
-        assert duration_ms is not None
-        relative = root / "media/proxy.mp4"
-        output = self.runtime_root / relative
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(_MP4)
-        return ProxyVideoArtifact(
-            relative_path=relative.as_posix(),
-            sha256=hashlib.sha256(_MP4).hexdigest(),
-            size_bytes=len(_MP4),
-            max_edge=1280,
-            normalized_start_ms=0,
-        )
 
     def extract_subtitle(
         self,

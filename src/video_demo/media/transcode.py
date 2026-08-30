@@ -21,8 +21,6 @@ from video_demo.media.process import ProcessResult, SafeProcessRunner
 from video_demo.storage.workspace import atomic_replace, safe_runtime_path, validate_path_component
 
 MAX_DURATION_AWARE_TIMEOUT_SECONDS = 14_400
-_MIN_PROXY_MAX_EDGE = 1_280
-_MAX_PROXY_MAX_EDGE = 2_560
 
 
 def duration_aware_timeout_seconds(base_timeout_seconds: int, duration_ms: int) -> int:
@@ -88,14 +86,6 @@ class NoAudioArtifact(FrozenModel):
     warning_code: str
 
 
-class ProxyVideoArtifact(FrozenModel):
-    relative_path: str
-    sha256: Sha256
-    size_bytes: int
-    max_edge: int
-    normalized_start_ms: int
-
-
 class ClipArtifact(TimeRange):
     clip_id: str
     relative_path: str
@@ -140,7 +130,6 @@ class FFmpegTranscoder:
         limits: TranscodeLimits | None = None,
         subtitle_limits: SubtitleLimits | None = None,
         available_bytes: Callable[[Path], int] | None = None,
-        proxy_max_edge: int = 1_280,
     ) -> None:
         self._executable = executable
         self._runner = runner
@@ -148,12 +137,6 @@ class FFmpegTranscoder:
         self._limits = limits or TranscodeLimits()
         self._subtitle_limits = subtitle_limits or SubtitleLimits()
         self._available_bytes = available_bytes or self._disk_free_bytes
-        if (
-            type(proxy_max_edge) is not int
-            or not _MIN_PROXY_MAX_EDGE <= proxy_max_edge <= _MAX_PROXY_MAX_EDGE
-        ):
-            raise ValueError("代理视频最大边必须位于 1280~2560 像素")
-        self._proxy_max_edge = proxy_max_edge
 
     @classmethod
     def from_path(
@@ -164,7 +147,6 @@ class FFmpegTranscoder:
         workspace_root: Path,
         is_cancel_requested: Callable[[], bool] = lambda: False,
         limits: TranscodeLimits | None = None,
-        proxy_max_edge: int = 1_280,
     ) -> FFmpegTranscoder:
         executable = resolve_workspace_binary(
             executable,
@@ -184,62 +166,7 @@ class FFmpegTranscoder:
             runner=runner,
             runtime_root=runtime_root,
             limits=limits,
-            proxy_max_edge=proxy_max_edge,
         )
-
-    def validate_visual_source(
-        self,
-        source: Path,
-        *,
-        duration_ms: int,
-        is_cancel_requested: Callable[[], bool],
-    ) -> str | None:
-        """用三个代表性时间点验证原视频可直接供视觉链路解码。"""
-
-        source = self._validate_source(source)
-        if type(duration_ms) is not int or duration_ms < 1:
-            return "INVALID_DURATION"
-        timestamps = tuple(
-            dict.fromkeys(
-                (0, duration_ms // 2, max(0, duration_ms - 1_000)),
-            ),
-        )
-        timeout_seconds = max(1, min(60, self._limits.timeout_seconds))
-        for timestamp_ms in timestamps:
-            try:
-                result = self._runner.run(
-                    [
-                        str(self._executable),
-                        "-nostdin",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-ss",
-                        _seconds(timestamp_ms),
-                        "-i",
-                        str(source),
-                        "-map",
-                        "0:v:0",
-                        "-an",
-                        "-sn",
-                        "-frames:v",
-                        "1",
-                        "-f",
-                        "null",
-                        "-",
-                    ],
-                    timeout_seconds=timeout_seconds,
-                )
-            except VideoDemoError as error:
-                if error.code in {
-                    ErrorCode.VIDEO_PROCESS_CANCELLED,
-                    ErrorCode.JOB_CANCELLED,
-                } or is_cancel_requested():
-                    raise
-                return f"DECODE_CHECK_{error.code.value}"
-            if result.returncode != 0:
-                return "DECODE_CHECK_FAILED"
-        return None
 
     def extract_subtitle(
         self,
@@ -360,76 +287,6 @@ class FFmpegTranscoder:
             sample_rate_hz=16_000,
             channels=1,
             codec="pcm_s16le",
-        )
-
-    def create_proxy(
-        self,
-        source: Path,
-        run_relative_root: Path,
-        *,
-        duration_ms: int | None = None,
-        input_fd: int | None = None,
-        output_fd: int | None = None,
-    ) -> ProxyVideoArtifact:
-        source = self._trusted_input(source, input_fd)
-        relative_path = run_relative_root / "media" / "proxy.mp4"
-        # MP4 muxer 会回写索引；macOS 的 /dev/fd 共享偏移会因此静默破坏码流。
-        # fd 输出改用无需回写头部的 fragmented MP4，普通路径仍保留 faststart。
-        movflags = (
-            "+frag_keyframe+empty_moov+delay_moov"
-            if output_fd is not None
-            else "+faststart"
-        )
-        video_filter = (
-            f"scale=w='if(gte(iw,ih),min({self._proxy_max_edge},iw),-2)':"
-            f"h='if(gte(iw,ih),-2,min({self._proxy_max_edge},ih))':flags=lanczos,"
-            "setpts=PTS-STARTPTS"
-        )
-        args = [
-            *self._base_args(
-                Path(f"/dev/fd/{input_fd}") if input_fd is not None else source
-            ),
-            "-map",
-            "0:v:0",
-            "-an",
-            "-vf",
-            video_filter,
-            "-vsync",
-            "vfr",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-movflags",
-            movflags,
-        ]
-        if input_fd is not None or output_fd is not None:
-            input_descriptor, output_descriptor = _require_descriptor_pair(
-                input_fd,
-                output_fd,
-            )
-            size_bytes, sha256 = self._produce_to_fd(
-                args,
-                output_descriptor,
-                "mp4",
-                (input_descriptor, output_descriptor),
-                timeout_seconds=self._timeout_for(duration_ms),
-            )
-        else:
-            final_path = self._destination_path(relative_path)
-            size_bytes, sha256 = self._produce(
-                args,
-                final_path,
-                timeout_seconds=self._timeout_for(duration_ms),
-            )
-        return ProxyVideoArtifact(
-            relative_path=relative_path.as_posix(),
-            sha256=sha256,
-            size_bytes=size_bytes,
-            max_edge=self._proxy_max_edge,
-            normalized_start_ms=0,
         )
 
     def create_clip(

@@ -61,7 +61,6 @@ def _transcoder(
     available_bytes: int = 1024 * 1024,
     max_output_bytes: int = 1024,
     subtitle_max_output_bytes: int = 256,
-    proxy_max_edge: int = 1280,
     timeout_seconds: int = 1_800,
 ) -> FFmpegTranscoder:
     runtime = tmp_path / "runtime"
@@ -76,7 +75,6 @@ def _transcoder(
         ),
         subtitle_limits=SubtitleLimits(max_output_bytes=subtitle_max_output_bytes),
         available_bytes=lambda _path: available_bytes,
-        proxy_max_edge=proxy_max_edge,
     )
 
 
@@ -110,43 +108,6 @@ def test_extract_subtitle_maps_absolute_stream_and_forces_webvtt(
     assert artifact.stream_index == 7
     assert artifact.language == "zh"
     assert artifact.codec_name == "mov_text"
-
-
-def test_validate_visual_source_checks_three_timestamps_without_writing_video(
-    tmp_path: Path,
-    source: Path,
-) -> None:
-    runner = WritingRunner()
-    result = _transcoder(tmp_path, runner).validate_visual_source(
-        source,
-        duration_ms=30_000,
-        is_cancel_requested=lambda: False,
-    )
-
-    assert result is None
-    assert len(runner.calls) == 3
-    assert all(command[-5:] == ["-frames:v", "1", "-f", "null", "-"] for command in runner.calls)
-    assert [command[command.index("-ss") + 1] for command in runner.calls] == [
-        "0.000",
-        "15.000",
-        "29.000",
-    ]
-
-
-def test_validate_visual_source_returns_decode_failure_reason(
-    tmp_path: Path,
-    source: Path,
-) -> None:
-    result = _transcoder(
-        tmp_path,
-        WritingRunner(returncode=1),
-    ).validate_visual_source(
-        source,
-        duration_ms=30_000,
-        is_cancel_requested=lambda: False,
-    )
-
-    assert result == "DECODE_CHECK_FAILED"
 
 
 @pytest.mark.parametrize("linked_component", ["subtitles", "media"])
@@ -264,53 +225,6 @@ def test_extract_audio_applies_timeline_to_preopened_output(
     assert output_path.read_bytes() == b"wav"
 
 
-def test_create_proxy_limits_long_edge_and_normalizes_pts(
-    tmp_path: Path,
-    source: Path,
-) -> None:
-    runner = WritingRunner(output=b"proxy")
-
-    artifact = _transcoder(tmp_path, runner).create_proxy(source, Path("runs/run_001"))
-
-    command = runner.calls[0]
-    video_filter = command[command.index("-vf") + 1]
-    assert "scale" in video_filter
-    assert "1280" in video_filter
-    assert "setpts=PTS-STARTPTS" in video_filter
-    assert "-an" in command
-    assert "-vsync" in command
-    assert command[command.index("-vsync") + 1] == "vfr"
-    assert artifact.relative_path == "runs/run_001/media/proxy.mp4"
-    assert artifact.max_edge == 1280
-    assert artifact.normalized_start_ms == 0
-
-
-def test_create_proxy_uses_configured_edge_in_filter_and_artifact(
-    tmp_path: Path,
-    source: Path,
-) -> None:
-    runner = WritingRunner(output=b"proxy")
-
-    artifact = _transcoder(tmp_path, runner, proxy_max_edge=1920).create_proxy(
-        source,
-        Path("runs/run_001"),
-    )
-
-    video_filter = runner.calls[0][runner.calls[0].index("-vf") + 1]
-    assert "min(1920,iw)" in video_filter
-    assert "min(1920,ih)" in video_filter
-    assert artifact.max_edge == 1920
-
-
-@pytest.mark.parametrize("proxy_max_edge", [1279, 2561])
-def test_transcoder_rejects_proxy_edge_outside_supported_range(
-    tmp_path: Path,
-    proxy_max_edge: int,
-) -> None:
-    with pytest.raises(ValueError, match="代理视频最大边"):
-        _transcoder(tmp_path, WritingRunner(), proxy_max_edge=proxy_max_edge)
-
-
 def test_duration_aware_timeout_uses_base_duration_and_hard_cap() -> None:
     assert duration_aware_timeout_seconds(3_600, 10_000) == 3_600
     assert duration_aware_timeout_seconds(1, 1_001) == 302
@@ -327,11 +241,6 @@ def test_full_length_ffmpeg_operations_receive_duration_aware_timeout(
     runner = WritingRunner(output=b"media")
     transcoder = _transcoder(tmp_path, runner, timeout_seconds=600)
 
-    transcoder.create_proxy(
-        source,
-        Path("runs/run_001"),
-        duration_ms=7_200_000,
-    )
     transcoder.extract_audio(
         source,
         Path("runs/run_001"),
@@ -339,39 +248,8 @@ def test_full_length_ffmpeg_operations_receive_duration_aware_timeout(
         duration_ms=7_200_000,
     )
 
-    assert runner.timeouts == [11_100, 11_100]
+    assert runner.timeouts == [11_100]
 
-
-@pytest.mark.skipif(os.name != "posix", reason="fd 输出契约仅适用于 POSIX")
-def test_create_proxy_uses_fragmented_mp4_for_preopened_output(
-    tmp_path: Path,
-    source: Path,
-) -> None:
-    runner = WritingRunner(output=b"proxy")
-    source_descriptor = os.open(source, os.O_RDONLY)
-    output_path = tmp_path / "proxy-output.mp4"
-    output_descriptor = os.open(
-        output_path,
-        os.O_RDWR | os.O_CREAT | os.O_EXCL,
-        0o600,
-    )
-    try:
-        _transcoder(tmp_path, runner).create_proxy(
-            source,
-            Path("runs/run_001"),
-            input_fd=source_descriptor,
-            output_fd=output_descriptor,
-        )
-    finally:
-        os.close(source_descriptor)
-        os.close(output_descriptor)
-
-    command = runner.calls[0]
-    assert (
-        command[command.index("-movflags") + 1]
-        == "+frag_keyframe+empty_moov+delay_moov"
-    )
-    assert output_path.read_bytes() == b"proxy"
 
 
 def test_create_clip_uses_exact_millisecond_half_open_range(
@@ -553,53 +431,6 @@ def test_create_audio_slice_rejects_destination_parent_symlink_before_runner(
     assert not (other_slices / "lid_vad_001.wav").exists()
 
 
-def test_transcode_rejects_source_outside_runtime_before_starting(tmp_path: Path) -> None:
-    source = tmp_path / "outside" / "source.mp4"
-    source.parent.mkdir()
-    source.write_bytes(b"source")
-    runner = WritingRunner()
-
-    with pytest.raises(VideoDemoError) as raised:
-        _transcoder(tmp_path, runner).create_proxy(source, Path("runs/run_001"))
-
-    assert raised.value.code == ErrorCode.WORKSPACE_PATH_ESCAPE
-    assert runner.calls == []
-
-
-def test_transcode_rejects_symlink_source_before_starting(tmp_path: Path) -> None:
-    runtime = tmp_path / "runtime"
-    target = runtime / "runs" / "run_001" / "input" / "target.mp4"
-    target.parent.mkdir(parents=True)
-    target.write_bytes(b"source")
-    source = target.with_name("source.mp4")
-    source.symlink_to(target)
-    runner = WritingRunner()
-
-    with pytest.raises(VideoDemoError) as raised:
-        _transcoder(tmp_path, runner).create_proxy(source, Path("runs/run_001"))
-
-    assert raised.value.code == ErrorCode.WORKSPACE_PATH_ESCAPE
-    assert runner.calls == []
-
-
-@pytest.mark.parametrize("source_kind", ["missing", "directory"])
-def test_transcode_rejects_source_that_is_not_a_regular_file(
-    tmp_path: Path,
-    source_kind: str,
-) -> None:
-    source = tmp_path / "runtime" / "runs" / "run_001" / "input" / "source.mp4"
-    source.parent.mkdir(parents=True)
-    if source_kind == "directory":
-        source.mkdir()
-    runner = WritingRunner()
-
-    with pytest.raises(VideoDemoError) as raised:
-        _transcoder(tmp_path, runner).create_proxy(source, Path("runs/run_001"))
-
-    assert raised.value.code == ErrorCode.VIDEO_INPUT_INVALID
-    assert runner.calls == []
-
-
 def test_transcode_applies_process_output_limit_to_every_ffmpeg_output(
     tmp_path: Path,
     source: Path,
@@ -613,7 +444,6 @@ def test_transcode_applies_process_output_limit_to_every_ffmpeg_output(
         has_audio=True,
         duration_ms=1_000,
     )
-    transcoder.create_proxy(source, Path("runs/run_001"))
     transcoder.create_clip(
         source,
         Path("runs/run_001"),
@@ -621,7 +451,7 @@ def test_transcode_applies_process_output_limit_to_every_ffmpeg_output(
         TimeRange(start_ms=0, end_ms=1_000),
     )
 
-    assert len(runner.calls) == 3
+    assert len(runner.calls) == 2
     for command in runner.calls:
         assert command[-3:-1] == ["-fs", "1024"]
 
@@ -633,9 +463,11 @@ def test_transcode_rejects_insufficient_disk_before_starting(
     runner = WritingRunner()
 
     with pytest.raises(VideoDemoError) as raised:
-        _transcoder(tmp_path, runner, available_bytes=64).create_proxy(
+        _transcoder(tmp_path, runner, available_bytes=64).extract_audio(
             source,
             Path("runs/run_001"),
+            has_audio=True,
+            duration_ms=1_000,
         )
 
     assert raised.value.code == ErrorCode.VIDEO_DISK_SPACE_INSUFFICIENT
@@ -647,23 +479,29 @@ def test_transcode_rejects_nonzero_empty_and_oversized_output(
     source: Path,
 ) -> None:
     with pytest.raises(VideoDemoError) as nonzero:
-        _transcoder(tmp_path, WritingRunner(returncode=1)).create_proxy(
+        _transcoder(tmp_path, WritingRunner(returncode=1)).extract_audio(
             source,
             Path("runs/run_001"),
+            has_audio=True,
+            duration_ms=1_000,
         )
     assert nonzero.value.code == ErrorCode.VIDEO_PROCESS_FAILED
 
     with pytest.raises(VideoDemoError) as empty:
-        _transcoder(tmp_path, WritingRunner(output=b"")).create_proxy(
+        _transcoder(tmp_path, WritingRunner(output=b"")).extract_audio(
             source,
             Path("runs/run_001"),
+            has_audio=True,
+            duration_ms=1_000,
         )
     assert empty.value.code == ErrorCode.VIDEO_OUTPUT_INVALID
 
     with pytest.raises(VideoDemoError) as oversized:
-        _transcoder(tmp_path, WritingRunner(output=b"12345"), max_output_bytes=4).create_proxy(
+        _transcoder(tmp_path, WritingRunner(output=b"12345"), max_output_bytes=4).extract_audio(
             source,
             Path("runs/run_001"),
+            has_audio=True,
+            duration_ms=1_000,
         )
     assert oversized.value.code == ErrorCode.VIDEO_OUTPUT_TOO_LARGE
 
