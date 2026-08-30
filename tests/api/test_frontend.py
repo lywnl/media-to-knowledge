@@ -151,6 +151,24 @@ def test_frontend_script_uses_existing_async_api_contract(client: TestClient) ->
     assert "speech_enrichment_mode" not in script
 
 
+def test_frontend_exposes_independent_video_audio_image_workflows(client: TestClient) -> None:
+    html = client.get("/").text
+    script = client.get("/static/app.js").text
+
+    assert 'data-media-kind="VIDEO"' in html
+    assert 'data-media-kind="AUDIO"' in html
+    assert 'data-media-kind="IMAGE"' in html
+    assert "音频" in html
+    assert "图片" in html
+    assert 'accept=".mp4,.mov,.mkv,.webm"' in html
+    assert "/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/audio-objects" in script
+    assert "/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/image-objects" in script
+    assert "/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/audio-understanding-runs" in script
+    assert "/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/image-understanding-runs" in script
+    assert "renderAudioResult" in script
+    assert "renderImageResult" in script
+
+
 def test_frontend_script_renders_untrusted_result_as_text(client: TestClient) -> None:
     script = client.get("/static/app.js").text
 

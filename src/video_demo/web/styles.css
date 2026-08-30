@@ -213,6 +213,40 @@ form {
   gap: 16px;
 }
 
+.media-kind-selector {
+  display: inline-flex;
+  gap: 6px;
+  margin: 0 0 18px 38px;
+  padding: 4px;
+  background: #f1f4f8;
+  border: 1px solid var(--line);
+}
+
+.media-kind {
+  min-height: 36px;
+  padding: 5px 16px;
+  color: var(--ink-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  font-size: 0.88rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.media-kind:hover,
+.media-kind:focus-visible {
+  color: var(--signal-dark);
+  border-color: var(--line-strong);
+  outline: none;
+}
+
+.media-kind.is-active {
+  color: var(--signal-dark);
+  background: var(--surface);
+  border-color: var(--signal);
+  box-shadow: 0 2px 6px rgba(24, 89, 209, 0.12);
+}
+
 .file-control {
   min-width: 0;
   padding: 18px;
@@ -475,6 +509,27 @@ input {
 .segment-summary {
   margin: 12px 0 0;
   color: var(--ink-muted);
+}
+
+.image-document {
+  padding: 22px 26px;
+  background: #f8fafc;
+  border: 1px solid var(--line);
+}
+
+.image-document .result-section-title + h4 {
+  margin-top: 0;
+}
+
+.image-document h4 {
+  margin: 18px 0 4px;
+  color: var(--signal-dark);
+  font-size: 0.92rem;
+}
+
+.image-document ul {
+  margin: 0;
+  padding-left: 1.3rem;
 }
 
 .chapter-body {

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="选择本地视频，查看后端生成的视频理解结果。">
+    <meta name="description" content="选择本地媒体，查看后端生成的理解结果。">
     <title>本地视频理解</title>
     <link rel="stylesheet" href="/static/styles.css">
   </head>
@@ -12,7 +12,7 @@
       <header class="page-header">
         <p class="eyebrow">VIDEO UNDERSTANDING</p>
         <h1>看懂一段视频，<br><span>从选择文件开始。</span></h1>
-        <p class="header-description">选择一个本地视频，交给后端完成语音、画面和内容理解。</p>
+        <p class="header-description">选择一个本地媒体，交给对应的后端流水线完成内容理解。</p>
         <p class="worker-note">
           <svg aria-hidden="true" viewBox="0 0 24 24">
             <path d="M12 8v4m0 4h.01M10.3 3.7 2.8 17a2 2 0 0 0 1.7 3h15a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z"/>
@@ -23,11 +23,16 @@
 
       <section class="panel upload-panel" aria-labelledby="upload-title">
         <div class="section-heading">
-          <span class="step-number" aria-hidden="true">01</span>
-          <div>
-            <h2 id="upload-title">选择视频</h2>
-            <p>支持后端已接受的 MP4、MOV、MKV 和 WebM 视频。</p>
-          </div>
+            <span class="step-number" aria-hidden="true">01</span>
+            <div>
+              <h2 id="upload-title">选择媒体</h2>
+              <p id="upload-description">视频会进入视频理解流水线，输出章节化 Markdown。</p>
+            </div>
+        </div>
+        <div class="media-kind-selector" role="group" aria-label="选择媒体类型">
+          <button class="media-kind is-active" type="button" data-media-kind="VIDEO" aria-pressed="true">视频</button>
+          <button class="media-kind" type="button" data-media-kind="AUDIO" aria-pressed="false">音频</button>
+          <button class="media-kind" type="button" data-media-kind="IMAGE" aria-pressed="false">图片</button>
         </div>
         <form id="upload-form" novalidate>
           <div class="file-control">
@@ -35,9 +40,9 @@
               <svg aria-hidden="true" viewBox="0 0 24 24">
                 <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5"/>
               </svg>
-              选择本地视频
+              <span id="file-action-label">选择本地视频</span>
             </label>
-            <input id="video-file" name="video-file" type="file" accept=".mp4,.mov,.mkv,.webm">
+            <input id="video-file" name="media-file" type="file" accept=".mp4,.mov,.mkv,.webm">
             <p id="file-detail">尚未选择文件</p>
           </div>
           <button id="submit-button" class="primary-button" type="submit">

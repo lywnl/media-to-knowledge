@@ -12,11 +12,52 @@
   const SUCCESS_STATUSES = new Set(["SUCCEEDED", "PARTIAL_SUCCEEDED"]);
   const FAILURE_STATUSES = new Set(["FAILED", "CANCELLED"]);
   const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 502, 503, 504]);
-  const MIME_BY_EXTENSION = Object.freeze({
-    ".mp4": "video/mp4",
-    ".mov": "video/quicktime",
-    ".mkv": "video/x-matroska",
-    ".webm": "video/webm",
+  const MEDIA_CONFIG = Object.freeze({
+    VIDEO: Object.freeze({
+      kind: "VIDEO",
+      label: "视频",
+      description: "视频会进入视频理解流水线，输出章节化 Markdown。",
+      accept: ".mp4,.mov,.mkv,.webm",
+      uploadPath: `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-objects`,
+      runPath: `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs`,
+      mimeByExtension: Object.freeze({
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".mkv": "video/x-matroska",
+        ".webm": "video/webm",
+      }),
+    }),
+    AUDIO: Object.freeze({
+      kind: "AUDIO",
+      label: "音频",
+      description: "音频会执行转写与章节写作，不包含画面补充。",
+      accept: ".mp3,.wav,.m4a,.aac,.ogg,.flac,.webm",
+      uploadPath: `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/audio-objects`,
+      runPath: `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/audio-understanding-runs`,
+      mimeByExtension: Object.freeze({
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".ogg": "audio/ogg",
+        ".flac": "audio/flac",
+        ".webm": "audio/webm",
+      }),
+    }),
+    IMAGE: Object.freeze({
+      kind: "IMAGE",
+      label: "图片",
+      description: "图片会执行单图视觉理解，输出图片 Markdown。",
+      accept: ".jpg,.jpeg,.png,.webp",
+      uploadPath: `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/image-objects`,
+      runPath: `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/image-understanding-runs`,
+      mimeByExtension: Object.freeze({
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+      }),
+    }),
   });
   const STAGE_LABELS = Object.freeze({
     REGISTER: "登记任务",
@@ -29,11 +70,17 @@
     CHAPTER_WRITE: "撰写章节",
     DOCUMENT_ASSEMBLY: "组装知识文档",
     RESULT: "整理结果",
+    SPEECH: "转写音频内容",
+    VLM: "理解图片内容",
   });
 
   const form = document.querySelector("#upload-form");
   const fileInput = document.querySelector("#video-file");
   const fileDetail = document.querySelector("#file-detail");
+  const mediaKindButtons = [...document.querySelectorAll("[data-media-kind]")];
+  const uploadTitle = document.querySelector("#upload-title");
+  const uploadDescription = document.querySelector("#upload-description");
+  const fileActionLabel = document.querySelector("#file-action-label");
   const submitButton = document.querySelector("#submit-button");
   const submitButtonLabel = submitButton.querySelector("span");
   const statusPanel = document.querySelector("#status-panel");
@@ -50,6 +97,7 @@
   const documentToc = document.querySelector("#document-toc");
   const documentChapters = document.querySelector("#document-chapters");
   const downloadStatus = document.querySelector("#download-status");
+  let currentMediaKind = "VIDEO";
   let activeController = null;
 
   class RequestError extends Error {
@@ -68,6 +116,43 @@
     }
   }
 
+  function currentMediaConfig() {
+    return MEDIA_CONFIG[currentMediaKind] ?? MEDIA_CONFIG.VIDEO;
+  }
+
+  function setMediaKind(kind) {
+    if (!MEDIA_CONFIG[kind]) return;
+    currentMediaKind = kind;
+    const media = currentMediaConfig();
+    mediaKindButtons.forEach((button) => {
+      const isActive = button.dataset.mediaKind === media.kind;
+      button.classList.toggle("is-active", isActive);
+      button.setAttribute("aria-pressed", String(isActive));
+    });
+    uploadTitle.textContent = `选择${media.label}`;
+    uploadDescription.textContent = media.description;
+    fileActionLabel.textContent = `选择本地${media.label}`;
+    fileInput.accept = media.accept;
+    fileInput.value = "";
+    fileDetail.textContent = "尚未选择文件";
+    resetOutput();
+    clearError();
+  }
+
+  function mediaResultPath(media, runId, suffix) {
+    return `${media.runPath}/${encodeURIComponent(runId)}${suffix}`;
+  }
+
+  mediaKindButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      if (activeController) return;
+      setMediaKind(button.dataset.mediaKind);
+      loadHistory();
+    });
+  });
+
+  setMediaKind(currentMediaKind);
+
   fileInput.addEventListener("change", () => {
     const [file] = fileInput.files;
     fileDetail.textContent = file
@@ -81,9 +166,10 @@
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    const media = currentMediaConfig();
     const [file] = fileInput.files;
     if (!file) {
-      renderError(new RequestError("请先选择一个本地视频文件"));
+      renderError(new RequestError(`请先选择一个本地${media.label}文件`));
       fileInput.focus();
       return;
     }
@@ -95,14 +181,14 @@
     setProcessing(true);
 
     try {
-      updateStatus("正在上传本地视频", "文件将上传到本机后端", 0);
-      const videoObject = await uploadVideo(file, controller.signal);
-      updateStatus("视频已上传，正在创建任务", "对象已登记", 1);
-      const createdRun = await createRun(videoObject.object_ref, controller.signal);
-      const completedRun = await waitForCompletion(createdRun.run_id, controller.signal);
+      updateStatus(`正在上传本地${media.label}`, "文件将上传到本机后端", 0);
+      const mediaObject = await uploadMedia(file, media, controller.signal);
+      updateStatus(`${media.label}已上传，正在创建任务`, "对象已登记", 1);
+      const createdRun = await createRun(mediaObject.object_ref, controller.signal, media);
+      const completedRun = await waitForCompletion(createdRun.run_id, controller.signal, media);
       updateStatus("处理完成，正在读取结果", "正在读取结构化知识文档", 3);
-      const result = await fetchResult(completedRun.run_id, controller.signal);
-      await renderResult(result, { ...completedRun, original_filename: videoObject.original_filename });
+      const result = await fetchResult(completedRun.run_id, controller.signal, media);
+      await renderResult(result, { ...completedRun, original_filename: mediaObject.original_filename }, media);
       await loadHistory();
       updateStatus("处理完成", "知识文档已准备就绪", 4);
     } catch (error) {
@@ -152,43 +238,37 @@
     return payload;
   }
 
-  async function uploadVideo(file, signal) {
+  async function uploadMedia(file, media, signal) {
     const extension = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
-    const declaredMime = MIME_BY_EXTENSION[extension];
+    const declaredMime = media.mimeByExtension[extension];
     if (!declaredMime) {
-      throw new RequestError("请选择 MP4、MOV、MKV 或 WebM 视频文件");
+      throw new RequestError(`请选择${media.label}支持的文件格式（${media.accept}）`);
     }
     const body = new FormData();
     const uploadFile = file.type === declaredMime
       ? file
       : new File([file], file.name, { type: declaredMime });
     body.append("file", uploadFile, uploadFile.name);
-    return requestJson(
-      `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-objects`,
-      { method: "POST", body, signal },
-    );
+    return requestJson(media.uploadPath, { method: "POST", body, signal });
   }
 
-  async function createRun(objectRef, signal) {
-    return requestJson(
-      `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          object_ref: objectRef,
-          idempotency_key: `web-${crypto.randomUUID()}`,
-          language_hints: [],
-        }),
-        signal,
-      },
-    );
+  async function createRun(objectRef, signal, media = currentMediaConfig()) {
+    return requestJson(media.runPath, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        object_ref: objectRef,
+        idempotency_key: `web-${crypto.randomUUID()}`,
+        language_hints: [],
+      }),
+      signal,
+    });
   }
 
-  async function waitForCompletion(runId, signal) {
+  async function waitForCompletion(runId, signal, media = currentMediaConfig()) {
     const startedAt = Date.now();
     let consecutiveFailures = 0;
-    const url = `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs/${encodeURIComponent(runId)}`;
+    const url = `${media.runPath}/${encodeURIComponent(runId)}`;
 
     while (true) {
       try {
@@ -226,20 +306,16 @@
     }
   }
 
-  async function fetchResult(runId, signal) {
-    return requestJson(
-      `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs/${encodeURIComponent(runId)}/result`,
-      { signal },
-    );
+  async function fetchResult(runId, signal, media = currentMediaConfig()) {
+    return requestJson(mediaResultPath(media, runId, "/result"), { signal });
   }
 
   async function loadHistory() {
+    const media = currentMediaConfig();
     historyStatus.textContent = "正在读取历史记录";
     try {
-      const payload = await requestJson(
-        `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs`,
-      );
-      renderHistory(payload.items ?? []);
+      const payload = await requestJson(media.runPath);
+      renderHistory(payload.items ?? [], media);
       historyStatus.textContent = payload.items?.length ? "" : "还没有历史解析记录";
     } catch (error) {
       historyList.replaceChildren();
@@ -249,7 +325,7 @@
     }
   }
 
-  function renderHistory(items) {
+  function renderHistory(items, media = currentMediaConfig()) {
     const fragment = document.createDocumentFragment();
     items.forEach((item) => {
       const button = element("button", "history-item");
@@ -258,13 +334,13 @@
         element("span", "history-item-name", item.original_filename),
         element("span", "history-item-meta", `${formatHistoryStatus(item)} · ${formatDate(item.created_at)}`),
       );
-      button.addEventListener("click", () => openHistoryItem(item));
+      button.addEventListener("click", () => openHistoryItem(item, media));
       fragment.append(button);
     });
     historyList.replaceChildren(fragment);
   }
 
-  async function openHistoryItem(item) {
+  async function openHistoryItem(item, media = currentMediaConfig()) {
     clearError();
     if (!SUCCESS_STATUSES.has(item.status)) {
       updateStatus("该任务尚未完成", `${item.original_filename} · ${formatHistoryStatus(item)}`, 1);
@@ -272,8 +348,8 @@
     }
     try {
       updateStatus("正在读取历史解析文本", item.original_filename, 3);
-      const result = await fetchResult(item.run_id);
-      await renderResult(result, item);
+      const result = await fetchResult(item.run_id, undefined, media);
+      await renderResult(result, item, media);
     } catch (error) {
       renderError(error);
     }
@@ -324,34 +400,23 @@
     });
   }
 
-  function renderResult(result, run) {
+  function renderResult(result, run, media = currentMediaConfig()) {
     downloadStatus.textContent = "";
 
-    renderDocumentOverview(result.summary, run);
-    renderDocumentToc(result.chapters ?? []);
-    const chapterList = element("ol", "segment-list");
-    result.chapters.forEach((chapter, chapterIndex) => {
-      const item = element("li", "segment-card");
-      item.id = `chapter-${chapterIndex + 1}`;
-      item.append(
-        element("span", "timecode", timeRange(chapter.start_ms, chapter.end_ms)),
-        element("h4", null, chapter.title),
-        element("p", "segment-summary", chapter.summary_zh),
-      );
-      chapter.body_blocks.forEach((block) => {
-        item.append(renderBodyBlock(block));
-      });
-      appendChapterClaims(item, chapter);
-      chapterList.append(item);
-    });
-    documentChapters.replaceChildren(chapterList);
+    if (media.kind === "IMAGE") {
+      renderImageResult(result, run);
+    } else if (media.kind === "AUDIO") {
+      renderAudioResult(result, run);
+    } else {
+      renderVideoResult(result, run);
+    }
     if (run.status === "PARTIAL_SUCCEEDED" && run.warning_codes?.length > 0) {
       documentChapters.prepend(element("p", "warning-message", `部分处理完成：${run.warning_codes.join("、")}`));
     }
     resultContent.replaceChildren(
       documentOverview,
       documentToc,
-      createDownloadLink(run.run_id),
+      createDownloadLink(run.run_id, media),
       downloadStatus,
       documentChapters,
     );
@@ -359,10 +424,62 @@
     resultPanel.scrollIntoView({ block: "start" });
   }
 
-  function renderDocumentOverview(summary, run) {
+  function renderVideoResult(result, run) {
+    renderDocumentOverview(result.summary, run, "视频");
+    renderChapterResult(result.chapters ?? []);
+  }
+
+  function renderAudioResult(result, run) {
+    renderDocumentOverview(result.summary, run, "音频");
+    renderChapterResult(result.chapters ?? []);
+  }
+
+  function renderImageResult(result, run) {
+    const document = result.document;
     const card = element("article", "result-summary");
     card.append(
-      element("p", "result-source", run.original_filename ? `视频文件：${run.original_filename}` : "知识文档"),
+      element("p", "result-source", run.original_filename ? `图片文件：${run.original_filename}` : "图片知识文档"),
+      element("h3", null, document.title),
+      element("p", null, document.overview_zh || "未提供核心概览。"),
+    );
+    documentOverview.replaceChildren(card);
+    documentToc.replaceChildren();
+    const content = element("article", "image-document");
+    content.append(element("h3", "result-section-title", "图片内容"));
+    document.content_blocks?.forEach((block) => {
+      content.append(element("h4", null, block.content_type), element("p", "chapter-body", block.text));
+    });
+    if (document.claims?.length) {
+      content.append(element("h3", "result-section-title", "关键结论"));
+      const claims = element("ul");
+      document.claims.forEach((claim) => claims.append(element("li", null, claim.text)));
+      content.append(claims);
+    }
+    documentChapters.replaceChildren(content);
+  }
+
+  function renderChapterResult(chapters) {
+    renderDocumentToc(chapters);
+    const chapterList = element("ol", "segment-list");
+    chapters.forEach((chapter, chapterIndex) => {
+      const item = element("li", "segment-card");
+      item.id = `chapter-${chapterIndex + 1}`;
+      item.append(
+        element("span", "timecode", timeRange(chapter.start_ms, chapter.end_ms)),
+        element("h4", null, chapter.title),
+        element("p", "segment-summary", chapter.summary_zh),
+      );
+      chapter.body_blocks?.forEach((block) => item.append(renderBodyBlock(block)));
+      appendChapterClaims(item, chapter);
+      chapterList.append(item);
+    });
+    documentChapters.replaceChildren(chapterList);
+  }
+
+  function renderDocumentOverview(summary, run, mediaLabel = "视频") {
+    const card = element("article", "result-summary");
+    card.append(
+      element("p", "result-source", run.original_filename ? `${mediaLabel}文件：${run.original_filename}` : "知识文档"),
       element("h3", null, summary.title),
       element("p", null, summary.overview_zh || "未提供核心概览。"),
     );
@@ -382,9 +499,9 @@
     documentToc.append(list);
   }
 
-  function createDownloadLink(runId) {
+  function createDownloadLink(runId, media = currentMediaConfig()) {
     const link = element("a", "document-download", "下载 Markdown");
-    link.href = `/api/kb/knowledge-bases/${SCOPE.knowledgeBaseId}/video-understanding-runs/${encodeURIComponent(runId)}/document`;
+    link.href = mediaResultPath(media, runId, "/document");
     link.addEventListener("click", (event) => downloadMarkdown(event, link.href));
     return link;
   }
