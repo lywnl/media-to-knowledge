@@ -47,3 +47,19 @@ def test_audio_result_is_not_ready_until_audio_worker_publishes(
     assert result.json()["error"]["code"] == "AUDIO_RESULT_NOT_READY"
     assert document.status_code == 409
     assert document.json()["error"]["code"] == "AUDIO_RESULT_NOT_READY"
+
+
+def test_audio_openapi_uses_audio_specific_response_contracts(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    audio_paths = {
+        path: operation
+        for path, item in schema["paths"].items()
+        if "/audio-" in path
+        for operation in item.values()
+        if isinstance(operation, dict)
+    }
+    references = str(audio_paths)
+    assert "AudioObjectResponse" in references
+    assert "AudioRunResponse" in references
+    assert "MediaObjectResponse" not in references
+    assert "MediaRunResponse" not in references

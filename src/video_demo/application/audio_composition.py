@@ -133,7 +133,7 @@ def build_audio_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
     )
     handler = AudioJobHandler(
         database,
-        FFprobeAudioClient(
+        FFprobeAudioClient.from_path(
             _production_tool_path(settings, "ffprobe"),
             workspace_root=settings.workspace_root,
         ),
