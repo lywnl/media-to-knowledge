@@ -105,3 +105,22 @@ def test_audio_repository_rejects_requested_digest_different_from_asset_row(tmp_
             repository.get(scope, "run_audio_001", "b" * 64)
 
     assert raised.value.code == ErrorCode.AUDIO_DIGEST_MISMATCH
+
+
+def test_audio_repository_rejects_asset_row_with_unsupported_schema(tmp_path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'audio-schema.db'}"
+    database = Database(database_url)
+    database.create_schema()
+    scope = Scope("tenant", "app", "kb")
+    with database.session() as session:
+        repository = AudioResultRepository(session)
+        repository.replace(scope, _result(), object_ref="obj_audio_001")
+        asset = session.scalar(
+            select(AudioAssetModel).where(AudioAssetModel.run_id == "run_audio_001"),
+        )
+        assert asset is not None
+        asset.schema_version = "0.9.0"
+        with pytest.raises(VideoDemoError) as raised:
+            repository.get(scope, "run_audio_001", "a" * 64)
+
+    assert raised.value.code == ErrorCode.RESULT_SCHEMA_UNSUPPORTED

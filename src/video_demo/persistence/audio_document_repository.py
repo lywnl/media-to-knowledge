@@ -101,6 +101,15 @@ class AudioResultRepository:
             raise VideoDemoError(ErrorCode.AUDIO_RESULT_NOT_READY, "音频资产结果行尚未就绪")
         if asset.source_sha256 != asset_sha256:
             raise VideoDemoError(ErrorCode.AUDIO_DIGEST_MISMATCH, "音频结果摘要与资产不一致")
+        if (
+            asset.schema_version != "1.0.0"
+            or asset.asset_id != asset.source_sha256
+            or not asset.object_ref
+        ):
+            raise VideoDemoError(
+                ErrorCode.RESULT_SCHEMA_UNSUPPORTED,
+                "音频资产结果版本或投影不受支持，请重新处理音频",
+            )
         segments = self._session.scalars(
             select(AudioSegmentModel)
             .where(
