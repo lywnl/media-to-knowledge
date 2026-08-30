@@ -162,7 +162,7 @@ def test_audio_pipeline_does_not_name_video_cancellation_code() -> None:
 def test_audio_query_uses_published_audio_consistency_path() -> None:
     source = Path("src/video_demo/application/audio_queries.py").read_text(encoding="utf-8")
     assert "self.publication.get(scope, run_id)" in source
-    assert "音频数据库结果与已发布制品不一致" in source
+    assert "AudioResultRepository" not in source
 
 
 def test_audio_worker_imports_are_parseable_without_video_domain_import() -> None:

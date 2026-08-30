@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
 from video_demo.application.audio_publication import AudioPublicationService
 from video_demo.application.audio_rendering import render_audio_markdown
@@ -14,7 +15,9 @@ from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.media_repositories import MediaRunRepository
 from video_demo.persistence.models import (
+    AudioAssetModel,
     AudioObjectModel,
+    AudioSummaryModel,
     AudioUnderstandingRunModel,
     VideoObjectStatus,
 )
@@ -189,3 +192,114 @@ def test_audio_publication_rejects_result_for_different_audio_object(tmp_path) -
         )
 
     assert raised.value.code == ErrorCode.AUDIO_DIGEST_MISMATCH
+
+
+def test_audio_publication_get_rejects_database_result_drift(tmp_path) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    database = Database(f"sqlite+pysqlite:///{runtime_root / 'audio.db'}")
+    database.create_schema()
+    scope = Scope("tenant", "app", "kb")
+    result = AudioUnderstandingResult(
+        run_id="run_audio_003",
+        asset_sha256="d" * 64,
+        summary=AudioDocumentSummary(title="音频", duration_ms=1_000, overview_zh="概览"),
+        chapters=(
+            AudioChapter(
+                chapter_id="audio_chapter_003",
+                start_ms=0,
+                end_ms=1_000,
+                title="章节",
+                title_evidence_refs=("asr_001",),
+                summary_zh="摘要",
+                summary_evidence_refs=("asr_001",),
+                body_blocks=(),
+                claims=(),
+                evidence_refs=("asr_001",),
+                transcript_source="ASR",
+            ),
+        ),
+    )
+    with database.session() as session:
+        MediaRunRepository(session, AudioUnderstandingRunModel).add(
+            scope=scope,
+            run_id=result.run_id,
+            object_ref="obj_audio_003",
+            idempotency_key="idempotency-audio-003",
+            config_snapshot={"result_schema_version": "1.0.0"},
+        )
+        session.add(
+            AudioObjectModel(
+                tenant_id=scope.tenant_id,
+                application_id=scope.application_id,
+                knowledge_base_id=scope.knowledge_base_id,
+                object_ref="obj_audio_003",
+                original_filename="speech.wav",
+                declared_mime="audio/wav",
+                detected_mime="audio/wav",
+                size_bytes=1,
+                sha256=result.asset_sha256,
+                relative_path="audio_object/source.wav",
+                status=VideoObjectStatus.READY,
+                scan_details={},
+            ),
+        )
+        JobRepository(session).enqueue_media_run(
+            scope=scope,
+            job_id="job_audio_003",
+            resource_id=result.run_id,
+            job_type="AUDIO_UNDERSTANDING",
+            resource_type="AUDIO_UNDERSTANDING_RUN",
+        )
+    with database.session() as session:
+        claimed = JobRepository(session).claim(
+            "audio-worker",
+            lease_seconds=60,
+            job_type="AUDIO_UNDERSTANDING",
+        )
+    assert claimed is not None
+    service = AudioPublicationService(database, AtomicArtifactStore(runtime_root))
+    service.persist(
+        scope,
+        result,
+        document=render_audio_markdown(result),
+        status="SUCCEEDED",
+        warnings=(),
+        fence=ResultWriteFence(claimed.id, claimed.worker_id, claimed.attempt_count),
+    )
+    with database.session() as session:
+        row = session.scalar(
+            select(AudioSummaryModel).where(AudioSummaryModel.run_id == result.run_id),
+        )
+        assert row is not None
+        row.payload_json = {
+            "summary": {
+                "title": "音频",
+                "duration_ms": 1_000,
+                "overview_zh": "已被篡改",
+            },
+        }
+
+    with pytest.raises(VideoDemoError) as raised:
+        service.get(scope, result.run_id)
+
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
+
+    with database.session() as session:
+        summary = session.scalar(
+            select(AudioSummaryModel).where(AudioSummaryModel.run_id == result.run_id),
+        )
+        assert summary is not None
+        summary.payload_json = {
+            "summary": result.summary.model_dump(mode="json"),
+        }
+        asset = session.scalar(
+            select(AudioAssetModel).where(AudioAssetModel.run_id == result.run_id),
+        )
+        assert asset is not None
+        asset.object_ref = "obj_audio_other"
+
+    with pytest.raises(VideoDemoError) as raised:
+        service.get(scope, result.run_id)
+
+    assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID

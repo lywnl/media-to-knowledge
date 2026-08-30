@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from video_demo.application.audio_rendering import (
     RenderedAudioDocument,
@@ -21,6 +22,7 @@ from video_demo.persistence.audio_document_repository import AudioResultReposito
 from video_demo.persistence.database import Database
 from video_demo.persistence.media_repositories import MediaObjectRepository, MediaRunRepository
 from video_demo.persistence.models import (
+    AudioAssetModel,
     AudioObjectModel,
     AudioUnderstandingRunModel,
     RunStatusValue,
@@ -227,6 +229,23 @@ class AudioPublicationService:
                     raise ValueError("音频运行状态与 bundle 不一致")
                 if tuple(run.warning_codes) != tuple(bundle_warnings):
                     raise ValueError("音频运行告警与 bundle 不一致")
+                asset = session.scalar(
+                    select(AudioAssetModel).where(
+                        AudioAssetModel.tenant_id == scope.tenant_id,
+                        AudioAssetModel.application_id == scope.application_id,
+                        AudioAssetModel.knowledge_base_id == scope.knowledge_base_id,
+                        AudioAssetModel.run_id == run_id,
+                    ),
+                )
+                if asset is None or asset.object_ref != run.object_ref:
+                    raise ValueError("音频资产对象引用与运行不一致")
+                stored = AudioResultRepository(session).get(
+                    scope,
+                    run_id,
+                    result.asset_sha256,
+                )
+                if stored != result:
+                    raise ValueError("音频数据库结果与 bundle 不一致")
             return AudioResultPublication(result=result, document=encoded_document)
         except VideoDemoError:
             raise
