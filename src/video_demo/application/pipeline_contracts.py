@@ -178,7 +178,7 @@ class ProbedAsset:
 @dataclass(frozen=True, slots=True)
 class PreparedMedia:
     source: ProbedAsset
-    # 视觉输入可以是原始视频，也可以是兼容性 fallback 生成的 proxy.mp4。
+    # 兼容下游命名；视觉输入始终是当前 Run 内的原始视频。
     proxy_path: Path
     proxy_sha256: str
     proxy_size_bytes: int
@@ -282,10 +282,9 @@ class SceneIndex(FrozenModel):
             ),
         )
         if (
-            not ordered
-            or ordered != self.scenes
-            or ordered[0].start_ms != 0
-            or ordered[-1].end_ms != self.duration_ms
+            (ordered and ordered != self.scenes)
+            or (ordered and ordered[0].start_ms != 0)
+            or (ordered and ordered[-1].end_ms != self.duration_ms)
             or any(left.end_ms != right.start_ms for left, right in pairwise(ordered))
         ):
             raise ValueError("场景索引时间轴必须有序、连续并覆盖完整视频")

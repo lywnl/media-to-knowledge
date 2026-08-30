@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import re
@@ -61,6 +62,13 @@ _FAILED_SAMPLE_STATUSES = frozenset(
     {"SEEK_FAILED", "DECODE_FAILED", "INVALID_TIMESTAMP", "OUT_OF_TOLERANCE"},
 )
 _NO_ARTIFACT_SAMPLE_STATUSES = _FAILED_SAMPLE_STATUSES | {"QUALITY_REJECTED"}
+_OPTIONAL_FRAME_FAILURE_CODES = frozenset(
+    {
+        ErrorCode.VISUAL_MEDIA_INVALID,
+        ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE,
+    },
+)
+_LOGGER = logging.getLogger(__name__)
 
 
 class ChapterFrameSearchBatch(FrozenModel):
@@ -212,14 +220,30 @@ class ChapterFrameSearcher:
             lock_timeout_seconds=self._candidate_lock_timeout_seconds,
         )
         try:
-            results = self._extractor.extract_samples(
-                media.proxy_path,
-                media.source.asset.run_relative_root,
-                samples,
-                is_cancel_requested=is_cancel_requested,
-                frame_tolerance_ms=scene_index.frame_tolerance_ms,
-                artifact_session=artifact_session,
-            )
+            try:
+                results = self._extractor.extract_samples(
+                    media.proxy_path,
+                    media.source.asset.run_relative_root,
+                    samples,
+                    is_cancel_requested=is_cancel_requested,
+                    frame_tolerance_ms=scene_index.frame_tolerance_ms,
+                    artifact_session=artifact_session,
+                )
+            except VideoDemoError as error:
+                if error.code not in _OPTIONAL_FRAME_FAILURE_CODES:
+                    raise
+                _LOGGER.warning(
+                    "视觉帧抽取失败 chapter=%s code=%s，已跳过该章节视觉补充",
+                    ",".join(chapter.chapter_id for chapter in chapters),
+                    error.code,
+                )
+                artifact_session.cleanup_unretained(frozenset())
+                return self._failed_extraction_batch(
+                    chapters,
+                    allowed_run_root,
+                    scene_index.frame_tolerance_ms,
+                    media.source.asset.source_sha256,
+                )
             self._validate_results(samples, results, scene_index.frame_tolerance_ms)
             candidates = self._collect_candidates(
                 results,
@@ -277,11 +301,15 @@ class ChapterFrameSearcher:
             ),
         )
         if (
-            not scene_index.scenes
-            or len(scene_ids) != len(set(scene_ids))
+            len(scene_ids) != len(set(scene_ids))
             or scene_index.scenes != ordered_scenes
-            or scene_index.scenes[0].start_ms != 0
-            or scene_index.scenes[-1].end_ms != scene_index.duration_ms
+            or (
+                bool(scene_index.scenes)
+                and (
+                    scene_index.scenes[0].start_ms != 0
+                    or scene_index.scenes[-1].end_ms != scene_index.duration_ms
+                )
+            )
             or any(
                 left.end_ms != right.start_ms
                 for left, right in pairwise(scene_index.scenes)
@@ -321,6 +349,31 @@ class ChapterFrameSearcher:
         if not proxy.is_relative_to(allowed_run_root) or not proxy.is_file():
             raise VideoDemoError(ErrorCode.WORKSPACE_PATH_ESCAPE, "视觉输入必须位于当前 Run 根")
         return allowed_run_root
+
+    @staticmethod
+    def _failed_extraction_batch(
+        chapters: tuple[ChapterPlan, ...],
+        allowed_run_root: Path,
+        frame_tolerance_ms: int,
+        asset_sha256: str,
+    ) -> ChapterFrameSearchBatch:
+        return ChapterFrameSearchBatch(
+            asset_sha256=asset_sha256,
+            allowed_run_root=allowed_run_root,
+            frame_tolerance_ms=frame_tolerance_ms,
+            frame_sets=tuple(
+                ChapterFrameSet(chapter_id=chapter.chapter_id, candidates=())
+                for chapter in chapters
+            ),
+            chapter_status=tuple(
+                (chapter.chapter_id, "DEGRADED") for chapter in chapters
+            ),
+            warnings=tuple(
+                f"CHAPTER_FRAME_DEGRADED:{chapter.chapter_id}" for chapter in chapters
+            ),
+            status="PARTIAL_SUCCEEDED",
+            metrics={"visual_frame_degraded_chapters": len(chapters)},
+        )
 
     def _build_samples(
         self,
@@ -535,7 +588,11 @@ class ChapterFrameSearcher:
                             window_end_ms=binding.window_end_ms,
                         ),
                     ),
-                    scene_id=_scene_at(scenes, candidate.timestamp_ms).evidence_id,
+                    scene_id=(
+                        _scene_at(scenes, candidate.timestamp_ms).evidence_id
+                        if scenes
+                        else "scene_unavailable"
+                    ),
                     created_by_call=candidate.created_by_call,
                 ),
             )

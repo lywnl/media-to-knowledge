@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 from typing import Protocol, TypeVar, cast
@@ -27,6 +29,7 @@ from video_demo.application.pipeline_contracts import (
     merge_model_metrics,
     merge_run_statuses,
     require_result_evidence_budget,
+    scene_index_sha256,
     stable_merge_document_evidence,
     stable_merge_warnings,
 )
@@ -49,6 +52,31 @@ from video_demo.storage.document_cache import DocumentModelCache
 from video_demo.storage.workspace import safe_runtime_path
 
 StageResult = TypeVar("StageResult")
+_LOGGER = logging.getLogger(__name__)
+
+
+def _is_optional_scene_failure(error: VideoDemoError) -> bool:
+    return error.code in {
+        ErrorCode.VISUAL_MEDIA_INVALID,
+        ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE,
+        ErrorCode.VISUAL_RESULT_INVALID,
+    }
+
+
+def _empty_scene_index(media: PreparedMedia) -> SceneIndex:
+    digest = scene_index_sha256(
+        proxy_sha256=media.proxy_sha256,
+        duration_ms=media.source.duration_ms,
+        frame_tolerance_ms=100,
+        scenes=(),
+    )
+    return SceneIndex(
+        proxy_sha256=media.proxy_sha256,
+        duration_ms=media.source.duration_ms,
+        frame_tolerance_ms=100,
+        scenes=(),
+        index_sha256=digest,
+    )
 
 
 class AssetRegistrar(Protocol):
@@ -416,8 +444,9 @@ class VideoUnderstandingPipeline:
             return sibling_cancel.is_set() or context.is_cancel_requested()
 
         first_error: BaseException | None = None
+        scene_failure: VideoDemoError | None = None
         speech_result: tuple[SpeechAnalysis, int] | None = None
-        scene_result: tuple[SceneIndex, int] | None = None
+        scene_result: tuple[SceneIndex | None, int] | None = None
         with ThreadPoolExecutor(
             max_workers=2,
             thread_name_prefix="document-evidence-prep",
@@ -447,7 +476,10 @@ class VideoUnderstandingPipeline:
                     try:
                         scene_result = scene_future.result()
                     except BaseException as error:
-                        if first_error is None:
+                        if isinstance(error, VideoDemoError) and _is_optional_scene_failure(error):
+                            scene_failure = error
+                            scene_result = (None, 0)
+                        elif first_error is None:
                             first_error = error
                 if first_error is not None:
                     sibling_cancel.set()
@@ -459,6 +491,18 @@ class VideoUnderstandingPipeline:
             raise AssertionError("证据准备分支未完整返回")
         speech, speech_duration = speech_result
         scene_index, scene_duration = scene_result
+        if scene_index is None:
+            scene_index = _empty_scene_index(prepared)
+            speech = replace(
+                speech,
+                warnings=tuple(
+                    dict.fromkeys((*speech.warnings, "SCENE_DETECTION_SKIPPED"))
+                ),
+            )
+            _LOGGER.warning(
+                "场景检测失败，已跳过视觉补充 code=%s",
+                scene_failure.code if scene_failure is not None else "UNKNOWN",
+            )
         self._check_cancelled(context)
         base_segments = build_base_segments(
             registered.source_sha256,
@@ -467,6 +511,7 @@ class VideoUnderstandingPipeline:
             scene_index.scenes,
             speech.boundary_candidates,
             self._evidence_preparation_limits,
+            allow_empty_scenes=not scene_index.scenes,
         )
         self._check_cancelled(context)
         stage_metrics.add("SPEECH", speech_duration)

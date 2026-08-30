@@ -313,6 +313,53 @@ def test_visual_disabled_short_circuits_without_opening_extractor(tmp_path: Path
     assert batch.metrics == {"visual_disabled_chapters": 1}
 
 
+def test_frame_search_can_extract_from_source_without_scene_index(tmp_path: Path) -> None:
+    media, original_scene_index = _fixture(tmp_path)
+    chapter = ChapterPlan(
+        chapter_id="chapter_001",
+        start_ms=0,
+        end_ms=10_000,
+        segment_refs=("segment_001",),
+        title_hint="章节",
+        visual_mode="SINGLE",
+        semantic_targets=(),
+        base_coverage_targets=(
+            VisualSearchTarget(
+                target_id="target_base",
+                purpose="BASE_COVERAGE",
+                query_zh="代表画面",
+                sample_timestamps_ms=(5_000,),
+            ),
+        ),
+    )
+    empty_scene_index = SceneIndex(
+        proxy_sha256=media.proxy_sha256,
+        duration_ms=original_scene_index.duration_ms,
+        frame_tolerance_ms=original_scene_index.frame_tolerance_ms,
+        scenes=(),
+        index_sha256=scene_index_sha256(
+            proxy_sha256=media.proxy_sha256,
+            duration_ms=original_scene_index.duration_ms,
+            frame_tolerance_ms=original_scene_index.frame_tolerance_ms,
+            scenes=(),
+        ),
+    )
+    extractor = _FakeExtractor({5_000: ("SUCCEEDED", _JPEG)})
+    extractor.runtime_root = tmp_path
+
+    batch = ChapterFrameSearcher(tmp_path, extractor).search(
+        media,
+        (chapter,),
+        {},
+        empty_scene_index,
+        DocumentGenerationConfig(),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert batch.chapter_status == ((chapter.chapter_id, "SUCCEEDED"),)
+    assert batch.frame_sets[0].candidates
+
+
 def test_candidate_budget_removes_current_call_files_and_degrades_chapter(
     tmp_path: Path,
 ) -> None:

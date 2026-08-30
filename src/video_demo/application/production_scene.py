@@ -15,14 +15,14 @@ from video_demo.domain.base import stable_identifier
 from video_demo.domain.evidence import SceneBoundary
 from video_demo.domain.manifest import Rational
 from video_demo.errors import ErrorCode, VideoDemoError
-from video_demo.storage.workspace import verified_mp4_file
+from video_demo.storage.workspace import verified_visual_file
 from video_demo.visual.scenes import SceneDetector
 
 _MIN_NORMALIZED_SCENE_MS = 1_200
 
 
 class ProductionSceneIndexProvider:
-    """只基于已验证视觉输入和场景检测器构造 3.0 场景索引。"""
+    """只基于已验证原始视觉输入和场景检测器构造场景索引。"""
 
     def __init__(
         self,
@@ -44,14 +44,14 @@ class ProductionSceneIndexProvider:
         limits: EvidencePreparationLimits,
         is_cancel_requested: Callable[[], bool] = lambda: False,
     ) -> SceneIndex:
-        proxy = verified_mp4_file(
+        proxy = verified_visual_file(
             self._runtime_root,
             media.source.asset.run_relative_root,
             media.proxy_path,
             expected_sha256=media.proxy_sha256,
             expected_size_bytes=media.proxy_size_bytes,
             max_size_bytes=self._max_video_bytes,
-            message="视觉输入必须位于当前运行目录内",
+            message="原始视觉输入必须位于当前运行目录内",
         )
         _check_cancelled(is_cancel_requested)
         duration_ms = media.source.duration_ms

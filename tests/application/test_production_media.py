@@ -140,7 +140,7 @@ def test_production_probe_propagates_video_timeline_without_changing_container_d
     assert probed.manifest.duration_ms == 1_000
 
 
-def test_production_transcoder_generates_scoped_proxy_and_explicit_no_audio_warning(
+def test_production_transcoder_uses_source_and_explicit_no_audio_warning(
     tmp_path: Path,
 ) -> None:
     runtime_root = tmp_path / ".codex" / "video-rag-demo"
@@ -157,28 +157,6 @@ def test_production_transcoder_generates_scoped_proxy_and_explicit_no_audio_warn
     ).probe(registered)
 
     class Transcoder:
-        def create_proxy(
-            self,
-            path: Path,
-            run_relative_root: Path,
-            *,
-            duration_ms: int | None = None,
-        ) -> ProxyVideoArtifact:
-            assert path == source
-            assert run_relative_root == Path("runs/scope/run_001")
-            assert duration_ms == 1_000
-            relative_path = run_relative_root / "media/proxy.mp4"
-            destination = runtime_root / relative_path
-            destination.parent.mkdir(parents=True)
-            destination.write_bytes(_MP4)
-            return ProxyVideoArtifact(
-                relative_path=relative_path.as_posix(),
-                sha256=hashlib.sha256(_MP4).hexdigest(),
-                size_bytes=len(_MP4),
-                max_edge=1280,
-                normalized_start_ms=0,
-            )
-
         def extract_audio(
             self,
             path: Path,
@@ -198,9 +176,9 @@ def test_production_transcoder_generates_scoped_proxy_and_explicit_no_audio_warn
         lambda _is_cancel_requested: Transcoder(),
     ).transcode(probed)
 
-    assert prepared.proxy_path == runtime_root / "runs/scope/run_001/media/proxy.mp4"
-    assert prepared.proxy_sha256 == hashlib.sha256(_MP4).hexdigest()
-    assert prepared.proxy_size_bytes == len(_MP4)
+    assert prepared.proxy_path == source
+    assert prepared.proxy_sha256 == registered.source_sha256
+    assert prepared.proxy_size_bytes == registered.source_size_bytes
     assert prepared.audio_path is None
     assert prepared.audio_sha256 is None
     assert prepared.subtitle is None
@@ -230,12 +208,12 @@ def test_production_transcoder_uses_source_video_when_visual_decode_is_safe(
     assert prepared.proxy_sha256 == probed.asset.source_sha256
     assert prepared.proxy_size_bytes == probed.asset.source_size_bytes
     assert client.create_proxy_durations == []
-    assert client.visual_source_calls == [(source, 30_000)]
+    assert client.visual_source_calls == []
     assert client.extract_audio_calls == [(True, 30_000)]
     assert "视觉输入选择 mode=SOURCE" in "\n".join(caplog.messages)
 
 
-def test_production_transcoder_falls_back_to_proxy_when_visual_decode_is_unsafe(
+def test_production_transcoder_keeps_source_when_visual_decode_is_unsafe(
     tmp_path: Path,
 ) -> None:
     runtime_root, probed = _probed_media(
@@ -254,8 +232,9 @@ def test_production_transcoder_falls_back_to_proxy_when_visual_decode_is_unsafe(
         lambda _cancel: client,
     ).transcode(probed)
 
-    assert prepared.proxy_path == runtime_root / "runs/scope/run_001/media/proxy.mp4"
-    assert client.create_proxy_durations == [30_000]
+    assert prepared.proxy_path == probed.asset.source_path
+    assert prepared.proxy_sha256 == probed.asset.source_sha256
+    assert client.create_proxy_durations == []
 
 
 @pytest.mark.parametrize(
@@ -265,7 +244,7 @@ def test_production_transcoder_falls_back_to_proxy_when_visual_decode_is_unsafe(
         ("video/mp4", "hevc"),
     ],
 )
-def test_production_transcoder_falls_back_for_unsupported_source_contract(
+def test_production_transcoder_keeps_source_for_unsupported_source_contract(
     tmp_path: Path,
     source_mime: str,
     codec_name: str,
@@ -299,7 +278,7 @@ def test_production_transcoder_falls_back_for_unsupported_source_contract(
     ).transcode(probed)
 
     assert client.visual_source_calls == []
-    assert client.create_proxy_durations == [30_000]
+    assert client.create_proxy_durations == []
 
 
 def test_production_transcoder_rejects_source_digest_mismatch_before_media_work(
@@ -643,7 +622,7 @@ def test_non_degradable_subtitle_failure_aborts_before_audio(
 
 
 @pytest.mark.parametrize("mutation", ["empty", "fake_mp4", "wrong_size", "too_large"])
-def test_production_transcoder_rejects_invalid_proxy_before_prepared_media(
+def test_production_transcoder_ignores_legacy_proxy_artifacts(
     tmp_path: Path,
     mutation: str,
 ) -> None:
@@ -659,42 +638,21 @@ def test_production_transcoder_rejects_invalid_proxy_before_prepared_media(
     probed = ProductionAssetProbe(
         lambda: _StaticProbeClient(_manifest(has_audio=False)),
     ).probe(registered)
-    payload = b"" if mutation == "empty" else (b"not-mp4" if mutation == "fake_mp4" else _MP4)
-
     class Transcoder:
-        def create_proxy(
-            self,
-            _path: Path,
-            root: Path,
-            *,
-            duration_ms: int | None = None,
-        ) -> ProxyVideoArtifact:
-            assert duration_ms == 1_000
-            relative = root / "media/proxy.mp4"
-            output = runtime_root / relative
-            output.parent.mkdir(parents=True)
-            output.write_bytes(payload)
-            declared_size = len(payload) + 1 if mutation == "wrong_size" else len(payload)
-            if mutation == "too_large":
-                declared_size = 2_000
-            return ProxyVideoArtifact(
-                relative_path=relative.as_posix(),
-                sha256=hashlib.sha256(payload).hexdigest(),
-                size_bytes=declared_size,
-                max_edge=1280,
-                normalized_start_ms=0,
-            )
-
         def extract_audio(self, *_args: object, **_kwargs: object) -> NoAudioArtifact:
-            raise AssertionError("非法 proxy 不得继续处理音频")
+            return NoAudioArtifact(warning_code="NO_AUDIO_TRACK")
 
     transcoder = ProductionMediaTranscoder(
         runtime_root,
         lambda _cancel: Transcoder(),
         max_proxy_bytes=1_000,
     )
-    with pytest.raises(VideoDemoError):
-        transcoder.transcode(probed)
+    prepared = transcoder.transcode(probed)
+
+    assert prepared.proxy_path == source
+    assert prepared.proxy_sha256 == registered.source_sha256
+    assert prepared.proxy_size_bytes == registered.source_size_bytes
+    assert not (runtime_root / "runs/scope/run_001/media/proxy.mp4").exists()
 
 
 class _StaticProbeClient:

@@ -191,6 +191,25 @@ def test_scene_index_rejects_non_contiguous_scene_timeline() -> None:
         )
 
 
+def test_scene_index_allows_empty_visual_result_for_text_only_continuation() -> None:
+    digest = contracts.scene_index_sha256(
+        proxy_sha256="a" * 64,
+        duration_ms=1_000,
+        frame_tolerance_ms=40,
+        scenes=(),
+    )
+
+    index = contracts.SceneIndex(
+        proxy_sha256="a" * 64,
+        duration_ms=1_000,
+        frame_tolerance_ms=40,
+        scenes=(),
+        index_sha256=digest,
+    )
+
+    assert index.scenes == ()
+
+
 def test_scene_index_rejects_duplicate_scene_ids() -> None:
     scenes = (
         SceneBoundary(

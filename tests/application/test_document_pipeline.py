@@ -659,6 +659,32 @@ def test_document_pipeline_treats_normal_no_frame_and_no_visual_as_succeeded(
     assert outcome.status == "SUCCEEDED"
 
 
+def test_document_pipeline_skips_scene_failure_and_keeps_text_generation(
+    tmp_path: Path,
+) -> None:
+    class SceneFailureFixture(_PipelineFixture):
+        def prepare_scene_index(
+            self,
+            _media: PreparedMedia,
+            *,
+            limits: EvidencePreparationLimits,
+            is_cancel_requested: Callable[[], bool],
+            ) -> SceneIndex:
+                del limits, is_cancel_requested
+                self.scene_started.set()
+                self.scene_finished.set()
+                raise VideoDemoError(ErrorCode.VISUAL_MEDIA_INVALID, "模拟视觉解码失败")
+
+    fixture = SceneFailureFixture(tmp_path)
+
+    outcome = _pipeline(fixture).run(_context("run_001"))
+
+    assert outcome.status == "SUCCEEDED"
+    assert "SCENE_DETECTION_SKIPPED" in outcome.warnings
+    assert "PLAN_CALL" in fixture.calls
+    assert "WRITE_CALL" in fixture.calls
+
+
 def test_visual_degradation_keeps_model_refined_asr_document(tmp_path: Path) -> None:
     fixture = _PipelineFixture(
         tmp_path,

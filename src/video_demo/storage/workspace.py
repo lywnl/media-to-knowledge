@@ -88,11 +88,38 @@ def verified_mp4_file(
     message: str,
 ) -> Path:
     """流式验证当前运行目录内、受限且具有 ISO BMFF ftyp 的 MP4。"""
+    path = verified_visual_file(
+        runtime_root,
+        allowed_relative_root,
+        candidate,
+        message=message,
+        expected_sha256=expected_sha256,
+        expected_size_bytes=expected_size_bytes,
+        max_size_bytes=max_size_bytes,
+    )
+    with path.open("rb") as stream:
+        header = stream.read(32)
+    if not _has_iso_bmff_ftyp(header, expected_size_bytes):
+        raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "MP4 缺少合法 ISO BMFF ftyp")
+    return path
+
+
+def verified_visual_file(
+    runtime_root: Path,
+    allowed_relative_root: Path,
+    candidate: Path,
+    *,
+    expected_sha256: str,
+    expected_size_bytes: int,
+    max_size_bytes: int,
+    message: str,
+) -> Path:
+    """验证当前 Run 内任意原始视觉视频的路径、大小和摘要。"""
 
     if expected_size_bytes < 1:
-        raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "MP4 声明大小必须大于 0")
+        raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "视觉输入声明大小必须大于 0")
     if max_size_bytes < 1 or expected_size_bytes > max_size_bytes:
-        raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "MP4 大小超过限制")
+        raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "视觉输入大小超过限制")
     path = verified_run_file(
         runtime_root,
         allowed_relative_root,
@@ -111,11 +138,9 @@ def verified_mp4_file(
             if len(header) < 32:
                 header += chunk[: 32 - len(header)]
     if actual_size != expected_size_bytes:
-        raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "MP4 实际大小与声明不一致")
+        raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "视觉输入实际大小与声明不一致")
     if digest.hexdigest() != expected_sha256:
-        raise VideoDemoError(ErrorCode.VIDEO_DIGEST_MISMATCH, "MP4 摘要校验失败")
-    if not _has_iso_bmff_ftyp(header, actual_size):
-        raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "MP4 缺少合法 ISO BMFF ftyp")
+        raise VideoDemoError(ErrorCode.VIDEO_DIGEST_MISMATCH, "视觉输入摘要校验失败")
     return path
 
 
