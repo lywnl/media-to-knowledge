@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - 受支持平台均提供，分支用�
     fcntl = None  # type: ignore[assignment]
 
 _LEGACY_REVISION = "0001_video_demo"
-_HEAD_REVISION = "0005_media_artifact_pointers"
+_HEAD_REVISION = "0006_audio_document_result"
 _SCOPE = {
     "tenant_id": ("VARCHAR(128)", False),
     "application_id": ("VARCHAR(128)", False),
@@ -156,6 +156,28 @@ _MEDIA_RUN_COLUMNS = {
     )
     for kind in ("audio_understanding_run", "image_understanding_run")
 }
+_AUDIO_RESULT_COLUMNS = {
+    "audio_asset": _columns(
+        run_id=("VARCHAR(128)", False),
+        asset_id=("VARCHAR(128)", False),
+        object_ref=("VARCHAR(128)", False),
+        source_sha256=("VARCHAR(64)", False),
+        schema_version=("VARCHAR(32)", False),
+    ),
+    "audio_segment": _columns(
+        run_id=("VARCHAR(128)", False),
+        segment_id=("VARCHAR(128)", False),
+        start_ms=("INTEGER", False),
+        end_ms=("INTEGER", False),
+        schema_version=("VARCHAR(32)", False),
+        payload_json=("JSON", False),
+    ),
+    "audio_summary": _columns(
+        run_id=("VARCHAR(128)", False),
+        schema_version=("VARCHAR(32)", False),
+        payload_json=("JSON", False),
+    ),
+}
 _HEAD_COLUMNS = {
     **_LEGACY_COLUMNS,
     "video_understanding_run": {
@@ -168,6 +190,7 @@ _HEAD_COLUMNS = {
 _HEAD_COLUMNS.update(_DOCUMENT_COLUMNS)
 _HEAD_COLUMNS.update(_MEDIA_OBJECT_COLUMNS)
 _HEAD_COLUMNS.update(_MEDIA_RUN_COLUMNS)
+_HEAD_COLUMNS.update(_AUDIO_RESULT_COLUMNS)
 _LEGACY_UNIQUES = {
     "video_object": {
         "uq_video_object_scope_ref": (
@@ -235,6 +258,21 @@ _LEGACY_UNIQUES = {
             "tenant_id", "application_id", "knowledge_base_id", "idempotency_key",
         ),
     },
+    "audio_asset": {
+        "uq_audio_asset_scope_run": (
+            "tenant_id", "application_id", "knowledge_base_id", "run_id",
+        ),
+    },
+    "audio_segment": {
+        "uq_audio_segment_scope_run_id": (
+            "tenant_id", "application_id", "knowledge_base_id", "run_id", "segment_id",
+        ),
+    },
+    "audio_summary": {
+        "uq_audio_summary_scope_run": (
+            "tenant_id", "application_id", "knowledge_base_id", "run_id",
+        ),
+    },
 }
 _LEGACY_INDEXES = {
     "video_object": {
@@ -265,6 +303,13 @@ _LEGACY_INDEXES = {
     },
     "audio_understanding_run": {},
     "image_understanding_run": {},
+    "audio_asset": {},
+    "audio_segment": {
+        "ix_audio_segment_scope_run_time": (
+            "tenant_id", "application_id", "knowledge_base_id", "run_id", "start_ms",
+        ),
+    },
+    "audio_summary": {},
 }
 
 

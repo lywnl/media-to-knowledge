@@ -13,6 +13,13 @@ EXPECTED_TABLES = {
     "video_segment",
     "video_summary",
     "video_understanding_run",
+    "audio_object",
+    "audio_understanding_run",
+    "image_object",
+    "image_understanding_run",
+    "audio_asset",
+    "audio_segment",
+    "audio_summary",
 }
 
 

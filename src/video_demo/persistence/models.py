@@ -281,6 +281,60 @@ class AudioUnderstandingRunModel(ScopeColumns, TimestampColumns, Base):
     document_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
 
 
+class AudioAssetModel(ScopeColumns, TimestampColumns, Base):
+    __tablename__ = "audio_asset"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "application_id", "knowledge_base_id", "run_id",
+            name="uq_audio_asset_scope_run",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    object_ref: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class AudioSegmentModel(ScopeColumns, TimestampColumns, Base):
+    __tablename__ = "audio_segment"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "application_id", "knowledge_base_id", "run_id", "segment_id",
+            name="uq_audio_segment_scope_run_id",
+        ),
+        Index(
+            "ix_audio_segment_scope_run_time",
+            "tenant_id", "application_id", "knowledge_base_id", "run_id", "start_ms",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    segment_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class AudioSummaryModel(ScopeColumns, TimestampColumns, Base):
+    __tablename__ = "audio_summary"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "application_id", "knowledge_base_id", "run_id",
+            name="uq_audio_summary_scope_run",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
 class ImageUnderstandingRunModel(ScopeColumns, TimestampColumns, Base):
     __tablename__ = "image_understanding_run"
     __table_args__ = (
