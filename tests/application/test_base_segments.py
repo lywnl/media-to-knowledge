@@ -102,24 +102,6 @@ def test_two_hour_textless_single_scene_uses_grid_and_covers_whole_video() -> No
     assert all(item.transcript_source == "NONE" for item in segments)
 
 
-def test_audio_segments_allow_empty_scene_evidence_when_explicitly_enabled() -> None:
-    transcript = (_speech("asr_001", 0, 1_000),)
-
-    segments = build_base_segments(
-        asset_sha256=_ASSET_SHA256,
-        duration_ms=1_000,
-        transcript_evidence=transcript,
-        scenes=(),
-        speech_boundaries=(),
-        limits=_limits(),
-        allow_empty_scenes=True,
-    )
-
-    assert len(segments) == 1
-    assert segments[0].scene_refs == ()
-    assert segments[0].evidence_refs == ("asr_001",)
-
-
 def test_empty_scene_evidence_remains_invalid_without_explicit_audio_mode() -> None:
     with pytest.raises(VideoDemoError) as raised:
         build_base_segments(

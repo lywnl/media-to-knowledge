@@ -5,12 +5,11 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from video_demo.domain.base import FrozenModel, Sha256, StableId
-from video_demo.domain.document import (
-    ChapterBodyBlock,
-    GroundedClaim,
-    TranscriptSource,
+from video_demo.domain.audio_plan import (
+    AudioBodyBlock,
+    AudioGroundedClaim,
+    AudioTranscriptSource,
 )
-from video_demo.domain.evidence import SpeechSegment, SubtitleCue
 from video_demo.domain.run import TimeRange
 
 
@@ -27,11 +26,11 @@ class AudioChapter(TimeRange):
     title_evidence_refs: tuple[StableId, ...] = Field(max_length=32)
     summary_zh: str = Field(max_length=4_000)
     summary_evidence_refs: tuple[StableId, ...] = Field(max_length=32)
-    body_blocks: tuple[ChapterBodyBlock, ...] = Field(max_length=128)
-    claims: tuple[GroundedClaim, ...] = Field(max_length=128)
+    body_blocks: tuple[AudioBodyBlock, ...] = Field(max_length=128)
+    claims: tuple[AudioGroundedClaim, ...] = Field(max_length=128)
     content_status: Literal["GROUNDED", "NO_SEMANTIC_EVIDENCE"] = "GROUNDED"
     evidence_refs: tuple[StableId, ...] = Field(max_length=256)
-    transcript_source: TranscriptSource
+    transcript_source: AudioTranscriptSource
 
     @model_validator(mode="after")
     def validate_content_boundary(self) -> AudioChapter:
@@ -76,6 +75,3 @@ class AudioUnderstandingResult(FrozenModel):
         ):
             raise ValueError("音频章节必须连续且无重叠")
         return self
-
-
-AudioTranscriptEvidence = SpeechSegment | SubtitleCue

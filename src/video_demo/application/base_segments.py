@@ -30,18 +30,11 @@ def build_base_segments(
     scenes: Sequence[SceneBoundary],
     speech_boundaries: Sequence[SpeechBoundaryCandidate],
     limits: EvidencePreparationLimits,
-    *,
-    allow_empty_scenes: bool = False,
 ) -> tuple[BaseSegment, ...]:
     if duration_ms <= 0:
         raise ValueError("duration_ms 必须大于 0")
     transcript = _validate_transcript_budget(transcript_evidence, duration_ms, limits)
-    ordered_scenes = _validate_scenes(
-        scenes,
-        duration_ms,
-        limits,
-        allow_empty=allow_empty_scenes,
-    )
+    ordered_scenes = _validate_scenes(scenes, duration_ms, limits)
     boundaries = _safe_boundaries(
         duration_ms,
         transcript,
@@ -92,8 +85,6 @@ def _validate_scenes(
     scenes: Sequence[SceneBoundary],
     duration_ms: int,
     limits: EvidencePreparationLimits,
-    *,
-    allow_empty: bool = False,
 ) -> tuple[SceneBoundary, ...]:
     ordered = tuple(
         sorted(
@@ -109,8 +100,6 @@ def _validate_scenes(
     scene_ids = tuple(item.evidence_id for item in ordered)
     if len(scene_ids) != len(set(scene_ids)):
         raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "规范场景标识不得重复")
-    if not ordered and allow_empty:
-        return ordered
     if not ordered or ordered[0].start_ms != 0 or ordered[-1].end_ms != duration_ms:
         raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "规范场景未覆盖完整视频")
     if any(left.end_ms != right.start_ms for left, right in pairwise(ordered)):
