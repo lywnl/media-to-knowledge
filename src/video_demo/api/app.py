@@ -170,7 +170,11 @@ def create_app(
 
     @app.get("/", include_in_schema=False)
     def frontend() -> FileResponse:
-        return FileResponse(web_root / "index.html", media_type="text/html")
+        return FileResponse(
+            web_root / "index.html",
+            media_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
 
     app.include_router(objects_router)
     app.include_router(build_media_router("AUDIO"))

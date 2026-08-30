@@ -89,18 +89,19 @@ def test_frontend_page_exposes_local_video_file_workflow(client: TestClient) -> 
     assert response.headers["content-type"].startswith("text/html")
     html = response.text
     assert '<html lang="zh-CN">' in html
-    assert "本地视频理解" in html
+    assert "本地媒体理解" in html
     assert 'id="video-file"' in html
     assert 'type="file"' in html
     assert 'accept=".mp4,.mov,.mkv,.webm"' in html
-    assert 'href="/static/styles.css"' in html
-    assert 'src="/static/app.js"' in html
+    assert 'href="/static/styles.css?v=media-pipelines-1"' in html
+    assert 'src="/static/app.js?v=media-pipelines-1"' in html
     assert "video-url" not in html
     assert "tenant-id" not in html
     assert "application-id" not in html
     assert "knowledge-base-id" not in html
     assert 'id="history-panel"' in html
     assert 'id="history-list"' in html
+    assert response.headers["cache-control"] == "no-store"
 
 
 def test_frontend_static_resources_are_available(client: TestClient) -> None:
