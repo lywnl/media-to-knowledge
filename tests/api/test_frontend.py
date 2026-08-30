@@ -93,8 +93,8 @@ def test_frontend_page_exposes_local_video_file_workflow(client: TestClient) -> 
     assert 'id="video-file"' in html
     assert 'type="file"' in html
     assert 'accept=".mp4,.mov,.mkv,.webm"' in html
-    assert 'href="/static/styles.css?v=media-pipelines-1"' in html
-    assert 'src="/static/app.js?v=media-pipelines-1"' in html
+    assert 'href="/static/styles.css?v=media-pipelines-2"' in html
+    assert 'src="/static/app.js?v=media-pipelines-2"' in html
     assert "video-url" not in html
     assert "tenant-id" not in html
     assert "application-id" not in html
@@ -202,6 +202,18 @@ def test_frontend_script_renders_chapter_claims(client: TestClient) -> None:
 
     assert "本章结论" in script
     assert "chapter.claims" in script
+
+
+def test_frontend_does_not_render_description_field_label(client: TestClient) -> None:
+    script = client.get("/static/app.js").text
+
+    assert 'block.content_type === "DESCRIPTION"' in script
+    assert 'element("h4", null, block.content_type)' in script
+    assert 'element("p", "chapter-body", block.text)' in script
+    assert (
+        'content.append(element("h4", null, block.content_type), '
+        'element("p", "chapter-body", block.text));'
+    ) not in script
 
 
 def test_frontend_does_not_map_keyframe_evidence_refs_to_images(client: TestClient) -> None:

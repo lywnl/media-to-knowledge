@@ -447,7 +447,14 @@
     const content = element("article", "image-document");
     content.append(element("h3", "result-section-title", "图片内容"));
     document.content_blocks?.forEach((block) => {
-      content.append(element("h4", null, block.content_type), element("p", "chapter-body", block.text));
+      if (block.content_type === "DESCRIPTION") {
+        content.append(element("p", "chapter-body", block.text));
+        return;
+      }
+      content.append(
+        element("h4", null, block.content_type),
+        element("p", "chapter-body", block.text),
+      );
     });
     if (document.claims?.length) {
       content.append(element("h3", "result-section-title", "关键结论"));
