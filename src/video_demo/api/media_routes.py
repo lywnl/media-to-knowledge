@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from collections.abc import Callable
+from typing import Annotated, Literal, cast
 
 from fastapi import APIRouter, Depends, File, Response, UploadFile, status
 
 from video_demo.api.dependencies import AppContainer, get_container, get_scope
 from video_demo.api.schemas import (
+    CreateAudioRunRequest,
     CreateMediaRunRequest,
     MediaObjectResponse,
     MediaRunHistoryItem,
@@ -87,26 +89,30 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
                 sha256=model.sha256,
             )
 
-    @router.post(
-        "-understanding-runs",
-        response_model=MediaRunResponse,
-        status_code=status.HTTP_202_ACCEPTED,
-    )
-    def create_run(
-        payload: CreateMediaRunRequest,
-        scope: MediaScope,
-        container: MediaContainer,
-    ) -> MediaRunResponse:
-        view = service(container).create(
-            scope=scope,
-            object_ref=payload.object_ref,
-            idempotency_key=payload.idempotency_key,
-            language_hints=payload.language_hints,
-            hotwords=payload.hotwords,
-            core_context=payload.core_context,
-            document_config=payload.document_config,
+    if kind == "AUDIO":
+        @router.post(
+            "-understanding-runs",
+            response_model=MediaRunResponse,
+            status_code=status.HTTP_202_ACCEPTED,
         )
-        return _run_response(view)
+        def create_audio_run(
+            payload: CreateAudioRunRequest,
+            scope: MediaScope,
+            container: MediaContainer,
+        ) -> MediaRunResponse:
+            return _create_media_run(payload, scope, container, service)
+    else:
+        @router.post(
+            "-understanding-runs",
+            response_model=MediaRunResponse,
+            status_code=status.HTTP_202_ACCEPTED,
+        )
+        def create_image_run(
+            payload: CreateMediaRunRequest,
+            scope: MediaScope,
+            container: MediaContainer,
+        ) -> MediaRunResponse:
+            return _create_media_run(payload, scope, container, service)
 
     @router.get("-understanding-runs", response_model=MediaRunHistoryResponse)
     def list_runs(
@@ -150,6 +156,25 @@ def build_media_router(kind: Literal["AUDIO", "IMAGE"]) -> APIRouter:
         )
 
     return router
+
+
+def _create_media_run(
+    payload: CreateAudioRunRequest | CreateMediaRunRequest,
+    scope: Scope,
+    container: AppContainer,
+    service: object,
+) -> MediaRunResponse:
+    runner = cast(Callable[[AppContainer], MediaRunService], service)(container)
+    view = runner.create(
+        scope=scope,
+        object_ref=payload.object_ref,
+        idempotency_key=payload.idempotency_key,
+        language_hints=payload.language_hints,
+        hotwords=payload.hotwords,
+        core_context=payload.core_context,
+        document_config=payload.document_config,
+    )
+    return _run_response(view)
 
 
 def _run_response(view: object) -> MediaRunResponse:

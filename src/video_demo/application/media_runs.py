@@ -4,7 +4,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
+from video_demo.application.audio_run_config import AudioRunConfig
 from video_demo.application.pipeline_contracts import PipelineRunConfig
+from video_demo.domain.audio_plan import AudioDocumentConfig
 from video_demo.domain.document import DocumentGenerationConfig
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
@@ -57,14 +59,23 @@ class MediaRunService:
         language_hints: tuple[str, ...] = (),
         hotwords: tuple[str, ...] = (),
         core_context: str | None = None,
-        document_config: DocumentGenerationConfig | None = None,
+        document_config: DocumentGenerationConfig | AudioDocumentConfig | None = None,
     ) -> MediaRunView:
-        config = PipelineRunConfig(
-            language_hints=language_hints,
-            hotwords=hotwords,
-            core_context=core_context,
-            document_config=document_config or DocumentGenerationConfig(),
-        )
+        config: PipelineRunConfig | AudioRunConfig
+        if self._kind == "AUDIO":
+            config = AudioRunConfig(
+                language_hints=language_hints,
+                hotwords=hotwords,
+                core_context=core_context,
+                document_config=document_config or AudioDocumentConfig(),
+            )
+        else:
+            config = PipelineRunConfig(
+                language_hints=language_hints,
+                hotwords=hotwords,
+                core_context=core_context,
+                document_config=document_config or DocumentGenerationConfig(),
+            )
         with self._database.session() as session:
             objects = MediaObjectRepository(session, self._object_model)
             if objects.get_ready(scope, object_ref) is None:
@@ -153,7 +164,12 @@ class MediaRunService:
     def require_result_ready(self, scope: Scope, run_id: str) -> MediaRunView:
         view = self.get(scope, run_id)
         if view.status not in {"SUCCEEDED", "PARTIAL_SUCCEEDED"}:
-            raise VideoDemoError(ErrorCode.VIDEO_RESULT_NOT_READY, "媒体理解结果尚未就绪")
+            code = (
+                ErrorCode.AUDIO_RESULT_NOT_READY
+                if self._kind == "AUDIO"
+                else ErrorCode.VIDEO_RESULT_NOT_READY
+            )
+            raise VideoDemoError(code, "媒体理解结果尚未就绪")
         return view
 
     def _object_not_found_code(self) -> ErrorCode:

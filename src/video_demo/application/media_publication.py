@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 from video_demo.application.document_publication import ResultWriteFence, scope_key
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.persistence.audio_document_repository import AudioResultRepository
 from video_demo.persistence.database import Database
 from video_demo.persistence.media_repositories import MediaRunRepository
 from video_demo.persistence.models import (
@@ -61,6 +62,10 @@ class MediaPublicationService:
         self._not_found_code = not_found_code
         self._max_document_bytes = max_document_bytes
         self._max_bundle_bytes = max_bundle_bytes
+
+    @property
+    def database(self) -> Database:
+        return self._database
 
     def persist(
         self,
@@ -128,6 +133,8 @@ class MediaPublicationService:
                 run.document_relative_path = document_receipt.relative_path
                 run.document_sha256 = document_receipt.sha256
                 run.document_size_bytes = document_receipt.size_bytes
+                if self._resource_type == "AUDIO_UNDERSTANDING_RUN":
+                    AudioResultRepository(session).replace(scope, validated)
         except BaseException:
             self._store.discard_artifact(bundle_receipt, max_bytes=self._max_bundle_bytes)
             self._store.discard_bytes(document_receipt)
@@ -139,7 +146,12 @@ class MediaPublicationService:
             if run is None:
                 raise VideoDemoError(self._not_found_code, "媒体运行不存在")
             if run.status not in {RunStatusValue.SUCCEEDED, RunStatusValue.PARTIAL_SUCCEEDED}:
-                raise VideoDemoError(ErrorCode.VIDEO_RESULT_NOT_READY, "媒体理解结果尚未就绪")
+                code = (
+                    ErrorCode.AUDIO_RESULT_NOT_READY
+                    if self._resource_type == "AUDIO_UNDERSTANDING_RUN"
+                    else ErrorCode.VIDEO_RESULT_NOT_READY
+                )
+                raise VideoDemoError(code, "媒体理解结果尚未就绪")
             if not all(
                 (
                     run.artifact_relative_path,

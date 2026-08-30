@@ -12,6 +12,8 @@ from video_demo.api.media_routes import build_media_router
 from video_demo.api.objects import router as objects_router
 from video_demo.api.runs import router as runs_router
 from video_demo.api.schemas import ErrorBody, ErrorResponse
+from video_demo.application.audio_publication import AudioPublicationService
+from video_demo.application.audio_queries import AudioQueryService
 from video_demo.application.audio_rendering import render_audio_markdown
 from video_demo.application.image_rendering import render_image_markdown
 from video_demo.application.media_publication import MediaPublicationService
@@ -50,6 +52,7 @@ _NOT_FOUND_CODES = {
 }
 _CONFLICT_CODES = {
     ErrorCode.VIDEO_RESULT_NOT_READY,
+    ErrorCode.AUDIO_RESULT_NOT_READY,
     ErrorCode.IDEMPOTENCY_CONFLICT,
     ErrorCode.JOB_NOT_RETRYABLE,
     ErrorCode.RESULT_SCHEMA_UNSUPPORTED,
@@ -130,8 +133,8 @@ def create_app(
             "IMAGE": MediaRunService(database, kind="IMAGE"),
         },
         media_query_services={
-            "AUDIO": MediaQueryService(
-                MediaPublicationService(
+            "AUDIO": AudioQueryService(
+                AudioPublicationService(
                     database,
                     AtomicArtifactStore(runtime.runtime_root),
                     run_model=AudioUnderstandingRunModel,

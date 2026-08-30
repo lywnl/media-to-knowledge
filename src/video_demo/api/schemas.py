@@ -9,6 +9,7 @@ from video_demo.domain.audio_document import (
     AudioChapter,
     AudioDocumentSummary,
 )
+from video_demo.domain.audio_plan import AudioDocumentConfig
 from video_demo.domain.base import LanguageCode, Probability, StableId
 from video_demo.domain.document import DocumentGenerationConfig
 from video_demo.domain.image_document import (
@@ -116,6 +117,15 @@ class CreateMediaRunRequest(ApiModel):
     hotwords: tuple[str, ...] = Field(default=(), max_length=50)
     core_context: str | None = Field(default=None, max_length=1000)
     document_config: DocumentGenerationConfig = Field(default_factory=DocumentGenerationConfig)
+
+
+class CreateAudioRunRequest(ApiModel):
+    object_ref: str = Field(pattern=r"^obj_[0-9a-f]{32}$")
+    idempotency_key: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    language_hints: tuple[Literal["zh", "en", "ja", "ko", "es"], ...] = ()
+    hotwords: tuple[str, ...] = Field(default=(), max_length=50)
+    core_context: str | None = Field(default=None, max_length=1000)
+    document_config: AudioDocumentConfig = Field(default_factory=AudioDocumentConfig)
 
 
 class MediaRunResponse(ApiModel):
