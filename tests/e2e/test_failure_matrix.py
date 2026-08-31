@@ -40,7 +40,7 @@ def test_each_failure_scenario_points_to_existing_test_functions() -> None:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             functions = {
                 node.name
-                for node in tree.body
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             }
             assert function_name in functions, f"{scenario}: {node_id}"

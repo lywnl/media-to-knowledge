@@ -268,8 +268,9 @@ def _live_request(manifest: ChapterVlmInputManifest) -> ChapterVisionRequest:
     timestamps = tuple(
         sorted({frame.requested_timestamp_ms for frame in manifest.frames})
     )
-    if len(timestamps) > 2:
-        timestamps = (timestamps[0], timestamps[-1])
+    # BASE_COVERAGE 目标只绑定程序确定的一个章节时间点；其余帧仍可作为
+    # 同一目标的补充候选帧交给 VLM。
+    timestamps = timestamps[:1]
     return ChapterVisionRequest(
         chapter_id=chapter_vlm_chapter_id(manifest),
         targets=(

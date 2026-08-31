@@ -88,7 +88,6 @@ def _result() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenceItem, ...
         relative_path=f"visual/keyframes/{image_sha}.jpg",
         mime_type="image/jpeg",
         sha256=image_sha,
-        perceptual_hash="0123456789abcdef",
         size_bytes=len(image),
     )
     observation = VisualObservationEvidence(
@@ -275,7 +274,7 @@ def test_prediction_round_trip_uses_three_layer_versions_and_chapter_claims(
 
     assert prediction.index.schema_version == "1.2.0"
     assert prediction.result is not None
-    assert prediction.result.schema_version == "4.1.0"
+    assert prediction.result.schema_version == "4.2.0"
     assert prediction.claims[0].source_kind == "CHAPTER_CLAIM"
     assert prediction.claims[0].source_id == "chapter_001"
     assert prediction.claims[0].evidence_refs == ("asr_001",)

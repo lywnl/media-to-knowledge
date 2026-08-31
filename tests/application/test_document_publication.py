@@ -164,7 +164,6 @@ def _keyframe() -> KeyframeEvidence:
         relative_path=f"visual/keyframes/{'b' * 64}.jpg",
         mime_type="image/jpeg",
         sha256="b" * 64,
-        perceptual_hash="0123456789abcdef",
         size_bytes=1_024,
     )
 
@@ -234,8 +233,8 @@ def test_document_publication_marks_pending_when_committed_bundle_reread_fails(
         ("1.0.0", "1.0.0", ErrorCode.RESULT_SCHEMA_UNSUPPORTED),
         ("2.0.0", "2.0.0", ErrorCode.RESULT_SCHEMA_UNSUPPORTED),
         ("1.0.0", "2.0.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
-        ("2.0.0", "4.1.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
-        ("3.0.0", "4.1.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
+        ("2.0.0", "4.2.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
+        ("3.0.0", "4.2.0", ErrorCode.ARTIFACT_SCHEMA_INVALID),
         ("", "", ErrorCode.ARTIFACT_SCHEMA_INVALID),
     ),
 )

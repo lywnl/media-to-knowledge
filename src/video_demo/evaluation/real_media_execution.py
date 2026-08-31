@@ -570,7 +570,10 @@ def _ffmpeg_frame_phase(
                 {
                     0,
                     prepared.source.duration_ms // 2,
-                    max(0, prepared.source.duration_ms - 1),
+                    # 精确落在容器时长边界时，部分编码器没有可输出的下一帧。
+                    # 按时长取不超过 1 秒的比例余量，短样本也能稳定抽到片尾
+                    # 附近的有效帧，而长视频仍只牺牲极小的尾部范围。
+                    _tail_sample_timestamp(prepared.source.duration_ms),
                 },
             ),
         )
@@ -620,6 +623,11 @@ def _ffmpeg_frame_phase(
         outputs=outputs,
     )
     return selected
+
+
+def _tail_sample_timestamp(duration_ms: int) -> int:
+    margin_ms = max(1, min(1_000, duration_ms // 10))
+    return max(0, duration_ms - margin_ms)
 
 
 def _complete_phase(

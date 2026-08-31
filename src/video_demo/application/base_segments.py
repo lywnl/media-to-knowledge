@@ -82,7 +82,7 @@ def _safe_boundaries(
     speech_boundaries: Sequence[SpeechBoundaryCandidate],
 ) -> tuple[int, ...]:
     # ASR 通常每 1~3 秒产生一条证据；把每条证据的首尾都作为切点会把
-    # 章节规划输入膨胀成数百个基础片段。优先使用稀疏的网格、镜头和
+    # 章节规划输入膨胀成数百个基础片段。优先使用稀疏的网格和
     # 高价值语音边界，只有在这些边界无法满足 5 分钟硬上限时才补充
     # 转写结束点。
     # 网格边界提供稳定的稀疏覆盖，视觉采样阶段再依据章节时间点补充画面。
@@ -285,7 +285,7 @@ def _add_blocking_transcript_boundaries(
 ) -> tuple[int, ...]:
     boundaries = set(safe)
     for item in transcript:
-        # ASR 通常是 1~3 秒的密集短片段；如果网格/镜头边界恰好穿过它，
+        # ASR 通常是 1~3 秒的密集短片段；如果网格边界恰好穿过它，
         # 为每条 ASR 补首尾会重新退化成“一条 ASR 一个基础片段”。ASR
         # 只需由 `_exclude_evidence_interiors()` 保证不被切穿，边界继续
         # 使用下一个安全候选。字幕 cue 更稀疏，仍保留精确起止边界，

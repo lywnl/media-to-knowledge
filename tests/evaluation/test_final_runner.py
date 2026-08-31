@@ -71,7 +71,6 @@ def _annotation(sample_id: str, media_sha256: str, language: str) -> dict[str, o
                 "text_lines": ["测试"],
             }
         ],
-        "scene_boundaries_ms": [100],
         "semantic_boundaries_ms": [200],
         "supported_facts": [
             {"fact_id": f"fact_{sample_id}", "canonical_text": "测试事实"}
@@ -296,7 +295,7 @@ def test_requirement_report_keeps_stable_ids_after_retired_requirements(tmp_path
     assert tuple(row.requirement for row in report.rows) == tuple(
         spec.requirement for spec in REQUIREMENT_SPECS
     )
-    assert len(QUALITY_THRESHOLDS) == 15
+    assert len(QUALITY_THRESHOLDS) == 14
     assert next(
         spec.requirement for spec in REQUIREMENT_SPECS if spec.requirement_id == 35
     ) == "十五项质量与资源阈值全部满足"

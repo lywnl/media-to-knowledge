@@ -254,7 +254,9 @@ class FFmpegFrameExtractor:
                 "-frames:v",
                 "1",
                 "-vf",
-                f"scale=min({self._frame_width},iw):-2",
+                # 通过 argv 传给 FFmpeg 时必须转义逗号，否则滤镜链会把
+                # `iw` 当成第二个滤镜名称，导致真实视频抽帧失败。
+                f"scale=min({self._frame_width}\\,iw):-2",
                 "-q:v",
                 str(self._ffmpeg_quality()),
                 str(destination),

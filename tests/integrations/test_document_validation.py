@@ -40,7 +40,6 @@ def _request() -> ChapterVisionRequest:
             sha256=f"{frame_id[-1]}" * 64,
             size_bytes=10,
             relative_path=f"visual/candidates/{frame_id[-1] * 64}.jpg",
-            perceptual_hash="0123456789abcdef",
             target_ids=(target.target_id,),
         )
         for frame_id, timestamp_ms in (("frame_a", 1_000), ("frame_b", 2_000))

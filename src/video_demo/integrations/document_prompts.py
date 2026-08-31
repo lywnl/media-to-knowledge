@@ -112,7 +112,7 @@ def prompt_for_boundary_coordination(
 def _planning_context(request: ChapterPlanningRequest) -> dict[str, object]:
     """只向章节规划模型发送决策所需字段，完整请求仍由程序保留并校验。
 
-    语言、置信度、场景引用和视觉配置不会改变章节边界，却会随每条转写重复
+    语言、置信度和视觉配置不会改变章节边界，却会随每条转写重复
     占用上下文。删掉这些冗余字段可以让更多视频在一次规划请求内完成，同时不
     改变缓存指纹或程序侧的证据闭包校验。
     """

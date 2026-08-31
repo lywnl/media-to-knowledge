@@ -44,7 +44,6 @@ def _annotation(media_sha256: str, *, duration_ms: int = 1_000) -> dict[str, obj
         "visual_frames": [
             {"frame_id": "frame_001", "timestamp_ms": 100, "text_lines": ["你好"]}
         ],
-        "scene_boundaries_ms": [500],
         "semantic_boundaries_ms": [500],
         "supported_facts": [{"fact_id": "fact_001", "canonical_text": "有人问好"}],
         "key_fact_ids": ["fact_001"],

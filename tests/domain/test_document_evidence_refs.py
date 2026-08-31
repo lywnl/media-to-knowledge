@@ -98,7 +98,6 @@ def _keyframe(
         relative_path=f"visual/keyframes/{'b' * 64}.jpg",
         mime_type="image/jpeg",
         sha256="b" * 64,
-        perceptual_hash="0123456789abcdef",
         size_bytes=123,
     )
 

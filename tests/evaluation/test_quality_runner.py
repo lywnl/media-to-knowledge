@@ -216,8 +216,7 @@ def _materialized_fixture(
                 text_lines=("你好",),
             ),
         ),
-        scene_boundaries_ms=(250,),
-        semantic_boundaries_ms=(250,),
+            semantic_boundaries_ms=(250,),
         supported_facts=(SupportedFact(fact_id="fact_001", canonical_text="你好"),),
         key_fact_ids=("fact_001",),
     )
@@ -286,8 +285,6 @@ def test_quality_uses_chapter_boundaries_and_marks_retired_visual_metrics_not_ru
         metrics["visual_key_field_recall"].not_run_reason
         == "代表性视觉质量事实尚未接入"
     )
-    assert metrics["scene_f1"].value is None
-    assert metrics["scene_f1"].not_run_reason == "3.0 生产结果不再公开场景边界证据"
     assert metrics["semantic_boundary_f1"].value == 1.0
     assert metrics["schema_time_valid_rate"].value == 1.0
     assert artifacts.sample_details[0].metric_inputs["semantic_boundary_f1"] == 1.0

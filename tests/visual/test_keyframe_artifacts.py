@@ -29,7 +29,6 @@ def _candidate(run_root: Path, payload: bytes) -> FrameCandidateArtifact:
         size_bytes=len(payload),
         relative_path=f"visual/candidates/{digest}.jpg",
         mime_type="image/jpeg",
-        perceptual_hash="0123456789abcdef",
         target_ids=("target_001",),
     )
 

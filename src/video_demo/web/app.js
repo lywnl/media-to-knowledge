@@ -62,7 +62,7 @@
     REGISTER: "登记任务",
     PROBE: "读取媒体信息",
     TRANSCODE: "转换媒体",
-    EVIDENCE_PREP: "并行准备语音与镜头证据",
+    EVIDENCE_PREP: "准备语音与基础片段",
     CHAPTER_PLAN: "规划知识章节",
     FRAME_SEARCH: "搜索章节关键帧",
     VISUAL_EVIDENCE: "理解章节画面",

@@ -99,7 +99,6 @@ def _keyframe() -> KeyframeEvidence:
         relative_path=f"visual/keyframes/{_KEYFRAME_SHA256}.jpg",
         mime_type="image/jpeg",
         sha256=_KEYFRAME_SHA256,
-        perceptual_hash="0123456789abcdef",
         size_bytes=100,
     )
 

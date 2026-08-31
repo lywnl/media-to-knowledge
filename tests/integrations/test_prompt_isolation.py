@@ -35,7 +35,6 @@ def _request(root: Path, text: str) -> ChapterVisionRequest:
                 size_bytes=len(payload),
                 relative_path=f"visual/candidates/{digest}.jpg",
                 mime_type="image/jpeg",
-                perceptual_hash="0123456789abcdef",
                 target_ids=("target-001",),
             ),
         ),

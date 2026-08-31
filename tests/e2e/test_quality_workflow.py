@@ -71,7 +71,6 @@ def _write_package(
                 frame_id="frame_001", timestamp_ms=100, text_lines=("你好",)
             ),
         ),
-        scene_boundaries_ms=(250,),
         semantic_boundaries_ms=(250,),
         supported_facts=(SupportedFact(fact_id="fact_001", canonical_text="你好"),),
         key_fact_ids=("fact_001",),
@@ -225,6 +224,11 @@ def test_prediction_quality_and_cleanup_workflow_uses_3_artifact_set(
     cloud_asr_environment: None,
     monkeypatch,
 ) -> None:
+    # 评测工作流显式驱动受控 worker；关闭 API lifespan 内的生产调度器，
+    # 避免它先于测试 worker 抢占同一条任务。
+    import video_demo.api.app as app_module
+
+    monkeypatch.setattr(app_module, "build_video_scheduler", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("VIDEO_DEMO_TEXT_LLM_BASE_URL", "https://text.example.test/v1")
     monkeypatch.setenv("VIDEO_DEMO_TEXT_LLM_API_KEY", "text-key")
     monkeypatch.setenv("VIDEO_DEMO_TEXT_LLM_MODEL_ID", "text-model")

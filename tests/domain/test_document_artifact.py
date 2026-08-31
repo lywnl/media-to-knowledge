@@ -77,8 +77,8 @@ def _artifact_payload() -> dict[str, object]:
 def test_document_artifact_requires_4_schema_and_document_digest() -> None:
     artifact = DocumentArtifactPayload.model_validate(_artifact_payload())
 
-    assert artifact.artifact_schema_version == "4.1.0"
-    assert artifact.result.schema_version == "4.1.0"
+    assert artifact.artifact_schema_version == "4.2.0"
+    assert artifact.result.schema_version == "4.2.0"
 
 
 @pytest.mark.parametrize("field,names", [

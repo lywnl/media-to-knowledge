@@ -147,7 +147,6 @@ class EvaluationAnnotation(FrozenModel):
     language: Literal["zh", "en", "ja", "ko", "es"]
     reference_text: str = Field(min_length=1)
     visual_frames: tuple[ReferenceVisualFrame, ...] = Field(min_length=1)
-    scene_boundaries_ms: tuple[int, ...] = Field(min_length=1)
     semantic_boundaries_ms: tuple[int, ...] = Field(min_length=1)
     supported_facts: tuple[SupportedFact, ...] = Field(min_length=1)
     key_fact_ids: tuple[StableId, ...] = Field(min_length=1)
@@ -172,7 +171,6 @@ class EvaluationAnnotation(FrozenModel):
         self._validate_unique_ids()
         if any(timestamp >= self.duration_ms for timestamp in self.visual_timestamps):
             raise ValueError("视觉帧时间不得超过媒体时长")
-        self._validate_boundaries(self.scene_boundaries_ms)
         self._validate_boundaries(self.semantic_boundaries_ms)
         fact_ids = {fact.fact_id for fact in self.supported_facts}
         if not set(self.key_fact_ids).issubset(fact_ids):

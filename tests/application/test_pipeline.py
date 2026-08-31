@@ -35,7 +35,7 @@ def test_pipeline_run_config_parses_only_4_snapshot() -> None:
             "hotwords": ["Qwen3-VL"],
             "core_context": "视频知识文档",
             "document_config": {"detail_level": "detailed"},
-            "result_schema_version": "4.1.0",
+            "result_schema_version": "4.2.0",
         }
     )
 
@@ -54,4 +54,4 @@ def test_pipeline_run_config_rejects_missing_or_legacy_schema(version: str | Non
         pipeline_run_config_from_snapshot(snapshot)
 
     assert raised.value.code == ErrorCode.RESULT_SCHEMA_UNSUPPORTED
-    assert raised.value.details == {"supported_schema_version": "4.1.0"}
+    assert raised.value.details == {"supported_schema_version": "4.2.0"}

@@ -10,7 +10,6 @@ class MetricThreshold:
     direction: Literal["max", "min"]
 
 
-SCENE_BOUNDARY_TOLERANCE_MS = 1_000
 SEMANTIC_BOUNDARY_TOLERANCE_MS = 2_000
 
 
@@ -22,7 +21,6 @@ QUALITY_THRESHOLDS: dict[str, MetricThreshold] = {
     "es_wer": MetricThreshold(0.18, "max"),
     "visual_text_accuracy": MetricThreshold(0.90, "min"),
     "visual_key_field_recall": MetricThreshold(0.90, "min"),
-    "scene_f1": MetricThreshold(0.85, "min"),
     "semantic_boundary_f1": MetricThreshold(0.75, "min"),
     "fact_support_rate": MetricThreshold(0.95, "min"),
     "key_fact_recall": MetricThreshold(0.85, "min"),

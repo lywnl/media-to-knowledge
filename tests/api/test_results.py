@@ -122,7 +122,6 @@ def _publish_result(
         relative_path=image_relative.as_posix(),
         mime_type="image/jpeg",
         sha256=image_sha,
-        perceptual_hash="0123456789abcdef",
         size_bytes=len(image),
     )
     observation = VisualObservationEvidence(
@@ -234,7 +233,7 @@ def test_result_document_evidence_and_keyframe_are_one_4_contract(
     )
 
     assert result_response.status_code == 200
-    assert result_response.json()["schema_version"] == "4.1.0"
+    assert result_response.json()["schema_version"] == "4.2.0"
     assert result_response.json()["chapters"][0]["chapter_id"] == "chapter_001"
     evidence = client.app.state.container.result_query_service.get_evidence(
         Scope("tenant-a", "app-a", "kb-a"), run_id

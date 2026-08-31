@@ -476,6 +476,9 @@ class CaseExecutionSession:
 
         def walk(descriptor: int, relative_root: Path) -> None:
             for name in os.listdir(descriptor):
+                # 候选帧会话的锁文件是并发控制元数据，不属于媒体制品。
+                if relative_root == Path("visual") and name == ".candidates.lock":
+                    continue
                 details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
                 relative = relative_root / name
                 if stat.S_ISDIR(details.st_mode):
@@ -502,6 +505,8 @@ class CaseExecutionSession:
             return
         for name in names:
             relative = relative_root / name
+            if relative_root == Path("visual") and name == ".candidates.lock":
+                continue
             try:
                 details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
             except OSError:

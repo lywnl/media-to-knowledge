@@ -213,7 +213,10 @@ class _MediaExecutionJournal:
             or artifact.relative_path != media_file.relative_path
             or artifact.sha256 != media_file.sha256
             or not media_file.relative_path.startswith(prefix)
-            or media_file.relative_path not in self._current[5]
+            or (
+                media_file.relative_path not in self._current[5]
+                and self._current[1] != "ffmpeg_frame_extract"
+            )
             or self.is_media_file_registered(case_id, media_file.relative_path)
             or any(
                 existing.relative_path == artifact.relative_path
@@ -222,6 +225,14 @@ class _MediaExecutionJournal:
         ):
             raise VideoDemoError(ErrorCode.SYSTEM_FAILURE, "媒体文件登记事实非法")
         self._media_registrations.append((case_id, media_file, artifact))
+        if (
+            self._current[1] == "ffmpeg_frame_extract"
+            and media_file.relative_path not in self._current[5]
+        ):
+            self._current = (
+                *self._current[:5],
+                (*self._current[5], media_file.relative_path),
+            )
 
     def is_media_file_registered(self, case_id: str, relative_path: str) -> bool:
         """返回媒体是否已越过 journal 的唯一所有权提交点。"""

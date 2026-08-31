@@ -25,7 +25,7 @@ from video_demo.evaluation.chapter_vlm_input import (
 )
 from video_demo.evaluation.dataset import EvaluationDataset, EvaluationSample
 from video_demo.media.probe import ProbeResult
-from video_demo.visual.keyframes import ExactFrameSampleResult, FrameCandidate
+from video_demo.visual.ffmpeg_frames import ExactFrameSampleResult, FrameCandidate
 
 
 def _sha(seed: str) -> str:
@@ -55,7 +55,6 @@ def _manifest() -> ChapterVlmInputManifest:
         relative_path=f"visual/candidates/{image_a}.jpg",
         sha256=image_a,
         size_bytes=100,
-        perceptual_hash="0123456789abcdef",
         target_ids=("target_001",),
     )
     frame_b = frame_a.model_copy(
@@ -111,7 +110,6 @@ def _manifest() -> ChapterVlmInputManifest:
         jpeg_quality=90,
         proxy_sha256=_sha("proxy"),
         proxy_size_bytes=1000,
-        frame_tolerance_ms=34,
         requested_reference_frame_ids=("reference_a", "reference_b"),
         requested_image_sha256s=(image_a, image_b),
         retained_reference_frame_ids=("reference_a", "reference_b"),
@@ -183,7 +181,6 @@ def _evaluation_package(tmp_path: Path, frame_count: int = 5) -> tuple[object, P
             "language": "zh",
             "reference_text": "参考文本",
             "visual_frames": visual_frames,
-            "scene_boundaries_ms": [5_000],
             "semantic_boundaries_ms": [5_000],
             "supported_facts": [{"fact_id": "fact_001", "canonical_text": "事实"}],
             "key_fact_ids": ["fact_001"],
@@ -288,10 +285,9 @@ class _PreparationExtractor:
         samples: tuple[object, ...],
         *,
         is_cancel_requested: object,
-        frame_tolerance_ms: int,
         artifact_session: object,
     ) -> tuple[ExactFrameSampleResult, ...]:
-        del is_cancel_requested, frame_tolerance_ms
+        del is_cancel_requested
         self.calls.append(tuple(samples))
         results: list[ExactFrameSampleResult] = []
         for index, sample in enumerate(samples):
@@ -311,10 +307,10 @@ class _PreparationExtractor:
                 continue
             candidate = FrameCandidate(
                 timestamp_ms=sample.timestamp_ms,
-                sharpness=1.0,
-                black_ratio=0.0,
-                perceptual_hash="0123456789abcdef",
                 relative_path=relative,
+                sha256=digest,
+                size_bytes=len(payload),
+                target_ids=(),
                 created_by_call=publication.created_by_call,
             )
             results.append(

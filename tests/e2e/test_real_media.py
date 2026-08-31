@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import sys
 from pathlib import Path
 from uuid import uuid4
@@ -90,13 +89,7 @@ def test_workspace_real_media_chain() -> None:
 def _generated_media_paths(root: Path) -> tuple[Path, ...]:
     if not root.exists():
         return ()
-    return tuple(
-        sorted(
-            path.relative_to(root)
-            for path in root.rglob("*")
-            if path.is_file()
-        )
-    )
+    return tuple(sorted(path.relative_to(root) for path in root.rglob("*") if path.is_file()))
 
 
 def _workspace_real_media_run_id() -> str:
@@ -155,9 +148,7 @@ def test_workspace_real_media_run_ids_force_current_preflight(
     second = PreflightRawReport.model_validate_json(
         (runtime_root / "eval" / "reports" / second_id / "preflight.json").read_bytes()
     )
-    assert tuple(issue.code for issue in second.issues) == (
-        ErrorCode.VIDEO_FFPROBE_UNAVAILABLE,
-    )
+    assert tuple(issue.code for issue in second.issues) == (ErrorCode.VIDEO_FFPROBE_UNAVAILABLE,)
 
 
 def test_workspace_real_media_chain_accepts_current_partial_preflight(
@@ -167,7 +158,6 @@ def test_workspace_real_media_chain_accepts_current_partial_preflight(
     """真实入口必须精确接受本次仅缺 ffprobe 的整体前置条件。"""
 
     import video_demo.evaluation.gate as gate_module
-    import video_demo.evaluation.media_runner as runner_module
 
     real_media_test_module = sys.modules[__name__]
     runtime_root = tmp_path / ".codex" / "video-rag-demo"
@@ -180,10 +170,11 @@ def test_workspace_real_media_chain_accepts_current_partial_preflight(
     runner = RealMediaRunner(settings, store)
     evaluation_run_id = "workspace-real-media-partial-preflight"
 
-    monkeypatch.setattr(runner_module.importlib.util, "find_spec", lambda _name: object())
     monkeypatch.setattr(
         gate_module, "_current_real_media_implementation_sha256", lambda _root: "a" * 64
     )
+    import video_demo.evaluation.media_runner as runner_module
+
     monkeypatch.setattr(
         runner_module, "_current_real_media_implementation_sha256", lambda _root: "a" * 64
     )
@@ -223,9 +214,4 @@ def _independent_preflight_issues(settings: Settings) -> tuple[ErrorCode, ...]:
             )
         except VideoDemoError:
             issues.append(code)
-    if (
-        importlib.util.find_spec("cv2") is None
-        or importlib.util.find_spec("scenedetect") is None
-    ):
-        issues.append(ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE)
     return tuple(issues)

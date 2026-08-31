@@ -82,7 +82,7 @@ def _fixture() -> tuple[VideoUnderstandingResult, tuple[SpeechSegment, ...]]:
 def test_v4_result_has_only_chapters_and_document_has_no_removed_blocks() -> None:
     result, evidence = _fixture()
 
-    assert result.schema_version == "4.1.0"
+    assert result.schema_version == "4.2.0"
     assert "sections" not in result.model_dump(mode="json")
     markdown = render_markdown(result, evidence).content.decode("utf-8")
     assert "## 第一章：安装步骤" in markdown

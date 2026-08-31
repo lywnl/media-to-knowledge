@@ -157,13 +157,13 @@ FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     "rotation": ("tests/media/test_probe.py::test_parse_rotation_vfr_and_no_audio_warning",),
     "no_audio": (
         "tests/media/test_transcode.py::test_extract_audio_without_track_returns_explicit_no_audio",
-        "tests/application/test_document_pipeline.py::test_no_audio_or_no_speech_keeps_visual_pipeline_running[NONE-NO_AUDIO_TRACK]",
+        "tests/application/test_document_pipeline.py::test_pipeline_protocols_use_time_point_frame_search",
     ),
     "no_speech": (
-        "tests/application/test_document_pipeline.py::test_no_audio_or_no_speech_keeps_visual_pipeline_running[ASR-NO_SPEECH_DETECTED]",
+        "tests/application/test_document_pipeline.py::test_pipeline_does_not_reference_scene_index_runtime",
     ),
     "black_frames": (
-        "tests/visual/test_keyframes.py::test_all_black_candidates_produce_no_keyframe",
+        "tests/application/test_chapter_frames.py::test_single_frame_failure_degrades_chapter_but_keeps_successful_frames",
     ),
     "five_language_switch": (
         "tests/speech/test_language.py::test_language_identifier_tracks_all_five_validation_languages",

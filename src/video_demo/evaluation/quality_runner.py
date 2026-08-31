@@ -297,10 +297,6 @@ class _Accumulators:
             value=None,
             not_run_reason="代表性视觉质量事实尚未接入",
         )
-        observations["scene_f1"] = MetricObservation(
-            value=None,
-            not_run_reason="3.0 生产结果不再公开场景边界证据",
-        )
         observations["semantic_boundary_f1"] = MetricObservation(
             value=match_counts_f1(self.semantic_boundary_counts)
         )

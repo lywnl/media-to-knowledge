@@ -77,8 +77,7 @@ def _package_with_frames(
         language="zh",
         reference_text="参考文本",
         visual_frames=frames,
-        scene_boundaries_ms=(5_000,),
-        semantic_boundaries_ms=(5_000,),
+            semantic_boundaries_ms=(5_000,),
         supported_facts=(
             {"fact_id": "fact_001", "canonical_text": "事实"},
         ),

@@ -134,7 +134,7 @@ def _result(
 def test_document_accepts_contiguous_chapters_without_retired_fields() -> None:
     result = _result((_chapter("ch_001", 0, 1_000), _chapter("ch_002", 1_000, 2_000)))
 
-    assert result.schema_version == "4.1.0"
+    assert result.schema_version == "4.2.0"
     assert result.summary.duration_ms == result.chapters[-1].end_ms
 
 

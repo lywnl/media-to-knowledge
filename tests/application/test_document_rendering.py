@@ -75,7 +75,6 @@ def _document_fixture() -> tuple[VideoUnderstandingResult, tuple[DocumentEvidenc
         relative_path=f"visual/keyframes/{KEYFRAME_SHA256}.jpg",
         mime_type="image/jpeg",
         sha256=KEYFRAME_SHA256,
-        perceptual_hash="0123456789abcdef",
         size_bytes=1_024,
     )
     observation = VisualObservationEvidence(

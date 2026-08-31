@@ -83,7 +83,6 @@ def _input_fixture(
         jpeg_quality=90,
         proxy_sha256=_sha(_MP4),
         proxy_size_bytes=len(_MP4),
-        frame_tolerance_ms=34,
         requested_reference_frame_ids=requested_ids,
         requested_image_sha256s=(image_sha_a, image_sha_b),
         retained_reference_frame_ids=requested_ids,
@@ -113,7 +112,6 @@ def _input_fixture(
                 relative_path=f"visual/candidates/{digest}.jpg",
                 sha256=digest,
                 size_bytes=len(payload),
-                perceptual_hash="0123456789abcdef",
                 target_ids=(target_id,),
             )
         )
@@ -140,7 +138,6 @@ def _input_fixture(
         proxy_is_variable_frame_rate=manifest.proxy_is_variable_frame_rate,
         proxy_duration_ms=manifest.proxy_duration_ms,
         duration_tolerance_ms=manifest.duration_tolerance_ms,
-        frame_tolerance_ms=manifest.frame_tolerance_ms,
         jpeg_quality=manifest.jpeg_quality,
         vlm_max_image_bytes=1024,
         max_candidate_frame_bytes_per_run=1024 * 1024,
@@ -171,7 +168,6 @@ def _input_fixture(
                     "key_fields": ["Alpha"],
                 },
             ],
-            "scene_boundaries_ms": [5_000],
             "semantic_boundaries_ms": [5_000],
             "supported_facts": [{"fact_id": "fact_001", "canonical_text": "事实"}],
             "key_fact_ids": ["fact_001"],
@@ -251,7 +247,7 @@ def test_execute_live_builds_one_answer_free_production_request(tmp_path: Path) 
     assert tuple(frame.frame_id for frame in request.frames) == tuple(
         frame.frame_id for frame in manifest.frames
     )
-    assert request.targets[0].sample_timestamps_ms == (1_000, 2_000)
+    assert request.targets[0].sample_timestamps_ms == (1_000,)
     assert request.transcript_evidence == ()
     assert request.document_config.max_visuals_per_chapter == 2
     payload = request.model_dump_json()

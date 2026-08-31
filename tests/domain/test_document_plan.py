@@ -56,21 +56,17 @@ def test_base_segment_without_transcript_allows_empty_evidence_refs() -> None:
     assert segment.evidence_refs == ()
 
 
-def test_base_segment_accepts_at_most_256_scene_refs() -> None:
-    scene_refs = tuple(f"scene_{index}" for index in range(256))
-    segment = BaseSegment(
-        segment_id="segment_001",
-        start_ms=0,
-        end_ms=10_000,
-        evidence_refs=(),
-        scene_refs=scene_refs,
-        transcript_source="NONE",
-    )
-
-    assert segment.scene_refs == scene_refs
-    with pytest.raises(ValidationError):
+def test_base_segment_rejects_retired_scene_refs() -> None:
+    with pytest.raises(ValidationError, match="scene_refs"):
         BaseSegment.model_validate(
-            {**segment.model_dump(), "scene_refs": (*scene_refs, "scene_256")},
+            {
+                "segment_id": "segment_001",
+                "start_ms": 0,
+                "end_ms": 10_000,
+                "evidence_refs": (),
+                "scene_refs": ("scene_001",),
+                "transcript_source": "NONE",
+            }
         )
 
 
@@ -85,13 +81,12 @@ def test_semantic_target_requires_one_to_three_transcript_anchors() -> None:
 
 
 def test_base_coverage_target_cannot_use_transcript_anchor() -> None:
-    with pytest.raises(ValidationError, match=r"scene_refs|锚点"):
+    with pytest.raises(ValidationError, match=r"锚点"):
         VisualSearchTarget(
             target_id="target_001",
             purpose="BASE_COVERAGE",
             query_zh="代表性画面",
             anchor_evidence_refs=("asr_001",),
-            scene_refs=(),
         )
 
 
@@ -103,7 +98,6 @@ def test_frame_candidate_has_bounded_identity_and_positive_size() -> None:
         sha256=digest,
         size_bytes=128,
         relative_path=f"visual/candidates/{digest}.jpg",
-        perceptual_hash="0123456789abcdef",
         target_ids=("target_001",),
     )
 
@@ -118,7 +112,6 @@ def test_frame_candidate_is_jpeg_only_and_uses_content_addressed_run_path() -> N
         "size_bytes": 128,
         "relative_path": f"visual/candidates/{'a' * 64}.jpg",
         "mime_type": "image/jpeg",
-        "perceptual_hash": "0123456789abcdef",
         "target_ids": ("target_001",),
     }
 
@@ -126,8 +119,6 @@ def test_frame_candidate_is_jpeg_only_and_uses_content_addressed_run_path() -> N
         ("mime_type", "image/png"),
         ("relative_path", f"runs/scope/run/visual/candidates/{'a' * 64}.jpg"),
         ("relative_path", "visual/candidates/wrong.jpg"),
-        ("perceptual_hash", "0123456789ABCDEf"),
-        ("perceptual_hash", "0123456789abcde"),
     ):
         with pytest.raises(ValidationError):
             FrameCandidateArtifact.model_validate({**valid, field: invalid})
@@ -155,7 +146,6 @@ def test_candidate_and_observation_accept_at_most_six_target_ids() -> None:
         sha256="a" * 64,
         size_bytes=128,
         relative_path=f"visual/candidates/{'a' * 64}.jpg",
-        perceptual_hash="0123456789abcdef",
         target_ids=target_ids,
     )
     observation = ChapterVisualObservation(

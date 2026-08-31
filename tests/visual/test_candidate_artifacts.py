@@ -49,7 +49,6 @@ def _frame(run_root: Path, payload: bytes) -> FrameCandidateArtifact:
         sha256=digest,
         size_bytes=len(payload),
         relative_path=f"visual/candidates/{digest}.jpg",
-        perceptual_hash="0123456789abcdef",
         target_ids=("target_001",),
     )
 

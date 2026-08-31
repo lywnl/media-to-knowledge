@@ -53,7 +53,6 @@ def _keyframe(payload: bytes, *, index: int = 1) -> KeyframeEvidence:
         relative_path=f"visual/keyframes/{digest}.jpg",
         mime_type="image/jpeg",
         sha256=digest,
-        perceptual_hash=f"{index:016x}",
         size_bytes=len(payload),
     )
 
@@ -821,7 +820,7 @@ def test_cleanup_repository_uses_real_sqlite_keyset_and_active_lease(tmp_path: P
                     application_id=scope.application_id,
                     knowledge_base_id=scope.knowledge_base_id,
                     run_id=run.run_id,
-                    schema_version="2.0.0" if index == 102 else "4.1.0",
+                    schema_version="2.0.0" if index == 102 else "4.2.0",
                     payload_json={},
                 )
             )

@@ -135,7 +135,6 @@ def _outcome() -> PipelineOutcome:
     frame_batch = ChapterFrameSearchBatch(
         asset_sha256="a" * 64,
         allowed_run_root=Path("runs/test-scope/run_001"),
-        frame_tolerance_ms=40,
         frame_sets=(),
         chapter_status=(),
         metrics={},

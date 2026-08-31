@@ -47,7 +47,6 @@ def _frame(root: Path, frame_id: str, timestamp_ms: int) -> FrameCandidateArtifa
         size_bytes=len(content),
         relative_path=path.relative_to(root).as_posix(),
         mime_type="image/jpeg",
-        perceptual_hash="0123456789abcdef",
         target_ids=("target_001",),
     )
 

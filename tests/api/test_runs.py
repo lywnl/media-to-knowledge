@@ -183,7 +183,7 @@ def test_create_run_persists_only_current_speech_configuration(
                 "include_verbatim_quotes": True,
                 "max_visuals_per_chapter": 2,
             },
-            "result_schema_version": "4.1.0",
+            "result_schema_version": "4.2.0",
         }
 
 
@@ -197,7 +197,7 @@ def test_create_run_sanitizes_document_title_and_includes_it_in_idempotency(
     first = {
         **_create_payload(object_ref),
         "document_config": {"document_title": "  教程/第一课\u0000  "},
-        "result_schema_version": "4.1.0",
+        "result_schema_version": "4.2.0",
     }
 
     created = client.post(runs_url, headers=scope_headers, json=first)
@@ -215,7 +215,7 @@ def test_create_run_sanitizes_document_title_and_includes_it_in_idempotency(
         json={
             **_create_payload(object_ref),
             "document_config": {"document_title": "另一课"},
-            "result_schema_version": "4.1.0",
+            "result_schema_version": "4.2.0",
         },
     )
     assert conflict.status_code == 409
