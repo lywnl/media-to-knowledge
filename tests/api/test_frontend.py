@@ -102,6 +102,8 @@ def test_frontend_page_exposes_local_video_file_workflow(client: TestClient) -> 
     assert 'id="history-panel"' in html
     assert 'id="history-list"' in html
     assert response.headers["cache-control"] == "no-store"
+    assert "视频任务由 API 内置调度器自动处理" in html
+    assert "请确认 API 与 Worker 已同时运行" not in html
 
 
 def test_frontend_static_resources_are_available(client: TestClient) -> None:
@@ -150,6 +152,10 @@ def test_frontend_script_uses_existing_async_api_contract(client: TestClient) ->
     assert "min_speakers" not in script
     assert "max_speakers" not in script
     assert "speech_enrichment_mode" not in script
+    assert "任务正在等待 API 调度" in script
+    assert "视频任务由 API 内置调度器处理" in script
+    assert "任务正在等待 Worker" not in script
+    assert "Worker 已启动" not in script
 
 
 def test_frontend_exposes_independent_video_audio_image_workflows(client: TestClient) -> None:

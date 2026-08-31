@@ -8,7 +8,6 @@
   });
   const POLL_INTERVAL_MS = 2000;
   const MAX_CONSECUTIVE_POLL_FAILURES = 5;
-  const WORKER_HINT_AFTER_MS = 30000;
   const SUCCESS_STATUSES = new Set(["SUCCEEDED", "PARTIAL_SUCCEEDED"]);
   const FAILURE_STATUSES = new Set(["FAILED", "CANCELLED"]);
   const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 502, 503, 504]);
@@ -380,12 +379,12 @@
   function updateRunStatus(run, elapsedMs) {
     const isPending = run.status === "PENDING";
     const stage = STAGE_LABELS[run.current_stage] ?? run.current_stage;
-    const workerHint = elapsedMs >= WORKER_HINT_AFTER_MS && isPending
-      ? " · 若长时间无进展，请确认 Worker 已启动"
+    const schedulerHint = isPending
+      ? " · 视频任务由 API 内置调度器处理"
       : "";
     updateStatus(
-      isPending ? "任务正在等待 Worker" : `正在${stage}`,
-      `${run.status} · ${stage} · 已等待 ${formatDuration(elapsedMs)}${workerHint}`,
+      isPending ? "任务正在等待 API 调度" : `正在${stage}`,
+      `${run.status} · ${stage} · 已等待 ${formatDuration(elapsedMs)}${schedulerHint}`,
       isPending ? 1 : 2,
     );
   }
