@@ -22,10 +22,7 @@ from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
 from video_demo.api.app import create_app
 from video_demo.api.schemas import PublicEvidence, PublicKeyframeEvidence
-from video_demo.application.composition import (
-    build_production_model_identity_report,
-    build_worker,
-)
+from video_demo.application.composition import build_production_model_identity_report
 from video_demo.capabilities import probe_runtime_capabilities
 from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel, Sha256, StableId
@@ -777,12 +774,7 @@ class DurabilityRunner:
             run_id = str(created.json()["run_id"])
             job_id = str(created.json()["job_id"])
             set_run_root(run_id)
-            worker = build_worker(self._settings, worker_id=f"durability-{evaluation_run_id}")
-            try:
-                if not worker.run_once():
-                    raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "耐久 Worker 未领取任务")
-            finally:
-                worker.close()
+            _wait_for_terminal_run(client, run_id, self._settings.process_timeout_seconds)
             run_response = client.get(
                 f"/api/kb/knowledge-bases/evaluation/video-understanding-runs/{run_id}",
                 headers=_DEFAULT_SCOPE_HEADERS,
@@ -1194,3 +1186,22 @@ def _verify_production_queries(
         ):
             raise ValueError("耐久关键帧内容与证据不一致")
     return document_bytes
+
+
+def _wait_for_terminal_run(client: Any, run_id: str, timeout_seconds: float) -> None:
+    """等待 FastAPI 进程内视频调度器完成当前 Run。"""
+
+    deadline = time.monotonic() + max(30.0, timeout_seconds)
+    url = f"/api/kb/knowledge-bases/evaluation/video-understanding-runs/{run_id}"
+    while time.monotonic() < deadline:
+        response = client.get(url, headers=_DEFAULT_SCOPE_HEADERS)
+        _require_status(response, 200)
+        if str(response.json().get("status")) in {
+            "SUCCEEDED",
+            "PARTIAL_SUCCEEDED",
+            "FAILED",
+            "CANCELLED",
+        }:
+            return
+        time.sleep(0.05)
+    raise VideoDemoError(ErrorCode.DEPENDENCY_TEMPORARY_FAILURE, "视频调度等待超时")

@@ -14,7 +14,7 @@ from video_demo.application.chapter_planning import ChapterPlanner
 from video_demo.application.chapter_vision import ChapterVisionService
 from video_demo.application.document_pipeline import VideoUnderstandingPipeline
 from video_demo.application.document_writing import DocumentWriter
-from video_demo.application.pipeline import PipelineJobHandler
+from video_demo.application.pipeline import VideoStagePipelineExecutor
 from video_demo.application.pipeline_contracts import EvidencePreparationLimits
 from video_demo.application.production_media import (
     ProductionAssetProbe,
@@ -25,8 +25,7 @@ from video_demo.application.production_media import (
 )
 from video_demo.application.production_scene import ProductionSceneIndexProvider
 from video_demo.application.queries import ResultQueryService
-from video_demo.application.visual_cleanup import PublishedVisualCleaner
-from video_demo.application.visual_cleanup_recovery import PublishedVisualCleanupRecovery
+from video_demo.application.video_scheduler import VideoTaskScheduler
 from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel, Sha256
 from video_demo.domain.document import PromptVersions
@@ -35,7 +34,6 @@ from video_demo.integrations.openai_document import OpenAIDocumentClient
 from video_demo.integrations.qwen_vl import QwenVisionClient
 from video_demo.media.probe import ProbeLimits
 from video_demo.persistence.database import Database
-from video_demo.persistence.migrations import upgrade_runtime_database
 from video_demo.speech.isolated import IsolatedSpeechAnalyzer
 from video_demo.speech.snapshots import SpeechFingerprintInputs
 from video_demo.speech.subprocess_protocol import (
@@ -340,53 +338,29 @@ def build_production_pipeline(
         return pipeline
 
 
-def build_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
-    """先迁移和恢复，再验证三套模型配置并构造 Worker。"""
+def build_video_scheduler(
+    settings: Settings,
+    database: Database,
+    object_store: LocalVideoObjectStore,
+    queries: ResultQueryService,
+) -> VideoTaskScheduler:
+    """构造 FastAPI 进程内视频总调度器；音频和图片仍走独立 Worker。"""
 
     assert settings.runtime_root is not None
-    runtime_root = settings.runtime_root
-    runtime_root.mkdir(parents=True, exist_ok=True)
-    database_url = f"sqlite+pysqlite:///{runtime_root / 'video-demo.db'}"
-    upgrade_runtime_database(settings.workspace_root, runtime_root, database_url)
-    database = Database(database_url)
-    artifact_store = AtomicArtifactStore(runtime_root)
-    cleaner = PublishedVisualCleaner(
-        runtime_root,
-        max_candidate_files=settings.max_candidate_frame_files_per_run,
-        max_candidate_bytes=settings.max_candidate_frame_bytes_per_run,
-        max_published_keyframe_files=settings.max_published_keyframe_files_per_run,
-        max_published_keyframe_bytes=settings.max_published_keyframe_bytes_per_run,
-        max_keyframe_bytes=settings.vlm_max_image_bytes,
-    )
-    queries = ResultQueryService(
+    pipeline = build_production_pipeline(settings, database, object_store)
+    executor = VideoStagePipelineExecutor(
         database,
-        artifact_store,
-        max_evidence_items=settings.max_result_evidence_items,
-        max_keyframe_bytes=settings.vlm_max_image_bytes,
-        max_document_bytes=settings.max_document_bytes,
-        max_bundle_bytes=settings.max_result_bundle_bytes,
-        visual_cleaner=cleaner,
+        pipeline,
+        queries,
+        settings.runtime_root,
     )
-    PublishedVisualCleanupRecovery(database, queries, cleaner).recover()
-    settings.require_cloud_asr_configuration()
-    settings.require_text_llm_configuration()
-    settings.require_vlm_configuration()
-    object_store = LocalVideoObjectStore(
-        runtime_root,
-        max_video_bytes=settings.max_video_bytes,
+    scheduler = VideoTaskScheduler(
+        executor,
+        transcription_concurrency=2,
+        llm_concurrency=2,
     )
-    with ExitStack() as resources:
-        pipeline = build_production_pipeline(settings, database, object_store)
-        resources.callback(pipeline.close)
-        handler = PipelineJobHandler(database, pipeline, queries)
-        worker = ReliableWorker(
-            database,
-            worker_id,
-            handler,
-            owned_resources=(pipeline,),
-        )
-        resources.pop_all()
-        return worker
+    scheduler._owned_pipeline = pipeline
+    return scheduler
 
 
 def build_image_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
@@ -577,7 +551,7 @@ __all__ = [
     "build_image_worker",
     "build_production_model_identity_report",
     "build_production_pipeline",
-    "build_worker",
+    "build_video_scheduler",
     "production_tool_path",
     "resolution_comparison_settings_fingerprint",
 ]

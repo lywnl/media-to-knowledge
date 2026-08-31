@@ -29,6 +29,7 @@ from video_demo.application.pipeline_contracts import (
     SceneIndex,
     SpeechAnalysis,
     StageMetric,
+    TranscriptionCheckpoint,
     merge_model_metrics,
     merge_run_statuses,
     require_result_evidence_budget,
@@ -271,6 +272,12 @@ class VideoUnderstandingPipeline:
         return self._document_writer
 
     def run(self, context: PipelineContext) -> PipelineOutcome:
+        checkpoint = self.run_transcription(context)
+        return self.run_llm(context, checkpoint)
+
+    def run_transcription(self, context: PipelineContext) -> TranscriptionCheckpoint:
+        """执行媒体准备和转写；结果可独立持久化后交接给 LLM 阶段。"""
+
         stage_metrics = _StageMetrics()
         registered = self._run_stage(
             context,
@@ -300,6 +307,33 @@ class VideoUnderstandingPipeline:
             prepared,
             stage_metrics,
         )
+        return TranscriptionCheckpoint(
+            registered=registered,
+            prepared=prepared,
+            speech=speech,
+            scene_index=scene_index,
+            base_segments=base_segments,
+            stage_metrics=stage_metrics.complete(),
+            stage_cache_hits=speech.stage_cache_hits,
+            model_cache=model_cache,
+        )
+
+    def run_llm(
+        self,
+        context: PipelineContext,
+        checkpoint: TranscriptionCheckpoint,
+    ) -> PipelineOutcome:
+        """从转写快照继续执行章节规划、视觉补充和文档发布前编排。"""
+
+        stage_metrics = _StageMetrics()
+        for stage, duration_ms in checkpoint.stage_metrics.items():
+            stage_metrics.add(stage, duration_ms)
+        registered = checkpoint.registered
+        prepared = checkpoint.prepared
+        speech = checkpoint.speech
+        scene_index = checkpoint.scene_index
+        base_segments = checkpoint.base_segments
+        model_cache = checkpoint.model_cache or self._new_run_cache(registered)
         planning_batch = self._run_chapter_planning(
             context,
             stage_metrics,

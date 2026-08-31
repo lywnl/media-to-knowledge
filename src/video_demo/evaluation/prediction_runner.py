@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,10 +16,7 @@ from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
 from video_demo.api.app import create_app
 from video_demo.api.schemas import PublicEvidence, PublicKeyframeEvidence
-from video_demo.application.composition import (
-    build_production_model_identity_report,
-    build_worker,
-)
+from video_demo.application.composition import build_production_model_identity_report
 from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel, Sha256, StableId
 from video_demo.domain.evidence import DocumentEvidenceItem, KeyframeEvidence
@@ -122,7 +120,7 @@ class PredictionRunner:
         settings: Settings,
         *,
         app_factory: Callable[[Settings], FastAPI] = create_app,
-        worker_factory: Callable[..., Any] = build_worker,
+        worker_factory: Callable[..., Any] | None = None,
         preflight: Callable[[], str | None] | None = None,
         scope_headers: Mapping[str, str] | None = None,
         knowledge_base_id: str = "evaluation",
@@ -194,7 +192,11 @@ class PredictionRunner:
         try:
             app = self._app_factory(self._settings)
             with TestClient(app) as client:
-                worker = self._worker_factory(self._settings, worker_id=self._worker_id)
+                worker = (
+                    self._worker_factory(self._settings, worker_id=self._worker_id)
+                    if self._worker_factory is not None
+                    else None
+                )
                 try:
                     for sample in verified_package.dataset.samples:
                         predictions.append(
@@ -208,9 +210,10 @@ class PredictionRunner:
                             )
                         )
                 finally:
-                    close = getattr(worker, "close", None)
-                    if callable(close):
-                        close()
+                    if worker is not None:
+                        close = getattr(worker, "close", None)
+                        if callable(close):
+                            close()
         except (OSError, ValueError, ValidationError, VideoDemoError):
             if not predictions:
                 predictions.append(
@@ -275,7 +278,7 @@ class PredictionRunner:
     def _predict_sample(
         self,
         client: TestClient,
-        worker: Any,
+        worker: Any | None,
         sample: EvaluationSample,
         package: ValidatedEvaluationPackage,
         evaluation_run_id: str,
@@ -316,17 +319,20 @@ class PredictionRunner:
             created_payload = created.json()
             run_id = str(created_payload["run_id"])
             job_id = str(created_payload["job_id"])
-            if not worker.run_once():
-                return self._failed_prediction(
-                    sample,
-                    evaluation_run_id,
-                    run_id,
-                    job_id,
-                    "WORKER_NO_JOB",
-                    models,
-                    started_at,
-                    eval_root=runtime_root / "eval",
-                )
+            if worker is not None:
+                if not worker.run_once():
+                    return self._failed_prediction(
+                        sample,
+                        evaluation_run_id,
+                        run_id,
+                        job_id,
+                        "WORKER_NO_JOB",
+                        models,
+                        started_at,
+                        eval_root=runtime_root / "eval",
+                    )
+            else:
+                self._wait_for_terminal_run(client, run_id)
             run_response = client.get(
                 f"/api/kb/knowledge-bases/{self._knowledge_base_id}/video-understanding-runs/{run_id}",
                 headers=self._scope_headers,
@@ -420,6 +426,22 @@ class PredictionRunner:
                 job_id=job_id,
                 run_payload=run_payload,
             )
+
+    def _wait_for_terminal_run(self, client: TestClient, run_id: str) -> None:
+        deadline = time.monotonic() + max(30.0, self._settings.process_timeout_seconds)
+        url = f"/api/kb/knowledge-bases/{self._knowledge_base_id}/video-understanding-runs/{run_id}"
+        while time.monotonic() < deadline:
+            response = client.get(url, headers=self._scope_headers)
+            _require_status(response, 200)
+            if str(response.json().get("status")) in {
+                "SUCCEEDED",
+                "PARTIAL_SUCCEEDED",
+                "FAILED",
+                "CANCELLED",
+            }:
+                return
+            time.sleep(0.05)
+        raise VideoDemoError(ErrorCode.DEPENDENCY_TEMPORARY_FAILURE, "视频调度等待超时")
 
     def _fetch_evidence(
         self,

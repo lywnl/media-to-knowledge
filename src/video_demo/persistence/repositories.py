@@ -6,7 +6,7 @@ from importlib import import_module
 from typing import Any, cast
 
 from sqlalchemy import Select, and_, exists, func, or_, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 import video_demo.domain as _domain_package
@@ -18,6 +18,8 @@ from video_demo.persistence.models import (
     VideoAssetModel,
     VideoObjectModel,
     VideoObjectStatus,
+    VideoPipelineStageModel,
+    VideoStageName,
     VideoSummaryModel,
     VideoUnderstandingRunModel,
 )
@@ -85,6 +87,435 @@ class MediaRunRecord:
     current_stage: str
     warning_codes: tuple[str, ...]
     error_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class VideoStageRecord:
+    scope: Scope
+    run_id: str
+    stage_name: VideoStageName
+    status: JobStatus
+    attempt_count: int
+    max_attempts: int
+    checkpoint_relative_path: str | None
+    checkpoint_sha256: str | None
+    error_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class VideoStageLease:
+    id: int
+    scope: Scope
+    run_id: str
+    stage_name: VideoStageName
+    worker_id: str
+    attempt_count: int
+    max_attempts: int
+
+
+class VideoStageRepository:
+    """视频转写与 LLM 阶段的持久化租约和恢复查询。"""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def ensure(self, scope: Scope, run_id: str, *, max_attempts: int = 3) -> None:
+        if max_attempts < 1:
+            raise ValueError("阶段最大尝试次数必须大于 0")
+        now = datetime.now(UTC)
+        for stage_name in (VideoStageName.TRANSCRIPTION, VideoStageName.LLM):
+            existing = self._session.scalar(
+                select(VideoPipelineStageModel).where(
+                    VideoPipelineStageModel.tenant_id == scope.tenant_id,
+                    VideoPipelineStageModel.application_id == scope.application_id,
+                    VideoPipelineStageModel.knowledge_base_id == scope.knowledge_base_id,
+                    VideoPipelineStageModel.run_id == run_id,
+                    VideoPipelineStageModel.stage_name == stage_name,
+                ),
+            )
+            if existing is None:
+                self._session.add(
+                    VideoPipelineStageModel(
+                        tenant_id=scope.tenant_id,
+                        application_id=scope.application_id,
+                        knowledge_base_id=scope.knowledge_base_id,
+                        run_id=run_id,
+                        stage_name=stage_name,
+                        status=JobStatus.PENDING,
+                        attempt_count=0,
+                        max_attempts=max_attempts,
+                        next_attempt_at=now,
+                    ),
+                )
+        self._session.flush()
+
+    def get(self, scope: Scope, run_id: str, stage_name: VideoStageName) -> VideoStageRecord | None:
+        model = self._session.scalar(
+            select(VideoPipelineStageModel).where(
+                VideoPipelineStageModel.tenant_id == scope.tenant_id,
+                VideoPipelineStageModel.application_id == scope.application_id,
+                VideoPipelineStageModel.knowledge_base_id == scope.knowledge_base_id,
+                VideoPipelineStageModel.run_id == run_id,
+                VideoPipelineStageModel.stage_name == stage_name,
+            ),
+        )
+        return _video_stage_record(model) if model is not None else None
+
+    def mark_recovery_failed(
+        self,
+        scope: Scope,
+        run_id: str,
+        stage_name: VideoStageName,
+        *,
+        error_code: ErrorCode,
+        now: datetime | None = None,
+    ) -> bool:
+        """将无法安全恢复的阶段关闭，避免重启后静默重跑已完成阶段。"""
+
+        current_time = now or datetime.now(UTC)
+        result = self._session.execute(
+            update(VideoPipelineStageModel)
+            .where(
+                VideoPipelineStageModel.tenant_id == scope.tenant_id,
+                VideoPipelineStageModel.application_id == scope.application_id,
+                VideoPipelineStageModel.knowledge_base_id == scope.knowledge_base_id,
+                VideoPipelineStageModel.run_id == run_id,
+                VideoPipelineStageModel.stage_name == stage_name,
+                VideoPipelineStageModel.status.in_(
+                    (JobStatus.PENDING, JobStatus.RETRY_WAIT, JobStatus.RUNNING)
+                ),
+            )
+            .values(
+                status=JobStatus.FAILED,
+                worker_id=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                error_code=str(error_code),
+                updated_at=current_time,
+            )
+            .execution_options(synchronize_session=False),
+        )
+        return bool(result.rowcount)  # type: ignore[attr-defined]
+
+    def list_recoverable(self, *, now: datetime | None = None) -> tuple[VideoStageRecord, ...]:
+        current_time = now or datetime.now(UTC)
+        transcription = aliased(VideoPipelineStageModel)
+        transcription_ready = exists(
+            select(transcription.id).where(
+                transcription.tenant_id == VideoPipelineStageModel.tenant_id,
+                transcription.application_id == VideoPipelineStageModel.application_id,
+                transcription.knowledge_base_id == VideoPipelineStageModel.knowledge_base_id,
+                transcription.run_id == VideoPipelineStageModel.run_id,
+                transcription.stage_name == VideoStageName.TRANSCRIPTION,
+                transcription.status == JobStatus.SUCCEEDED,
+            ),
+        )
+        models = self._session.scalars(
+            select(VideoPipelineStageModel).where(
+                or_(
+                    (
+                        VideoPipelineStageModel.status.in_(
+                            (JobStatus.PENDING, JobStatus.RETRY_WAIT),
+                        )
+                        & (VideoPipelineStageModel.next_attempt_at <= current_time)
+                    ),
+                    (
+                        (VideoPipelineStageModel.status == JobStatus.RUNNING)
+                        & (VideoPipelineStageModel.lease_expires_at <= current_time)
+                    ),
+                ),
+                or_(
+                    VideoPipelineStageModel.stage_name != VideoStageName.LLM,
+                    transcription_ready,
+                ),
+            ).order_by(VideoPipelineStageModel.id),
+        )
+        return tuple(_video_stage_record(model) for model in models)
+
+    def heartbeat(
+        self,
+        lease: VideoStageLease,
+        *,
+        lease_seconds: int = 60,
+        now: datetime | None = None,
+    ) -> None:
+        if lease_seconds < 1:
+            raise ValueError("阶段租约时长必须大于 0")
+        current_time = now or datetime.now(UTC)
+        result = self._session.execute(
+            update(VideoPipelineStageModel).where(
+                VideoPipelineStageModel.id == lease.id,
+                VideoPipelineStageModel.worker_id == lease.worker_id,
+                VideoPipelineStageModel.attempt_count == lease.attempt_count,
+                VideoPipelineStageModel.status == JobStatus.RUNNING,
+                VideoPipelineStageModel.lease_expires_at > current_time,
+            ).values(
+                heartbeat_at=current_time,
+                lease_expires_at=current_time + timedelta(seconds=lease_seconds),
+                updated_at=current_time,
+            ).execution_options(synchronize_session=False),
+        )
+        if result.rowcount != 1:  # type: ignore[attr-defined]
+            raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "视频阶段租约已丢失")
+
+    def mark_cancelled(self, lease: VideoStageLease, *, now: datetime | None = None) -> None:
+        current_time = now or datetime.now(UTC)
+        result = self._session.execute(
+            update(VideoPipelineStageModel).where(
+                VideoPipelineStageModel.id == lease.id,
+                VideoPipelineStageModel.worker_id == lease.worker_id,
+                VideoPipelineStageModel.attempt_count == lease.attempt_count,
+                VideoPipelineStageModel.status == JobStatus.RUNNING,
+            ).values(
+                status=JobStatus.CANCELLED,
+                worker_id=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                error_code=str(ErrorCode.JOB_CANCELLED),
+                updated_at=current_time,
+            ).execution_options(synchronize_session=False),
+        )
+        if result.rowcount == 1:  # type: ignore[attr-defined]
+            return
+        already_cancelled = self._session.scalar(
+            select(VideoPipelineStageModel.id).where(
+                VideoPipelineStageModel.id == lease.id,
+                VideoPipelineStageModel.attempt_count == lease.attempt_count,
+                VideoPipelineStageModel.status == JobStatus.CANCELLED,
+            )
+        )
+        if already_cancelled is not None:
+            return
+        raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "视频阶段租约已丢失")
+
+    def claim(
+        self,
+        scope: Scope,
+        run_id: str,
+        stage_name: VideoStageName,
+        worker_id: str,
+        *,
+        lease_seconds: int = 60,
+        now: datetime | None = None,
+    ) -> VideoStageLease | None:
+        if lease_seconds < 1 or not worker_id.strip():
+            raise ValueError("阶段租约参数非法")
+        current_time = now or datetime.now(UTC)
+        model = self._session.scalar(
+            select(VideoPipelineStageModel).where(
+                VideoPipelineStageModel.tenant_id == scope.tenant_id,
+                VideoPipelineStageModel.application_id == scope.application_id,
+                VideoPipelineStageModel.knowledge_base_id == scope.knowledge_base_id,
+                VideoPipelineStageModel.run_id == run_id,
+                VideoPipelineStageModel.stage_name == stage_name,
+                VideoPipelineStageModel.attempt_count < VideoPipelineStageModel.max_attempts,
+                or_(
+                    (
+                        VideoPipelineStageModel.status.in_(
+                            (JobStatus.PENDING, JobStatus.RETRY_WAIT),
+                        )
+                        & (VideoPipelineStageModel.next_attempt_at <= current_time)
+                    ),
+                    (
+                        (VideoPipelineStageModel.status == JobStatus.RUNNING)
+                        & (VideoPipelineStageModel.lease_expires_at <= current_time)
+                    ),
+                ),
+            ).limit(1),
+        )
+        if model is None:
+            return None
+        expected_status = model.status
+        statement = update(VideoPipelineStageModel).where(
+            VideoPipelineStageModel.id == model.id,
+            VideoPipelineStageModel.status == expected_status,
+            VideoPipelineStageModel.attempt_count == model.attempt_count,
+        )
+        if expected_status == JobStatus.RUNNING:
+            statement = statement.where(VideoPipelineStageModel.lease_expires_at <= current_time)
+        else:
+            statement = statement.where(VideoPipelineStageModel.next_attempt_at <= current_time)
+        result = self._session.execute(
+            statement.values(
+                status=JobStatus.RUNNING,
+                worker_id=worker_id,
+                heartbeat_at=current_time,
+                lease_expires_at=current_time + timedelta(seconds=lease_seconds),
+                attempt_count=VideoPipelineStageModel.attempt_count + 1,
+                updated_at=current_time,
+            ).execution_options(synchronize_session=False),
+        )
+        if result.rowcount != 1:  # type: ignore[attr-defined]
+            return None
+        self._session.expire_all()
+        claimed = self._session.get(VideoPipelineStageModel, model.id)
+        assert claimed is not None
+        return VideoStageLease(
+            id=claimed.id,
+            scope=scope,
+            run_id=run_id,
+            stage_name=stage_name,
+            worker_id=worker_id,
+            attempt_count=claimed.attempt_count,
+            max_attempts=claimed.max_attempts,
+        )
+
+    def mark_succeeded(
+        self,
+        lease: VideoStageLease,
+        *,
+        checkpoint_relative_path: str | None = None,
+        checkpoint_sha256: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        current_time = now or datetime.now(UTC)
+        result = self._session.execute(
+            update(VideoPipelineStageModel).where(
+                VideoPipelineStageModel.id == lease.id,
+                VideoPipelineStageModel.worker_id == lease.worker_id,
+                VideoPipelineStageModel.attempt_count == lease.attempt_count,
+                VideoPipelineStageModel.status == JobStatus.RUNNING,
+            ).values(
+                status=JobStatus.SUCCEEDED,
+                worker_id=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                checkpoint_relative_path=checkpoint_relative_path,
+                checkpoint_sha256=checkpoint_sha256,
+                error_code=None,
+                updated_at=current_time,
+            ).execution_options(synchronize_session=False),
+        )
+        if result.rowcount != 1:  # type: ignore[attr-defined]
+            raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "视频阶段租约已丢失")
+
+    def reconcile_succeeded(
+        self,
+        scope: Scope,
+        run_id: str,
+        stage_name: VideoStageName,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """结果已经提交时，将同一阶段收敛为成功，保证发布幂等。"""
+
+        current_time = now or datetime.now(UTC)
+        self._session.execute(
+            update(VideoPipelineStageModel)
+            .where(
+                VideoPipelineStageModel.tenant_id == scope.tenant_id,
+                VideoPipelineStageModel.application_id == scope.application_id,
+                VideoPipelineStageModel.knowledge_base_id == scope.knowledge_base_id,
+                VideoPipelineStageModel.run_id == run_id,
+                VideoPipelineStageModel.stage_name == stage_name,
+                VideoPipelineStageModel.status.in_((JobStatus.PENDING, JobStatus.RUNNING)),
+            )
+            .values(
+                status=JobStatus.SUCCEEDED,
+                worker_id=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                error_code=None,
+                updated_at=current_time,
+            )
+            .execution_options(synchronize_session=False),
+        )
+
+    def reset_for_retry(
+        self,
+        scope: Scope,
+        run_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[VideoStageName, ...]:
+        """人工重试时只重置失败阶段，已成功转写阶段保持不变。"""
+
+        current_time = now or datetime.now(UTC)
+        failed = tuple(
+            self._session.scalars(
+                select(VideoPipelineStageModel.stage_name)
+                .where(
+                    VideoPipelineStageModel.tenant_id == scope.tenant_id,
+                    VideoPipelineStageModel.application_id == scope.application_id,
+                    VideoPipelineStageModel.knowledge_base_id == scope.knowledge_base_id,
+                    VideoPipelineStageModel.run_id == run_id,
+                    VideoPipelineStageModel.status == JobStatus.FAILED,
+                )
+                .order_by(VideoPipelineStageModel.id)
+            )
+        )
+        if not failed:
+            return ()
+        self._session.execute(
+            update(VideoPipelineStageModel)
+            .where(
+                VideoPipelineStageModel.tenant_id == scope.tenant_id,
+                VideoPipelineStageModel.application_id == scope.application_id,
+                VideoPipelineStageModel.knowledge_base_id == scope.knowledge_base_id,
+                VideoPipelineStageModel.run_id == run_id,
+                VideoPipelineStageModel.status == JobStatus.FAILED,
+            )
+            .values(
+                status=JobStatus.PENDING,
+                attempt_count=0,
+                next_attempt_at=current_time,
+                worker_id=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                error_code=None,
+                updated_at=current_time,
+            )
+            .execution_options(synchronize_session=False),
+        )
+        return failed
+
+    def mark_failed(
+        self,
+        lease: VideoStageLease,
+        *,
+        error_code: ErrorCode,
+        retryable: bool,
+        retry_delay_seconds: int = 5,
+        now: datetime | None = None,
+    ) -> None:
+        current_time = now or datetime.now(UTC)
+        status = (
+            JobStatus.RETRY_WAIT
+            if retryable and lease.attempt_count < lease.max_attempts
+            else JobStatus.FAILED
+        )
+        result = self._session.execute(
+            update(VideoPipelineStageModel).where(
+                VideoPipelineStageModel.id == lease.id,
+                VideoPipelineStageModel.worker_id == lease.worker_id,
+                VideoPipelineStageModel.attempt_count == lease.attempt_count,
+                VideoPipelineStageModel.status == JobStatus.RUNNING,
+            ).values(
+                status=status,
+                next_attempt_at=current_time + timedelta(seconds=retry_delay_seconds),
+                error_code=str(error_code),
+                worker_id=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                updated_at=current_time,
+            ).execution_options(synchronize_session=False),
+        )
+        if result.rowcount != 1:  # type: ignore[attr-defined]
+            raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "视频阶段租约已丢失")
+
+
+def _video_stage_record(model: VideoPipelineStageModel) -> VideoStageRecord:
+    return VideoStageRecord(
+        scope=Scope(model.tenant_id, model.application_id, model.knowledge_base_id),
+        run_id=model.run_id,
+        stage_name=model.stage_name,
+        status=model.status,
+        attempt_count=model.attempt_count,
+        max_attempts=model.max_attempts,
+        checkpoint_relative_path=model.checkpoint_relative_path,
+        checkpoint_sha256=model.checkpoint_sha256,
+        error_code=model.error_code,
+    )
 
 
 def reject_sensitive_json(value: object, path: str = "$") -> None:
@@ -501,6 +932,64 @@ class JobRepository:
             ),
         )
 
+    def claim_video_run(
+        self,
+        scope: Scope,
+        run_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: int = 120,
+        now: datetime | None = None,
+    ) -> ClaimedJob | None:
+        """为 LLM 发布阶段领取指定视频总任务，避免重新执行转写。"""
+
+        if not worker_id.strip() or lease_seconds < 1:
+            raise ValueError("视频任务租约参数非法")
+        current_time = now or datetime.now(UTC)
+        candidate = self._session.scalar(
+            select(JobModel).where(
+                JobModel.tenant_id == scope.tenant_id,
+                JobModel.application_id == scope.application_id,
+                JobModel.knowledge_base_id == scope.knowledge_base_id,
+                JobModel.resource_type == "VIDEO_UNDERSTANDING_RUN",
+                JobModel.resource_id == run_id,
+                JobModel.status.in_((JobStatus.PENDING, JobStatus.RETRY_WAIT)),
+                JobModel.cancel_requested.is_(False),
+                JobModel.next_attempt_at <= current_time,
+            ),
+        )
+        if candidate is None:
+            return None
+        result = self._session.execute(
+            update(JobModel).where(
+                JobModel.id == candidate.id,
+                JobModel.status == candidate.status,
+                JobModel.attempt_count == candidate.attempt_count,
+                JobModel.cancel_requested.is_(False),
+            ).values(
+                status=JobStatus.RUNNING,
+                worker_id=worker_id,
+                heartbeat_at=current_time,
+                lease_expires_at=current_time + timedelta(seconds=lease_seconds),
+                attempt_count=JobModel.attempt_count + 1,
+                updated_at=current_time,
+            ).execution_options(synchronize_session=False),
+        )
+        if result.rowcount != 1:  # type: ignore[attr-defined]
+            return None
+        self._session.expire_all()
+        claimed = self._session.get(JobModel, candidate.id)
+        assert claimed is not None and claimed.worker_id is not None
+        return ClaimedJob(
+            id=claimed.id,
+            job_id=claimed.job_id,
+            resource_id=claimed.resource_id,
+            worker_id=claimed.worker_id,
+            attempt_count=claimed.attempt_count,
+            max_attempts=claimed.max_attempts,
+            scope=scope,
+        )
+
     def heartbeat(
         self,
         job_pk: int,
@@ -812,6 +1301,106 @@ class JobRepository:
             return
         raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "任务租约已丢失")
 
+    def release_video_stage(
+        self,
+        job: ClaimedJob,
+        *,
+        status: JobStatus = JobStatus.PENDING,
+        current_stage: str | None = None,
+        error_code: ErrorCode | None = None,
+        retry_delay_seconds: int = 5,
+        now: datetime | None = None,
+    ) -> None:
+        """释放视频阶段占用的总任务租约，并原子更新运行阶段。"""
+
+        if status not in (JobStatus.PENDING, JobStatus.RETRY_WAIT, JobStatus.FAILED):
+            raise ValueError("视频阶段只能释放为可重试或失败状态")
+        if retry_delay_seconds < 0:
+            raise ValueError("任务重试延迟不能为负数")
+        current_time = now or datetime.now(UTC)
+        if current_stage is not None:
+            run = self._session.scalar(
+                select(VideoUnderstandingRunModel).where(
+                    VideoUnderstandingRunModel.tenant_id == job.scope.tenant_id,
+                    VideoUnderstandingRunModel.application_id == job.scope.application_id,
+                    VideoUnderstandingRunModel.knowledge_base_id == job.scope.knowledge_base_id,
+                    VideoUnderstandingRunModel.run_id == job.resource_id,
+                ),
+            )
+            if run is None:
+                raise VideoDemoError(ErrorCode.VIDEO_RUN_NOT_FOUND, "视频理解运行不存在")
+            run.current_stage = current_stage
+            if status == JobStatus.FAILED:
+                run.status = RunStatusValue.FAILED
+                run.error_code = str(error_code) if error_code else None
+            else:
+                run.status = RunStatusValue.PENDING
+                run.error_code = str(error_code) if error_code else None
+        result = self._session.execute(
+            update(JobModel).where(
+                JobModel.id == job.id,
+                JobModel.worker_id == job.worker_id,
+                JobModel.attempt_count == job.attempt_count,
+                JobModel.status == JobStatus.RUNNING,
+                JobModel.lease_expires_at > current_time,
+            ).values(
+                status=status,
+                worker_id=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                next_attempt_at=(
+                    current_time + timedelta(seconds=retry_delay_seconds)
+                    if status == JobStatus.RETRY_WAIT
+                    else current_time
+                ),
+                error_code=str(error_code) if error_code else None,
+                updated_at=current_time,
+            ).execution_options(synchronize_session=False),
+        )
+        if result.rowcount != 1:  # type: ignore[attr-defined]
+            raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "任务租约已丢失")
+
+    def fail_unclaimed_video_run(
+        self,
+        scope: Scope,
+        run_id: str,
+        *,
+        error_code: ErrorCode,
+        current_stage: str,
+        now: datetime | None = None,
+    ) -> bool:
+        current_time = now or datetime.now(UTC)
+        result = self._session.execute(
+            update(JobModel)
+            .where(
+                JobModel.tenant_id == scope.tenant_id,
+                JobModel.application_id == scope.application_id,
+                JobModel.knowledge_base_id == scope.knowledge_base_id,
+                JobModel.resource_type == "VIDEO_UNDERSTANDING_RUN",
+                JobModel.resource_id == run_id,
+                JobModel.status.in_((JobStatus.PENDING, JobStatus.RETRY_WAIT)),
+            )
+            .values(
+                status=JobStatus.FAILED,
+                error_code=str(error_code),
+                updated_at=current_time,
+            )
+            .execution_options(synchronize_session=False),
+        )
+        run = self._session.scalar(
+            select(VideoUnderstandingRunModel).where(
+                VideoUnderstandingRunModel.tenant_id == scope.tenant_id,
+                VideoUnderstandingRunModel.application_id == scope.application_id,
+                VideoUnderstandingRunModel.knowledge_base_id == scope.knowledge_base_id,
+                VideoUnderstandingRunModel.run_id == run_id,
+            )
+        )
+        if run is not None:
+            run.status = RunStatusValue.FAILED
+            run.current_stage = current_stage
+            run.error_code = str(error_code)
+        return bool(result.rowcount)  # type: ignore[attr-defined]
+
     def mark_cancelled(
         self,
         job_pk: int,
@@ -972,6 +1561,28 @@ class JobRepository:
         # 通用 Job 单测和未来非视频资源可以没有对应的视频运行。
         if result.rowcount not in (0, 1):  # type: ignore[attr-defined]
             raise RuntimeError("视频运行取消更新影响了意外数量的记录")
+        if resource_type == "VIDEO_UNDERSTANDING_RUN":
+            self._session.execute(
+                update(VideoPipelineStageModel)
+                .where(
+                    VideoPipelineStageModel.tenant_id == scope.tenant_id,
+                    VideoPipelineStageModel.application_id == scope.application_id,
+                    VideoPipelineStageModel.knowledge_base_id == scope.knowledge_base_id,
+                    VideoPipelineStageModel.run_id == resource_id,
+                    VideoPipelineStageModel.status.in_(
+                        (JobStatus.PENDING, JobStatus.RETRY_WAIT, JobStatus.RUNNING)
+                    ),
+                )
+                .values(
+                    status=JobStatus.CANCELLED,
+                    error_code=str(ErrorCode.JOB_CANCELLED),
+                    worker_id=None,
+                    lease_expires_at=None,
+                    heartbeat_at=None,
+                    updated_at=datetime.now(UTC),
+                )
+                .execution_options(synchronize_session=False),
+            )
 
     def _is_owned_cancellation(
         self,

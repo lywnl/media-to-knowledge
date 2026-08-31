@@ -15,6 +15,7 @@ from video_demo.application.media_uploads import MediaUploadService
 from video_demo.application.queries import ResultQueryService
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
+from video_demo.application.video_scheduler import VideoTaskScheduler
 from video_demo.persistence.database import Database
 from video_demo.persistence.scope import Scope
 from video_demo.storage.object_store import LocalVideoObjectStore
@@ -34,6 +35,7 @@ class AppContainer:
     audio_upload_service: AudioUploadService
     audio_run_service: AudioRunService
     audio_query_service: AudioQueryService
+    video_scheduler: VideoTaskScheduler | None = None
 
 
 def get_container(request: Request) -> AppContainer:

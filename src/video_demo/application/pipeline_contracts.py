@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, Self
+from typing import TYPE_CHECKING, Literal, Self, cast
 
 from pydantic import Field, StrictInt, model_validator
 
@@ -18,6 +19,7 @@ from video_demo.domain.document_artifact import (
     MODEL_METRIC_NAMES,
     RESULT_STAGE_NAMES,
 )
+from video_demo.domain.document_plan import BaseSegment
 from video_demo.domain.evidence import (
     DocumentEvidenceItem,
     KeyframeEvidence,
@@ -38,6 +40,7 @@ if TYPE_CHECKING:
     from video_demo.domain.document import VideoUnderstandingResult
     from video_demo.media.subtitles import ParsedSubtitle
     from video_demo.persistence.scope import Scope
+    from video_demo.storage.document_cache import DocumentModelCache
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +189,194 @@ class PreparedMedia:
     audio_sha256: str | None
     subtitle: ParsedSubtitle | None = None
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionCheckpoint:
+    """转写阶段完成后交给 LLM 阶段的已验证事实快照。"""
+
+    registered: RegisteredAsset
+    prepared: PreparedMedia
+    speech: SpeechAnalysis
+    scene_index: SceneIndex
+    base_segments: tuple[BaseSegment, ...]
+    stage_metrics: Mapping[str, int] = field(default_factory=dict)
+    stage_cache_hits: tuple[str, ...] = ()
+    model_cache: DocumentModelCache | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.registered.source_sha256 != self.prepared.source.asset.source_sha256:
+            raise ValueError("转写快照的原始视频摘要不一致")
+        if self.prepared.proxy_sha256 != self.scene_index.proxy_sha256:
+            raise ValueError("转写快照的场景索引摘要不一致")
+
+
+def transcription_checkpoint_to_payload(checkpoint: TranscriptionCheckpoint) -> dict[str, object]:
+    """将转写快照编码为可持久化 JSON，不包含模型缓存实例。"""
+
+    prepared = checkpoint.prepared
+    speech = checkpoint.speech
+    evidence = [
+        {
+            "kind": "SUBTITLE_CUE" if isinstance(item, SubtitleCue) else "ASR_SEGMENT",
+            "payload": item.model_dump(mode="json"),
+        }
+        for item in speech.transcript_evidence
+    ]
+    return {
+        "schema_version": "1.0.0",
+        "registered": {
+            "source_path": str(checkpoint.registered.source_path),
+            "source_sha256": checkpoint.registered.source_sha256,
+            "object_ref": checkpoint.registered.object_ref,
+            "source_size_bytes": checkpoint.registered.source_size_bytes,
+            "source_mime": checkpoint.registered.source_mime,
+            "run_relative_root": checkpoint.registered.run_relative_root.as_posix(),
+            "config": checkpoint.registered.config.model_dump(mode="json"),
+        },
+        "probed": {
+            "manifest": prepared.source.manifest.model_dump(mode="json"),
+            "limits": asdict(prepared.source.limits),
+            "warnings": list(prepared.source.warnings),
+            "timeline_duration_ms": prepared.source.timeline_duration_ms,
+        },
+        "prepared": {
+            "proxy_path": str(prepared.proxy_path),
+            "proxy_sha256": prepared.proxy_sha256,
+            "proxy_size_bytes": prepared.proxy_size_bytes,
+            "audio_path": str(prepared.audio_path) if prepared.audio_path else None,
+            "audio_sha256": prepared.audio_sha256,
+            "subtitle": prepared.subtitle.model_dump(mode="json") if prepared.subtitle else None,
+            "warnings": list(prepared.warnings),
+        },
+        "speech": {
+            "transcript_source": speech.transcript_source,
+            "evidence": evidence,
+            "warnings": list(speech.warnings),
+            "boundary_candidates": [
+                {
+                    "timestamp_ms": item.timestamp_ms,
+                    "source": item.source,
+                    "score": item.score,
+                }
+                for item in speech.boundary_candidates
+            ],
+            "stage_metrics": [
+                {"stage": item.stage, "duration_ms": item.duration_ms}
+                for item in speech.stage_metrics
+            ],
+            "stage_cache_hits": list(speech.stage_cache_hits),
+        },
+        "scene_index": checkpoint.scene_index.model_dump(mode="json"),
+        "base_segments": [item.model_dump(mode="json") for item in checkpoint.base_segments],
+        "stage_metrics": dict(checkpoint.stage_metrics),
+        "stage_cache_hits": list(checkpoint.stage_cache_hits),
+    }
+
+
+def transcription_checkpoint_from_payload(
+    payload: Mapping[str, object],
+) -> TranscriptionCheckpoint:
+    """从 JSON 快照恢复转写事实，并重新执行领域校验。"""
+
+    if payload.get("schema_version") != "1.0.0":
+        raise ValueError("转写快照版本不受支持")
+    registered_payload = _mapping(payload, "registered")
+    config = PipelineRunConfig.model_validate(_mapping(registered_payload, "config"))
+    registered = RegisteredAsset(
+        source_path=Path(str(registered_payload["source_path"])),
+        source_sha256=str(registered_payload["source_sha256"]),
+        object_ref=str(registered_payload["object_ref"]),
+        source_size_bytes=int(registered_payload["source_size_bytes"]),
+        source_mime=cast(SupportedMime, str(registered_payload["source_mime"])),
+        run_relative_root=Path(str(registered_payload["run_relative_root"])),
+        config=config,
+    )
+    probed_payload = _mapping(payload, "probed")
+    manifest = VideoAssetManifest.model_validate(_mapping(probed_payload, "manifest"))
+    probed = ProbedAsset(
+        asset=registered,
+        manifest=manifest,
+        limits=ProbeLimits(**dict(_mapping(probed_payload, "limits"))),
+        warnings=tuple(str(item) for item in probed_payload.get("warnings", [])),
+        timeline_duration_ms=(
+            int(probed_payload["timeline_duration_ms"])
+            if probed_payload.get("timeline_duration_ms") is not None
+            else None
+        ),
+    )
+    prepared_payload = _mapping(payload, "prepared")
+    subtitle_payload = prepared_payload.get("subtitle")
+    subtitle_type = importlib.import_module("video_demo.media.subtitles").ParsedSubtitle
+    subtitle = (
+        subtitle_type.model_validate(subtitle_payload)
+        if isinstance(subtitle_payload, dict)
+        else None
+    )
+    prepared = PreparedMedia(
+        source=probed,
+        proxy_path=Path(str(prepared_payload["proxy_path"])),
+        proxy_sha256=str(prepared_payload["proxy_sha256"]),
+        proxy_size_bytes=int(prepared_payload["proxy_size_bytes"]),
+        audio_path=(
+            Path(str(prepared_payload["audio_path"]))
+            if prepared_payload.get("audio_path")
+            else None
+        ),
+        audio_sha256=(
+            str(prepared_payload["audio_sha256"])
+            if prepared_payload.get("audio_sha256")
+            else None
+        ),
+        subtitle=subtitle,
+        warnings=tuple(str(item) for item in prepared_payload.get("warnings", [])),
+    )
+    speech_payload = _mapping(payload, "speech")
+    evidence: list[SpeechSegment | SubtitleCue] = []
+    for item in speech_payload.get("evidence", []):
+        item_payload = _mapping(item, "evidence item")
+        model_payload = _mapping(item_payload, "payload")
+        if item_payload.get("kind") == "SUBTITLE_CUE":
+            evidence.append(SubtitleCue.model_validate(model_payload))
+        elif item_payload.get("kind") == "ASR_SEGMENT":
+            evidence.append(SpeechSegment.model_validate(model_payload))
+        else:
+            raise ValueError("转写快照包含未知证据类型")
+    speech = SpeechAnalysis(
+        transcript_source=cast(TranscriptSource, str(speech_payload["transcript_source"])),
+        evidence=tuple(evidence),
+        warnings=tuple(str(item) for item in speech_payload.get("warnings", [])),
+        boundary_candidates=tuple(
+            SpeechBoundaryCandidate(**_mapping(item, "boundary candidate"))
+            for item in speech_payload.get("boundary_candidates", [])
+        ),
+        stage_metrics=tuple(
+            StageMetric(**_mapping(item, "stage metric"))
+            for item in speech_payload.get("stage_metrics", [])
+        ),
+        stage_cache_hits=tuple(str(item) for item in speech_payload.get("stage_cache_hits", [])),
+    )
+    return TranscriptionCheckpoint(
+        registered=registered,
+        prepared=prepared,
+        speech=speech,
+        scene_index=SceneIndex.model_validate(_mapping(payload, "scene_index")),
+        base_segments=tuple(
+            BaseSegment.model_validate(item)
+            for item in payload.get("base_segments", [])
+        ),
+        stage_metrics={
+            str(key): int(value)
+            for key, value in _mapping(payload, "stage_metrics").items()
+        },
+        stage_cache_hits=tuple(str(item) for item in payload.get("stage_cache_hits", [])),
+    )
+
+
+def _mapping(value: object, name: str) -> Mapping[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"转写快照字段 {name} 必须是对象")
+    return value
 
 
 @dataclass(frozen=True, slots=True)

@@ -196,6 +196,8 @@ def test_native_silero_backend_reads_pcm16_without_third_party_audio_backend(
 ) -> None:
     from video_demo.speech.vad import NativeSileroBackend
 
+    pytest.importorskip("torch")
+
     class Module:
         @staticmethod
         def load_silero_vad() -> object:

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+from video_demo.api.app import create_app
 from video_demo.application.document_publication import ResultWriteFence
 from video_demo.application.document_rendering import render_markdown
+from video_demo.config import ApiRuntimeConfig
 from video_demo.domain.document import (
     DocumentGenerationConfig,
     DocumentGenerationMetadata,
@@ -27,6 +31,27 @@ from video_demo.domain.evidence import (
 )
 from video_demo.persistence.models import VideoSegmentModel, VideoSummaryModel
 from video_demo.persistence.repositories import JobRepository, Scope
+
+
+@pytest.fixture
+def client(tmp_path: Path, cloud_asr_environment: None) -> Iterator[TestClient]:
+    """结果接口测试使用无视频调度器容器，避免手工发布与后台消费竞争。"""
+
+    runtime_root = tmp_path / ".codex" / "video-rag-demo"
+    settings = ApiRuntimeConfig(
+        workspace_root=tmp_path,
+        runtime_root=runtime_root,
+        max_video_bytes=1024 * 1024,
+        max_result_bundle_bytes=64 * 1024 * 1024,
+        max_document_bytes=16 * 1024 * 1024,
+        max_result_evidence_items=25_000,
+        vlm_max_image_bytes=8 * 1024 * 1024,
+        max_audio_bytes=4 * 1024 * 1024 * 1024,
+        max_audio_duration_ms=7_200_000,
+        max_image_bytes=8 * 1024 * 1024,
+    )
+    with TestClient(create_app(settings)) as test_client:
+        yield test_client
 
 
 def _sha256(content: bytes | str) -> str:

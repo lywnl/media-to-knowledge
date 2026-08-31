@@ -65,33 +65,29 @@ uv sync --extra dev --extra speech --extra vision --extra evaluation
 
 任何缺少模型、外部凭据或授权评测素材的质量项都必须报告 `NOT_RUN`，不能用 mock 结果冒充通过。
 
-## 启动 API 与 Worker
+## 启动 API
 
-API 和 Worker 必须同时运行；API 只创建持久任务，Worker 才负责领取和处理：
+视频任务由 FastAPI 进程内的总调度器自动领取和处理；音频、图片任务仍可使用各自独立 Worker：
 
 ```bash
-.venv/bin/uvicorn video_demo.main:app --host 127.0.0.1 --port 8000
-.venv/bin/video-demo-worker
+.venv/bin/video-demo-api
 ```
 
-启动时 API 与 Worker 会使用 `.database-migration.lock` 串行升级运行时 SQLite。该机制仅支持
+API 默认监听 `127.0.0.1:7999`；如需直接使用 Uvicorn，等价命令为
+`.venv/bin/uvicorn video_demo.main:app --host 127.0.0.1 --port 7999`。
+
+启动时 API 会使用 `.database-migration.lock` 串行升级运行时 SQLite。该机制仅支持
 macOS/Linux 的本地文件系统；运行目录和数据库不得放在 NFS 等网络文件系统上，也不要依赖
 网络文件锁提供等价安全性。
 
-两个进程启动后，浏览器访问 `http://127.0.0.1:8000/`，选择一个本地视频并点击
+启动 API 后，浏览器访问 `http://127.0.0.1:7999/`，选择一个本地视频并点击
 “开始处理”。页面会自动完成上传、创建任务、查询处理状态和展示结果，内部固定使用
 `tenant-demo / app-demo / kb-demo` 作为本地演示作用域；现有 API 的调用方式不变。
 
-如果页面长时间停留在等待状态，请先确认 Worker 进程仍在运行。模型或外部服务凭据不完整时，
-Worker 会按现有错误语义结束任务，页面只展示后端返回的结果，不会用前端模拟处理成功。
+如果页面长时间停留在等待状态，请先查看 API 日志中的调度器阶段状态。模型或外部服务凭据不完整时，
+调度器会按现有错误语义结束任务，页面只展示后端返回的结果，不会用前端模拟处理成功。
 
-排查任务领取时可运行一次领取尝试：
-
-```bash
-.venv/bin/video-demo-worker --once --worker-id local-debug-worker
-```
-
-缺少 ffmpeg/ffprobe、Silero 运行依赖或外部服务凭据时，Worker 会以稳定错误码失败关闭，真实媒体、五语质量与性能验收保持 `NOT_RUN`。当前工作区已包含 FFmpeg/ffprobe 6.0，无需重复下载。
+缺少 ffmpeg/ffprobe、Silero 运行依赖或外部服务凭据时，视频任务会以稳定错误码失败关闭，真实媒体、五语质量与性能验收保持 `NOT_RUN`。当前工作区已包含 FFmpeg/ffprobe 6.0，无需重复下载。
 
 ## 唯一评测 CLI
 

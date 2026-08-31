@@ -204,7 +204,10 @@ def test_audio_publication_does_not_require_generic_media_constructor() -> None:
     assert "class AudioPublicationService" in source
 
 
-def test_video_worker_has_dedicated_composition_entrypoint() -> None:
-    source = Path("src/video_demo/worker_main.py").read_text(encoding="utf-8")
-    assert "video_demo.application.video_composition import build_worker" in source
-    assert Path("src/video_demo/application/video_composition.py").is_file()
+def test_video_tasks_use_fastapi_scheduler_and_keep_media_workers_independent() -> None:
+    composition = Path("src/video_demo/application/composition.py").read_text(encoding="utf-8")
+    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+    assert "def build_video_scheduler" in composition
+    assert "video-demo-worker" not in pyproject
+    assert "video-demo-audio-worker" in pyproject
+    assert "video-demo-image-worker" in pyproject

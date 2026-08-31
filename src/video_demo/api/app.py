@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -17,6 +19,7 @@ from video_demo.application.audio_publication import AudioPublicationService
 from video_demo.application.audio_queries import AudioQueryService
 from video_demo.application.audio_runs import AudioRunService
 from video_demo.application.audio_uploads import AudioUploadService
+from video_demo.application.composition import build_video_scheduler
 from video_demo.application.image_rendering import render_image_markdown
 from video_demo.application.media_publication import MediaPublicationService
 from video_demo.application.media_queries import MediaQueryService
@@ -25,7 +28,7 @@ from video_demo.application.media_uploads import MediaUploadService
 from video_demo.application.queries import ResultQueryService
 from video_demo.application.runs import RunService
 from video_demo.application.uploads import UploadService
-from video_demo.config import ApiRuntimeConfig, ApiRuntimeSettings, Settings
+from video_demo.config import ApiRuntimeConfig, Settings
 from video_demo.domain.image_document import ImageUnderstandingResult
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
@@ -34,6 +37,7 @@ from video_demo.persistence.models import (
     ImageObjectModel,
     ImageUnderstandingRunModel,
 )
+from video_demo.persistence.repositories import VideoStageRepository
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.audio_object_store import AudioObjectStore
 from video_demo.storage.image_object_store import ImageObjectStore
@@ -83,13 +87,34 @@ _PUBLIC_DETAIL_KEYS = frozenset(
 )
 
 
+def _has_model_configuration(settings: Settings) -> bool:
+    """区分测试中的空配置与生产配置错误，避免静默禁用调度器。"""
+
+    return any(
+        value
+        for value in (
+            settings.openai_base_url,
+            settings.openai_api_key,
+            settings.openai_model,
+            settings.text_llm_base_url,
+            settings.text_llm_api_key,
+            settings.text_llm_model_id,
+            settings.vlm_base_url,
+            settings.vlm_api_key,
+        )
+    )
+
+
 def create_app(
     settings: Settings | ApiRuntimeConfig | None = None,
 ) -> FastAPI:
+    settings_for_scheduler: Settings | None = None
     if settings is None:
-        runtime = ApiRuntimeSettings(_env_file=None).to_runtime_config()
+        settings_for_scheduler = Settings()
+        runtime = settings_for_scheduler.to_api_runtime_config()
     elif isinstance(settings, Settings):
         runtime = settings.to_api_runtime_config()
+        settings_for_scheduler = settings
     else:
         runtime = settings
     runtime.runtime_root.mkdir(parents=True, exist_ok=True)
@@ -159,13 +184,51 @@ def create_app(
         ),
     )
 
+    scheduler = None
+    try:
+        if settings_for_scheduler is not None:
+            scheduler = build_video_scheduler(
+                settings_for_scheduler,
+                database,
+                object_store,
+                container.result_query_service,
+            )
+            container = replace(
+                container,
+                run_service=RunService(database, scheduler),
+                video_scheduler=scheduler,
+            )
+    except VideoDemoError:
+        if settings_for_scheduler is not None and _has_model_configuration(settings_for_scheduler):
+            raise
+        scheduler = None
+    except AttributeError:
+        scheduler = None
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if scheduler is not None:
+            recoverable: list[tuple[object, str, object]] = []
+            with database.session() as session:
+                for record in VideoStageRepository(session).list_recoverable():
+                    recoverable.append((record.scope, record.run_id, record.stage_name))
+            scheduler.recover(tuple(recoverable))
+            scheduler.start()
+        try:
+            yield
+        finally:
+            if scheduler is not None:
+                scheduler.shutdown(wait=True, timeout=10)
+
     app = FastAPI(
+        lifespan=lifespan,
         title="视频理解文本 Demo",
         version="0.1.0",
         description="独立视频上传、异步理解与 Markdown 文本 API；证据接口仅供内部校验和诊断。",
     )
     web_root = Path(__file__).resolve().parent.parent / "web"
     app.state.container = container
+    app.state.video_scheduler = scheduler
     app.mount("/static", StaticFiles(directory=web_root), name="static")
 
     @app.get("/", include_in_schema=False)

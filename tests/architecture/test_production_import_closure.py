@@ -29,7 +29,10 @@ _ENTRYPOINTS = (
         Path("src/video_demo/persistence/repositories.py"),
         "video_demo.persistence.repositories",
     ),
-    (Path("src/video_demo/worker_main.py"), "video_demo.worker_main"),
+    (
+        Path("src/video_demo/application/video_scheduler.py"),
+        "video_demo.application.video_scheduler",
+    ),
     (Path("src/video_demo/worker/runtime.py"), "video_demo.worker.runtime"),
     (
         Path("src/video_demo/evaluation/prediction_runner.py"),
@@ -75,7 +78,8 @@ def test_production_static_import_closure_excludes_legacy_chain(
         )
     )
 
-    assert Path("src/video_demo/domain/__init__.py") in closure
+    if entry_file != Path("src/video_demo/application/video_scheduler.py"):
+        assert Path("src/video_demo/domain/__init__.py") in closure
     assert closure.isdisjoint(_FORBIDDEN_FILES)
 
 

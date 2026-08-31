@@ -72,6 +72,11 @@ class JobStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class VideoStageName(StrEnum):
+    TRANSCRIPTION = "TRANSCRIPTION"
+    LLM = "LLM"
+
+
 class ScopeColumns:
     tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
     application_id: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -401,6 +406,52 @@ class JobModel(ScopeColumns, TimestampColumns, Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     heartbeat_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error_code: Mapped[str | None] = mapped_column(String(128))
+
+
+class VideoPipelineStageModel(ScopeColumns, TimestampColumns, Base):
+    """视频跨进程可恢复的阶段状态；内存队列只负责调度，不承载事实。"""
+
+    __tablename__ = "video_pipeline_stage"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "application_id",
+            "knowledge_base_id",
+            "run_id",
+            "stage_name",
+            name="uq_video_stage_scope_run_name",
+        ),
+        Index(
+            "ix_video_stage_recovery",
+            "stage_name",
+            "status",
+            "next_attempt_at",
+            "lease_expires_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    stage_name: Mapped[VideoStageName] = mapped_column(
+        Enum(VideoStageName, native_enum=False, length=32),
+        nullable=False,
+    )
+    status: Mapped[JobStatus] = mapped_column(
+        Enum(JobStatus, native_enum=False, length=32),
+        nullable=False,
+        default=JobStatus.PENDING,
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        UtcDateTime(), nullable=False, default=utc_now,
+    )
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    heartbeat_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    checkpoint_relative_path: Mapped[str | None] = mapped_column(String(1024))
+    checkpoint_sha256: Mapped[str | None] = mapped_column(String(64))
     error_code: Mapped[str | None] = mapped_column(String(128))
 
 

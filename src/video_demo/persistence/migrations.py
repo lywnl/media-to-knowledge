@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - 受支持平台均提供，分支用�
     fcntl = None  # type: ignore[assignment]
 
 _LEGACY_REVISION = "0001_video_demo"
-_HEAD_REVISION = "0006_audio_document_result"
+_HEAD_REVISION = "0007_video_stage_scheduler"
 _SCOPE = {
     "tenant_id": ("VARCHAR(128)", False),
     "application_id": ("VARCHAR(128)", False),
@@ -178,6 +178,22 @@ _AUDIO_RESULT_COLUMNS = {
         payload_json=("JSON", False),
     ),
 }
+_VIDEO_STAGE_COLUMNS = {
+    "video_pipeline_stage": _columns(
+        run_id=("VARCHAR(128)", False),
+        stage_name=("VARCHAR(32)", False),
+        status=("VARCHAR(32)", False),
+        attempt_count=("INTEGER", False),
+        max_attempts=("INTEGER", False),
+        next_attempt_at=("DATETIME", False),
+        worker_id=("VARCHAR(128)", True),
+        lease_expires_at=("DATETIME", True),
+        heartbeat_at=("DATETIME", True),
+        checkpoint_relative_path=("VARCHAR(1024)", True),
+        checkpoint_sha256=("VARCHAR(64)", True),
+        error_code=("VARCHAR(128)", True),
+    ),
+}
 _HEAD_COLUMNS = {
     **_LEGACY_COLUMNS,
     "video_understanding_run": {
@@ -191,6 +207,7 @@ _HEAD_COLUMNS.update(_DOCUMENT_COLUMNS)
 _HEAD_COLUMNS.update(_MEDIA_OBJECT_COLUMNS)
 _HEAD_COLUMNS.update(_MEDIA_RUN_COLUMNS)
 _HEAD_COLUMNS.update(_AUDIO_RESULT_COLUMNS)
+_HEAD_COLUMNS.update(_VIDEO_STAGE_COLUMNS)
 _LEGACY_UNIQUES = {
     "video_object": {
         "uq_video_object_scope_ref": (
@@ -231,6 +248,15 @@ _LEGACY_UNIQUES = {
     },
     "video_summary": {
         "uq_video_summary_scope_run": ("tenant_id", "application_id", "knowledge_base_id", "run_id")
+    },
+    "video_pipeline_stage": {
+        "uq_video_stage_scope_run_name": (
+            "tenant_id",
+            "application_id",
+            "knowledge_base_id",
+            "run_id",
+            "stage_name",
+        ),
     },
     "audio_object": {
         "uq_audio_object_scope_ref": (
@@ -310,6 +336,11 @@ _LEGACY_INDEXES = {
         ),
     },
     "audio_summary": {},
+    "video_pipeline_stage": {
+        "ix_video_stage_recovery": (
+            "stage_name", "status", "next_attempt_at", "lease_expires_at",
+        ),
+    },
 }
 
 

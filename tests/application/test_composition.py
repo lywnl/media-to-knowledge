@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import inspect
-import shutil
 from pathlib import Path
-
-import pytest
 
 import video_demo.application.composition as composition
 from video_demo.application.chapter_vision import ChapterVisionService
@@ -16,7 +13,6 @@ from video_demo.application.production_media import (
 )
 from video_demo.application.production_scene import ProductionSceneIndexProvider
 from video_demo.config import Settings
-from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.storage.object_store import LocalVideoObjectStore
 
 
@@ -34,10 +30,6 @@ def _model_settings(tmp_path: Path, **overrides: object) -> Settings:
     }
     values.update(overrides)
     return Settings(**values, _env_file=None)
-
-
-def _copy_migrations(tmp_path: Path) -> None:
-    shutil.copytree(Path.cwd() / "migrations", tmp_path / "migrations")
 
 
 def test_production_composition_import_surface_contains_no_legacy_chain() -> None:
@@ -112,94 +104,29 @@ def test_text_and_vlm_fingerprints_are_component_isolated(tmp_path: Path) -> Non
     )
 
 
-@pytest.mark.parametrize(
-    "missing",
-    ["openai_api_key", "text_llm_api_key", "vlm_api_key"],
-)
-def test_worker_migrates_and_recovers_before_rejecting_model_configuration(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    missing: str,
-) -> None:
-    _copy_migrations(tmp_path)
-    settings = _model_settings(tmp_path, **{missing: None})
-    calls: list[str] = []
-    original_upgrade = composition.upgrade_runtime_database
-
-    def upgrade(*args: object, **kwargs: object) -> None:
-        calls.append("migrate")
-        original_upgrade(*args, **kwargs)
-
-    class Recovery:
-        def __init__(self, *_args: object, **_kwargs: object) -> None:
-            pass
-
-        def recover(self) -> None:
-            calls.append("recover")
-
-    monkeypatch.setattr(composition, "upgrade_runtime_database", upgrade)
-    monkeypatch.setattr(composition, "PublishedVisualCleanupRecovery", Recovery)
-    monkeypatch.setattr(
-        composition,
-        "build_production_pipeline",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("配置失败时不得构造 Pipeline")
-        ),
-    )
-
-    with pytest.raises(VideoDemoError) as raised:
-        composition.build_worker(settings, worker_id="worker-test")
-
-    assert raised.value.code == ErrorCode.INVALID_CONFIGURATION
-    assert calls == ["migrate", "recover"]
-
-
-def test_worker_startup_order_is_migrate_recover_require_then_pipeline(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _copy_migrations(tmp_path)
+def test_video_scheduler_composition_uses_two_cross_video_stage_slots(tmp_path: Path) -> None:
     settings = _model_settings(tmp_path)
-    calls: list[str] = []
-    original_upgrade = composition.upgrade_runtime_database
+    assert settings.runtime_root is not None
+    settings.runtime_root.mkdir(parents=True, exist_ok=True)
+    from video_demo.application.queries import ResultQueryService
+    from video_demo.persistence.database import Database
+    from video_demo.storage.artifacts import AtomicArtifactStore
 
-    def upgrade(*args: object, **kwargs: object) -> None:
-        calls.append("migrate")
-        original_upgrade(*args, **kwargs)
-
-    class Recovery:
-        def __init__(self, *_args: object, **_kwargs: object) -> None:
-            pass
-
-        def recover(self) -> None:
-            calls.append("recover")
-
-    for name, label in (
-        ("require_cloud_asr_configuration", "asr"),
-        ("require_text_llm_configuration", "text"),
-        ("require_vlm_configuration", "vlm"),
-    ):
-        original = getattr(Settings, name)
-
-        def wrapped(self: Settings, _original=original, _label=label):
-            calls.append(_label)
-            return _original(self)
-
-        monkeypatch.setattr(Settings, name, wrapped)
-
-    class Pipeline:
-        def close(self) -> None:
-            calls.append("pipeline-close")
-
-    monkeypatch.setattr(composition, "upgrade_runtime_database", upgrade)
-    monkeypatch.setattr(composition, "PublishedVisualCleanupRecovery", Recovery)
-    monkeypatch.setattr(
-        composition,
-        "build_production_pipeline",
-        lambda *_args, **_kwargs: calls.append("pipeline") or Pipeline(),
+    database = Database(f"sqlite+pysqlite:///{settings.runtime_root / 'scheduler.db'}")
+    database.create_schema()
+    object_store = LocalVideoObjectStore(
+        settings.runtime_root,
+        max_video_bytes=settings.max_video_bytes,
     )
-    worker = composition.build_worker(settings, worker_id="worker-order")
+    scheduler = composition.build_video_scheduler(
+        settings,
+        database,
+        object_store,
+        ResultQueryService(database, AtomicArtifactStore(settings.runtime_root)),
+    )
     try:
-        assert calls[:6] == ["migrate", "recover", "asr", "text", "vlm", "pipeline"]
+        snapshot = scheduler.snapshot()
+        assert snapshot["queues"]["TRANSCRIPTION"]["concurrency"] == 2  # type: ignore[index]
+        assert snapshot["queues"]["LLM"]["concurrency"] == 2  # type: ignore[index]
     finally:
-        worker.close()
+        scheduler.shutdown(wait=True, timeout=1)

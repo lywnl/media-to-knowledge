@@ -24,6 +24,7 @@ from video_demo.persistence.repositories import (
     JobRepository,
     VideoObjectRepository,
     VideoRunRepository,
+    VideoStageRepository,
 )
 from video_demo.persistence.scope import Scope
 
@@ -64,8 +65,9 @@ class JobView:
 
 
 class RunService:
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, scheduler: object | None = None) -> None:
         self._database = database
+        self._scheduler = scheduler
 
     def create(
         self,
@@ -128,7 +130,13 @@ class RunService:
                 job_id=job_id,
                 run_id=run_id,
             )
-            return _run_view(run, job_id)
+            VideoStageRepository(session).ensure(scope, run_id)
+            view = _run_view(run, job_id)
+        if self._scheduler is not None:
+            result = self._scheduler.submit(scope, run_id)
+            if result == "rejected":
+                raise VideoDemoError(ErrorCode.JOB_NOT_RETRYABLE, "视频调度器暂不可用")
+        return view
 
     @staticmethod
     def _same_config(snapshot: dict[str, object], expected: PipelineRunConfig) -> bool:
@@ -190,8 +198,19 @@ class RunService:
             return _job_view(job)
 
     def retry_job(self, scope: Scope, job_id: str) -> JobView:
+        stage_to_submit = None
+        resource_id = None
         with self._database.session() as session:
-            return _job_view(JobRepository(session).retry(scope, job_id))
+            repository = JobRepository(session)
+            job = repository.retry(scope, job_id)
+            if job.resource_type == "VIDEO_UNDERSTANDING_RUN":
+                resource_id = job.resource_id
+                reset = VideoStageRepository(session).reset_for_retry(scope, resource_id)
+                stage_to_submit = reset[0] if reset else None
+            view = _job_view(job)
+        if self._scheduler is not None and resource_id is not None and stage_to_submit is not None:
+            self._scheduler.submit(scope, resource_id, stage_to_submit)
+        return view
 
 
 def _run_view(run: VideoUnderstandingRunModel, job_id: str) -> RunView:
