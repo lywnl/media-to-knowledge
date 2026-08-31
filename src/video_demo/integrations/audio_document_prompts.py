@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from video_demo.integrations.audio_document_port import (
+    AudioChapterBoundaryCoordinationRequest,
     AudioChapterPlanningRequest,
     AudioChapterPlanRepairRequest,
     AudioChapterWritingRepairRequest,
@@ -41,11 +42,31 @@ def prompt_for_audio_planning(request: AudioChapterPlanningRequest) -> tuple[str
 def prompt_for_audio_plan_repair(request: AudioChapterPlanRepairRequest) -> tuple[str, str, str]:
     return _prompt(
         request.prompt_version,
-        "只修复音频章节范围和结构，必须按原片段顺序完整覆盖，不添加原证据之外的事实。只返回 JSON。",
+        (
+            "只修复音频章节范围和结构，不添加原证据之外的事实。"
+            "必须满足 0 ≤ start_segment_index < end_segment_index；"
+            "普通章节 end_segment_index 不得超过 segments 长度；"
+            "最后一个章节最多允许 segments 长度加 1，程序最终会归一化为 segments 长度。"
+            "所有范围必须按原片段顺序连续、完整覆盖且不可重复消费任何片段。只返回 JSON。"
+        ),
         {
             "request": _planning_context(request.request),
             "invalid_response": request.invalid_response.model_dump(mode="json"),
         },
+    )
+
+
+def prompt_for_audio_boundary_coordination(
+    request: AudioChapterBoundaryCoordinationRequest,
+) -> tuple[str, str, str]:
+    return _prompt(
+        request.prompt_version,
+        (
+            "只判断相邻批次边界是否属于同一主题。每个 boundary_index 只能返回 KEEP 或 MERGE；"
+            "不得创建章节，不得返回时间或片段范围。只有明确连续且主题相同才返回 MERGE，"
+            "否则返回 KEEP。只返回 JSON。"
+        ),
+        request.model_dump(mode="json"),
     )
 
 

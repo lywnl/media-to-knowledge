@@ -47,6 +47,51 @@ class AudioChapterPlanningResponse(FrozenModel):
     chapter_drafts: tuple[AudioChapterDraft, ...] = Field(min_length=1, max_length=240)
 
 
+class AudioChapterBoundaryInput(FrozenModel):
+    """跨批次音频章节边界协调所需的最小事实投影。"""
+
+    boundary_index: int = Field(ge=0)
+    left_title_hint: str = Field(min_length=1, max_length=200)
+    right_title_hint: str = Field(min_length=1, max_length=200)
+    left_duration_ms: int = Field(gt=0, le=300_000)
+    right_duration_ms: int = Field(gt=0, le=300_000)
+    left_tail_evidence: tuple[AudioTranscriptEvidence, ...] = Field(max_length=2)
+    right_head_evidence: tuple[AudioTranscriptEvidence, ...] = Field(max_length=2)
+
+
+class AudioChapterBoundaryCoordinationRequest(FrozenModel):
+    boundaries: tuple[AudioChapterBoundaryInput, ...] = Field(min_length=1, max_length=63)
+    prompt_version: Literal["audio-chapter-boundary-coordinator-v1"]
+
+    @model_validator(mode="after")
+    def validate_request_size(self) -> AudioChapterBoundaryCoordinationRequest:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > 64 * 1024:
+            raise ValueError("音频章节边界协调请求超过 64 KiB")
+        return self
+
+
+class AudioChapterBoundaryDecision(FrozenModel):
+    boundary_index: int = Field(ge=0)
+    decision: Literal["KEEP", "MERGE"]
+    merged_title_hint: str | None = Field(default=None, max_length=200)
+
+
+class AudioChapterBoundaryCoordinationResponse(FrozenModel):
+    decisions: tuple[AudioChapterBoundaryDecision, ...] = Field(max_length=63)
+
+    @model_validator(mode="after")
+    def reject_duplicate_boundaries(self) -> AudioChapterBoundaryCoordinationResponse:
+        values = tuple(item.boundary_index for item in self.decisions)
+        if len(values) != len(set(values)):
+            raise ValueError("音频边界协调 decisions.boundary_index 不得重复")
+        return self
+
+
 class AudioInvalidModelResponse(FrozenModel):
     content_sha256: Sha256
     validation_errors: tuple[str, ...] = Field(min_length=1, max_length=32)
@@ -137,6 +182,13 @@ class AudioTextPort(Protocol):
         *,
         on_provider_attempt: Callable[[], None] | None = None,
     ) -> AudioChapterPlanningResponse: ...
+
+    def coordinate_chapter_boundaries(
+        self,
+        request: AudioChapterBoundaryCoordinationRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> AudioChapterBoundaryCoordinationResponse: ...
 
 
 class AudioChapterWritingRequest(FrozenModel):

@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field, ValidationError
 from video_demo.domain.audio_plan import AudioChapterDraft
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.audio_document_port import (
+    AudioChapterBoundaryCoordinationRequest,
+    AudioChapterBoundaryCoordinationResponse,
     AudioChapterPlanningRequest,
     AudioChapterPlanningResponse,
     AudioChapterPlanRepairRequest,
@@ -26,6 +28,7 @@ from video_demo.integrations.audio_document_port import (
     audio_invalid_model_response,
 )
 from video_demo.integrations.audio_document_prompts import (
+    prompt_for_audio_boundary_coordination,
     prompt_for_audio_global,
     prompt_for_audio_global_repair,
     prompt_for_audio_plan_repair,
@@ -37,6 +40,7 @@ from video_demo.integrations.model_response import (
     extract_model_message_content,
     parse_json_content,
     strip_removed_document_fields,
+    unwrap_single_response_envelope,
 )
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
@@ -96,6 +100,7 @@ class AudioDocumentClient(AudioDocumentTextPort):
             extra_payload={"thinking": {"type": "disabled"}},
         )
         try:
+            compact = _normalize_audio_compact_response(compact, len(request.segments))
             return _expand_planning_response(compact, request)
         except VideoDemoError as error:
             raise AudioModelResponseValidationError(
@@ -122,6 +127,10 @@ class AudioDocumentClient(AudioDocumentTextPort):
             extra_payload={"thinking": {"type": "disabled"}},
         )
         try:
+            compact = _normalize_audio_compact_response(
+                compact,
+                len(request.request.segments),
+            )
             return _expand_planning_response(compact, request.request)
         except VideoDemoError as error:
             raise AudioModelResponseValidationError(
@@ -132,6 +141,20 @@ class AudioDocumentClient(AudioDocumentTextPort):
                     parsed_json=compact.model_dump(mode="json"),
                 ),
             ) from None
+
+    def coordinate_chapter_boundaries(
+        self,
+        request: AudioChapterBoundaryCoordinationRequest,
+        *,
+        on_provider_attempt: Callable[[], None] | None = None,
+    ) -> AudioChapterBoundaryCoordinationResponse:
+        return self._call(
+            prompt_for_audio_boundary_coordination(request),
+            AudioChapterBoundaryCoordinationResponse,
+            "audio_chapter_boundary_coordination_v1",
+            on_provider_attempt,
+            extra_payload={"thinking": {"type": "disabled"}},
+        )
 
     def write_chapter(
         self,
@@ -219,19 +242,7 @@ class AudioDocumentClient(AudioDocumentTextPort):
         }
         if extra_payload:
             payload.update(extra_payload)
-        try:
-            raw = self._post(payload, callback)
-        except VideoDemoError as error:
-            if error.code != ErrorCode.TEXT_LLM_CAPABILITY_UNAVAILABLE:
-                raise
-            # 部分 OpenAI 兼容代理不接受 json_schema；退到 json_object 后仍由
-            # 本地宽松 JSON 解析和音频业务校验收口，不把一次能力差异变成章节兜底。
-            _LOGGER.warning(
-                "音频文本模型不支持 json_schema，改用 json_object: schema=%s",
-                schema_name,
-            )
-            payload["response_format"] = {"type": "json_object"}
-            raw = self._post(payload, callback)
+        raw = self._post(payload, callback)
         return _parse_audio_response(raw, response_type)
 
     def _post(self, payload: dict[str, object], callback: Callable[[], None] | None) -> bytes:
@@ -314,35 +325,190 @@ def _schema_name(payload: dict[str, object]) -> str:
 
 
 def _parse_audio_response(raw: bytes, response_type: type[ResponseModel]) -> ResponseModel:
-    envelope: object | None = None
-    message = ""
+    raw_message, parsed, finish_reason = _extract_audio_model_message(raw)
     try:
-        envelope = json.loads(raw)
-        message = extract_model_message_content(envelope)
-        if not message:
-            raise ValueError("response_envelope:invalid")
-        parsed = parse_json_content(message)
-    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
-        raise AudioModelResponseValidationError(
-            "音频文本模型响应结构非法",
-            audio_invalid_model_response(
-                message.encode("utf-8") if message else raw,
-                ("response_envelope:invalid",),
-                parsed_json=envelope,
-            ),
-        ) from error
-    try:
-        return response_type.model_validate(strip_removed_document_fields(parsed))
+        normalized = _normalize_audio_response_payload(
+            unwrap_single_response_envelope(strip_removed_document_fields(parsed)),
+            response_type,
+        )
+        return response_type.model_validate(normalized)
     except ValidationError as error:
         summaries = tuple(_pydantic_error_summary(item) for item in error.errors())
+        _LOGGER.warning(
+            "音频文本模型响应校验失败 finish_reason=%s response_bytes=%d "
+            "validation_errors=%s",
+            finish_reason,
+            len(raw_message),
+            ",".join(summaries[:8]),
+        )
         raise AudioModelResponseValidationError(
             "音频文本模型响应结构非法",
             audio_invalid_model_response(
-                message.encode("utf-8"),
+                raw_message,
                 summaries,
                 parsed_json=parsed,
             ),
         ) from None
+
+
+def _extract_audio_model_message(
+    content: bytes,
+) -> tuple[bytes, object, str]:
+    envelope: object | None = None
+    raw_message: bytes | None = None
+    finish_reason = "unknown"
+    try:
+        envelope = json.loads(
+            content,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+        if not isinstance(envelope, dict):
+            raise ValueError
+        choices = envelope.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            value = choices[0].get("finish_reason")
+            if isinstance(value, str):
+                normalized = " ".join(value.split())
+                if normalized and len(normalized) <= 64 and all(
+                    character.isprintable() for character in normalized
+                ):
+                    finish_reason = normalized
+        message = extract_model_message_content(envelope)
+        if not message:
+            raise ValueError
+        raw_message = message.encode("utf-8")
+        parsed = parse_json_content(message)
+        return raw_message, parsed, finish_reason
+    except (KeyError, IndexError, TypeError, ValueError, UnicodeDecodeError) as error:
+        _LOGGER.warning(
+            "音频文本模型响应解析失败 finish_reason=%s response_bytes=%d "
+            "validation_errors=response_envelope:invalid",
+            finish_reason,
+            len(raw_message) if raw_message is not None else len(content),
+        )
+        raise AudioModelResponseValidationError(
+            "音频文本模型响应结构非法",
+            audio_invalid_model_response(
+                raw_message if raw_message is not None else content,
+                ("response_envelope:invalid",),
+                parsed_json=envelope if raw_message is None else None,
+            ),
+        ) from error
+
+
+def _normalize_audio_compact_response(
+    response: _CompactResponse,
+    segment_count: int,
+) -> _CompactResponse:
+    """裁掉尾部空草稿，归一化边界并验证范围完整覆盖当前批次。"""
+
+    drafts = list(response.chapter_drafts)
+    while len(drafts) > 1 and drafts[-1].start_segment_index == drafts[-1].end_segment_index:
+        drafts.pop()
+    expected_start = 0
+    for index, draft in enumerate(drafts):
+        if draft.end_segment_index > segment_count:
+            if index != len(drafts) - 1 or draft.end_segment_index != segment_count + 1:
+                raise VideoDemoError(
+                    ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+                    "音频章节片段范围越界",
+                )
+            drafts[index] = draft.model_copy(update={"end_segment_index": segment_count})
+            draft = drafts[index]
+        if draft.start_segment_index >= draft.end_segment_index:
+            raise VideoDemoError(
+                ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+                "音频章节片段范围为空",
+            )
+        if draft.start_segment_index != expected_start:
+            raise VideoDemoError(
+                ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+                "音频章节片段范围不连续",
+            )
+        expected_start = draft.end_segment_index
+    if expected_start != segment_count:
+        raise VideoDemoError(
+            ErrorCode.TEXT_LLM_RESPONSE_INVALID,
+            "音频章节未完整覆盖片段",
+        )
+    normalized = tuple(drafts)
+    if normalized == response.chapter_drafts:
+        return response
+    return _CompactResponse(chapter_drafts=normalized)
+
+
+def _normalize_audio_response_payload(
+    value: object,
+    response_type: type[ResponseModel],
+) -> object:
+    """在音频适配器边界兼容常见包装、数组和字段别名。"""
+
+    if isinstance(value, list):
+        if response_type is _CompactResponse:
+            return _normalize_audio_compact_payload({"chapter_drafts": value})
+        if response_type is AudioChapterPlanningResponse:
+            return {"chapter_drafts": value}
+        if response_type is AudioChapterBoundaryCoordinationResponse:
+            return {"decisions": value}
+        return value
+    if not isinstance(value, dict):
+        return value
+    if response_type is _CompactResponse:
+        return _normalize_audio_compact_payload(value)
+    if response_type is AudioChapterBoundaryCoordinationResponse:
+        return _normalize_audio_boundary_payload(value)
+    if response_type is AudioChapterWritingResponse:
+        normalized = dict(value)
+        normalized.setdefault("body_blocks", [])
+        normalized.setdefault("claims", [])
+        return normalized
+    return value
+
+
+def _normalize_audio_compact_payload(value: dict[str, object]) -> dict[str, object]:
+    raw_drafts = value.get("chapter_drafts")
+    if not isinstance(raw_drafts, list):
+        return value
+    drafts: list[object] = []
+    for raw_draft in raw_drafts:
+        if not isinstance(raw_draft, dict):
+            drafts.append(raw_draft)
+            continue
+        draft = {
+            key: raw_draft[key]
+            for key in ("start_segment_index", "end_segment_index", "title_hint")
+            if key in raw_draft
+        }
+        if "title_hint" not in draft and isinstance(raw_draft.get("title"), str):
+            draft["title_hint"] = raw_draft["title"]
+        for key in ("start_segment_index", "end_segment_index"):
+            if isinstance(draft.get(key), str) and draft[key].strip().lstrip("-").isdigit():
+                draft[key] = int(draft[key])
+        drafts.append(draft)
+    return {"chapter_drafts": drafts}
+
+
+def _normalize_audio_boundary_payload(value: dict[str, object]) -> dict[str, object]:
+    decisions = value.get("decisions")
+    if not isinstance(decisions, list):
+        return value
+    normalized: list[object] = []
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            normalized.append(decision)
+            continue
+        item = {
+            key: decision[key]
+            for key in ("boundary_index", "decision", "merged_title_hint")
+            if key in decision
+        }
+        if (
+            isinstance(item.get("boundary_index"), str)
+            and item["boundary_index"].strip().lstrip("-").isdigit()
+        ):
+            item["boundary_index"] = int(item["boundary_index"])
+        normalized.append(item)
+    return {"decisions": normalized}
 
 
 def _pydantic_error_summary(error: object) -> str:
@@ -350,7 +516,26 @@ def _pydantic_error_summary(error: object) -> str:
         return "response:invalid"
     location = ".".join(str(item) for item in error.get("loc", ())) or "response"
     error_type = str(error.get("type", "invalid"))
-    return f"{location}:{error_type}"[:500]
+    summary = f"{location}:{error_type}"
+    if error_type == "value_error":
+        context = error.get("ctx")
+        reason = context.get("error") if isinstance(context, dict) else None
+        reason_text = str(reason).strip() if reason is not None else ""
+        if _is_safe_validation_reason(reason_text):
+            summary += f":{reason_text}"
+    return summary[:500]
+
+
+def _is_safe_validation_reason(value: str) -> bool:
+    """只把固定的业务校验原因带入音频修复上下文，避免回显模型内容。"""
+
+    if not value or len(value) > 200 or any(ord(char) < 32 for char in value):
+        return False
+    lowered = value.lower()
+    return not any(
+        marker in lowered
+        for marker in ("http://", "https://", "data:", "bearer ", "api_key", "token")
+    )
 
 
 def _model_dump_bytes(model: BaseModel) -> bytes:
@@ -391,30 +576,14 @@ def _expand_planning_response(
     request: AudioChapterPlanningRequest,
 ) -> AudioChapterPlanningResponse:
     segment_ids = tuple(item.segment_id for item in request.segments)
-    drafts = []
-    expected_start = 0
-    for draft in response.chapter_drafts:
-        if draft.end_segment_index > len(segment_ids):
-            if (
-                draft is response.chapter_drafts[-1]
-                and draft.end_segment_index == len(segment_ids) + 1
-            ):
-                end = len(segment_ids)
-            else:
-                raise VideoDemoError(ErrorCode.TEXT_LLM_RESPONSE_INVALID, "音频章节片段范围越界")
-        else:
-            end = draft.end_segment_index
-        if draft.start_segment_index >= end:
-            raise VideoDemoError(ErrorCode.TEXT_LLM_RESPONSE_INVALID, "音频章节片段范围为空")
-        if draft.start_segment_index != expected_start:
-            raise VideoDemoError(ErrorCode.TEXT_LLM_RESPONSE_INVALID, "音频章节片段范围不连续")
-        drafts.append(
+    return AudioChapterPlanningResponse(
+        chapter_drafts=tuple(
             AudioChapterDraft(
-                segment_refs=segment_ids[draft.start_segment_index : end],
+                segment_refs=segment_ids[
+                    draft.start_segment_index : draft.end_segment_index
+                ],
                 title_hint=draft.title_hint,
-            ),
-        )
-        expected_start = end
-    if sum(len(item.segment_refs) for item in drafts) != len(segment_ids):
-        raise VideoDemoError(ErrorCode.TEXT_LLM_RESPONSE_INVALID, "音频章节未完整覆盖片段")
-    return AudioChapterPlanningResponse(chapter_drafts=tuple(drafts))
+            )
+            for draft in response.chapter_drafts
+        ),
+    )

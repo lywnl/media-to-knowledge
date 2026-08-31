@@ -7,9 +7,16 @@ import pytest
 
 from video_demo.domain.audio_plan import AudioBaseSegment, AudioDocumentConfig
 from video_demo.domain.evidence import SpeechSegment
-from video_demo.errors import VideoDemoError
-from video_demo.integrations.audio_document_client import AudioDocumentClient
-from video_demo.integrations.audio_document_port import AudioChapterPlanningRequest
+from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.integrations.audio_document_client import (
+    AudioDocumentClient,
+    _pydantic_error_summary,
+)
+from video_demo.integrations.audio_document_port import (
+    AudioChapterBoundaryCoordinationRequest,
+    AudioChapterPlanningRequest,
+    AudioModelResponseValidationError,
+)
 
 
 def test_audio_client_expands_compact_ranges_and_uses_audio_schema() -> None:
@@ -192,6 +199,215 @@ def test_audio_client_normalizes_final_segment_count_plus_one() -> None:
         "audio_segment_0",
         "audio_segment_1",
         "audio_segment_2",
+    )
+
+
+def test_audio_client_wraps_invalid_normalization_as_model_response_error() -> None:
+    client = _client_for_body(
+        {
+            "chapter_drafts": [
+                {"start_segment_index": 0, "end_segment_index": 5, "title_hint": "越界"},
+            ],
+        },
+    )
+
+    with pytest.raises(AudioModelResponseValidationError) as raised:
+        client.plan_chapters(_planning_request())
+
+    assert raised.value.invalid_response.validation_errors == ("音频章节片段范围越界",)
+
+
+def test_audio_client_unwraps_result_envelope_and_top_level_draft_array() -> None:
+    client = _client_for_body(
+        {
+            "result": [
+                {
+                    "start_segment_index": "0",
+                    "end_segment_index": "3",
+                    "title": "主题",
+                    "key_points": ["旧字段"],
+                },
+            ],
+        },
+    )
+
+    response = client.plan_chapters(_planning_request())
+
+    assert response.chapter_drafts[0].title_hint == "主题"
+    assert response.chapter_drafts[0].segment_refs == tuple(
+        item.segment_id for item in _planning_request().segments
+    )
+
+
+def test_audio_client_retries_temporary_failure_before_parsing() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503, request=request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "chapter_drafts": [
+                                        {
+                                            "start_segment_index": 0,
+                                            "end_segment_index": 3,
+                                            "title_hint": "主题",
+                                        },
+                                    ],
+                                },
+                            ),
+                        },
+                    },
+                ],
+            },
+            request=request,
+        )
+
+    client = AudioDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="secret",
+        model_id="text-model",
+        max_attempts=2,
+        sleeper=sleeps.append,
+    )
+
+    response = client.plan_chapters(_planning_request())
+
+    assert response.chapter_drafts[0].title_hint == "主题"
+    assert attempts == 2
+    assert sleeps == [1]
+
+
+def test_audio_client_does_not_retry_capability_error() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(404, request=request)
+
+    client = AudioDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="secret",
+        model_id="text-model",
+        max_attempts=3,
+        sleeper=lambda _delay: None,
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        client.plan_chapters(_planning_request())
+
+    assert raised.value.code == ErrorCode.TEXT_LLM_CAPABILITY_UNAVAILABLE
+    assert attempts == 1
+
+
+def test_audio_client_validation_summary_keeps_only_safe_provider_reason() -> None:
+    assert _pydantic_error_summary(
+        {
+            "loc": ("chapter_drafts", 0, "title_hint"),
+            "type": "value_error",
+            "ctx": {"error": "标题内容不符合约束"},
+        },
+    ) == "chapter_drafts.0.title_hint:value_error:标题内容不符合约束"
+    assert _pydantic_error_summary(
+        {
+            "loc": ("chapter_drafts",),
+            "type": "value_error",
+            "ctx": {"error": "https://example.invalid/secret"},
+        },
+    ) == "chapter_drafts:value_error"
+
+
+def test_audio_client_normalizes_boundary_coordination_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "result": {
+                                        "decisions": [
+                                            {
+                                                "boundary_index": "0",
+                                                "decision": "KEEP",
+                                            },
+                                        ],
+                                    },
+                                },
+                            ),
+                        },
+                    },
+                ],
+            },
+            request=request,
+        )
+
+    request = AudioChapterBoundaryCoordinationRequest(
+        boundaries=(
+            {
+                "boundary_index": 0,
+                "left_title_hint": "左",
+                "right_title_hint": "右",
+                "left_duration_ms": 60_000,
+                "right_duration_ms": 60_000,
+                "left_tail_evidence": (),
+                "right_head_evidence": (),
+            },
+        ),
+        prompt_version="audio-chapter-boundary-coordinator-v1",
+    )
+    client = AudioDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="secret",
+        model_id="text-model",
+        max_attempts=1,
+        sleeper=lambda _delay: None,
+    )
+
+    response = client.coordinate_chapter_boundaries(request)
+
+    assert response.decisions[0].boundary_index == 0
+    assert response.decisions[0].decision == "KEEP"
+
+
+def test_audio_client_ignores_trailing_empty_draft_without_repair() -> None:
+    client = _client_for_body(
+        {
+            "chapter_drafts": [
+                {
+                    "start_segment_index": 0,
+                    "end_segment_index": 3,
+                    "title_hint": "章节",
+                },
+                {
+                    "start_segment_index": 3,
+                    "end_segment_index": 3,
+                    "title_hint": "多余空章",
+                },
+            ],
+        },
+    )
+
+    response = client.plan_chapters(_planning_request())
+
+    assert len(response.chapter_drafts) == 1
+    assert response.chapter_drafts[0].segment_refs == tuple(
+        item.segment_id for item in _planning_request().segments
     )
 
 
