@@ -494,7 +494,6 @@ class PredictionRunner:
                     relative_path=f"visual/keyframes/{public_item.sha256}.jpg",
                     mime_type=public_item.mime_type,
                     sha256=public_item.sha256,
-                    perceptual_hash=public_item.perceptual_hash,
                     size_bytes=public_item.size_bytes,
                 )
                 response = client.get(

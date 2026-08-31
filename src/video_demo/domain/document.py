@@ -19,7 +19,7 @@ from video_demo.domain.run import TimeRange
 from video_demo.domain.title import TITLE_MAX_LENGTH, sanitize_document_title
 from video_demo.errors import ErrorCode, VideoDemoError
 
-RESULT_SCHEMA_VERSION: Literal["4.1.0"] = "4.1.0"
+RESULT_SCHEMA_VERSION: Literal["4.2.0"] = "4.2.0"
 TranscriptSource: TypeAlias = Literal["SUBTITLE", "ASR", "NONE"]
 _TITLE_MAX_LENGTH = TITLE_MAX_LENGTH
 _VISUAL_CAPTION_MAX_LENGTH = 2_000
@@ -199,7 +199,7 @@ class DocumentGenerationMetadata(FrozenModel):
 
 
 class VideoUnderstandingResult(FrozenModel):
-    schema_version: Literal["4.1.0"] = RESULT_SCHEMA_VERSION
+    schema_version: Literal["4.2.0"] = RESULT_SCHEMA_VERSION
     run_id: StableId
     asset_sha256: Sha256
     summary: VideoDocumentSummary

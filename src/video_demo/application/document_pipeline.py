@@ -3,15 +3,11 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Mapping
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import replace
 from pathlib import Path
-from threading import Event
-from typing import Protocol, TypeVar, cast
+from typing import Protocol, TypeVar
 
 from video_demo.application.base_segments import (
     build_base_segments,
-    build_text_only_base_segments,
 )
 from video_demo.application.chapter_frames import ChapterFrameSearchBatch
 from video_demo.application.chapter_planning import ChapterPlanningBatch
@@ -26,14 +22,12 @@ from video_demo.application.pipeline_contracts import (
     PreparedMedia,
     ProbedAsset,
     RegisteredAsset,
-    SceneIndex,
     SpeechAnalysis,
     StageMetric,
     TranscriptionCheckpoint,
     merge_model_metrics,
     merge_run_statuses,
     require_result_evidence_budget,
-    scene_index_sha256,
     stable_merge_document_evidence,
     stable_merge_warnings,
 )
@@ -46,7 +40,6 @@ from video_demo.domain.document_plan import BaseSegment, ChapterPlan
 from video_demo.domain.evidence import (
     DocumentEvidenceItem,
     KeyframeEvidence,
-    SceneBoundary,
     SpeechSegment,
     SubtitleCue,
     VisualObservationEvidence,
@@ -57,30 +50,6 @@ from video_demo.storage.workspace import safe_runtime_path
 
 StageResult = TypeVar("StageResult")
 _LOGGER = logging.getLogger(__name__)
-
-
-def _is_optional_scene_failure(error: VideoDemoError) -> bool:
-    return error.code in {
-        ErrorCode.VISUAL_MEDIA_INVALID,
-        ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE,
-        ErrorCode.VISUAL_RESULT_INVALID,
-    }
-
-
-def _empty_scene_index(media: PreparedMedia) -> SceneIndex:
-    digest = scene_index_sha256(
-        proxy_sha256=media.proxy_sha256,
-        duration_ms=media.source.duration_ms,
-        frame_tolerance_ms=100,
-        scenes=(),
-    )
-    return SceneIndex(
-        proxy_sha256=media.proxy_sha256,
-        duration_ms=media.source.duration_ms,
-        frame_tolerance_ms=100,
-        scenes=(),
-        index_sha256=digest,
-    )
 
 
 class AssetRegistrar(Protocol):
@@ -109,16 +78,6 @@ class SpeechAnalyzer(Protocol):
     ) -> SpeechAnalysis: ...
 
 
-class SceneIndexProvider(Protocol):
-    def prepare_scene_index(
-        self,
-        media: PreparedMedia,
-        *,
-        limits: EvidencePreparationLimits,
-        is_cancel_requested: Callable[[], bool],
-    ) -> SceneIndex: ...
-
-
 class ChapterPlannerPort(Protocol):
     def plan(
         self,
@@ -129,7 +88,6 @@ class ChapterPlannerPort(Protocol):
         duration_ms: int,
         segments: tuple[BaseSegment, ...],
         transcript_evidence: tuple[SpeechSegment | SubtitleCue, ...],
-        scenes: tuple[SceneBoundary, ...],
         document_config: DocumentGenerationConfig,
         is_cancel_requested: Callable[[], bool],
     ) -> ChapterPlanningBatch: ...
@@ -141,7 +99,6 @@ class ChapterFrameSearcherPort(Protocol):
         media: PreparedMedia,
         chapters: tuple[ChapterPlan, ...],
         transcript_by_id: Mapping[str, SpeechSegment | SubtitleCue],
-        scene_index: SceneIndex,
         document_config: DocumentGenerationConfig,
         *,
         is_cancel_requested: Callable[[], bool],
@@ -206,7 +163,6 @@ class VideoUnderstandingPipeline:
         probe: AssetProbe,
         transcoder: MediaTranscoder,
         speech_analyzer: SpeechAnalyzer,
-        scene_index_provider: SceneIndexProvider,
         chapter_planner: ChapterPlannerPort,
         frame_searcher: ChapterFrameSearcherPort,
         chapter_vision: ChapterVisionPort,
@@ -224,7 +180,6 @@ class VideoUnderstandingPipeline:
         self._probe = probe
         self._transcoder = transcoder
         self._speech_analyzer = speech_analyzer
-        self._scene_index_provider = scene_index_provider
         self._chapter_planner = chapter_planner
         self._frame_searcher = frame_searcher
         self._chapter_vision = chapter_vision
@@ -250,10 +205,6 @@ class VideoUnderstandingPipeline:
     @property
     def speech_analyzer(self) -> SpeechAnalyzer:
         return self._speech_analyzer
-
-    @property
-    def scene_index_provider(self) -> SceneIndexProvider:
-        return self._scene_index_provider
 
     @property
     def chapter_planner(self) -> ChapterPlannerPort:
@@ -301,7 +252,7 @@ class VideoUnderstandingPipeline:
                 is_cancel_requested=context.is_cancel_requested,
             ),
         )
-        speech, scene_index, base_segments = self._run_evidence_preparation(
+        speech, base_segments = self._run_evidence_preparation(
             context,
             registered,
             prepared,
@@ -311,7 +262,6 @@ class VideoUnderstandingPipeline:
             registered=registered,
             prepared=prepared,
             speech=speech,
-            scene_index=scene_index,
             base_segments=base_segments,
             stage_metrics=stage_metrics.complete(),
             stage_cache_hits=speech.stage_cache_hits,
@@ -331,7 +281,6 @@ class VideoUnderstandingPipeline:
         registered = checkpoint.registered
         prepared = checkpoint.prepared
         speech = checkpoint.speech
-        scene_index = checkpoint.scene_index
         base_segments = checkpoint.base_segments
         model_cache = checkpoint.model_cache or self._new_run_cache(registered)
         planning_batch = self._run_chapter_planning(
@@ -341,7 +290,6 @@ class VideoUnderstandingPipeline:
             registered,
             prepared,
             speech,
-            scene_index,
             base_segments,
         )
         chapter_plans = planning_batch.plans
@@ -353,7 +301,6 @@ class VideoUnderstandingPipeline:
                 prepared,
                 chapter_plans,
                 speech.transcript_by_id,
-                scene_index,
                 context.document_config,
                 is_cancel_requested=context.is_cancel_requested,
             ),
@@ -412,7 +359,6 @@ class VideoUnderstandingPipeline:
         registered: RegisteredAsset,
         prepared: PreparedMedia,
         speech: SpeechAnalysis,
-        scene_index: SceneIndex,
         base_segments: tuple[BaseSegment, ...],
     ) -> ChapterPlanningBatch:
         return self._run_stage(
@@ -426,7 +372,6 @@ class VideoUnderstandingPipeline:
                 duration_ms=prepared.source.duration_ms,
                 segments=base_segments,
                 transcript_evidence=speech.transcript_evidence,
-                scenes=scene_index.scenes,
                 document_config=context.document_config,
                 is_cancel_requested=context.is_cancel_requested,
             ),
@@ -472,98 +417,23 @@ class VideoUnderstandingPipeline:
         registered: RegisteredAsset,
         prepared: PreparedMedia,
         stage_metrics: _StageMetrics,
-    ) -> tuple[SpeechAnalysis, SceneIndex, tuple[BaseSegment, ...]]:
+    ) -> tuple[SpeechAnalysis, tuple[BaseSegment, ...]]:
         self._start_stage(context, "EVIDENCE_PREP")
         started_at = self._clock()
-        sibling_cancel = Event()
-
-        def branch_cancel_requested() -> bool:
-            return sibling_cancel.is_set() or context.is_cancel_requested()
-
-        first_error: BaseException | None = None
-        scene_failure: VideoDemoError | None = None
-        speech_result: tuple[SpeechAnalysis, int] | None = None
-        scene_result: tuple[SceneIndex | None, int] | None = None
-        with ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="document-evidence-prep",
-        ) as executor:
-            speech_future = executor.submit(
-                self._timed_speech,
-                prepared,
-                branch_cancel_requested,
-            )
-            scene_future = executor.submit(
-                self._timed_scene_index,
-                prepared,
-                branch_cancel_requested,
-            )
-            pending: set[Future[object]] = {
-                cast(Future[object], speech_future),
-                cast(Future[object], scene_future),
-            }
-            while pending and first_error is None:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                if speech_future in done:
-                    try:
-                        speech_result = speech_future.result()
-                    except BaseException as error:
-                        first_error = error
-                if scene_future in done:
-                    try:
-                        scene_result = scene_future.result()
-                    except BaseException as error:
-                        if isinstance(error, VideoDemoError) and _is_optional_scene_failure(error):
-                            scene_failure = error
-                            scene_result = (None, 0)
-                        elif first_error is None:
-                            first_error = error
-                if first_error is not None:
-                    sibling_cancel.set()
-                    for future in pending:
-                        future.cancel()
-        if first_error is not None:
-            raise first_error.with_traceback(first_error.__traceback__)
-        if speech_result is None or scene_result is None:
-            raise AssertionError("证据准备分支未完整返回")
-        speech, speech_duration = speech_result
-        scene_index, scene_duration = scene_result
-        if scene_index is None:
-            scene_index = _empty_scene_index(prepared)
-            speech = replace(
-                speech,
-                warnings=tuple(
-                    dict.fromkeys((*speech.warnings, "SCENE_DETECTION_SKIPPED"))
-                ),
-            )
-            _LOGGER.warning(
-                "场景检测失败，已跳过视觉补充 code=%s",
-                scene_failure.code if scene_failure is not None else "UNKNOWN",
-            )
+        speech, speech_duration = self._timed_speech(prepared, context.is_cancel_requested)
         self._check_cancelled(context)
-        if scene_index.scenes:
-            base_segments = build_base_segments(
-                registered.source_sha256,
-                prepared.source.duration_ms,
-                speech.transcript_evidence,
-                scene_index.scenes,
-                speech.boundary_candidates,
-                self._evidence_preparation_limits,
-            )
-        else:
-            base_segments = build_text_only_base_segments(
-                registered.source_sha256,
-                prepared.source.duration_ms,
-                speech.transcript_evidence,
-                speech.boundary_candidates,
-                self._evidence_preparation_limits,
-            )
+        base_segments = build_base_segments(
+            registered.source_sha256,
+            prepared.source.duration_ms,
+            speech.transcript_evidence,
+            speech.boundary_candidates,
+            self._evidence_preparation_limits,
+        )
         self._check_cancelled(context)
         stage_metrics.add("SPEECH", speech_duration)
         stage_metrics.add_many(speech.stage_metrics)
-        stage_metrics.add("SCENE_DETECT", scene_duration)
         stage_metrics.add("EVIDENCE_PREP", self._elapsed_ms(started_at))
-        return speech, scene_index, base_segments
+        return speech, base_segments
 
     def _timed_speech(
         self,
@@ -573,19 +443,6 @@ class VideoUnderstandingPipeline:
         started_at = self._clock()
         result = self._speech_analyzer.analyze(
             prepared,
-            is_cancel_requested=is_cancel_requested,
-        )
-        return result, self._elapsed_ms(started_at)
-
-    def _timed_scene_index(
-        self,
-        prepared: PreparedMedia,
-        is_cancel_requested: Callable[[], bool],
-    ) -> tuple[SceneIndex, int]:
-        started_at = self._clock()
-        result = self._scene_index_provider.prepare_scene_index(
-            prepared,
-            limits=self._evidence_preparation_limits,
             is_cancel_requested=is_cancel_requested,
         )
         return result, self._elapsed_ms(started_at)

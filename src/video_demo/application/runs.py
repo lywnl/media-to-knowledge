@@ -79,7 +79,7 @@ class RunService:
         hotwords: tuple[str, ...] = (),
         core_context: str | None = None,
         document_config: DocumentGenerationConfig | None = None,
-        result_schema_version: Literal["4.1.0"] = "4.1.0",
+        result_schema_version: Literal["4.2.0"] = "4.2.0",
     ) -> RunView:
         config = PipelineRunConfig(
             language_hints=language_hints,

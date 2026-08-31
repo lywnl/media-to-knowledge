@@ -23,7 +23,6 @@ from video_demo.application.production_media import (
     build_ffmpeg_factory,
     build_ffprobe_factory,
 )
-from video_demo.application.production_scene import ProductionSceneIndexProvider
 from video_demo.application.queries import ResultQueryService
 from video_demo.application.video_scheduler import VideoTaskScheduler
 from video_demo.config import Settings
@@ -44,8 +43,7 @@ from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
 from video_demo.storage.object_store import LocalVideoObjectStore
 from video_demo.storage.snapshots import SnapshotStore
-from video_demo.visual.keyframes import OpenCvFrameExtractor
-from video_demo.visual.scenes import PySceneDetectAdapter
+from video_demo.visual.ffmpeg_frames import FFmpegFrameExtractor
 from video_demo.worker.runtime import ReliableWorker
 
 
@@ -56,7 +54,7 @@ class Closable(Protocol):
 class ProductionModelIdentityReport(FrozenModel):
     """4.1 生产组件身份和不含密钥的全局配置指纹。"""
 
-    schema_version: Literal["4.1.0"] = "4.1.0"
+    schema_version: Literal["4.2.0"] = "4.2.0"
     models: tuple[ModelIdentity, ...]
     settings_fingerprint: Sha256
 
@@ -88,12 +86,6 @@ def build_production_model_identity_report(settings: Settings) -> ProductionMode
     vision = settings.require_vlm_configuration()
     return ProductionModelIdentityReport(
         models=(
-            _local_model_identity(
-                "silero_vad",
-                "silero-vad",
-                package="silero-vad",
-                device="cpu",
-            ),
             ModelIdentity(
                 component="cloud_whisper",
                 provider="openai_compatible",
@@ -108,11 +100,6 @@ def build_production_model_identity_report(settings: Settings) -> ProductionMode
                 component="chapter_vlm",
                 provider="qwen",
                 model_id=vision.model_id,
-            ),
-            ModelIdentity(
-                component="scene_detect",
-                provider="local",
-                model_id="pyscenedetect-content-detector",
             ),
         ),
         settings_fingerprint=_settings_fingerprint(settings),
@@ -213,11 +200,6 @@ def build_production_pipeline(
                 credentials=SpeechSubprocessCredentials(openai_api_key=cloud_asr.api_key),
                 asr_timeout_seconds=settings.speech_subprocess_timeout_seconds,
             ),
-            ProductionSceneIndexProvider(
-                runtime_root,
-                PySceneDetectAdapter(),
-                max_video_bytes=settings.max_video_bytes,
-            ),
             ChapterPlanner(
                 text_client,
                 _identity(
@@ -249,8 +231,10 @@ def build_production_pipeline(
             ),
             ChapterFrameSearcher(
                 runtime_root,
-                OpenCvFrameExtractor(
+                FFmpegFrameExtractor.from_path(
+                    ffmpeg,
                     runtime_root,
+                    workspace_root=settings.workspace_root,
                     max_frame_bytes=vision.max_image_bytes,
                     jpeg_quality=settings.keyframe_jpeg_quality,
                 ),
@@ -381,7 +365,6 @@ def _evidence_limits(settings: Settings) -> EvidencePreparationLimits:
     return EvidencePreparationLimits(
         max_transcript_evidence_items=settings.max_transcript_evidence_items,
         max_transcript_chars=settings.max_transcript_chars,
-        max_scene_boundaries=settings.max_scene_boundaries,
         max_base_segments=settings.max_base_segments,
     )
 
@@ -440,7 +423,7 @@ def _settings_payload(settings: Settings) -> dict[str, object]:
     text = settings.require_text_llm_configuration()
     vision = settings.require_vlm_configuration()
     return {
-        "schema_version": "4.1.0",
+        "schema_version": "4.2.0",
         "cloud_asr": {
             "base_url": cloud.base_url,
             "model_id": cloud.model,

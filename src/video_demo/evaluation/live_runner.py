@@ -511,8 +511,6 @@ class LiveValidationRunner:
             self._settings.require_vlm_configuration()
         except VideoDemoError:
             issues.append(ErrorCode.INVALID_CONFIGURATION)
-        if not self._module_available("cv2"):
-            issues.append(ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE)
         assert self._settings.runtime_root is not None
         ffmpeg = self._settings.ffmpeg_path or self._settings.runtime_root / "tools" / "ffmpeg"
         ffprobe = self._settings.ffprobe_path or self._settings.runtime_root / "tools" / "ffprobe"
@@ -542,11 +540,14 @@ class LiveValidationRunner:
             production_tool_path(self._settings, "ffprobe"),
             workspace_root=self._settings.workspace_root,
         )
-        from video_demo.visual.keyframes import OpenCvFrameExtractor
+        from video_demo.visual.ffmpeg_frames import FFmpegFrameExtractor
 
-        extractor = OpenCvFrameExtractor(
-            self._settings.runtime_root,
+        extractor = FFmpegFrameExtractor.from_path(
+            production_tool_path(self._settings, "ffmpeg"),
+            runtime_root=self._settings.runtime_root,
+            workspace_root=self._settings.workspace_root,
             max_frame_bytes=vision.max_image_bytes,
+            frame_width=self._settings.visual_proxy_max_edge,
             jpeg_quality=self._settings.keyframe_jpeg_quality,
         )
         parent_id = evaluation_run_id

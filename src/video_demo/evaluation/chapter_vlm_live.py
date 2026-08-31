@@ -257,7 +257,6 @@ def _frame_descriptor(frame: ChapterVlmInputFrame) -> FrameCandidateArtifact:
         size_bytes=frame.size_bytes,
         relative_path=frame.relative_path,
         mime_type=frame.mime_type,
-        perceptual_hash=frame.perceptual_hash,
         target_ids=frame.target_ids,
     )
 

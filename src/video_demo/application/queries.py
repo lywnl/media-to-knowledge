@@ -131,10 +131,10 @@ class ResultQueryService:
         self,
         scope: Scope,
         run_id: str,
-        schema_version: str = "4.1.0",
+        schema_version: str = "4.2.0",
     ) -> DocumentArtifactPayload:
-        if schema_version != "4.1.0":
-            raise ValueError("只支持 4.1.0")
+        if schema_version != "4.2.0":
+            raise ValueError("只支持 4.2.0")
         artifact, _ = self.get_artifact(scope, run_id)
         return artifact
 

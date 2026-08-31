@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,33 +43,25 @@ _MediaPhase = Literal[
     "generate",
     "probe",
     "audio",
-    "opencv_decode",
-    "scene_detect",
-    "keyframe_select",
+    "ffmpeg_frame_extract",
 ]
 _MediaExecutable = Literal[
     "ffmpeg",
     "ffprobe",
     "FFmpegTranscoder",
-    "OpenCvFrameExtractor",
-    "PySceneDetectAdapter",
-    "KeyframeSelector",
+    "FFmpegFrameExtractor",
 ]
 _MEDIA_PHASE_SEQUENCE: tuple[_MediaPhase, ...] = (
     "generate",
     "probe",
     "audio",
-    "opencv_decode",
-    "scene_detect",
-    "keyframe_select",
+    "ffmpeg_frame_extract",
 )
 _MEDIA_PHASE_EXECUTABLES: dict[_MediaPhase, _MediaExecutable] = {
     "generate": "ffmpeg",
     "probe": "ffprobe",
     "audio": "FFmpegTranscoder",
-    "opencv_decode": "OpenCvFrameExtractor",
-    "scene_detect": "PySceneDetectAdapter",
-    "keyframe_select": "KeyframeSelector",
+    "ffmpeg_frame_extract": "FFmpegFrameExtractor",
 }
 
 
@@ -205,9 +196,7 @@ class _MediaExecutionJournal:
             "generate": ("SOURCE", "MP4"),
             "probe": None,
             "audio": ("AUDIO", "WAV"),
-            "opencv_decode": None,
-            "scene_detect": None,
-            "keyframe_select": ("KEYFRAME", "JPEG"),
+            "ffmpeg_frame_extract": ("KEYFRAME", "JPEG"),
         }
         artifact_role: ArtifactRole = (
             "INPUT_MEDIA" if media_file.role == "SOURCE" else "OUTPUT_MEDIA"
@@ -545,11 +534,6 @@ class RealMediaRunner:
                 issues.append(code)
             else:
                 binaries[name] = path
-        if (
-            importlib.util.find_spec("cv2") is None
-            or importlib.util.find_spec("scenedetect") is None
-        ):
-            issues.append(ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE)
         return binaries, tuple(issues)
 
     def _resolve_binary(self, name: str) -> Path | None:

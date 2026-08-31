@@ -99,8 +99,6 @@ def _collect_active_production_environment_issues(
         settings.require_vlm_configuration()
     except VideoDemoError:
         issues.append(ErrorCode.INVALID_CONFIGURATION)
-    if not _module_available("cv2"):
-        issues.append(ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE)
     assert settings.runtime_root is not None
     ffmpeg = settings.ffmpeg_path or settings.runtime_root / "tools" / "ffmpeg"
     ffprobe = settings.ffprobe_path or settings.runtime_root / "tools" / "ffprobe"
@@ -627,7 +625,7 @@ class DurabilityRunner:
         if self._probe_media is None:
             capabilities = probe_runtime_capabilities(self._settings)
             issues.extend(issue.code for issue in capabilities.issues)
-            for module in ("cv2", "scenedetect"):
+            for module in ():
                 try:
                     available = importlib.util.find_spec(module) is not None
                 except (ImportError, ModuleNotFoundError, ValueError):

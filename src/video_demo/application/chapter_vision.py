@@ -358,7 +358,6 @@ class ChapterVisionService:
                 analyses,
                 frame_batch,
                 frame_batch.allowed_run_root,
-                frame_tolerance_ms=frame_batch.frame_tolerance_ms,
             )
         except _DeferredExecutorCleanup as deferred:
             cleanup_handoff.defer(deferred.executor, lease)
@@ -964,8 +963,6 @@ class ChapterVisionService:
         analyses: tuple[_ChapterAnalysis, ...],
         frame_batch: ChapterFrameSearchBatch,
         allowed_run_root: Path,
-        *,
-        frame_tolerance_ms: int,
     ) -> ChapterVisionBatch:
         observations = _collect_materialized_observations(analyses)
         artifacts = KeyframeArtifactSession(
@@ -989,7 +986,6 @@ class ChapterVisionService:
                 retained,
                 frames,
                 budget_chapters,
-                frame_tolerance_ms=frame_tolerance_ms,
             )
             artifacts.publish(frames, existing)
             return batch
@@ -1056,7 +1052,6 @@ def _validate_frame_batch_semantics(
                 frame.size_bytes,
                 frame.relative_path,
                 frame.mime_type,
-                frame.perceptual_hash,
                 frame.target_ids,
             )
             if frame.frame_id in frame_metadata and frame_metadata[frame.frame_id] != metadata:
@@ -1481,13 +1476,11 @@ def _materialize_batch(
     retained: tuple[_MaterializedObservation, ...],
     frames: tuple[FrameCandidateArtifact, ...],
     budget_chapters: tuple[str, ...],
-    *,
-    frame_tolerance_ms: int,
 ) -> ChapterVisionBatch:
     keyframes = tuple(_keyframe_evidence(frame) for frame in frames)
     keyframe_by_frame = {item.keyframe_id: item for item in keyframes}
     evidence_observations = tuple(
-        _to_evidence(item, keyframe_by_frame, frame_tolerance_ms=frame_tolerance_ms)
+        _to_evidence(item, keyframe_by_frame)
         for item in retained
     )
     used_ids = {ref for item in evidence_observations for ref in item.keyframe_refs}
@@ -1536,7 +1529,6 @@ def _keyframe_evidence(frame: FrameCandidateArtifact) -> KeyframeEvidence:
         relative_path=f"visual/keyframes/{frame.sha256}.jpg",
         mime_type="image/jpeg",
         sha256=frame.sha256,
-        perceptual_hash=frame.perceptual_hash,
         size_bytes=frame.size_bytes,
     )
 
@@ -1544,8 +1536,6 @@ def _keyframe_evidence(frame: FrameCandidateArtifact) -> KeyframeEvidence:
 def _to_evidence(
     item: _MaterializedObservation,
     keyframe_by_frame: Mapping[str, KeyframeEvidence],
-    *,
-    frame_tolerance_ms: int,
 ) -> VisualObservationEvidence:
     keyframes = tuple(keyframe_by_frame[frame.frame_id] for frame in item.frames)
     draft = item.draft
@@ -1553,13 +1543,10 @@ def _to_evidence(
         frame.keyframe_id: frame.evidence_id
         for frame in keyframes
     }
-    start_ms = max(
-        item.chapter.start_ms,
-        min(frame.timestamp_ms for frame in keyframes) - frame_tolerance_ms,
-    )
+    start_ms = max(item.chapter.start_ms, min(frame.timestamp_ms for frame in keyframes))
     end_ms = min(
         item.chapter.end_ms,
-        max(frame.timestamp_ms for frame in keyframes) + frame_tolerance_ms + 1,
+        max(frame.timestamp_ms for frame in keyframes) + 1,
     )
     payload: dict[str, object] = {
         "chapter_id": item.chapter.chapter_id,

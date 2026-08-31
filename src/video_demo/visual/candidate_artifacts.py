@@ -4,7 +4,6 @@ import fcntl
 import hashlib
 import math
 import os
-import re
 import stat
 import threading
 import time
@@ -29,7 +28,6 @@ CandidateLeaseMode = Literal["SHARED", "EXCLUSIVE"]
 
 _LOCK_POLL_SECONDS = 0.05
 _PROCESS_LOCK_GUARD = threading.Lock()
-_PERCEPTUAL_HASH_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
 @dataclass(slots=True)
@@ -526,7 +524,6 @@ def validate_candidate_descriptor(
         timestamp_ms = frame.timestamp_ms
         frame_id = frame.frame_id
         mime_type = frame.mime_type
-        perceptual_hash = frame.perceptual_hash
         target_ids = tuple(frame.target_ids)
         size_bytes = frame.size_bytes
     except (AttributeError, TypeError, ValueError) as error:
@@ -537,7 +534,6 @@ def validate_candidate_descriptor(
         or not _is_sha256(frame_sha256)
         or relative_path != Path("visual/candidates") / f"{frame_sha256}.jpg"
         or mime_type != "image/jpeg"
-        or _PERCEPTUAL_HASH_PATTERN.fullmatch(perceptual_hash) is None
         or not target_ids
         or len(target_ids) != len(set(target_ids))
         or type(timestamp_ms) is not int

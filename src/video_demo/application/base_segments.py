@@ -10,7 +10,7 @@ from video_demo.application.pipeline_contracts import (
 from video_demo.domain.base import Sha256, stable_identifier
 from video_demo.domain.document import TranscriptSource
 from video_demo.domain.document_plan import BaseSegment
-from video_demo.domain.evidence import SceneBoundary, SpeechSegment, SubtitleCue
+from video_demo.domain.evidence import SpeechSegment, SubtitleCue
 from video_demo.errors import ErrorCode, VideoDemoError
 
 _GRID_INTERVAL_MS = 30_000
@@ -20,25 +20,21 @@ _SENTENCE_BOUNDARY_GRID_TOLERANCE_MS = 8_000
 _EMPTY_TRANSCRIPT_RANGE_MAX_MS = 10_000
 _MAX_SEGMENT_DURATION_MS = 300_000
 _MAX_SEGMENT_EVIDENCE_REFS = 256
-_MAX_SEGMENT_SCENE_REFS = 256
 
 
 def build_base_segments(
     asset_sha256: Sha256,
     duration_ms: int,
     transcript_evidence: Sequence[SpeechSegment | SubtitleCue],
-    scenes: Sequence[SceneBoundary],
     speech_boundaries: Sequence[SpeechBoundaryCandidate],
     limits: EvidencePreparationLimits,
 ) -> tuple[BaseSegment, ...]:
     if duration_ms <= 0:
         raise ValueError("duration_ms 必须大于 0")
     transcript = _validate_transcript_budget(transcript_evidence, duration_ms, limits)
-    ordered_scenes = _validate_scenes(scenes, duration_ms, limits)
     boundaries = _safe_boundaries(
         duration_ms,
         transcript,
-        ordered_scenes,
         speech_boundaries,
     )
     ranges = _merge_empty_transcript_ranges(
@@ -49,31 +45,7 @@ def build_base_segments(
         asset_sha256,
         ranges,
         transcript,
-        ordered_scenes,
     )
-    if len(segments) > limits.max_base_segments:
-        raise _budget_error("基础片段数量超过上限")
-    return segments
-
-
-def build_text_only_base_segments(
-    asset_sha256: Sha256,
-    duration_ms: int,
-    transcript_evidence: Sequence[SpeechSegment | SubtitleCue],
-    speech_boundaries: Sequence[SpeechBoundaryCandidate],
-    limits: EvidencePreparationLimits,
-) -> tuple[BaseSegment, ...]:
-    """视频视觉证据不可用时，构建不含场景引用的纯文字片段。"""
-
-    if duration_ms <= 0:
-        raise ValueError("duration_ms 必须大于 0")
-    transcript = _validate_transcript_budget(transcript_evidence, duration_ms, limits)
-    boundaries = _safe_boundaries(duration_ms, transcript, (), speech_boundaries)
-    ranges = _merge_empty_transcript_ranges(
-        tuple(pairwise((0, *boundaries, duration_ms))),
-        transcript,
-    )
-    segments = _assemble_segments(asset_sha256, ranges, transcript, ())
     if len(segments) > limits.max_base_segments:
         raise _budget_error("基础片段数量超过上限")
     return segments
@@ -104,46 +76,16 @@ def _validate_transcript_budget(
     return ordered
 
 
-def _validate_scenes(
-    scenes: Sequence[SceneBoundary],
-    duration_ms: int,
-    limits: EvidencePreparationLimits,
-) -> tuple[SceneBoundary, ...]:
-    ordered = tuple(
-        sorted(
-            scenes,
-            key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),
-        ),
-    )
-    if len(ordered) > limits.max_scene_boundaries:
-        raise VideoDemoError(
-            ErrorCode.VISUAL_RESULT_INVALID,
-            "基础片段收到超过预算的非规范场景集合",
-        )
-    scene_ids = tuple(item.evidence_id for item in ordered)
-    if len(scene_ids) != len(set(scene_ids)):
-        raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "规范场景标识不得重复")
-    if not ordered or ordered[0].start_ms != 0 or ordered[-1].end_ms != duration_ms:
-        raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "规范场景未覆盖完整视频")
-    if any(left.end_ms != right.start_ms for left, right in pairwise(ordered)):
-        raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "规范场景必须连续且无重叠")
-    return ordered
-
-
 def _safe_boundaries(
     duration_ms: int,
     transcript: Sequence[SpeechSegment | SubtitleCue],
-    scenes: Sequence[SceneBoundary],
     speech_boundaries: Sequence[SpeechBoundaryCandidate],
 ) -> tuple[int, ...]:
     # ASR 通常每 1~3 秒产生一条证据；把每条证据的首尾都作为切点会把
     # 章节规划输入膨胀成数百个基础片段。优先使用稀疏的网格、镜头和
     # 高价值语音边界，只有在这些边界无法满足 5 分钟硬上限时才补充
     # 转写结束点。
-    # 场景检测边界用于给每个基础片段建立 scene_refs，不再直接变成切点。
-    # 视频编辑中的短镜头可能只有 1~2 秒；把每个镜头都切成基础片段会让
-    # 章节规划输入按镜头数量膨胀，迫使模型重复调用，而不会改善章节语义。
-    # 网格边界提供稳定的稀疏覆盖，章节抽帧阶段仍会读取完整场景索引。
+    # 网格边界提供稳定的稀疏覆盖，视觉采样阶段再依据章节时间点补充画面。
     grid_candidates = set(range(_GRID_INTERVAL_MS, duration_ms, _GRID_INTERVAL_MS))
     candidates = {
         *grid_candidates,
@@ -394,11 +336,9 @@ def _assemble_segments(
     asset_sha256: str,
     ranges: Sequence[tuple[int, int]],
     transcript: Sequence[SpeechSegment | SubtitleCue],
-    scenes: Sequence[SceneBoundary],
 ) -> tuple[BaseSegment, ...]:
     segments: list[BaseSegment] = []
     transcript_index = 0
-    scene_index = 0
     for start_ms, end_ms in ranges:
         evidence_refs, transcript_index = _take_transcript_refs(
             transcript,
@@ -406,16 +346,12 @@ def _assemble_segments(
             start_ms,
             end_ms,
         )
-        while scene_index < len(scenes) and scenes[scene_index].end_ms <= start_ms:
-            scene_index += 1
-        scene_refs = _overlapping_scene_refs(scenes, scene_index, start_ms, end_ms)
         segments.append(
             _build_segment(
                 asset_sha256,
                 start_ms,
                 end_ms,
                 evidence_refs,
-                scene_refs,
                 _transcript_source(transcript, evidence_refs),
             ),
         )
@@ -446,35 +382,15 @@ def _take_transcript_refs(
     return tuple(evidence_refs), index
 
 
-def _overlapping_scene_refs(
-    scenes: Sequence[SceneBoundary],
-    index: int,
-    start_ms: int,
-    end_ms: int,
-) -> tuple[str, ...]:
-    refs: list[str] = []
-    while index < len(scenes) and scenes[index].start_ms < end_ms:
-        if start_ms < scenes[index].end_ms:
-            refs.append(scenes[index].evidence_id)
-        index += 1
-    return tuple(refs)
-
-
 def _build_segment(
     asset_sha256: str,
     start_ms: int,
     end_ms: int,
     evidence_refs: tuple[str, ...],
-    scene_refs: tuple[str, ...],
     transcript_source: TranscriptSource,
 ) -> BaseSegment:
     if len(evidence_refs) > _MAX_SEGMENT_EVIDENCE_REFS:
         raise _budget_error("单个基础片段的转写证据引用超过 256 条")
-    if len(scene_refs) > _MAX_SEGMENT_SCENE_REFS:
-        raise VideoDemoError(
-            ErrorCode.VISUAL_RESULT_INVALID,
-            "基础片段引用了超过 256 个非规范场景",
-        )
     return BaseSegment(
         segment_id=stable_identifier(
             "base_segment",
@@ -488,7 +404,6 @@ def _build_segment(
         start_ms=start_ms,
         end_ms=end_ms,
         evidence_refs=evidence_refs,
-        scene_refs=scene_refs,
         transcript_source=transcript_source,
     )
 

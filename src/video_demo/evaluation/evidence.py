@@ -671,17 +671,13 @@ _REAL_MEDIA_PHASES: tuple[str, ...] = (
     "generate",
     "probe",
     "audio",
-    "opencv_decode",
-    "scene_detect",
-    "keyframe_select",
+    "ffmpeg_frame_extract",
 )
 _REAL_MEDIA_PHASE_EXECUTABLES: dict[str, str] = {
     "generate": "ffmpeg",
     "probe": "ffprobe",
     "audio": "FFmpegTranscoder",
-    "opencv_decode": "OpenCvFrameExtractor",
-    "scene_detect": "PySceneDetectAdapter",
-    "keyframe_select": "KeyframeSelector",
+    "ffmpeg_frame_extract": "FFmpegFrameExtractor",
 }
 
 
@@ -1229,17 +1225,13 @@ class RealMediaCommand(FrozenModel):
         "generate",
         "probe",
         "audio",
-        "opencv_decode",
-        "scene_detect",
-        "keyframe_select",
+        "ffmpeg_frame_extract",
     ]
     executable: Literal[
         "ffmpeg",
         "ffprobe",
         "FFmpegTranscoder",
-        "OpenCvFrameExtractor",
-        "PySceneDetectAdapter",
-        "KeyframeSelector",
+        "FFmpegFrameExtractor",
     ]
     arguments: tuple[str, ...] = ()
     input_relative_paths: tuple[str, ...] = ()
@@ -1329,8 +1321,6 @@ class RealMediaSample(FrozenModel):
     rotation_degrees: StrictInt | None = Field(default=None, ge=0, le=359)
     is_variable_frame_rate: StrictBool | None = None
     warnings: tuple[str, ...] = ()
-    opencv_decoded_frame_count: StrictInt | None = Field(default=None, ge=0)
-    scene_count: StrictInt | None = Field(default=None, ge=0)
     selected_keyframe_count: StrictInt | None = Field(default=None, ge=0)
     files: tuple[RealMediaFile, ...] = ()
     commands: tuple[RealMediaCommand, ...] = ()
@@ -1362,8 +1352,6 @@ class RealMediaSample(FrozenModel):
                         self.has_audio,
                         self.rotation_degrees,
                         self.is_variable_frame_rate,
-                        self.opencv_decoded_frame_count,
-                        self.scene_count,
                         self.selected_keyframe_count,
                     )
                 )
@@ -1531,14 +1519,10 @@ class RealMediaRawReport(FrozenModel):
                 sample.has_audio,
                 sample.rotation_degrees,
                 sample.is_variable_frame_rate,
-                sample.opencv_decoded_frame_count,
-                sample.scene_count,
                 sample.selected_keyframe_count,
             )
         ) or (
-            sample.opencv_decoded_frame_count == 0
-            or sample.scene_count == 0
-            or sample.selected_keyframe_count == 0
+            sample.selected_keyframe_count == 0
         ):
             raise ValueError("成功媒体样本必须包含完整非空 probe 与视觉事实")
         files_by_role: dict[str, list[RealMediaFile]] = {}
@@ -1569,9 +1553,7 @@ class RealMediaRawReport(FrozenModel):
             ("generate", (), paths_by_role["SOURCE"]),
             ("probe", paths_by_role["SOURCE"], ()),
             ("audio", paths_by_role["SOURCE"], paths_by_role.get("AUDIO", ())),
-            ("opencv_decode", paths_by_role["SOURCE"], ()),
-            ("scene_detect", paths_by_role["SOURCE"], ()),
-            ("keyframe_select", paths_by_role["SOURCE"], paths_by_role["KEYFRAME"]),
+            ("ffmpeg_frame_extract", paths_by_role["SOURCE"], paths_by_role["KEYFRAME"]),
         )
         if any(
             command.phase != phase

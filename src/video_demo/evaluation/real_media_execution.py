@@ -13,9 +13,7 @@ from video_demo.application.pipeline import (
     ProbedAsset,
     RegisteredAsset,
 )
-from video_demo.application.production_scene import frame_tolerance_ms_for_rate
 from video_demo.config import Settings
-from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.evaluation.evidence import (
     ArtifactRole,
@@ -42,26 +40,8 @@ from video_demo.media.transcode import (
     NoAudioArtifact,
     TranscodeLimits,
 )
-from video_demo.visual.keyframes import (
-    FrameCandidate,
-    KeyframeSelector,
-    OpenCvFrameExtractor,
-)
-from video_demo.visual.scenes import PySceneDetectAdapter
-
-
-def _load_cv2() -> object:
-    import cv2
-
-    return cv2
-
-
-def _load_scenedetect() -> tuple[object, object]:
-    import scenedetect
-    from scenedetect import detectors
-
-    return scenedetect, detectors
-
+from video_demo.visual.candidate_artifacts import CandidateArtifactSession
+from video_demo.visual.ffmpeg_frames import FFmpegFrameExtractor, FrameCandidate, FrameSample
 
 MediaRole = Literal["SOURCE", "AUDIO", "KEYFRAME"]
 MediaFormat = Literal["MP4", "WAV", "JPEG"]
@@ -69,17 +49,13 @@ MediaPhase = Literal[
     "generate",
     "probe",
     "audio",
-    "opencv_decode",
-    "scene_detect",
-    "keyframe_select",
+    "ffmpeg_frame_extract",
 ]
 MediaExecutable = Literal[
     "ffmpeg",
     "ffprobe",
     "FFmpegTranscoder",
-    "OpenCvFrameExtractor",
-    "PySceneDetectAdapter",
-    "KeyframeSelector",
+    "FFmpegFrameExtractor",
 ]
 
 
@@ -260,13 +236,14 @@ def execute_real_media(
         ),
     )
     # 评测链路保留固定六帧采样，避免历史评测样本的解码计数与生产成本策略耦合。
-    extractor = OpenCvFrameExtractor(
+    extractor = FFmpegFrameExtractor.from_path(
+        binaries["ffmpeg"],
         settings.runtime_root,
-        module_loader=_load_cv2,
-        samples_per_window=6,
+        workspace_root=settings.workspace_root,
+        max_frame_bytes=settings.vlm_max_image_bytes,
+        frame_width=settings.visual_proxy_max_edge,
+        jpeg_quality=settings.keyframe_jpeg_quality,
     )
-    scene_detector = PySceneDetectAdapter(module_loader=_load_scenedetect)
-    selector = KeyframeSelector()
     samples: list[RealMediaSample] = []
     artifacts: list[TraceArtifact] = []
     for case_id in CASE_IDS:
@@ -278,8 +255,6 @@ def execute_real_media(
             probe=probe,
             transcoder=transcoder,
             extractor=extractor,
-            scene_detector=scene_detector,
-            selector=selector,
             settings=settings,
             store=store,
             journal=journal,
@@ -298,9 +273,7 @@ def _execute_case(
     generator: SafeProcessRunner,
     probe: FFprobeClient,
     transcoder: FFmpegTranscoder,
-    extractor: OpenCvFrameExtractor,
-    scene_detector: PySceneDetectAdapter,
-    selector: KeyframeSelector,
+    extractor: FFmpegFrameExtractor,
     settings: Settings,
     store: EvidenceStore,
     journal: MediaJournal,
@@ -341,24 +314,8 @@ def _execute_case(
             session,
         )
         session.assert_registered_leaves(facts.registered_paths)
-        candidates = _opencv_phase(
-            case_id, prepared, extractor, journal, facts, session
-        )
-        session.assert_registered_leaves(facts.registered_paths)
-        scenes = _scene_phase(
-            case_id, prepared, scene_detector, journal, facts, session
-        )
-        session.assert_registered_leaves(facts.registered_paths)
-        selected = _keyframe_phase(
-            case_id,
-            prepared,
-            candidates,
-            selector,
-            store,
-            journal,
-            facts,
-            max_bytes,
-            session,
+        selected = _ffmpeg_frame_phase(
+            case_id, prepared, extractor, journal, facts, session, store, max_bytes
         )
         session.assert_registered_leaves(facts.registered_paths)
         sample = RealMediaSample(
@@ -369,8 +326,6 @@ def _execute_case(
             rotation_degrees=probed.manifest.video_stream.rotation_degrees,
             is_variable_frame_rate=probed.manifest.video_stream.is_variable_frame_rate,
             warnings=prepared.warnings,
-            opencv_decoded_frame_count=len(candidates),
-            scene_count=len(scenes),
             selected_keyframe_count=len(selected),
             files=tuple(facts.files),
             commands=tuple(facts.commands),
@@ -555,9 +510,7 @@ def _audio_phase(
     if isinstance(audio, NoAudioArtifact):
         warnings.append(audio.warning_code)
     else:
-        transferred = _transfer_audio(
-            case_id, audio, store, journal, facts, max_bytes, session
-        )
+        transferred = _transfer_audio(case_id, audio, store, journal, facts, max_bytes, session)
         audio_path = store.runtime_root / audio.relative_path
         audio_sha256 = transferred.media_file.sha256
     session.assert_registered_leaves(facts.registered_paths)
@@ -581,169 +534,88 @@ def _audio_phase(
     )
 
 
-def _opencv_phase(
+def _ffmpeg_frame_phase(
     case_id: str,
     prepared: PreparedMedia,
-    extractor: OpenCvFrameExtractor,
+    extractor: FFmpegFrameExtractor,
     journal: MediaJournal,
     facts: _CaseFacts,
     session: CaseExecutionSession,
-) -> tuple[FrameCandidate, ...]:
-    session.assert_registered_leaves(facts.registered_paths)
-    source = _source_relative(facts)
-    journal.begin_phase(
-        case_id=case_id,
-        phase="opencv_decode",
-        executable="OpenCvFrameExtractor",
-        arguments=("full_duration",),
-        input_relative_paths=(source,),
-    )
-    window = TimeRange(start_ms=0, end_ms=prepared.source.duration_ms)
-    tolerance = frame_tolerance_ms_for_rate(
-        prepared.source.manifest.video_stream.average_frame_rate,
-        is_variable_frame_rate=(
-            prepared.source.manifest.video_stream.is_variable_frame_rate
-        ),
-    )
-
-    def write_jpeg(relative: Path, payload: bytes, limit: int) -> None:
-        session.write_output_bytes(
-            relative.relative_to(prepared.source.asset.run_relative_root),
-            payload,
-            limit,
-        )
-
-    source_descriptor = session.open_registered_leaf(Path("source.mp4"))
-    try:
-        groups = extractor.extract(
-            prepared.proxy_path,
-            prepared.source.asset.run_relative_root,
-            (window,),
-            is_cancel_requested=lambda: False,
-            frame_tolerance_ms=tolerance,
-            input_fd=source_descriptor,
-            write_jpeg=write_jpeg,
-        )
-    finally:
-        os.close(source_descriptor)
-    candidates = tuple(candidate for group in groups for candidate in group.candidates)
-    if not candidates:
-        raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "OpenCV 未产生候选帧")
-    session.assert_registered_leaves(facts.registered_paths)
-    _complete_phase(
-        journal,
-        facts,
-        phase="opencv_decode",
-        executable="OpenCvFrameExtractor",
-        arguments=("full_duration",),
-        inputs=(source,),
-        outputs=(),
-    )
-    return candidates
-
-
-def _scene_phase(
-    case_id: str,
-    prepared: PreparedMedia,
-    detector: PySceneDetectAdapter,
-    journal: MediaJournal,
-    facts: _CaseFacts,
-    session: CaseExecutionSession,
-) -> tuple[object, ...]:
-    session.assert_registered_leaves(facts.registered_paths)
-    source = _source_relative(facts)
-    journal.begin_phase(
-        case_id=case_id,
-        phase="scene_detect",
-        executable="PySceneDetectAdapter",
-        arguments=("full_duration",),
-        input_relative_paths=(source,),
-    )
-    tolerance = frame_tolerance_ms_for_rate(
-        prepared.source.manifest.video_stream.average_frame_rate,
-        is_variable_frame_rate=(
-            prepared.source.manifest.video_stream.is_variable_frame_rate
-        ),
-    )
-    source_descriptor = session.open_registered_leaf(Path("source.mp4"))
-    try:
-        scenes = detector.detect(
-            prepared.proxy_path,
-            duration_ms=prepared.source.duration_ms,
-            source_sha256=prepared.proxy_sha256,
-            frame_tolerance_ms=tolerance,
-            input_fd=source_descriptor,
-        )
-    finally:
-        os.close(source_descriptor)
-    if not scenes:
-        raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "镜头检测未产生结果")
-    session.assert_registered_leaves(facts.registered_paths)
-    _complete_phase(
-        journal,
-        facts,
-        phase="scene_detect",
-        executable="PySceneDetectAdapter",
-        arguments=("full_duration",),
-        inputs=(source,),
-        outputs=(),
-    )
-    return scenes
-
-
-def _keyframe_phase(
-    case_id: str,
-    prepared: PreparedMedia,
-    candidates: tuple[FrameCandidate, ...],
-    selector: KeyframeSelector,
     store: EvidenceStore,
-    journal: MediaJournal,
-    facts: _CaseFacts,
     max_bytes: int,
-    session: CaseExecutionSession,
 ) -> tuple[FrameCandidate, ...]:
     session.assert_registered_leaves(facts.registered_paths)
-    window = TimeRange(start_ms=0, end_ms=prepared.source.duration_ms)
-    selected = selector.select(window, candidates).frames
-    if not selected:
-        raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "关键帧选择结果为空")
-    run_root = prepared.source.asset.run_relative_root
-    selected_paths = {frame.relative_path for frame in selected}
-    for candidate in candidates:
-        if candidate.relative_path not in selected_paths:
-            session.remove_leaf(candidate.relative_path.relative_to(run_root))
     source = _source_relative(facts)
-    outputs = tuple(
-        _runtime_file_relative(store, frame.relative_path) for frame in selected
-    )
     journal.begin_phase(
         case_id=case_id,
-        phase="keyframe_select",
-        executable="KeyframeSelector",
-        arguments=("select_nonempty",),
+        phase="ffmpeg_frame_extract",
+        executable="FFmpegFrameExtractor",
+        arguments=("representative",),
         input_relative_paths=(source,),
-        output_relative_paths=outputs,
     )
-    for frame in selected:
-        transferred = _transfer_to_journal(
-            case_id=case_id,
-            path=store.runtime_root / frame.relative_path,
-            role="KEYFRAME",
-            format_name="JPEG",
-            store=store,
-            journal=journal,
-            max_bytes=max_bytes,
-            facts=facts,
-            session=session,
+    run_root = prepared.source.asset.run_relative_root
+    runtime_root = session.runtime_root
+    candidate_session = CandidateArtifactSession(
+        runtime_root=runtime_root,
+        max_unique_bytes=max_bytes,
+        max_files=16,
+        max_file_bytes=max_bytes,
+    )
+    candidate_session.prepare_run(run_root)
+    selected: tuple[FrameCandidate, ...] = ()
+    outputs: tuple[str, ...] = ()
+    try:
+        timestamps = tuple(
+            sorted(
+                {
+                    0,
+                    prepared.source.duration_ms // 2,
+                    max(0, prepared.source.duration_ms - 1),
+                },
+            ),
         )
-        _accept_transfer(transferred, facts)
+        samples = tuple(
+            FrameSample(f"eval-{index}", timestamp, "BASE_PRIMARY")
+            for index, timestamp in enumerate(timestamps)
+        )
+        extracted = extractor.extract_samples(
+            prepared.proxy_path,
+            run_root,
+            samples,
+            is_cancel_requested=lambda: False,
+            artifact_session=candidate_session,
+        )
+        selected = tuple(item.candidate for item in extracted if item.candidate is not None)
+        if not selected:
+            raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "FFmpeg 未产生候选帧")
+        for frame in selected:
+            transferred = _transfer_to_journal(
+                case_id=case_id,
+                path=runtime_root / run_root / frame.relative_path,
+                role="KEYFRAME",
+                format_name="JPEG",
+                store=store,
+                journal=journal,
+                max_bytes=max_bytes,
+                facts=facts,
+                session=session,
+            )
+            _accept_transfer(transferred, facts)
+        outputs = tuple(
+            _runtime_file_relative(store, run_root / frame.relative_path) for frame in selected
+        )
+    finally:
+        candidate_session.cleanup_unretained(
+            frozenset(frame.sha256 for frame in selected),
+        )
+        candidate_session.close()
     session.assert_registered_leaves(facts.registered_paths)
     _complete_phase(
         journal,
         facts,
-        phase="keyframe_select",
-        executable="KeyframeSelector",
-        arguments=("select_nonempty",),
+        phase="ffmpeg_frame_extract",
+        executable="FFmpegFrameExtractor",
+        arguments=("representative",),
         inputs=(source,),
         outputs=outputs,
     )

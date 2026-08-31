@@ -43,7 +43,7 @@ class CreateRunRequest(ApiModel):
     document_config: DocumentGenerationConfig = Field(
         default_factory=DocumentGenerationConfig,
     )
-    result_schema_version: Literal["4.1.0"] = "4.1.0"
+    result_schema_version: Literal["4.2.0"] = "4.2.0"
 
     @model_validator(mode="after")
     def normalize_speech_configuration(self) -> Self:
@@ -242,7 +242,6 @@ class PublicKeyframeEvidence(PublicTimedEvidence):
     timestamp_ms: int
     mime_type: Literal["image/jpeg"]
     sha256: str
-    perceptual_hash: str
     size_bytes: int = Field(ge=1)
 
 

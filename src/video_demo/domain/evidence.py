@@ -41,12 +41,6 @@ class SubtitleCue(TimedEvidence):
     stream_index: int = Field(ge=0)
 
 
-class SceneBoundary(TimedEvidence):
-    evidence_type: Literal["SCENE"] = "SCENE"
-    transition: Literal["hard_cut", "gradual", "candidate"]
-    score: Probability
-
-
 class KeyframeEvidence(TimedEvidence):
     evidence_type: Literal["KEYFRAME"] = "KEYFRAME"
     keyframe_id: StableId
@@ -54,7 +48,6 @@ class KeyframeEvidence(TimedEvidence):
     relative_path: str = Field(min_length=1, max_length=1024)
     mime_type: Literal["image/jpeg"]
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    perceptual_hash: str = Field(min_length=8, max_length=128)
     size_bytes: int = Field(ge=1)
 
     @model_validator(mode="after")

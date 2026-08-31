@@ -297,13 +297,16 @@ class VisualQualityRunner:
         )
 
     def _extractor(self) -> Any:
-        from video_demo.visual.keyframes import OpenCvFrameExtractor
+        from video_demo.visual.ffmpeg_frames import FFmpegFrameExtractor
 
         assert self._settings.runtime_root is not None
-        return OpenCvFrameExtractor(
-            self._settings.runtime_root,
+        return FFmpegFrameExtractor.from_path(
+            production_tool_path(self._settings, "ffmpeg"),
             max_frame_bytes=self._settings.vlm_max_image_bytes,
+            frame_width=self._settings.visual_proxy_max_edge,
             jpeg_quality=self._settings.keyframe_jpeg_quality,
+            runtime_root=self._settings.runtime_root,
+            workspace_root=self._settings.workspace_root,
         )
 
     def report_not_run(

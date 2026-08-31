@@ -73,7 +73,7 @@ class ResultRepository:
                     segment_id=chapter.chapter_id,
                     start_ms=chapter.start_ms,
                     end_ms=chapter.end_ms,
-                    schema_version="4.1.0",
+                    schema_version="4.2.0",
                     payload_json=payload,
                 )
             )
@@ -83,7 +83,7 @@ class ResultRepository:
                 application_id=scope.application_id,
                 knowledge_base_id=scope.knowledge_base_id,
                 run_id=validated.run_id,
-                schema_version="4.1.0",
+                schema_version="4.2.0",
                 payload_json=summary_payload,
             )
         )
@@ -152,16 +152,16 @@ def _require_supported_rows(
     if not segments and not summaries:
         raise VideoDemoError(ErrorCode.VIDEO_RESULT_NOT_READY, "知识文档结果尚未就绪")
     if not segments or len(summaries) != 1:
-        _invalid("4.1 结果行缺失或重复")
+        _invalid("4.2 结果行缺失或重复")
     versions = {str(item.schema_version) for item in segments} | {
         str(item.schema_version) for item in summaries
     }
     if len(versions) == 1 and versions <= {"1.0.0", "2.0.0", "3.0.0", "4.0.0"}:
         raise VideoDemoError(
             ErrorCode.RESULT_SCHEMA_UNSUPPORTED,
-            "结果 Schema 4.0.0 及更早版本已停用，请重新处理视频 (当前支持 4.1.0)",
+            "结果 Schema 4.0.0 及更早版本已停用，请重新处理视频 (当前支持 4.2.0)",
         )
-    if versions != {"4.1.0"}:
+    if versions != {"4.2.0"}:
         _invalid("结果行 Schema 版本非法或混杂")
 
 

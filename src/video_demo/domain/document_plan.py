@@ -38,7 +38,6 @@ def frame_candidate_id(
 class BaseSegment(TimeRange):
     segment_id: StableId
     evidence_refs: tuple[StableId, ...] = Field(max_length=256)
-    scene_refs: tuple[StableId, ...] = Field(default=(), max_length=256)
     transcript_source: TranscriptSource
 
     @model_validator(mode="after")
@@ -55,26 +54,19 @@ class VisualSearchTarget(FrozenModel):
     purpose: Literal["SEMANTIC", "BASE_COVERAGE"]
     query_zh: str = Field(min_length=1, max_length=500)
     anchor_evidence_refs: tuple[StableId, ...] = Field(default=(), max_length=3)
-    scene_refs: tuple[StableId, ...] = Field(default=(), max_length=8)
-    sample_timestamps_ms: tuple[int, ...] = Field(default=(), max_length=2)
+    sample_timestamps_ms: tuple[int, ...] = Field(default=(), max_length=1)
 
     @model_validator(mode="after")
     def validate_target_bindings(self) -> VisualSearchTarget:
         if self.purpose == "SEMANTIC":
             if not 1 <= len(self.anchor_evidence_refs) <= 3:
                 raise ValueError("SEMANTIC 目标必须绑定 1~3 个转写锚点")
-            if self.scene_refs or self.sample_timestamps_ms:
-                raise ValueError("SEMANTIC 目标不能绑定场景或程序采样时间")
+            if self.sample_timestamps_ms:
+                raise ValueError("SEMANTIC 目标不能绑定程序采样时间")
         elif self.anchor_evidence_refs:
             raise ValueError("BASE_COVERAGE 目标不能绑定转写锚点")
-        elif bool(self.scene_refs) == bool(self.sample_timestamps_ms):
-            raise ValueError(
-                "BASE_COVERAGE 目标必须绑定 scene_refs 或 sample_timestamps_ms (二选一)",
-            )
-        elif self.scene_refs and not 1 <= len(self.scene_refs) <= 2:
-            raise ValueError("BASE_COVERAGE 目标必须绑定 1~2 个 scene_refs")
-        elif self.sample_timestamps_ms and not 1 <= len(self.sample_timestamps_ms) <= 2:
-            raise ValueError("BASE_COVERAGE 目标必须绑定 1~2 个 sample_timestamps_ms")
+        elif len(self.sample_timestamps_ms) != 1:
+            raise ValueError("BASE_COVERAGE 目标必须绑定一个程序采样时间")
         return self
 
 
@@ -135,7 +127,6 @@ class FrameCandidateArtifact(FrozenModel):
     size_bytes: int = Field(gt=0)
     relative_path: str = Field(min_length=1, max_length=1024)
     mime_type: Literal["image/jpeg"] = "image/jpeg"
-    perceptual_hash: str = Field(pattern=r"^[0-9a-f]{16}$")
     target_ids: tuple[StableId, ...] = Field(min_length=1, max_length=6)
 
     @model_validator(mode="after")

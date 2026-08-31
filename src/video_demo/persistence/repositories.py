@@ -752,7 +752,7 @@ class VideoRunRepository:
                     VideoSummaryModel.knowledge_base_id
                     == VideoUnderstandingRunModel.knowledge_base_id,
                     VideoSummaryModel.run_id == VideoUnderstandingRunModel.run_id,
-                    VideoSummaryModel.schema_version == "4.1.0",
+                    VideoSummaryModel.schema_version == "4.2.0",
                 ),
             )
             .where(

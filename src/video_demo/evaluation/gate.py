@@ -1329,7 +1329,6 @@ def _verify_chapter_vlm_inputs(
         proxy_is_variable_frame_rate=proxy_probe.manifest.video_stream.is_variable_frame_rate,
         proxy_duration_ms=proxy_probe.manifest.duration_ms,
         duration_tolerance_ms=manifest.duration_tolerance_ms,
-        frame_tolerance_ms=manifest.frame_tolerance_ms,
         jpeg_quality=manifest.jpeg_quality,
         vlm_max_image_bytes=settings.vlm_max_image_bytes,
         max_candidate_frame_bytes_per_run=settings.max_candidate_frame_bytes_per_run,

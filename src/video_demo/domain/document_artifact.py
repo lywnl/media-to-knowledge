@@ -17,7 +17,6 @@ RESULT_STAGE_NAMES = frozenset(
         "EVIDENCE_PREP",
         "SPEECH",
         "SPEECH_ASR",
-        "SCENE_DETECT",
         "CHAPTER_PLAN",
         "FRAME_SEARCH",
         "VISUAL_EVIDENCE",
@@ -60,7 +59,7 @@ MODEL_METRIC_NAMES = frozenset(
 
 
 class DocumentArtifactPayload(FrozenModel):
-    artifact_schema_version: Literal["4.1.0"] = "4.1.0"
+    artifact_schema_version: Literal["4.2.0"] = "4.2.0"
     result: VideoUnderstandingResult
     evidence: tuple[DocumentEvidenceItem, ...]
     stage_metrics: dict[str, StrictInt]

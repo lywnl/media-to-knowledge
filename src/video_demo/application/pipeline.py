@@ -32,9 +32,6 @@ from video_demo.application.pipeline_contracts import (
     RegisteredAsset as RegisteredAsset,
 )
 from video_demo.application.pipeline_contracts import (
-    SceneIndex as SceneIndex,
-)
-from video_demo.application.pipeline_contracts import (
     SpeechAnalysis as SpeechAnalysis,
 )
 from video_demo.application.pipeline_contracts import (

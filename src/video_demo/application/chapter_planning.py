@@ -26,7 +26,7 @@ from video_demo.domain.document_plan import (
     VisualSearchTarget,
     VisualTargetDraft,
 )
-from video_demo.domain.evidence import SceneBoundary, SpeechSegment, SubtitleCue
+from video_demo.domain.evidence import SpeechSegment, SubtitleCue
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.document_port import (
     ChapterBoundaryCoordinationRequest,
@@ -199,7 +199,6 @@ class ChapterPlanner:
         duration_ms: int,
         segments: tuple[BaseSegment, ...],
         transcript_evidence: tuple[SpeechSegment | SubtitleCue, ...],
-        scenes: tuple[SceneBoundary, ...],
         document_config: DocumentGenerationConfig,
         is_cancel_requested: Callable[[], bool],
     ) -> ChapterPlanningBatch:
@@ -207,7 +206,6 @@ class ChapterPlanner:
             duration_ms,
             segments,
             transcript_evidence,
-            scenes,
         )
         _validate_chapter_count_feasibility(ordered_segments, self._max_chapters)
         counters = _PlanningCounters()
@@ -278,7 +276,6 @@ class ChapterPlanner:
             normalized,
             ordered_segments,
             transcript_evidence,
-            scenes,
         )
         warnings = tuple(
             f"CHAPTER_PLANNING_FALLBACK:{plan.chapter_id}"
@@ -681,7 +678,6 @@ def _validate_planning_inputs(
     duration_ms: int,
     segments: tuple[BaseSegment, ...],
     transcript_evidence: tuple[SpeechSegment | SubtitleCue, ...],
-    scenes: tuple[SceneBoundary, ...],
 ) -> tuple[BaseSegment, ...]:
     if not segments or segments[0].start_ms != 0 or segments[-1].end_ms != duration_ms:
         raise VideoDemoError(ErrorCode.UNKNOWN_SEGMENT_REFERENCE, "基础片段未覆盖完整视频")
@@ -712,14 +708,6 @@ def _validate_planning_inputs(
                 ErrorCode.EVIDENCE_OUTSIDE_SEGMENT,
                 "转写证据不在引用它的基础片段内",
             )
-    if scenes:
-        if scenes[0].start_ms != 0 or scenes[-1].end_ms != duration_ms:
-            raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "场景未覆盖完整视频")
-        if any(left.end_ms != right.start_ms for left, right in pairwise(scenes)):
-            raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "场景必须连续且有序")
-        scene_ids = tuple(item.evidence_id for item in scenes)
-        if len(scene_ids) != len(set(scene_ids)):
-            raise VideoDemoError(ErrorCode.VISUAL_RESULT_INVALID, "场景标识不得重复")
     return segments
 
 
@@ -1044,7 +1032,6 @@ def _materialize_plans(
     drafts: tuple[ChapterDraft, ...],
     segments: tuple[BaseSegment, ...],
     transcript_evidence: tuple[SpeechSegment | SubtitleCue, ...],
-    scenes: tuple[SceneBoundary, ...],
 ) -> tuple[ChapterPlan, ...]:
     segment_by_id = {item.segment_id: item for item in segments}
     transcript_ids = {item.evidence_id for item in transcript_evidence}
@@ -1075,7 +1062,6 @@ def _materialize_plans(
             chapter_id,
             start_ms,
             end_ms,
-            scenes,
         )
         plans.append(
             ChapterPlan(
@@ -1125,21 +1111,9 @@ def _base_coverage_target(
     chapter_id: str,
     start_ms: int,
     end_ms: int,
-    scenes: tuple[SceneBoundary, ...],
 ) -> VisualSearchTarget:
-    overlapping = tuple(
-        item.evidence_id
-        for item in scenes
-        if start_ms < item.end_ms and item.start_ms < end_ms
-    )
-    scene_refs = (
-        overlapping
-        if len(overlapping) <= 2
-        else (overlapping[0], overlapping[-1])
-    )
-    sample_timestamps = () if scene_refs else (start_ms + (end_ms - start_ms) // 2,)
+    sample_timestamps = (start_ms + (end_ms - start_ms) // 2,)
     payload = {
-        "scene_refs": list(scene_refs),
         "sample_timestamps_ms": list(sample_timestamps),
     }
     return VisualSearchTarget(
@@ -1155,7 +1129,6 @@ def _base_coverage_target(
         ),
         purpose="BASE_COVERAGE",
         query_zh="检查本章代表性画面是否提供语音之外的信息",
-        scene_refs=scene_refs,
         sample_timestamps_ms=sample_timestamps,
     )
 

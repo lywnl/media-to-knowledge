@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import hashlib
 import importlib
-import json
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
-from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Self, cast
@@ -23,7 +20,6 @@ from video_demo.domain.document_plan import BaseSegment
 from video_demo.domain.evidence import (
     DocumentEvidenceItem,
     KeyframeEvidence,
-    SceneBoundary,
     SpeechSegment,
     SubtitleCue,
     VisualObservationEvidence,
@@ -116,7 +112,7 @@ class PipelineRunConfig(FrozenModel):
     document_config: DocumentGenerationConfig = Field(
         default_factory=DocumentGenerationConfig,
     )
-    result_schema_version: Literal["4.1.0"] = "4.1.0"
+    result_schema_version: Literal["4.2.0"] = "4.2.0"
 
     @model_validator(mode="after")
     def normalize_speech_configuration(self) -> Self:
@@ -137,11 +133,11 @@ def pipeline_run_config_from_snapshot(
 ) -> PipelineRunConfig:
     """只在读取历史数据库快照时丢弃三个已退役语音字段。"""
 
-    if snapshot.get("result_schema_version") != "4.1.0":
+    if snapshot.get("result_schema_version") != "4.2.0":
         raise VideoDemoError(
             ErrorCode.RESULT_SCHEMA_UNSUPPORTED,
             "运行配置快照不是 4.1",
-            {"supported_schema_version": "4.1.0"},
+            {"supported_schema_version": "4.2.0"},
         )
 
     normalized = {
@@ -198,7 +194,6 @@ class TranscriptionCheckpoint:
     registered: RegisteredAsset
     prepared: PreparedMedia
     speech: SpeechAnalysis
-    scene_index: SceneIndex
     base_segments: tuple[BaseSegment, ...]
     stage_metrics: Mapping[str, int] = field(default_factory=dict)
     stage_cache_hits: tuple[str, ...] = ()
@@ -207,8 +202,6 @@ class TranscriptionCheckpoint:
     def __post_init__(self) -> None:
         if self.registered.source_sha256 != self.prepared.source.asset.source_sha256:
             raise ValueError("转写快照的原始视频摘要不一致")
-        if self.prepared.proxy_sha256 != self.scene_index.proxy_sha256:
-            raise ValueError("转写快照的场景索引摘要不一致")
 
 
 def transcription_checkpoint_to_payload(checkpoint: TranscriptionCheckpoint) -> dict[str, object]:
@@ -224,7 +217,7 @@ def transcription_checkpoint_to_payload(checkpoint: TranscriptionCheckpoint) -> 
         for item in speech.transcript_evidence
     ]
     return {
-        "schema_version": "1.0.0",
+        "schema_version": "2.0.0",
         "registered": {
             "source_path": str(checkpoint.registered.source_path),
             "source_sha256": checkpoint.registered.source_sha256,
@@ -267,7 +260,6 @@ def transcription_checkpoint_to_payload(checkpoint: TranscriptionCheckpoint) -> 
             ],
             "stage_cache_hits": list(speech.stage_cache_hits),
         },
-        "scene_index": checkpoint.scene_index.model_dump(mode="json"),
         "base_segments": [item.model_dump(mode="json") for item in checkpoint.base_segments],
         "stage_metrics": dict(checkpoint.stage_metrics),
         "stage_cache_hits": list(checkpoint.stage_cache_hits),
@@ -279,7 +271,7 @@ def transcription_checkpoint_from_payload(
 ) -> TranscriptionCheckpoint:
     """从 JSON 快照恢复转写事实，并重新执行领域校验。"""
 
-    if payload.get("schema_version") != "1.0.0":
+    if payload.get("schema_version") != "2.0.0":
         raise ValueError("转写快照版本不受支持")
     registered_payload = _mapping(payload, "registered")
     config = PipelineRunConfig.model_validate(_mapping(registered_payload, "config"))
@@ -360,7 +352,6 @@ def transcription_checkpoint_from_payload(
         registered=registered,
         prepared=prepared,
         speech=speech,
-        scene_index=SceneIndex.model_validate(_mapping(payload, "scene_index")),
         base_segments=tuple(
             BaseSegment.model_validate(item)
             for item in payload.get("base_segments", [])
@@ -450,64 +441,7 @@ def _matches_transcript_source(
 class EvidencePreparationLimits(FrozenModel):
     max_transcript_evidence_items: int = Field(ge=1)
     max_transcript_chars: int = Field(ge=1)
-    max_scene_boundaries: int = Field(ge=1)
     max_base_segments: int = Field(ge=1)
-
-
-class SceneIndex(FrozenModel):
-    proxy_sha256: Sha256
-    duration_ms: int = Field(gt=0, le=7_200_000)
-    frame_tolerance_ms: int = Field(ge=0, le=100)
-    scenes: tuple[SceneBoundary, ...]
-    index_sha256: Sha256
-
-    @model_validator(mode="after")
-    def validate_index_digest(self) -> Self:
-        scene_ids = tuple(scene.evidence_id for scene in self.scenes)
-        if len(scene_ids) != len(set(scene_ids)):
-            raise ValueError("场景索引标识不得重复")
-        ordered = tuple(
-            sorted(
-                self.scenes,
-                key=lambda scene: (scene.start_ms, scene.end_ms, scene.evidence_id),
-            ),
-        )
-        if (
-            (ordered and ordered != self.scenes)
-            or (ordered and ordered[0].start_ms != 0)
-            or (ordered and ordered[-1].end_ms != self.duration_ms)
-            or any(left.end_ms != right.start_ms for left, right in pairwise(ordered))
-        ):
-            raise ValueError("场景索引时间轴必须有序、连续并覆盖完整视频")
-        if self.index_sha256 != scene_index_sha256(
-            proxy_sha256=self.proxy_sha256,
-            duration_ms=self.duration_ms,
-            frame_tolerance_ms=self.frame_tolerance_ms,
-            scenes=self.scenes,
-        ):
-            raise ValueError("场景索引摘要与规范内容不一致")
-        return self
-
-
-def scene_index_sha256(
-    *,
-    proxy_sha256: str,
-    duration_ms: int,
-    frame_tolerance_ms: int,
-    scenes: tuple[SceneBoundary, ...],
-) -> str:
-    encoded = json.dumps(
-        {
-            "proxy_sha256": proxy_sha256,
-            "duration_ms": duration_ms,
-            "frame_tolerance_ms": frame_tolerance_ms,
-            "scenes": [scene.model_dump(mode="json") for scene in scenes],
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 class DocumentWritingContext(FrozenModel):

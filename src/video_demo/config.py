@@ -229,7 +229,6 @@ class Settings(BaseSettings):
 
     max_transcript_evidence_items: int = Field(default=20_000, ge=1)
     max_transcript_chars: int = Field(default=2_000_000, ge=1)
-    max_scene_boundaries: int = Field(default=20_000, ge=1)
     max_base_segments: int = Field(default=20_000, ge=1)
     max_document_chapters: int = Field(default=240, ge=1)
     max_result_evidence_items: int = Field(default=25_000, ge=1)

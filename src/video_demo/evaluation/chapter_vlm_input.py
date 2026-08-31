@@ -12,7 +12,6 @@ from typing import Literal
 
 from pydantic import ConfigDict, Field, StrictBool, StrictInt, model_validator
 
-from video_demo.application.production_scene import frame_tolerance_ms_for_rate
 from video_demo.domain.base import FrozenModel, Sha256, StableId, stable_identifier
 from video_demo.domain.document_plan import FrameCandidateArtifact, frame_candidate_id
 from video_demo.domain.manifest import Rational, VideoAssetManifest
@@ -36,7 +35,7 @@ from video_demo.visual.candidate_artifacts import (
     CandidateDirectoryLease,
     read_verified_candidate_jpeg,
 )
-from video_demo.visual.keyframes import FrameSample, OpenCvFrameExtractor
+from video_demo.visual.ffmpeg_frames import FFmpegFrameExtractor, FrameSample
 
 _MAX_CHAPTER_SPAN_MS = 300_000
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -88,7 +87,6 @@ class ChapterVlmInputFrame(FrozenModel):
     mime_type: Literal["image/jpeg"] = "image/jpeg"
     sha256: Sha256
     size_bytes: StrictInt = Field(gt=0, le=8 * 1024 * 1024)
-    perceptual_hash: str = Field(pattern=r"^[0-9a-f]{16}$")
     target_ids: tuple[StableId, ...] = Field(min_length=1, max_length=1)
 
 
@@ -113,7 +111,6 @@ class ChapterVlmInputManifest(FrozenModel):
     jpeg_quality: StrictInt = Field(ge=1, le=100)
     proxy_sha256: Sha256
     proxy_size_bytes: StrictInt = Field(gt=0)
-    frame_tolerance_ms: StrictInt = Field(ge=1, le=100)
     requested_reference_frame_ids: tuple[StableId, ...] = Field(min_length=2, max_length=4)
     requested_image_sha256s: tuple[Sha256, ...] = Field(min_length=2, max_length=4)
     retained_reference_frame_ids: tuple[StableId, ...] = Field(min_length=2, max_length=4)
@@ -178,8 +175,7 @@ class ChapterVlmInputManifest(FrozenModel):
                 raise ValueError("评测 frame_id 与媒体、时间和图片摘要不匹配")
             if (
                 frame.actual_timestamp_ms >= self.proxy_duration_ms
-                or abs(frame.actual_timestamp_ms - frame.requested_timestamp_ms)
-                > self.frame_tolerance_ms
+                or abs(frame.actual_timestamp_ms - frame.requested_timestamp_ms) > 0
             ):
                 raise ValueError("评测帧实际时间超出容差或代理时长")
         if self.proxy_frame_rate.numerator <= 0 or self.proxy_frame_rate.denominator <= 0:
@@ -257,7 +253,6 @@ class ValidatedChapterVlmInputContext(FrozenModel):
     proxy_is_variable_frame_rate: StrictBool
     proxy_duration_ms: StrictInt = Field(gt=0, le=7_200_000)
     duration_tolerance_ms: StrictInt = Field(ge=0, le=1_000)
-    frame_tolerance_ms: StrictInt = Field(ge=1, le=100)
     jpeg_quality: StrictInt = Field(ge=1, le=100)
     vlm_max_image_bytes: StrictInt = Field(gt=0, le=8 * 1024 * 1024)
     max_candidate_frame_bytes_per_run: StrictInt = Field(gt=0, le=512 * 1024 * 1024)
@@ -341,7 +336,6 @@ def validate_chapter_vlm_input_manifest(
         (manifest.proxy_is_variable_frame_rate, context.proxy_is_variable_frame_rate),
         (manifest.proxy_duration_ms, context.proxy_duration_ms),
         (manifest.duration_tolerance_ms, context.duration_tolerance_ms),
-        (manifest.frame_tolerance_ms, context.frame_tolerance_ms),
         (manifest.jpeg_quality, context.jpeg_quality),
     )
     if any(actual != expected for actual, expected in pairs):
@@ -384,7 +378,6 @@ def validate_chapter_vlm_input_manifest(
                 size_bytes=frame.size_bytes,
                 relative_path=frame.relative_path,
                 mime_type=frame.mime_type,
-                perceptual_hash=frame.perceptual_hash,
                 target_ids=frame.target_ids,
             ),
             max_bytes=context.vlm_max_image_bytes,
@@ -445,7 +438,6 @@ def _context_from_parts(
     proxy_size_bytes: int,
     proxy_max_edge: int,
     jpeg_quality: int,
-    frame_tolerance_ms: int,
     vlm_max_image_bytes: int,
     max_candidate_frame_bytes_per_run: int,
     max_candidate_frame_files_per_run: int,
@@ -471,7 +463,6 @@ def _context_from_parts(
         proxy_is_variable_frame_rate=proxy_manifest.video_stream.is_variable_frame_rate,
         proxy_duration_ms=proxy_manifest.duration_ms,
         duration_tolerance_ms=_DEFAULT_DURATION_TOLERANCE_MS,
-        frame_tolerance_ms=frame_tolerance_ms,
         jpeg_quality=jpeg_quality,
         vlm_max_image_bytes=vlm_max_image_bytes,
         max_candidate_frame_bytes_per_run=max_candidate_frame_bytes_per_run,
@@ -533,7 +524,7 @@ def prepare_chapter_vlm_input(
     max_candidate_frame_bytes_per_run: int,
     max_candidate_frame_files_per_run: int,
     ffprobe: FFprobeClient,
-    frame_extractor: OpenCvFrameExtractor,
+    frame_extractor: FFmpegFrameExtractor,
     runtime_root: Path,
     sample_id: StableId | None = None,
     requested_reference_frame_ids: tuple[StableId, ...] | None = None,
@@ -627,10 +618,6 @@ def prepare_chapter_vlm_input(
                     source_mime="video/mp4",
                     limits=ProbeLimits(max_duration_ms=7_200_000),
                 )
-                tolerance = frame_tolerance_ms_for_rate(
-                    proxy_probe.manifest.video_stream.average_frame_rate,
-                    is_variable_frame_rate=proxy_probe.manifest.video_stream.is_variable_frame_rate,
-                )
                 context = _context_from_parts(
                     manifest=existing,
                     run_root=run_root,
@@ -640,7 +627,6 @@ def prepare_chapter_vlm_input(
                     proxy_size_bytes=proxy_size,
                     proxy_max_edge=proxy_max_edge,
                     jpeg_quality=jpeg_quality,
-                    frame_tolerance_ms=tolerance,
                     vlm_max_image_bytes=vlm_max_image_bytes,
                     max_candidate_frame_bytes_per_run=max_candidate_frame_bytes_per_run,
                     max_candidate_frame_files_per_run=max_candidate_frame_files_per_run,
@@ -649,7 +635,6 @@ def prepare_chapter_vlm_input(
                     existing.evaluation_run_id != evaluation_run_id
                     or existing.proxy_sha256 != proxy_sha
                     or existing.proxy_size_bytes != proxy_size
-                    or existing.frame_tolerance_ms != tolerance
                 ):
                     raise VideoDemoError(ErrorCode.IDEMPOTENCY_CONFLICT, "既有评测输入上下文不一致")
                 validate_chapter_vlm_input_manifest(existing, context=context)
@@ -678,10 +663,6 @@ def prepare_chapter_vlm_input(
                 source_mime="video/mp4",
                 limits=ProbeLimits(max_duration_ms=7_200_000),
             )
-            tolerance = frame_tolerance_ms_for_rate(
-                proxy_probe.manifest.video_stream.average_frame_rate,
-                is_variable_frame_rate=proxy_probe.manifest.video_stream.is_variable_frame_rate,
-            )
             session = CandidateArtifactSession(
                 runtime_root=runtime,
                 max_unique_bytes=max_candidate_frame_bytes_per_run,
@@ -704,7 +685,6 @@ def prepare_chapter_vlm_input(
                     run_relative_root,
                     samples,
                     is_cancel_requested=is_cancel_requested,
-                    frame_tolerance_ms=tolerance,
                     artifact_session=session,
                 )
                 by_id = {item.sample_id: item for item in extracted}
@@ -756,7 +736,6 @@ def prepare_chapter_vlm_input(
                     jpeg_quality=jpeg_quality,
                     proxy_sha256=proxy_sha,
                     proxy_size_bytes=proxy_size,
-                    frame_tolerance_ms=tolerance,
                     requested_reference_frame_ids=requested_reference_frame_ids,
                     requested_image_sha256s=requested_sha,
                     retained_reference_frame_ids=retained,
@@ -784,7 +763,6 @@ def prepare_chapter_vlm_input(
                         )
                         .stat()
                         .st_size,
-                        perceptual_hash=candidates[reference_id].perceptual_hash,
                         target_ids=(target_id,),
                     )
                     for reference_id in retained
@@ -803,7 +781,6 @@ def prepare_chapter_vlm_input(
                     proxy_size_bytes=proxy_size,
                     proxy_max_edge=proxy_max_edge,
                     jpeg_quality=jpeg_quality,
-                    frame_tolerance_ms=tolerance,
                     vlm_max_image_bytes=vlm_max_image_bytes,
                     max_candidate_frame_bytes_per_run=max_candidate_frame_bytes_per_run,
                     max_candidate_frame_files_per_run=max_candidate_frame_files_per_run,
