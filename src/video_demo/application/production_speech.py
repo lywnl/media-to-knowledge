@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -14,14 +15,11 @@ from video_demo.application.pipeline_contracts import (
     SpeechBoundaryCandidate,
 )
 from video_demo.domain.base import StableId
-from video_demo.domain.evidence import SpeechSegment
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.media.transcode import AudioSliceArtifact
 from video_demo.speech.asr import (
     WindowRecognizerPort,
-    build_cloud_asr_windows,
-    project_cloud_asr_window,
     remove_adjacent_cloud_asr_duplicates,
 )
 from video_demo.speech.snapshots import (
@@ -29,15 +27,17 @@ from video_demo.speech.snapshots import (
     AsrWindowSnapshotPayload,
     asr_window_fingerprint,
 )
-from video_demo.speech.vad import VadResult
+from video_demo.speech.video_asr import (
+    VIDEO_ASR_CHUNK_DURATION_MS,
+    VIDEO_ASR_CONCURRENCY,
+    FixedAsrWindow,
+    build_fixed_asr_windows,
+    project_fixed_asr_window,
+)
 from video_demo.storage.snapshots import AsrWindowSnapshotStore
 from video_demo.storage.workspace import safe_runtime_path
 
 _LOGGER = logging.getLogger(__name__)
-
-
-class VadPort(Protocol):
-    def detect(self, audio: Path, *, duration_ms: int) -> VadResult: ...
 
 
 class AudioSlicer(Protocol):
@@ -52,10 +52,10 @@ class AudioSlicer(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class AsrComponents:
-    vad: VadPort
     recognizer: WindowRecognizerPort
     slicer: AudioSlicer
     slice_namespace: StableId
+    is_cancel_requested: Callable[[], bool] = lambda: False
 
 
 AsrComponentFactory = Callable[[PreparedMedia, Callable[[], bool]], AsrComponents]
@@ -90,135 +90,197 @@ def run_asr_stage(
     *,
     window_store: AsrWindowSnapshotStore,
     asr_fingerprint: str,
-    max_window_ms: int,
-    overlap_ms: int,
-    merge_gap_ms: int = 2_000,
+    chunk_duration_ms: int = VIDEO_ASR_CHUNK_DURATION_MS,
+    concurrency: int = VIDEO_ASR_CONCURRENCY,
     max_upload_bytes: int = 25 * 1024 * 1024,
 ) -> AsrSnapshotPayload:
-    """严格串行识别 VAD 窗口，并在每个成功窗口后立即持久化。"""
+    """固定十分钟分块并发识别；所有块成功后才发布完整 ASR 结果。"""
 
     if media.audio_path is None:
         raise VideoDemoError(ErrorCode.SPEECH_AUDIO_INVALID, "云端 ASR 缺少音频")
-    vad = components.vad.detect(media.audio_path, duration_ms=media.source.duration_ms)
-    windows = build_cloud_asr_windows(
-        vad.speech,
-        max_window_ms=max_window_ms,
-        overlap_ms=overlap_ms,
-        merge_gap_ms=merge_gap_ms,
-        max_upload_bytes=max_upload_bytes,
+    if concurrency != VIDEO_ASR_CONCURRENCY:
+        raise ValueError("视频 ASR 并发数必须固定为 2")
+    windows = build_fixed_asr_windows(
+        media.source.duration_ms,
+        chunk_duration_ms=chunk_duration_ms,
     )
-    language_spans = []
-    segments: list[SpeechSegment] = []
-    warnings: list[str] = []
+    _LOGGER.info(
+        "视频 ASR 固定分块完成 chunks=%d chunk_duration_ms=%d concurrency=%d",
+        len(windows),
+        chunk_duration_ms,
+        concurrency,
+    )
     prompt = cloud_asr_prompt(
         media.source.asset.config.hotwords,
         media.source.asset.config.core_context,
     )
     language_hint = _single_language_hint(media.source.asset.config.language_hints)
-    for index, window in enumerate(windows, start=1):
-        _LOGGER.info(
-            "云端 ASR 窗口: index=%d/%d upload=%d-%dms owned=%d-%dms duration=%dms sources=%d",
-            index,
-            len(windows),
-            window.upload_range.start_ms,
-            window.upload_range.end_ms,
-            window.owned_range.start_ms,
-            window.owned_range.end_ms,
-            window.upload_range.duration_ms,
-            len(window.source_intervals),
-        )
-        fingerprint = asr_window_fingerprint(
-            asr_fingerprint=asr_fingerprint,
-            window=window,
-        )
-        cached = window_store.load(media.source.asset.run_relative_root, fingerprint)
-        if cached is None:
-            payload = _recognize_window(
-                media,
-                components,
-                window_store,
-                window,
-                fingerprint,
-                language_hint=language_hint,
-                prompt=prompt,
-            )
-        else:
-            payload = cached[0]
-        language_spans.append(payload.language_span)
-        segments.extend(payload.segments)
-        warnings.extend(payload.warnings)
-    ordered_spans = tuple(
-        sorted(language_spans, key=lambda item: (item.start_ms, item.end_ms, item.evidence_id))
+    results = _recognize_windows_concurrently(
+        media,
+        components,
+        windows,
+        window_store,
+        asr_fingerprint,
+        language_hint=language_hint,
+        prompt=prompt,
+        max_upload_bytes=max_upload_bytes,
     )
-    ordered_segments = tuple(
-        sorted(segments, key=lambda item: (item.start_ms, item.end_ms, item.evidence_id))
+    language_spans = tuple(payload.language_span for payload in results)
+    segments = tuple(segment for payload in results for segment in payload.segments)
+    warnings = tuple(
+        warning for payload in results for warning in payload.warnings
     )
-    deduplicated = remove_adjacent_cloud_asr_duplicates(ordered_segments)
+    deduplicated = remove_adjacent_cloud_asr_duplicates(
+        tuple(sorted(segments, key=lambda item: (item.start_ms, item.end_ms, item.evidence_id)))
+    )
     if windows and not deduplicated:
-        warnings.append("ASR_NO_VALID_SEGMENTS")
+        warnings = (*warnings, "ASR_NO_VALID_SEGMENTS")
+    _LOGGER.info("视频 ASR 全部块完成 chunks=%d", len(windows))
     return AsrSnapshotPayload(
-        language_spans=ordered_spans,
+        language_spans=tuple(
+            sorted(language_spans, key=lambda item: (item.start_ms, item.end_ms, item.evidence_id))
+        ),
         segments=deduplicated,
-        vad_warnings=vad.warnings,
-        silence_boundaries_ms=vad.long_silence_boundaries_ms,
         language_change_boundaries_ms=tuple(
             current.start_ms
-            for previous, current in pairwise(ordered_spans)
+            for previous, current in pairwise(
+                sorted(
+                    language_spans,
+                    key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),
+                )
+            )
             if previous.language != current.language
         ),
         asr_warnings=tuple(dict.fromkeys(warnings)),
     )
 
 
+def _recognize_windows_concurrently(
+    media: PreparedMedia,
+    components: AsrComponents,
+    windows: tuple[FixedAsrWindow, ...],
+    window_store: AsrWindowSnapshotStore,
+    asr_fingerprint: str,
+    *,
+    language_hint: str | None,
+    prompt: str | None,
+    max_upload_bytes: int,
+) -> tuple[AsrWindowSnapshotPayload, ...]:
+    results: dict[int, AsrWindowSnapshotPayload] = {}
+    futures: dict[Future[AsrWindowSnapshotPayload], FixedAsrWindow] = {}
+    first_error: Exception | None = None
+    with ThreadPoolExecutor(
+        max_workers=VIDEO_ASR_CONCURRENCY,
+        thread_name_prefix="video-asr",
+    ) as executor:
+        for window in windows:
+            futures[executor.submit(
+                _recognize_window,
+                media,
+                components,
+                window_store,
+                window,
+                asr_fingerprint,
+                language_hint=language_hint,
+                prompt=prompt,
+                max_upload_bytes=max_upload_bytes,
+            )] = window
+        for future in as_completed(futures):
+            window = futures[future]
+            try:
+                results[window.chunk_index] = future.result()
+            except Exception as error:
+                first_error = error
+                _LOGGER.warning(
+                    "视频 ASR 块失败 chunk=%d/%d code=%s",
+                    window.chunk_index + 1,
+                    len(windows),
+                    getattr(error, "code", type(error).__name__),
+                )
+                for pending in futures:
+                    if pending is not future:
+                        pending.cancel()
+                break
+    if first_error is not None:
+        raise first_error
+    if len(results) != len(windows):
+        raise VideoDemoError(ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID, "视频 ASR 块结果不完整")
+    return tuple(results[index] for index in range(len(windows)))
+
+
 def _recognize_window(
     media: PreparedMedia,
     components: AsrComponents,
     window_store: AsrWindowSnapshotStore,
-    window: object,
+    window: FixedAsrWindow,
     fingerprint: str,
     *,
     language_hint: str | None,
     prompt: str | None,
+    max_upload_bytes: int,
 ) -> AsrWindowSnapshotPayload:
-    from video_demo.speech.asr import CloudAsrWindow
-
-    if not isinstance(window, CloudAsrWindow):
-        raise TypeError("云端 ASR 窗口类型非法")
     assert media.audio_path is not None
+    if components.is_cancel_requested():
+        raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
+    window_fingerprint = asr_window_fingerprint(
+        asr_fingerprint=fingerprint,
+        window=window,
+    )
+    cached = window_store.load(
+        media.source.asset.run_relative_root,
+        window_fingerprint,
+    )
+    if cached is not None:
+        _LOGGER.info(
+            "视频 ASR 块完成 chunk=%d cached=true segments=%d",
+            window.chunk_index + 1,
+            len(cached[0].segments),
+        )
+        return cached[0]
+    _LOGGER.info(
+        "视频 ASR 块开始 chunk=%d range=%d-%dms",
+        window.chunk_index + 1,
+        window.upload_range.start_ms,
+        window.upload_range.end_ms,
+    )
     audio_slice = components.slicer.create(
         media.audio_path,
         media.source.asset.run_relative_root,
-        f"{components.slice_namespace}_{fingerprint[:24]}",
+        f"{components.slice_namespace}_{window_fingerprint[:24]}",
         window.upload_range,
     )
     try:
-        _LOGGER.info(
-            "云端 ASR 切片: upload=%d-%dms size_bytes=%d",
-            window.upload_range.start_ms,
-            window.upload_range.end_ms,
-            audio_slice.stat().st_size,
-        )
+        if audio_slice.stat().st_size > max_upload_bytes:
+            raise VideoDemoError(ErrorCode.VIDEO_OUTPUT_TOO_LARGE, "ASR 音频切片超过大小限制")
         result = components.recognizer.transcribe_window(
             audio_slice,
             language_hint=language_hint,
             prompt=prompt,
         )
-        projection = project_cloud_asr_window(
+        projection = project_fixed_asr_window(
             window,
             language=result.language,
             raw_segments=result.segments,
             warnings=result.warnings,
         )
         payload = AsrWindowSnapshotPayload(
+            chunk_index=window.chunk_index,
             upload_range=window.upload_range,
             owned_range=window.owned_range,
-            speech_interval=window.speech_interval,
-            source_intervals=window.source_intervals,
             language_span=projection.language_span,
             segments=projection.segments,
             warnings=projection.warnings,
         )
-        window_store.publish(media.source.asset.run_relative_root, fingerprint, payload)
+        window_store.publish(
+            media.source.asset.run_relative_root,
+            window_fingerprint,
+            payload,
+        )
+        _LOGGER.info(
+            "视频 ASR 块完成 chunk=%d cached=false segments=%d",
+            window.chunk_index + 1,
+            len(payload.segments),
+        )
         return payload
     finally:
         _discard_audio_slice(audio_slice)
@@ -228,9 +290,7 @@ def analysis_from_asr_snapshot(
     media: PreparedMedia,
     payload: AsrSnapshotPayload,
 ) -> SpeechAnalysis:
-    warnings = tuple(
-        dict.fromkeys((*media.warnings, *payload.vad_warnings, *payload.asr_warnings))
-    )
+    warnings = tuple(dict.fromkeys((*media.warnings, *payload.asr_warnings)))
     if not payload.language_spans:
         warnings = tuple(dict.fromkeys((*warnings, "NO_SPEECH_DETECTED")))
     return SpeechAnalysis(
@@ -239,7 +299,6 @@ def analysis_from_asr_snapshot(
         warnings=warnings,
         boundary_candidates=_boundary_candidates(
             media.source.duration_ms,
-            silence=payload.silence_boundaries_ms,
             sentence_ends=tuple(item.end_ms for item in payload.segments),
             language_changes=payload.language_change_boundaries_ms,
         ),

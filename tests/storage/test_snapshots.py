@@ -12,7 +12,6 @@ from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.speech.language import LanguageSpan
 from video_demo.speech.snapshots import AsrWindowSnapshotPayload
-from video_demo.speech.vad import SpeechInterval
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.snapshots import AsrWindowSnapshotStore, SnapshotStore
 
@@ -295,12 +294,6 @@ def _window_payload(
     start_ms: int,
     end_ms: int,
 ) -> AsrWindowSnapshotPayload:
-    speech = SpeechInterval(
-        evidence_id=f"vad_{start_ms}",
-        start_ms=start_ms,
-        end_ms=end_ms,
-        confidence=0.9,
-    )
     time_range = TimeRange(start_ms=start_ms, end_ms=end_ms)
     language_span = LanguageSpan(
         evidence_id=f"lid_{start_ms}",
@@ -311,9 +304,9 @@ def _window_payload(
         is_fully_evaluated_language=True,
     )
     return AsrWindowSnapshotPayload(
+        chunk_index=start_ms // 10_000,
         upload_range=time_range,
         owned_range=time_range,
-        speech_interval=speech,
         language_span=language_span,
         segments=(
             SpeechSegment(

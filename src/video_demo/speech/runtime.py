@@ -17,14 +17,13 @@ from video_demo.application.production_speech import (
 from video_demo.config import Settings
 from video_demo.integrations.cloud_whisper import CloudWhisperClient
 from video_demo.speech.asr import WindowRecognizerPort
-from video_demo.speech.vad import NativeSileroBackend, SileroVadAdapter
 
 
 @dataclass(frozen=True, slots=True)
 class ProductionSpeechModels:
     """生产诊断入口复用的 Silero 与云端识别端口。"""
 
-    vad: SileroVadAdapter
+    vad: object
     recognizer: WindowRecognizerPort
 
 
@@ -33,6 +32,8 @@ def build_diagnostic_speech_models(
     http_client: httpx.Client,
 ) -> ProductionSpeechModels:
     configuration = settings.require_cloud_asr_configuration()
+    from video_demo.speech.vad import NativeSileroBackend, SileroVadAdapter
+
     return ProductionSpeechModels(
         vad=SileroVadAdapter(NativeSileroBackend()),
         recognizer=CloudWhisperClient(
@@ -60,7 +61,6 @@ def build_speech_component_factory(
         assert callable(factory)
         ffmpeg_client: TranscodeClient = factory(is_cancel_requested)
         return AsrComponents(
-            vad=models.vad,
             recognizer=models.recognizer,
             slicer=VerifiedAudioSlicer(
                 runtime_root,
@@ -68,6 +68,7 @@ def build_speech_component_factory(
                 media.source.duration_ms,
             ),
             slice_namespace="speech_diagnostic",
+            is_cancel_requested=is_cancel_requested,
         )
 
     return build
@@ -81,20 +82,13 @@ def build_subprocess_asr_components(
     ffmpeg_path: Path,
     recognizer: WindowRecognizerPort,
     slice_namespace: str,
-    vad_threshold: float,
-    vad_merge_gap_ms: int,
     is_cancel_requested: Callable[[], bool] = lambda: False,
 ) -> AsrComponents:
-    """构造单次子进程使用的 VAD、切片器和云端识别端口。"""
+    """构造单次视频 ASR 子进程使用的切片器和云端识别端口。"""
 
     ffmpeg_factory = build_ffmpeg_factory(workspace_root, runtime_root, ffmpeg_path)
     ffmpeg_client: TranscodeClient = ffmpeg_factory(is_cancel_requested)
     return AsrComponents(
-        vad=SileroVadAdapter(
-            NativeSileroBackend(),
-            threshold=vad_threshold,
-            merge_gap_ms=vad_merge_gap_ms,
-        ),
         recognizer=recognizer,
         slicer=VerifiedAudioSlicer(
             runtime_root,
@@ -102,4 +96,5 @@ def build_subprocess_asr_components(
             media.source.duration_ms,
         ),
         slice_namespace=slice_namespace,
+        is_cancel_requested=is_cancel_requested,
     )

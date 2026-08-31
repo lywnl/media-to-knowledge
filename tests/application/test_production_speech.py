@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
+from threading import Lock
 
 import pytest
 
@@ -23,7 +25,6 @@ from video_demo.media.probe import ProbeLimits
 from video_demo.media.subtitles import ParsedSubtitle, SubtitleArtifact
 from video_demo.speech.asr import RawAsrSegment, WindowTranscriptionResult
 from video_demo.speech.snapshots import AsrSnapshotPayload
-from video_demo.speech.vad import SpeechInterval, VadResult
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.snapshots import AsrWindowSnapshotStore
 
@@ -57,8 +58,6 @@ def test_analysis_from_asr_snapshot_projects_warnings_and_boundaries(tmp_path: P
     payload = AsrSnapshotPayload(
         language_spans=(),
         segments=(),
-        vad_warnings=("VAD_WARNING",),
-        silence_boundaries_ms=(1_000,),
         language_change_boundaries_ms=(),
         asr_warnings=("ASR_OVERLAP_TIMESTAMP_CLAMPED",),
     )
@@ -66,14 +65,8 @@ def test_analysis_from_asr_snapshot_projects_warnings_and_boundaries(tmp_path: P
     result = analysis_from_asr_snapshot(media, payload)
 
     assert result.transcript_source == "ASR"
-    assert result.warnings == (
-        "VAD_WARNING",
-        "ASR_OVERLAP_TIMESTAMP_CLAMPED",
-        "NO_SPEECH_DETECTED",
-    )
-    assert [(item.timestamp_ms, item.source) for item in result.boundary_candidates] == [
-        (1_000, "silence")
-    ]
+    assert result.warnings == ("ASR_OVERLAP_TIMESTAMP_CLAMPED", "NO_SPEECH_DETECTED")
+    assert result.boundary_candidates == ()
 
 
 def test_cloud_asr_prompt_combines_context_then_hotwords_without_rewriting() -> None:
@@ -84,23 +77,14 @@ def test_cloud_asr_prompt_combines_context_then_hotwords_without_rewriting() -> 
     assert cloud_asr_prompt(("Milvus",), None) == "Milvus"
 
 
-def test_run_asr_stage_is_serial_and_resumes_completed_windows(tmp_path: Path) -> None:
+def test_run_asr_stage_uses_two_concurrent_fixed_windows_and_resumes_cached_chunks(
+    tmp_path: Path,
+) -> None:
     media = _media(tmp_path, duration_ms=1_800_000)
-    vad = _Vad(
-        (
-            SpeechInterval(
-                evidence_id="vad_long",
-                start_ms=0,
-                end_ms=1_800_000,
-                confidence=0.9,
-            ),
-        )
-    )
     calls: list[str] = []
     slices: list[Path] = []
-    recognizer = _Recognizer(calls, fail_at=3)
+    recognizer = _Recognizer(calls, fail_at=3, delay_seconds=0.01)
     components = AsrComponents(
-        vad=vad,
         recognizer=recognizer,
         slicer=_Slicer(tmp_path, calls, slices),
         slice_namespace="speech_request_resume",
@@ -113,13 +97,10 @@ def test_run_asr_stage_is_serial_and_resumes_completed_windows(tmp_path: Path) -
             components,
             window_store=window_store,
             asr_fingerprint="a" * 64,
-            max_window_ms=600_000,
-            overlap_ms=1_000,
         )
 
     assert raised.value.code == ErrorCode.DEPENDENCY_TEMPORARY_FAILURE
-    assert calls == ["slice-1", "recognize-1", "slice-2", "recognize-2", "slice-3", "recognize-3"]
-    assert recognizer.max_active_calls == 1
+    assert len(calls) >= 4
     assert all(not path.exists() for path in slices)
 
     calls.clear()
@@ -130,15 +111,13 @@ def test_run_asr_stage_is_serial_and_resumes_completed_windows(tmp_path: Path) -
         components,
         window_store=window_store,
         asr_fingerprint="a" * 64,
-        max_window_ms=600_000,
-        overlap_ms=1_000,
     )
 
-    assert calls == ["slice-4", "recognize-4", "slice-5", "recognize-5"]
+    assert recognizer.max_active_calls == 2
     assert [segment.start_ms for segment in payload.segments] == sorted(
         segment.start_ms for segment in payload.segments
     )
-    assert len(payload.language_spans) == 4
+    assert len(payload.language_spans) == 3
     assert all(not path.exists() for path in slices)
 
 
@@ -153,7 +132,6 @@ def test_run_asr_stage_uses_single_language_hint_and_exact_prompt(tmp_path: Path
     )
     recognizer = _Recognizer([])
     components = AsrComponents(
-        vad=_Vad((_speech(0, 5_000),)),
         recognizer=recognizer,
         slicer=_Slicer(tmp_path, [], []),
         slice_namespace="speech_request_prompt",
@@ -164,23 +142,9 @@ def test_run_asr_stage_uses_single_language_hint_and_exact_prompt(tmp_path: Path
         components,
         window_store=AsrWindowSnapshotStore(AtomicArtifactStore(tmp_path)),
         asr_fingerprint="b" * 64,
-        max_window_ms=600_000,
-        overlap_ms=1_000,
     )
 
     assert recognizer.inputs == [("zh", "向量数据库课程\nMilvus Qwen")]
-
-
-class _Vad:
-    def __init__(self, speech: tuple[SpeechInterval, ...]) -> None:
-        self._speech = speech
-
-    def detect(self, _audio: Path, *, duration_ms: int) -> VadResult:
-        return VadResult(
-            speech=self._speech,
-            silence=(),
-            long_silence_boundaries_ms=(),
-        )
 
 
 class _Slicer:
@@ -206,13 +170,21 @@ class _Slicer:
 
 
 class _Recognizer:
-    def __init__(self, calls: list[str], *, fail_at: int | None = None) -> None:
+    def __init__(
+        self,
+        calls: list[str],
+        *,
+        fail_at: int | None = None,
+        delay_seconds: float = 0,
+    ) -> None:
         self._calls = calls
         self.fail_at = fail_at
+        self._delay_seconds = delay_seconds
         self._count = 0
         self._active_calls = 0
         self.max_active_calls = 0
         self.inputs: list[tuple[str | None, str | None]] = []
+        self._lock = Lock()
 
     def transcribe_window(
         self,
@@ -221,32 +193,28 @@ class _Recognizer:
         language_hint: str | None,
         prompt: str | None,
     ) -> WindowTranscriptionResult:
-        self._count += 1
-        self._active_calls += 1
-        self.max_active_calls = max(self.max_active_calls, self._active_calls)
+        with self._lock:
+            self._count += 1
+            call_number = self._count
+            self._active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self._active_calls)
         try:
-            self._calls.append(f"recognize-{self._count}")
+            self._calls.append(f"recognize-{call_number}")
             self.inputs.append((language_hint, prompt))
-            if self.fail_at == self._count:
+            if self._delay_seconds:
+                time.sleep(self._delay_seconds)
+            if self.fail_at == call_number:
                 raise VideoDemoError(
                     ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
                     "模拟临时失败",
                 )
             return WindowTranscriptionResult(
                 language=language_hint or "zh",
-                segments=(RawAsrSegment(0, 1_000, f"窗口 {self._count}", 0.9),),
+                segments=(RawAsrSegment(0, 1_000, f"窗口 {call_number}", 0.9),),
             )
         finally:
-            self._active_calls -= 1
-
-
-def _speech(start_ms: int, end_ms: int) -> SpeechInterval:
-    return SpeechInterval(
-        evidence_id=f"vad_{start_ms}",
-        start_ms=start_ms,
-        end_ms=end_ms,
-        confidence=0.9,
-    )
+            with self._lock:
+                self._active_calls -= 1
 
 
 def _subtitle() -> ParsedSubtitle:

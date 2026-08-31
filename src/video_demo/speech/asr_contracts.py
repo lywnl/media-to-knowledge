@@ -7,12 +7,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from video_demo.domain.evidence import SpeechSegment
 from video_demo.domain.run import TimeRange
 from video_demo.speech.language import LanguageSpan
-from video_demo.speech.vad import SpeechInterval
+
+if TYPE_CHECKING:
+    from video_demo.speech.vad import SpeechInterval
 
 
 @dataclass(frozen=True, slots=True)

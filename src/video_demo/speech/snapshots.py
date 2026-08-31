@@ -9,30 +9,26 @@ from pydantic import Field
 from video_demo.domain.base import FrozenModel
 from video_demo.domain.evidence import SpeechSegment
 from video_demo.domain.run import ModelIdentity, TimeRange
-from video_demo.speech.asr import CloudAsrWindow
 from video_demo.speech.language import LanguageSpan
-from video_demo.speech.vad import SpeechInterval
+from video_demo.speech.video_asr import FixedAsrWindow
 
-_ASR_COMPONENTS = frozenset({"silero_vad", "cloud_whisper"})
-_CLOUD_ASR_WINDOW_STRATEGY_VERSION: Literal["2.0.0"] = "2.0.0"
+_ASR_COMPONENTS = frozenset({"cloud_whisper"})
+_VIDEO_ASR_WINDOW_STRATEGY_VERSION: Literal["fixed-10m-v1"] = "fixed-10m-v1"
 
 
 class AsrSnapshotPayload(FrozenModel):
-    schema_version: Literal["1.1.0", "1.2.0", "1.3.0"] = "1.3.0"
+    schema_version: Literal["2.0.0"] = "2.0.0"
     language_spans: tuple[LanguageSpan, ...]
     segments: tuple[SpeechSegment, ...]
-    vad_warnings: tuple[str, ...]
-    silence_boundaries_ms: tuple[int, ...]
     language_change_boundaries_ms: tuple[int, ...]
     asr_warnings: tuple[str, ...] = ()
 
 
 class AsrWindowSnapshotPayload(FrozenModel):
-    schema_version: Literal["1.1.0"] = "1.1.0"
+    schema_version: Literal["2.0.0"] = "2.0.0"
+    chunk_index: int
     upload_range: TimeRange
     owned_range: TimeRange
-    speech_interval: SpeechInterval
-    source_intervals: tuple[SpeechInterval, ...] = ()
     language_span: LanguageSpan
     segments: tuple[SpeechSegment, ...]
     warnings: tuple[str, ...] = ()
@@ -41,12 +37,9 @@ class AsrWindowSnapshotPayload(FrozenModel):
 class SpeechFingerprintInputs(FrozenModel):
     model_identities: tuple[ModelIdentity, ...]
     cloud_asr_base_url: str = Field(min_length=1, max_length=2048)
-    max_window_ms: int = Field(gt=0)
-    overlap_ms: int = Field(ge=0)
-    window_strategy_version: Literal["2.0.0"] = _CLOUD_ASR_WINDOW_STRATEGY_VERSION
-    vad_threshold: float = 0.5
-    vad_merge_gap_ms: int = 200
-    merge_gap_ms: int = 2_000
+    chunk_duration_ms: int = Field(default=600_000, gt=0)
+    chunk_concurrency: Literal[2] = 2
+    window_strategy_version: Literal["fixed-10m-v1"] = _VIDEO_ASR_WINDOW_STRATEGY_VERSION
     max_upload_bytes: int = 25 * 1024 * 1024
 
 
@@ -71,13 +64,10 @@ def asr_fingerprint(
             "core_context": core_context,
             "model_identities": _model_payload(inputs, _ASR_COMPONENTS),
             "cloud_asr_base_url": inputs.cloud_asr_base_url,
-            "max_window_ms": inputs.max_window_ms,
-            "overlap_ms": inputs.overlap_ms,
-            "merge_gap_ms": inputs.merge_gap_ms,
-            "max_upload_bytes": inputs.max_upload_bytes,
+            "chunk_duration_ms": inputs.chunk_duration_ms,
+            "chunk_concurrency": inputs.chunk_concurrency,
             "window_strategy_version": inputs.window_strategy_version,
-            "vad_threshold": inputs.vad_threshold,
-            "vad_merge_gap_ms": inputs.vad_merge_gap_ms,
+            "max_upload_bytes": inputs.max_upload_bytes,
         }
     )
 
@@ -85,7 +75,7 @@ def asr_fingerprint(
 def asr_window_fingerprint(
     *,
     asr_fingerprint: str,
-    window: CloudAsrWindow,
+    window: FixedAsrWindow,
 ) -> str:
     return _canonical_sha256(
         {
@@ -101,14 +91,7 @@ def asr_window_fingerprint(
                 mode="json",
                 exclude_computed_fields=True,
             ),
-            "speech_interval": window.speech_interval.model_dump(
-                mode="json",
-                exclude_computed_fields=True,
-            ),
-            "source_intervals": tuple(
-                item.model_dump(mode="json", exclude_computed_fields=True)
-                for item in window.source_intervals
-            ),
+            "chunk_index": window.chunk_index,
         }
     )
 

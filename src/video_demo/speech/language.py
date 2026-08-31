@@ -4,11 +4,13 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from video_demo.domain.base import FrozenModel, LanguageCode, Probability, stable_identifier
 from video_demo.domain.run import TimeRange
-from video_demo.speech.vad import SpeechInterval
+
+if TYPE_CHECKING:
+    from video_demo.speech.vad import SpeechInterval
 
 _FULLY_EVALUATED_LANGUAGES = frozenset({"zh", "en", "ja", "ko", "es"})
 
@@ -32,7 +34,7 @@ class LanguageIdentificationResult(FrozenModel):
     change_boundaries_ms: tuple[int, ...]
 
 
-LanguageDetector = Callable[[Path, SpeechInterval, tuple[str, ...]], LanguageDetection]
+LanguageDetector = Callable[[Path, "SpeechInterval", tuple[str, ...]], LanguageDetection]
 
 
 class SegmentLanguageIdentifier:

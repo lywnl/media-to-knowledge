@@ -4,6 +4,7 @@ import logging
 import math
 import unicodedata
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from video_demo.domain.base import stable_identifier
 from video_demo.domain.evidence import SpeechSegment
@@ -16,7 +17,9 @@ from video_demo.speech.asr_contracts import (
     WindowTranscriptionResult,
 )
 from video_demo.speech.language import LanguageSpan
-from video_demo.speech.vad import SpeechInterval
+
+if TYPE_CHECKING:
+    from video_demo.speech.vad import SpeechInterval
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -138,6 +141,8 @@ def _merged_speech_interval(
     confidence = sum(
         item.confidence * item.duration_ms for item in source_intervals
     ) / total_duration
+    from video_demo.speech.vad import SpeechInterval
+
     speech_interval = SpeechInterval(
         evidence_id=stable_identifier(
             "vad-window",

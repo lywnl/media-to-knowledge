@@ -66,7 +66,7 @@ class AsrWindowSnapshotStore:
             receipt, payload = inspect_artifact(
                 self._artifact_store,
                 path,
-                schema_version="1.1.0",
+                schema_version="2.0.0",
                 upstream_sha256=fingerprint,
                 max_bytes=_MAX_ASR_WINDOW_PAYLOAD_BYTES,
             )

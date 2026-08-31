@@ -455,8 +455,6 @@ def _asr_payload() -> AsrSnapshotPayload:
                 is_fully_evaluated_language=True,
             ),
         ),
-        vad_warnings=(),
-        silence_boundaries_ms=(),
         language_change_boundaries_ms=(),
     )
 
@@ -465,16 +463,18 @@ def _speech_runtime() -> SpeechRuntimeConfig:
     inputs = SpeechFingerprintInputs(
         model_identities=(),
         cloud_asr_base_url="https://ai-proxy.example/v1",
-        max_window_ms=600_000,
-        overlap_ms=1_000,
+        chunk_duration_ms=600_000,
+        chunk_concurrency=2,
+        max_upload_bytes=25 * 1024 * 1024,
     )
     return SpeechRuntimeConfig(
         base_url=inputs.cloud_asr_base_url,
         model="openai/whisper",
         timeout_seconds=300,
         max_attempts=3,
-        max_window_ms=inputs.max_window_ms,
-        overlap_ms=inputs.overlap_ms,
+        chunk_duration_ms=inputs.chunk_duration_ms,
+        chunk_concurrency=inputs.chunk_concurrency,
+        max_upload_bytes=inputs.max_upload_bytes,
         model_identities=inputs.model_identities,
         ffmpeg_relative_path="tools/ffmpeg",
     )

@@ -440,40 +440,38 @@ def _settings_payload(settings: Settings) -> dict[str, object]:
     text = settings.require_text_llm_configuration()
     vision = settings.require_vlm_configuration()
     return {
-            "schema_version": "4.1.0",
-            "cloud_asr": {
-                "base_url": cloud.base_url,
-                "model_id": cloud.model,
-                "timeout_seconds": cloud.timeout_seconds,
-                "max_attempts": cloud.max_attempts,
-                "max_window_ms": cloud.max_window_ms,
-                "overlap_ms": cloud.overlap_ms,
-            },
-            "text": {
-                "base_url": text.base_url,
-                "model_id": text.model_id,
-                "timeout_seconds": text.timeout_seconds,
-                "max_attempts": text.max_attempts,
-            },
-            "vision": {
-                "base_url": vision.base_url,
-                "model_id": vision.model_id,
-                "timeout_seconds": vision.timeout_seconds,
-                "max_attempts": vision.max_attempts,
-                "proxy_max_edge": settings.visual_proxy_max_edge,
-                "jpeg_quality": settings.keyframe_jpeg_quality,
-            },
-            "budgets": {
-                "result_evidence": settings.max_result_evidence_items,
-                "candidate_bytes": settings.max_candidate_frame_bytes_per_run,
-                "published_keyframe_bytes": (
-                    settings.max_published_keyframe_bytes_per_run
-                ),
-                "bundle_bytes": settings.max_result_bundle_bytes,
-                "document_bytes": settings.max_document_bytes,
-            },
-            "prompts": _prompt_versions().model_dump(mode="json"),
-        }
+        "schema_version": "4.1.0",
+        "cloud_asr": {
+            "base_url": cloud.base_url,
+            "model_id": cloud.model,
+            "timeout_seconds": cloud.timeout_seconds,
+            "max_attempts": cloud.max_attempts,
+            "chunk_duration_ms": 600_000,
+            "chunk_concurrency": 2,
+        },
+        "text": {
+            "base_url": text.base_url,
+            "model_id": text.model_id,
+            "timeout_seconds": text.timeout_seconds,
+            "max_attempts": text.max_attempts,
+        },
+        "vision": {
+            "base_url": vision.base_url,
+            "model_id": vision.model_id,
+            "timeout_seconds": vision.timeout_seconds,
+            "max_attempts": vision.max_attempts,
+            "proxy_max_edge": settings.visual_proxy_max_edge,
+            "jpeg_quality": settings.keyframe_jpeg_quality,
+        },
+        "budgets": {
+            "result_evidence": settings.max_result_evidence_items,
+            "candidate_bytes": settings.max_candidate_frame_bytes_per_run,
+            "published_keyframe_bytes": settings.max_published_keyframe_bytes_per_run,
+            "bundle_bytes": settings.max_result_bundle_bytes,
+            "document_bytes": settings.max_document_bytes,
+        },
+        "prompts": _prompt_versions().model_dump(mode="json"),
+    }
 
 
 def resolution_comparison_settings_fingerprint(settings: Settings) -> str:
@@ -510,12 +508,6 @@ def _speech_fingerprint_inputs(settings: Settings) -> SpeechFingerprintInputs:
     configuration = settings.require_cloud_asr_configuration()
     return SpeechFingerprintInputs(
         model_identities=(
-            _local_model_identity(
-                "silero_vad",
-                "silero-vad",
-                package="silero-vad",
-                device="cpu",
-            ),
             ModelIdentity(
                 component="cloud_whisper",
                 provider="openai_compatible",
@@ -523,8 +515,9 @@ def _speech_fingerprint_inputs(settings: Settings) -> SpeechFingerprintInputs:
             ),
         ),
         cloud_asr_base_url=configuration.base_url,
-        max_window_ms=configuration.max_window_ms,
-        overlap_ms=configuration.overlap_ms,
+        chunk_duration_ms=600_000,
+        chunk_concurrency=2,
+        max_upload_bytes=configuration.max_upload_bytes,
     )
 
 
@@ -536,11 +529,10 @@ def _speech_runtime_config(settings: Settings, ffmpeg: Path) -> SpeechRuntimeCon
         model=configuration.model,
         timeout_seconds=configuration.timeout_seconds,
         max_attempts=configuration.max_attempts,
-        max_window_ms=configuration.max_window_ms,
-        overlap_ms=configuration.overlap_ms,
+        chunk_duration_ms=600_000,
+        chunk_concurrency=2,
         model_identities=inputs.model_identities,
-        vad_threshold=inputs.vad_threshold,
-        vad_merge_gap_ms=inputs.vad_merge_gap_ms,
+        max_upload_bytes=configuration.max_upload_bytes,
         ffmpeg_relative_path=ffmpeg.relative_to(settings.workspace_root).as_posix(),
     )
 

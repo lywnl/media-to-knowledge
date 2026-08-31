@@ -84,7 +84,7 @@ def test_asr_only_ipc_rejects_retired_request_fields(field: str, value: object) 
 def test_asr_only_ipc_success_and_failure_bind_request_and_asr_fingerprint() -> None:
     receipt = ArtifactReceipt(
         relative_path="runs/scope/run_001/speech/snapshots/asr/payload.json",
-        schema_version="1.3.0",
+        schema_version="2.0.0",
         sha256="e" * 64,
         upstream_sha256="d" * 64,
     )
@@ -336,10 +336,10 @@ def _runtime() -> SpeechRuntimeConfig:
         model="openai/whisper",
         timeout_seconds=300,
         max_attempts=3,
-        max_window_ms=600_000,
-        overlap_ms=1_000,
+        chunk_duration_ms=600_000,
+        chunk_concurrency=2,
+        max_upload_bytes=25 * 1024 * 1024,
         model_identities=(
-            ModelIdentity(component="silero_vad", provider="local", model_id="silero-vad"),
             ModelIdentity(
                 component="cloud_whisper",
                 provider="openai_compatible",
@@ -416,8 +416,6 @@ def _asr_payload() -> AsrSnapshotPayload:
     return AsrSnapshotPayload(
         language_spans=(),
         segments=(),
-        vad_warnings=(),
-        silence_boundaries_ms=(),
         language_change_boundaries_ms=(),
     )
 

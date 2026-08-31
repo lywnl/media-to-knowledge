@@ -124,9 +124,9 @@ def _execute_request(
         model=request.runtime.model,
         timeout_seconds=request.runtime.timeout_seconds,
         max_attempts=request.runtime.max_attempts,
-        max_window_ms=request.runtime.max_window_ms,
-        overlap_ms=request.runtime.overlap_ms,
-        merge_gap_ms=request.runtime.merge_gap_ms,
+        max_window_ms=request.runtime.chunk_duration_ms,
+        overlap_ms=0,
+        merge_gap_ms=0,
         max_upload_bytes=request.runtime.max_upload_bytes,
     )
     artifact_store = AtomicArtifactStore(runtime_root)
@@ -143,17 +143,14 @@ def _execute_request(
             ffmpeg_path=ffmpeg,
             recognizer=recognizer,
             slice_namespace=request.request_id,
-            vad_threshold=request.runtime.vad_threshold,
-            vad_merge_gap_ms=request.runtime.vad_merge_gap_ms,
         )
         payload = run_asr_stage(
             media,
             components,
             window_store=AsrWindowSnapshotStore(artifact_store),
             asr_fingerprint=request.asr_fingerprint,
-            max_window_ms=request.runtime.max_window_ms,
-            overlap_ms=request.runtime.overlap_ms,
-            merge_gap_ms=request.runtime.merge_gap_ms,
+            chunk_duration_ms=request.runtime.chunk_duration_ms,
+            concurrency=request.runtime.chunk_concurrency,
             max_upload_bytes=request.runtime.max_upload_bytes,
         )
     snapshots = SnapshotStore(artifact_store)
