@@ -14,6 +14,7 @@ from video_demo.domain.document_plan import BaseSegment, ChapterPlan
 from video_demo.domain.evidence import SpeechSegment
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.document_port import (
+    ChapterBoundaryCoordinationRequest,
     ChapterPlanningRequest,
     ChapterPlanRepairRequest,
     ChapterWritingRepairRequest,
@@ -147,6 +148,72 @@ def test_plan_request_uses_main_schema_prompt_and_temperature_zero() -> None:
     assert "30 秒" in payloads[0]["messages"][0]["content"]  # type: ignore[index]
     assert "fine 60~120 秒" in payloads[0]["messages"][0]["content"]  # type: ignore[index]
     assert "text-secret" not in json.dumps(payloads)
+
+
+def test_boundary_coordination_normalizes_one_envelope_and_numeric_index() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return _provider_response(
+            request,
+            {
+                "result": {
+                    "decisions": [
+                        {"boundary_index": "0", "decision": "KEEP"},
+                    ],
+                },
+            },
+        )
+
+    request = ChapterBoundaryCoordinationRequest(
+        boundaries=(
+            {
+                "boundary_index": 0,
+                "left_title_hint": "左",
+                "right_title_hint": "右",
+                "left_duration_ms": 60_000,
+                "right_duration_ms": 60_000,
+                "left_tail_evidence": (),
+                "right_head_evidence": (),
+            },
+        ),
+        prompt_version="chapter-boundary-coordinator-v1",
+    )
+    client = _client(httpx.MockTransport(handler))
+
+    result = client.coordinate_chapter_boundaries(request)
+
+    assert result.decisions[0].boundary_index == 0
+    assert result.decisions[0].decision == "KEEP"
+    assert payloads[0]["thinking"] == {"type": "disabled"}
+
+
+def test_boundary_coordination_accepts_top_level_decision_array() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _provider_response(
+            request,
+            [{"boundary_index": 0, "decision": "KEEP"}],
+        )
+
+    request = ChapterBoundaryCoordinationRequest(
+        boundaries=(
+            {
+                "boundary_index": 0,
+                "left_title_hint": "左",
+                "right_title_hint": "右",
+                "left_duration_ms": 60_000,
+                "right_duration_ms": 60_000,
+                "left_tail_evidence": (),
+                "right_head_evidence": (),
+            },
+        ),
+        prompt_version="chapter-boundary-coordinator-v1",
+    )
+
+    result = _client(httpx.MockTransport(handler)).coordinate_chapter_boundaries(request)
+
+    assert result.decisions[0].decision == "KEEP"
 
 
 def test_plan_accepts_content_blocks_and_markdown_wrapped_json() -> None:
@@ -621,8 +688,15 @@ def test_compact_planning_normalizes_last_end_index_one_past_segment_count() -> 
                 "chapter_drafts": [
                     {
                         "start_segment_index": 0,
+                        "end_segment_index": 2,
+                        "title_hint": "前一章",
+                        "visual_mode": "NONE",
+                        "semantic_targets": [],
+                    },
+                    {
+                        "start_segment_index": 2,
                         "end_segment_index": 4,
-                        "title_hint": "完整章节",
+                        "title_hint": "最后一章",
                         "visual_mode": "NONE",
                         "semantic_targets": [],
                     },
@@ -641,9 +715,150 @@ def test_compact_planning_normalizes_last_end_index_one_past_segment_count() -> 
 
     result = client.plan_chapters(request)
 
-    assert result.chapter_drafts[0].segment_refs == tuple(
-        f"segment_{index:03d}" for index in range(3)
+    assert result.chapter_drafts[1].segment_refs == tuple(
+        f"segment_{index:03d}" for index in range(2, 3)
     )
+
+
+@pytest.mark.parametrize(
+    "drafts",
+    [
+        [
+            {
+                "start_segment_index": 0,
+                "end_segment_index": 4,
+                "title_hint": "越界普通章节",
+                "visual_mode": "NONE",
+                "semantic_targets": [],
+            },
+            {
+                "start_segment_index": 2,
+                "end_segment_index": 3,
+                "title_hint": "最后一章",
+                "visual_mode": "NONE",
+                "semantic_targets": [],
+            },
+        ],
+        [
+            {
+                "start_segment_index": 0,
+                "end_segment_index": 5,
+                "title_hint": "超过一位越界",
+                "visual_mode": "NONE",
+                "semantic_targets": [],
+            },
+        ],
+    ],
+)
+def test_compact_planning_rejects_invalid_end_index_ranges(
+    drafts: list[dict[str, object]],
+) -> None:
+    segments = tuple(
+        _segment().model_copy(
+            update={
+                "segment_id": f"segment_{index:03d}",
+                "start_ms": index * 10_000,
+                "end_ms": (index + 1) * 10_000,
+            },
+        )
+        for index in range(3)
+    )
+    request = _planning_request().model_copy(
+        update={"segments": segments, "duration_ms": 30_000},
+    )
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        return _provider_response(http_request, {"chapter_drafts": drafts})
+
+    with pytest.raises(ModelResponseValidationError):
+        OpenAIDocumentClient(
+            httpx.Client(transport=httpx.MockTransport(handler)),
+            base_url="https://text.example.test/v1",
+            api_key="text-secret",
+            model_id="text-model",
+            compact_planning=True,
+            sleeper=lambda _delay: None,
+        ).plan_chapters(request)
+
+
+def test_compact_planning_accepts_top_level_draft_array() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _provider_response(
+            request,
+            [
+                {
+                    "start_segment_index": 0,
+                    "end_segment_index": 1,
+                    "title_hint": "章节",
+                    "visual_mode": "NONE",
+                    "semantic_targets": [],
+                },
+            ],
+        )
+
+    result = OpenAIDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="text-secret",
+        model_id="text-model",
+        compact_planning=True,
+        sleeper=lambda _delay: None,
+    ).plan_chapters(_planning_request())
+
+    assert result.chapter_drafts[0].segment_refs == ("segment_001",)
+
+
+def test_compact_planning_last_boundary_is_normalized_before_expansion() -> None:
+    segments = tuple(
+        _segment().model_copy(
+            update={
+                "segment_id": f"segment_{index:03d}",
+                "start_ms": index * 10_000,
+                "end_ms": (index + 1) * 10_000,
+            },
+        )
+        for index in range(3)
+    )
+    request = _planning_request().model_copy(
+        update={"segments": segments, "duration_ms": 30_000},
+    )
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        return _provider_response(
+            http_request,
+            {
+                "chapter_drafts": [
+                    {
+                        "start_segment_index": 0,
+                        "end_segment_index": 2,
+                        "title_hint": "第一章",
+                        "visual_mode": "NONE",
+                        "semantic_targets": [],
+                    },
+                    {
+                        "start_segment_index": 2,
+                        "end_segment_index": 4,
+                        "title_hint": "第二章",
+                        "visual_mode": "NONE",
+                        "semantic_targets": [],
+                    },
+                ],
+            },
+        )
+
+    result = OpenAIDocumentClient(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://text.example.test/v1",
+        api_key="text-secret",
+        model_id="text-model",
+        compact_planning=True,
+        sleeper=lambda _delay: None,
+    ).plan_chapters(request)
+
+    assert [draft.segment_refs for draft in result.chapter_drafts] == [
+        ("segment_000", "segment_001"),
+        ("segment_002",),
+    ]
 
 
 def test_plan_request_allows_large_repair_budget_for_provider_validation() -> None:

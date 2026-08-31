@@ -38,6 +38,7 @@ from video_demo.integrations.model_response import (
     extract_model_message_content,
     parse_json_content,
     strip_removed_document_fields,
+    unwrap_single_response_envelope,
 )
 from video_demo.storage.workspace import reject_symlink_components, validate_path_component
 from video_demo.visual.candidate_artifacts import read_verified_candidate_jpeg
@@ -553,7 +554,9 @@ def _parse_response(
             raise ValueError
         raw_message = message.encode("utf-8")
         parsed = normalize_chapter_vision_response_data(
-            strip_removed_document_fields(parse_json_content(message)),
+            unwrap_single_response_envelope(
+                strip_removed_document_fields(parse_json_content(message)),
+            ),
             request,
         )
         return ChapterVisionResponse.model_validate(parsed), raw_message, parsed

@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import time
+import unicodedata
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from itertools import pairwise
 from threading import Lock
 from typing import Literal
@@ -27,6 +29,9 @@ from video_demo.domain.document_plan import (
 from video_demo.domain.evidence import SceneBoundary, SpeechSegment, SubtitleCue
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.integrations.document_port import (
+    ChapterBoundaryCoordinationRequest,
+    ChapterBoundaryCoordinationResponse,
+    ChapterBoundaryInput,
     ChapterPlanningRequest,
     ChapterPlanningResponse,
     ChapterPlanRepairRequest,
@@ -49,6 +54,7 @@ _DEFAULT_PLANNING_CONCURRENCY = 2
 # 每批限制为 24 个基础片段，避免单次输出过长导致结构校验失败；批次之间
 # 批次之间由上层最多并发 2 个请求，失败时只影响当前批次。
 _MAX_PLANNING_SEGMENTS_PER_BATCH = 24
+_MAX_BOUNDARY_REQUEST_BYTES = 64 * 1024
 _GRANULARITY_TARGET_DURATION_MS = {
     "fine": 120_000,
     "standard": 180_000,
@@ -64,6 +70,21 @@ _CHAPTER_PLANNING_METRIC_NAMES = frozenset(
     },
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _PlanningCallResult:
+    response: ChapterPlanningResponse | None
+    repair_used: bool = False
+    fallback: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _PlanningBatchResult:
+    request: ChapterPlanningRequest
+    response: ChapterPlanningResponse | None
+    repair_used: bool = False
+    fallback: bool = False
 
 
 class ChapterPlanningBatch(FrozenModel):
@@ -132,6 +153,7 @@ class ChapterPlanner:
         max_planning_batches: int = _DEFAULT_MAX_PLANNING_BATCHES,
         concurrency: int = _DEFAULT_PLANNING_CONCURRENCY,
         compact_planning: bool = False,
+        boundary_identity: ModelInvocationIdentity | None = None,
     ) -> None:
         if min(
             max_input_chars,
@@ -158,6 +180,15 @@ class ChapterPlanner:
         self._concurrency = concurrency
         self._compact_planning = compact_planning
         self._invocation_wait_timeout_seconds = invocation_wait_timeout_seconds
+        self._boundary_identity = boundary_identity or identity.model_copy(
+            update={
+                "logical_operation": "chapter_boundary_coordination",
+                "main_response_schema_name": "chapter_boundary_coordination_v1",
+                "main_prompt_version": "chapter-boundary-coordinator-v1",
+                "repair_response_schema_name": "chapter_boundary_coordination_v1",
+                "repair_prompt_version": "chapter-boundary-coordinator-v1",
+            },
+        )
 
     def plan(
         self,
@@ -198,17 +229,34 @@ class ChapterPlanner:
                 counters,
                 is_cancel_requested,
             )
-            for request, response in results:
+            batch_drafts: list[list[ChapterDraft]] = []
+            for result in results:
+                request = result.request
+                response = result.response
                 if response is None:
-                    drafts.extend(_rule_drafts(
+                    local_drafts = list(_rule_drafts(
                         request.segments,
                         request.transcript_evidence,
                         request.document_config,
                     ))
+                    drafts.extend(local_drafts)
                     fallback_segment_ids.update(segment.segment_id for segment in request.segments)
                     used_fallback = True
                 else:
-                    drafts.extend(response.chapter_drafts)
+                    local_drafts = list(response.chapter_drafts)
+                    drafts.extend(local_drafts)
+                batch_drafts.append(local_drafts)
+            self._coordinate_suspicious_boundaries(
+                batch_drafts,
+                results,
+                transcript_evidence,
+                ordered_segments,
+                document_config,
+                counters,
+                cache,
+                is_cancel_requested,
+            )
+            drafts = [draft for batch in batch_drafts for draft in batch]
         else:
             drafts = list(_rule_drafts(ordered_segments, (), document_config))
 
@@ -251,15 +299,15 @@ class ChapterPlanner:
         all_segments: tuple[BaseSegment, ...],
         counters: _PlanningCounters,
         is_cancel_requested: Callable[[], bool],
-    ) -> tuple[tuple[ChapterPlanningRequest, ChapterPlanningResponse | None], ...]:
+    ) -> tuple[_PlanningBatchResult, ...]:
         results: list[
-            tuple[ChapterPlanningRequest, ChapterPlanningResponse | None] | None
+            _PlanningBatchResult | None
         ] = [None] * len(requests)
         executor = ThreadPoolExecutor(
             max_workers=self._concurrency,
             thread_name_prefix="chapter-planning",
         )
-        pending: dict[Future[ChapterPlanningResponse | None], tuple[int, float]] = {}
+        pending: dict[Future[_PlanningCallResult], tuple[int, float]] = {}
         next_index = 0
         try:
             while next_index < len(requests) or pending:
@@ -282,7 +330,7 @@ class ChapterPlanner:
                 completed, _ = wait(tuple(pending), timeout=0.05, return_when=FIRST_COMPLETED)
                 for future in completed:
                     index, started_at = pending.pop(future)
-                    response = future.result()
+                    call_result = future.result()
                     request = requests[index]
                     data = self._planning_prompt(request)[2]
                     _LOGGER.info(
@@ -297,9 +345,14 @@ class ChapterPlanner:
                         len(data),
                         len(data.encode("utf-8")),
                         max(0, round((time.monotonic() - started_at) * 1_000)),
-                        "SUCCEEDED" if response is not None else "FALLBACK",
+                        "SUCCEEDED" if call_result.response is not None else "FALLBACK",
                     )
-                    results[index] = (request, response)
+                    results[index] = _PlanningBatchResult(
+                        request=request,
+                        response=call_result.response,
+                        repair_used=call_result.repair_used,
+                        fallback=call_result.fallback,
+                    )
         except BaseException:
             for future in pending:
                 future.cancel()
@@ -308,6 +361,116 @@ class ChapterPlanner:
         else:
             executor.shutdown(wait=True)
         return tuple(result for result in results if result is not None)
+
+    def _coordinate_suspicious_boundaries(
+        self,
+        batch_drafts: list[list[ChapterDraft]],
+        batch_results: tuple[_PlanningBatchResult, ...],
+        transcript_evidence: tuple[SpeechSegment | SubtitleCue, ...],
+        segments: tuple[BaseSegment, ...],
+        document_config: DocumentGenerationConfig,
+        counters: _PlanningCounters,
+        cache: DocumentModelCache,
+        is_cancel_requested: Callable[[], bool],
+    ) -> None:
+        if len(batch_drafts) < 2:
+            return
+        suspicious = tuple(
+            index
+            for index in range(len(batch_drafts) - 1)
+            if batch_drafts[index]
+            and batch_drafts[index + 1]
+            and _boundary_is_suspicious(
+                index,
+                batch_drafts,
+                batch_results,
+                segments,
+                document_config,
+            )
+        )
+        if not suspicious:
+            _LOGGER.info("章节边界协调跳过 reason=NORMAL_BOUNDARIES")
+            return
+        request = _boundary_request(
+            suspicious,
+            batch_drafts,
+            batch_results,
+            transcript_evidence,
+            segments,
+        )
+        if request is None:
+            _LOGGER.info("章节边界协调跳过 reason=REQUEST_SIZE_LIMIT")
+            return
+        _LOGGER.info(
+            "章节边界协调开始 boundaries=%d suspicious=%d",
+            len(batch_drafts) - 1,
+            len(suspicious),
+        )
+        response = self._coordinate_boundaries(
+            request,
+            cache,
+            counters,
+            is_cancel_requested,
+        )
+        if response is None:
+            _LOGGER.info("章节边界协调跳过 reason=COORDINATOR_FAILED")
+            return
+        _apply_boundary_decisions(response, suspicious, batch_drafts, segments)
+
+    def _coordinate_boundaries(
+        self,
+        request: ChapterBoundaryCoordinationRequest,
+        cache: DocumentModelCache,
+        counters: _PlanningCounters,
+        is_cancel_requested: Callable[[], bool],
+    ) -> ChapterBoundaryCoordinationResponse | None:
+        def validate(response: ChapterBoundaryCoordinationResponse) -> None:
+            allowed = {item.boundary_index for item in request.boundaries}
+            if any(item.boundary_index not in allowed for item in response.decisions):
+                raise ValueError("边界协调返回未知 boundary_index")
+
+        cached = cache.get(
+            self._boundary_identity,
+            request,
+            ChapterBoundaryCoordinationResponse,
+            validate,
+        )
+        if cached is not None:
+            counters.cache_hit()
+            return cached.response
+        try:
+            with cache.invocation_lock(
+                self._boundary_identity,
+                request,
+                wait_timeout_seconds=self._invocation_wait_timeout_seconds,
+                is_cancel_requested=is_cancel_requested,
+            ):
+                cached = cache.get(
+                    self._boundary_identity,
+                    request,
+                    ChapterBoundaryCoordinationResponse,
+                    validate,
+                )
+                if cached is not None:
+                    counters.cache_hit()
+                    return cached.response
+                response = self._text_port.coordinate_chapter_boundaries(
+                    request,
+                    on_provider_attempt=counters.provider_attempt,
+                )
+                validate(response)
+                return cache.put(
+                    self._boundary_identity,
+                    request,
+                    response,
+                    successful_path="MAIN",
+                    validate=validate,
+                ).response
+        except (ModelResponseValidationError, ValueError, VideoDemoError) as error:
+            if isinstance(error, VideoDemoError) and error.code == ErrorCode.JOB_CANCELLED:
+                raise
+            _LOGGER.info("章节边界协调跳过 reason=%s", type(error).__name__)
+            return None
 
     def _planning_requests(
         self,
@@ -416,7 +579,7 @@ class ChapterPlanner:
         all_segments: tuple[BaseSegment, ...],
         counters: _PlanningCounters,
         is_cancel_requested: Callable[[], bool],
-    ) -> ChapterPlanningResponse | None:
+    ) -> _PlanningCallResult:
         def validate(response: ChapterPlanningResponse) -> None:
             _validate_planning_response(response, request, all_segments)
         cached = cache.get(
@@ -427,7 +590,10 @@ class ChapterPlanner:
         )
         if cached is not None:
             counters.cache_hit()
-            return cached.response
+            return _PlanningCallResult(
+                cached.response,
+                repair_used=cached.successful_path == "REPAIR",
+            )
         with cache.invocation_lock(
             self._identity,
             request,
@@ -442,7 +608,10 @@ class ChapterPlanner:
             )
             if cached is not None:
                 counters.cache_hit()
-                return cached.response
+                return _PlanningCallResult(
+                    cached.response,
+                    repair_used=cached.successful_path == "REPAIR",
+                )
             invalid_response: InvalidModelResponse | None = None
             try:
                 response = self._text_port.plan_chapters(
@@ -453,7 +622,7 @@ class ChapterPlanner:
                 invalid_response = error.invalid_response
             except VideoDemoError as error:
                 if _is_fallback_error(error):
-                    return None
+                    return _PlanningCallResult(None, fallback=True)
                 raise
             else:
                 try:
@@ -466,23 +635,24 @@ class ChapterPlanner:
                 try:
                     response = self._repair(request, invalid_response, counters)
                 except ModelResponseValidationError:
-                    return None
+                    return _PlanningCallResult(None, fallback=True)
                 except VideoDemoError as error:
                     if _is_fallback_error(error):
-                        return None
+                        return _PlanningCallResult(None, fallback=True)
                     raise
                 try:
                     validate(response)
                 except (ValueError, TypeError):
-                    return None
+                    return _PlanningCallResult(None, fallback=True)
                 successful_path = "REPAIR"
-            return cache.put(
+            stored = cache.put(
                 self._identity,
                 request,
                 response,
                 successful_path=successful_path,
                 validate=validate,
             ).response
+            return _PlanningCallResult(stored, repair_used=successful_path == "REPAIR")
 
     def _repair(
         self,
@@ -834,10 +1004,20 @@ def _drafts_can_merge(
     compatible_single_targets = (
         left.visual_mode == right.visual_mode == "SINGLE" and len(targets) <= 2
     )
+    anchor_groups = (
+        *(set(target.anchor_evidence_refs) for target in left.semantic_targets),
+        *(set(target.anchor_evidence_refs) for target in right.semantic_targets),
+    )
+    anchors_are_disjoint = not any(
+        group & other
+        for index, group in enumerate(anchor_groups)
+        for other in anchor_groups[index + 1 :]
+    )
     return (
         duration_ms <= _MAX_CHAPTER_DURATION_MS
         and len(targets) <= 4
         and (not both_have_targets or compatible_single_targets)
+        and anchors_are_disjoint
     )
 
 
@@ -1016,3 +1196,194 @@ def _is_fallback_error(error: BaseException) -> bool:
         ErrorCode.DEPENDENCY_TEMPORARY_FAILURE,
         ErrorCode.TEXT_LLM_RESPONSE_INVALID,
     }
+
+
+def _boundary_is_suspicious(
+    index: int,
+    batch_drafts: list[list[ChapterDraft]],
+    batch_results: tuple[_PlanningBatchResult, ...],
+    segments: tuple[BaseSegment, ...],
+    document_config: DocumentGenerationConfig,
+) -> bool:
+    left = batch_drafts[index][-1]
+    right = batch_drafts[index + 1][0]
+    left_title_key = _draft_title_key(left.title_hint)
+    right_title_key = _draft_title_key(right.title_hint)
+    return (
+        (
+            bool(left_title_key)
+            and bool(right_title_key)
+            and (
+                left_title_key == right_title_key
+                or left_title_key in right_title_key
+                or right_title_key in left_title_key
+            )
+        )
+        or _boundary_draft_duration_ms(left, segments)
+        < _minimum_chapter_duration_ms(document_config)
+        or _boundary_draft_duration_ms(right, segments)
+        < _minimum_chapter_duration_ms(document_config)
+        or batch_results[index].repair_used
+        or batch_results[index + 1].repair_used
+        or batch_results[index].fallback
+        or batch_results[index + 1].fallback
+    )
+
+
+def _draft_title_key(value: str) -> str:
+    return "".join(
+        char for char in unicodedata.normalize("NFKC", value).casefold()
+        if char.isalnum()
+    )
+
+
+def _boundary_draft_duration_ms(
+    draft: ChapterDraft,
+    segments: tuple[BaseSegment, ...],
+) -> int:
+    segment_by_id = {item.segment_id: item for item in segments}
+    return (
+        segment_by_id[draft.segment_refs[-1]].end_ms
+        - segment_by_id[draft.segment_refs[0]].start_ms
+    )
+
+
+def _boundary_request(
+    suspicious: tuple[int, ...],
+    batch_drafts: list[list[ChapterDraft]],
+    batch_results: tuple[_PlanningBatchResult, ...],
+    transcript_evidence: tuple[SpeechSegment | SubtitleCue, ...],
+    segments: tuple[BaseSegment, ...],
+) -> ChapterBoundaryCoordinationRequest | None:
+    evidence_by_id = {item.evidence_id: item for item in transcript_evidence}
+    segments_by_id = {
+        item.segment_id: item
+        for result in batch_results
+        for item in result.request.segments
+    }
+    boundaries: list[ChapterBoundaryInput] = []
+    for index in suspicious:
+        if len(boundaries) >= 63:
+            _LOGGER.warning(
+                "章节边界协调跳过部分边界 boundary_index=%d reason=REQUEST_SIZE_LIMIT",
+                index,
+            )
+            break
+        left = batch_drafts[index][-1]
+        right = batch_drafts[index + 1][0]
+        left_evidence_ids = {
+            evidence_id
+            for segment_id in left.segment_refs
+            for evidence_id in segments_by_id[segment_id].evidence_refs
+        }
+        right_evidence_ids = {
+            evidence_id
+            for segment_id in right.segment_refs
+            for evidence_id in segments_by_id[segment_id].evidence_refs
+        }
+        left_evidence = tuple(
+            _truncate_boundary_evidence(evidence_by_id[item.evidence_id])
+            for item in transcript_evidence
+            if item.evidence_id in left_evidence_ids
+        )[-2:]
+        right_evidence = tuple(
+            _truncate_boundary_evidence(evidence_by_id[item.evidence_id])
+            for item in transcript_evidence
+            if item.evidence_id in right_evidence_ids
+        )[:2]
+        boundary = ChapterBoundaryInput(
+            boundary_index=index,
+            left_title_hint=left.title_hint,
+            right_title_hint=right.title_hint,
+            left_duration_ms=_boundary_draft_duration_ms(left, segments),
+            right_duration_ms=_boundary_draft_duration_ms(
+                right,
+                segments,
+            ),
+            left_tail_evidence=left_evidence,
+            right_head_evidence=right_evidence,
+        )
+        try:
+            ChapterBoundaryCoordinationRequest(
+                boundaries=tuple((*boundaries, boundary)),
+                prompt_version="chapter-boundary-coordinator-v1",
+            )
+        except ValueError as error:
+            if "64 KiB" not in str(error):
+                raise
+            _LOGGER.warning(
+                "章节边界协调跳过部分边界 boundary_index=%d reason=REQUEST_SIZE_LIMIT",
+                index,
+            )
+            break
+        boundaries.append(boundary)
+    if not boundaries:
+        return None
+    return ChapterBoundaryCoordinationRequest(
+        boundaries=tuple(boundaries),
+        prompt_version="chapter-boundary-coordinator-v1",
+    )
+
+
+def _truncate_boundary_evidence(
+    evidence: SpeechSegment | SubtitleCue,
+) -> SpeechSegment | SubtitleCue:
+    """限制边界协调器看到的单条转写长度，不改变原始证据。"""
+
+    if len(evidence.text) <= 240:
+        return evidence
+    return evidence.model_copy(update={"text": evidence.text[:240]})
+
+
+def _apply_boundary_decisions(
+    response: ChapterBoundaryCoordinationResponse,
+    suspicious: tuple[int, ...],
+    batch_drafts: list[list[ChapterDraft]],
+    segments: tuple[BaseSegment, ...],
+) -> None:
+    segment_by_id = {item.segment_id: item for item in segments}
+    consumed: set[int] = set()
+    for decision in sorted(response.decisions, key=lambda item: item.boundary_index):
+        index = decision.boundary_index
+        if index not in suspicious:
+            continue
+        if decision.decision != "MERGE":
+            continue
+        if not batch_drafts[index] or not batch_drafts[index + 1]:
+            _LOGGER.info(
+                "章节边界合并拒绝 boundary_index=%d reason=CHAPTER_ALREADY_CONSUMED",
+                index,
+            )
+            continue
+        left = batch_drafts[index][-1]
+        right = batch_drafts[index + 1][0]
+        if id(left) in consumed or id(right) in consumed:
+            _LOGGER.info(
+                "章节边界合并拒绝 boundary_index=%d reason=CHAPTER_ALREADY_CONSUMED",
+                index,
+            )
+            continue
+        left_last = segment_by_id[left.segment_refs[-1]]
+        right_first = segment_by_id[right.segment_refs[0]]
+        if left_last.end_ms != right_first.start_ms:
+            _LOGGER.info(
+                "章节边界合并拒绝 boundary_index=%d reason=NON_CONTIGUOUS",
+                index,
+            )
+            continue
+        if not _drafts_can_merge(left, right, segment_by_id):
+            _LOGGER.info(
+                "章节边界合并拒绝 boundary_index=%d reason=MERGE_CONSTRAINT",
+                index,
+            )
+            continue
+        if decision.merged_title_hint:
+            merged = _merge_drafts(left, right).model_copy(
+                update={"title_hint": decision.merged_title_hint},
+            )
+        else:
+            merged = _merge_drafts(left, right)
+        batch_drafts[index][-1] = merged
+        del batch_drafts[index + 1][0]
+        consumed.update({id(left), id(right)})
+        _LOGGER.info("章节边界协调完成 status=MERGED boundary_index=%d", index)

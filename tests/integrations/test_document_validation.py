@@ -11,7 +11,10 @@ from video_demo.domain.evidence import (
     VisualTextContentDraft,
 )
 from video_demo.integrations.document_port import ChapterVisionRequest, ChapterVisionResponse
-from video_demo.integrations.document_validation import validate_chapter_vision_response
+from video_demo.integrations.document_validation import (
+    normalize_chapter_vision_response_data,
+    validate_chapter_vision_response,
+)
 
 
 def _request() -> ChapterVisionRequest:
@@ -176,6 +179,79 @@ def test_shared_validation_revalidates_model_copy_nested_references() -> None:
 
     with pytest.raises(ValueError, match="response:invalid"):
         validate_chapter_vision_response(response, request, max_selected_frames=2)
+
+
+def test_normalization_drops_one_malformed_observation_and_keeps_valid_one() -> None:
+    request = _request()
+    valid = _observation().model_dump(mode="json")
+    malformed = {
+        "target_ids": ["target_001"],
+        "selected_frame_ids": ["frame_a"],
+        "visual_type": "TEXT",
+    }
+
+    normalized = normalize_chapter_vision_response_data(
+        {"observations": [malformed, valid]},
+        request,
+    )
+
+    assert normalized == {"observations": [valid]}
+    validate_chapter_vision_response(
+        ChapterVisionResponse.model_validate(normalized),
+        request,
+        max_selected_frames=2,
+    )
+
+
+def test_normalization_drops_all_structurally_invalid_observations_to_no_value() -> None:
+    request = _request()
+    normalized = normalize_chapter_vision_response_data(
+        {
+            "observations": [
+                {"target_ids": ["target_001"]},
+                "不是对象",
+            ],
+        },
+        request,
+    )
+
+    assert normalized == {"observations": []}
+    assert ChapterVisionResponse.model_validate(normalized).observations == ()
+
+
+def test_normalization_preserves_unknown_reference_for_hard_validation() -> None:
+    request = _request()
+    unknown = _observation().model_dump(mode="json")
+    unknown["selected_frame_ids"] = ["frame_unknown"]
+
+    normalized = normalize_chapter_vision_response_data(
+        {"observations": [unknown]},
+        request,
+    )
+
+    response = ChapterVisionResponse.model_validate(normalized)
+    with pytest.raises(ValueError, match="unknown_reference"):
+        validate_chapter_vision_response(response, request, max_selected_frames=2)
+
+
+def test_normalization_drops_malformed_block_for_unselected_known_frame() -> None:
+    request = _request()
+    observation = _observation().model_dump(mode="json")
+    observation["content_blocks"] = [
+        {
+            "content_type": "TEXT",
+            "source_frame_ids": ["frame_b"],
+            "text": "",
+        },
+    ]
+
+    normalized = normalize_chapter_vision_response_data(
+        {"observations": [observation]},
+        request,
+    )
+
+    assert normalized["observations"][0]["content_blocks"] == []  # type: ignore[index]
+    assert len(ChapterVisionResponse.model_validate(normalized).observations) == 1
 
 
 def test_shared_validation_rejects_duplicate_request_ids_and_incomplete_whitelist() -> None:
