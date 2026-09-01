@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Thread, local
 from typing import Protocol
 
 from video_demo.errors import ErrorCode, VideoDemoError, is_retryable_error_code
@@ -39,6 +39,7 @@ class ImageStagePipelineExecutor:
         self._lease_seconds = lease_seconds
         self._owned_resources = owned_resources
         self._closed = False
+        self._active_job = local()
 
     def run(self, scope: Scope, run_id: str) -> None:
         worker_id = f"image-api-{uuid.uuid4().hex}"
@@ -51,13 +52,18 @@ class ImageStagePipelineExecutor:
             )
         if job is None:
             raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "图片任务无法领取")
+        self._active_job.claim = job
         try:
             self._run_with_heartbeat(job, lambda: self._handler.process(
                 job,
                 is_cancel_requested=lambda: self._is_cancelled(job),
             ))
-        except VideoDemoError:
+        except BaseException:
+            # 调度器会在同一执行线程中调用 stage_failed()，因此保留本次
+            # 领取的租约，禁止失败处理重新按 run_id 查找其他执行者的租约。
             raise
+        else:
+            self._clear_active_job(job)
 
     def is_cancelled(self, scope: Scope, run_id: str) -> bool:
         with self._database.session() as session:
@@ -77,47 +83,43 @@ class ImageStagePipelineExecutor:
         job: ClaimedJob | None = None,
     ) -> bool:
         if job is None:
+            job = self._current_active_job(scope, run_id)
+        try:
             with self._database.session() as session:
-                job_model = JobRepository(session).get_by_resource_type(
-                    scope,
-                    run_id,
-                    "IMAGE_UNDERSTANDING_RUN",
+                repository = JobRepository(session)
+                if error.code == ErrorCode.JOB_CANCELLED:
+                    repository.mark_cancelled(
+                        job.id,
+                        job.worker_id,
+                        attempt_count=job.attempt_count,
+                    )
+                    return False
+                retryable = is_retryable_error_code(error.code)
+                should_retry = retryable and job.attempt_count < job.max_attempts
+                repository.update_owned_media_run(
+                    job,
+                    values={
+                        "status": (
+                            RunStatusValue.PENDING
+                            if should_retry
+                            else RunStatusValue.FAILED
+                        ),
+                        "current_stage": "VLM",
+                        "error_code": error.code.value,
+                    },
+                    run_model=ImageUnderstandingRunModel,
+                    resource_type="IMAGE_UNDERSTANDING_RUN",
                 )
-            if job_model is None or job_model.worker_id is None:
-                return False
-            job = ClaimedJob(
-                id=job_model.id,
-                job_id=job_model.job_id,
-                resource_id=job_model.resource_id,
-                worker_id=job_model.worker_id,
-                attempt_count=job_model.attempt_count,
-                max_attempts=job_model.max_attempts,
-                scope=scope,
-            )
-        with self._database.session() as session:
-            repository = JobRepository(session)
-            if error.code == ErrorCode.JOB_CANCELLED:
-                repository.mark_cancelled(job.id, job.worker_id, attempt_count=job.attempt_count)
-                return False
-            retryable = is_retryable_error_code(error.code)
-            repository.update_owned_media_run(
-                job,
-                values={
-                    "status": RunStatusValue.PENDING if retryable else RunStatusValue.FAILED,
-                    "current_stage": "VLM",
-                    "error_code": error.code.value,
-                },
-                run_model=ImageUnderstandingRunModel,
-                resource_type="IMAGE_UNDERSTANDING_RUN",
-            )
-            repository.mark_failed(
-                job.id,
-                job.worker_id,
-                error_code=error.code,
-                retryable=retryable,
-                attempt_count=job.attempt_count,
-            )
-            return retryable and job.attempt_count < job.max_attempts
+                repository.mark_failed(
+                    job.id,
+                    job.worker_id,
+                    error_code=error.code,
+                    retryable=retryable,
+                    attempt_count=job.attempt_count,
+                )
+                return should_retry
+        finally:
+            self._clear_active_job(job)
 
     def close(self) -> None:
         if self._closed:
@@ -163,6 +165,20 @@ class ImageStagePipelineExecutor:
                 job.worker_id,
                 attempt_count=job.attempt_count,
             )
+
+    def _current_active_job(self, scope: Scope, run_id: str) -> ClaimedJob:
+        job = getattr(self._active_job, "claim", None)
+        if (
+            not isinstance(job, ClaimedJob)
+            or job.scope != scope
+            or job.resource_id != run_id
+        ):
+            raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "图片任务租约已丢失")
+        return job
+
+    def _clear_active_job(self, job: ClaimedJob) -> None:
+        if getattr(self._active_job, "claim", None) == job:
+            del self._active_job.claim
 
 
 __all__ = ["ImageStagePipelineExecutor"]

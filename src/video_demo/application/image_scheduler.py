@@ -240,6 +240,11 @@ class ImageTaskScheduler:
         except VideoDemoError:
             self._logger.exception("image scheduler failure recording failed run_id=%s", run_id)
             return False
+        except Exception:
+            # 失败写回属于状态收口；即使数据库或其他基础设施异常，也不能
+            # 让单个图片任务线程把整个调度器拖死。
+            self._logger.exception("image scheduler failure recording crashed run_id=%s", run_id)
+            return False
 
     def _delayed_enqueue(self, scope: Scope, run_id: str) -> None:
         deadline = time.monotonic() + self._retry_delay_seconds
