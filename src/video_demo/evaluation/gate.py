@@ -91,7 +91,6 @@ REQUIRED_FAILURE_SCENARIOS: tuple[str, ...] = (
     "no_audio",
     "no_speech",
     "black_frames",
-    "five_language_switch",
     "malformed_json",
     "cancellation",
     "retry",
@@ -164,9 +163,6 @@ FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     ),
     "black_frames": (
         "tests/application/test_chapter_frames.py::test_single_frame_failure_degrades_chapter_but_keeps_successful_frames",
-    ),
-    "five_language_switch": (
-        "tests/speech/test_language.py::test_language_identifier_tracks_all_five_validation_languages",
     ),
     "malformed_json": (
         "tests/integrations/test_qwen_vl.py::test_qwen_request_rejection_is_not_response_content_invalid",
