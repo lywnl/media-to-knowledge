@@ -12,23 +12,7 @@ from video_demo.domain.audio_plan import AudioGroundedClaim, AudioParagraphBlock
 def test_audio_asr_receives_core_context_and_hotwords(tmp_path: Path) -> None:
     from video_demo.application.audio_pipeline import AudioSpeechAnalyzer
     from video_demo.application.audio_run_config import AudioRunConfig
-    from video_demo.speech.asr import WindowTranscriptionResult
-    from video_demo.speech.vad import SpeechInterval, VadResult
-
-    class Vad:
-        def detect(self, _audio: Path, *, duration_ms: int) -> VadResult:
-            return VadResult(
-                speech=(
-                    SpeechInterval(
-                        evidence_id="speech_001",
-                        start_ms=0,
-                        end_ms=duration_ms,
-                        confidence=0.9,
-                    ),
-                ),
-                silence=(),
-                long_silence_boundaries_ms=(),
-            )
+    from video_demo.speech.asr_contracts import WindowTranscriptionResult
 
     class Slicer:
         def create(self, _audio, _root, _slice_id, _range):
@@ -40,16 +24,18 @@ def test_audio_asr_receives_core_context_and_hotwords(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.prompt = None
 
-        def transcribe_window(self, _slice, *, language_hint, prompt):
+        def transcribe_window(self, _slice, *, language_hint, prompt, chunk_index=None):
             self.prompt = prompt
             return WindowTranscriptionResult(language="zh", segments=())
 
     recognizer = Recognizer()
     analyzer = AudioSpeechAnalyzer(
-        Vad(), recognizer, Slicer(), max_window_ms=60_000, overlap_ms=0, max_upload_bytes=2_000_000
+        recognizer,
+        Slicer(),
     )
     analyzer.analyze(
         tmp_path / "audio.wav",
+        asset_sha256="a" * 64,
         duration_ms=1_000,
         config=AudioRunConfig(hotwords=("Qwen",), core_context="课程"),
         run_root=Path("runs/audio"),
@@ -58,28 +44,17 @@ def test_audio_asr_receives_core_context_and_hotwords(tmp_path: Path) -> None:
     assert recognizer.prompt == "课程\nQwen"
 
 
-def test_audio_asr_resumes_completed_windows_from_audio_snapshot(tmp_path: Path) -> None:
+def test_audio_asr_resumes_completed_windows_from_audio_snapshot(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    import logging
+
     from video_demo.application.audio_pipeline import AudioSpeechAnalyzer
     from video_demo.application.audio_run_config import AudioRunConfig
     from video_demo.speech.asr_contracts import RawAsrSegment, WindowTranscriptionResult
-    from video_demo.speech.vad import SpeechInterval, VadResult
     from video_demo.storage.artifacts import AtomicArtifactStore
     from video_demo.storage.audio_snapshots import AudioAsrWindowSnapshotStore
-
-    class Vad:
-        def detect(self, _audio: Path, *, duration_ms: int) -> VadResult:
-            return VadResult(
-                speech=(
-                    SpeechInterval(
-                        evidence_id="speech_resume",
-                        start_ms=0,
-                        end_ms=duration_ms,
-                        confidence=0.9,
-                    ),
-                ),
-                silence=(),
-                long_silence_boundaries_ms=(),
-            )
 
     class Slicer:
         def __init__(self) -> None:
@@ -94,9 +69,11 @@ def test_audio_asr_resumes_completed_windows_from_audio_snapshot(tmp_path: Path)
     class Recognizer:
         def __init__(self) -> None:
             self.calls = 0
+            self.chunk_indexes = []
 
-        def transcribe_window(self, _slice, *, language_hint, prompt):
+        def transcribe_window(self, _slice, *, language_hint, prompt, chunk_index=None):
             self.calls += 1
+            self.chunk_indexes.append(chunk_index)
             return WindowTranscriptionResult(
                 language=language_hint or "zh",
                 segments=(RawAsrSegment(0, 1_000, f"窗口 {self.calls}", 0.9),),
@@ -105,61 +82,42 @@ def test_audio_asr_resumes_completed_windows_from_audio_snapshot(tmp_path: Path)
     store = AudioAsrWindowSnapshotStore(AtomicArtifactStore(tmp_path))
     recognizer = Recognizer()
     analyzer = AudioSpeechAnalyzer(
-        Vad(),
         recognizer,
         Slicer(),
-        max_window_ms=60_000,
-        overlap_ms=0,
-        max_upload_bytes=2_000_000,
         window_store=store,
     )
     run_root = Path("runs/scope_001/run_audio_001")
     analyzer.analyze(
         tmp_path / "audio.wav",
-        duration_ms=120_000,
+        asset_sha256="b" * 64,
+        duration_ms=1_200_000,
         config=AudioRunConfig(language_hints=("zh",)),
         run_root=run_root,
         is_cancel_requested=lambda: False,
     )
     assert recognizer.calls == 2
+    assert sorted(recognizer.chunk_indexes) == [0, 1]
 
+    caplog.set_level(logging.INFO, logger="video_demo.application.audio_pipeline")
     analyzer.analyze(
         tmp_path / "audio.wav",
-        duration_ms=120_000,
+        asset_sha256="b" * 64,
+        duration_ms=1_200_000,
         config=AudioRunConfig(language_hints=("zh",)),
         run_root=run_root,
         is_cancel_requested=lambda: False,
     )
     assert recognizer.calls == 2
+    assert "音频 ASR 块命中快照 chunk=1/2 segments=1" in caplog.text
+    assert "音频 ASR 块命中快照 chunk=2/2 segments=1" in caplog.text
+    assert "chunk=1/0" not in caplog.text
 
 
-def test_audio_asr_isolates_a_failed_window_and_continues(tmp_path: Path) -> None:
+def test_audio_asr_fails_the_stage_when_any_fixed_chunk_fails(tmp_path: Path) -> None:
     from video_demo.application.audio_pipeline import AudioSpeechAnalyzer
     from video_demo.application.audio_run_config import AudioRunConfig
     from video_demo.errors import ErrorCode, VideoDemoError
     from video_demo.speech.asr_contracts import RawAsrSegment, WindowTranscriptionResult
-    from video_demo.speech.vad import SpeechInterval, VadResult
-
-    class Vad:
-        def detect(self, _audio: Path, *, duration_ms: int) -> VadResult:
-            return VadResult(
-                speech=(
-                    SpeechInterval(
-                        evidence_id="speech_one",
-                        start_ms=0,
-                        end_ms=60_000,
-                        confidence=0.9,
-                    ),
-                    SpeechInterval(
-                        evidence_id="speech_two",
-                        start_ms=60_000,
-                        end_ms=duration_ms,
-                        confidence=0.9,
-                    ),
-                ),
-                silence=(),
-                long_silence_boundaries_ms=(),
-            )
 
     class Slicer:
         def __init__(self) -> None:
@@ -175,7 +133,7 @@ def test_audio_asr_isolates_a_failed_window_and_continues(tmp_path: Path) -> Non
         def __init__(self) -> None:
             self.calls = 0
 
-        def transcribe_window(self, _slice, *, language_hint, prompt):
+        def transcribe_window(self, _slice, *, language_hint, prompt, chunk_index=None):
             self.calls += 1
             if self.calls == 1:
                 raise VideoDemoError(ErrorCode.DEPENDENCY_TEMPORARY_FAILURE, "模拟窗口失败")
@@ -186,56 +144,35 @@ def test_audio_asr_isolates_a_failed_window_and_continues(tmp_path: Path) -> Non
 
     recognizer = Recognizer()
     analyzer = AudioSpeechAnalyzer(
-        Vad(),
         recognizer,
         Slicer(),
-        max_window_ms=60_000,
-        overlap_ms=0,
-        max_upload_bytes=2_000_000,
     )
-    result = analyzer.analyze(
-        tmp_path / "audio.wav",
-        duration_ms=120_000,
-        config=AudioRunConfig(language_hints=("zh",)),
-        run_root=Path("runs/scope_001/run_audio_002"),
-        is_cancel_requested=lambda: False,
-    )
+    import pytest
 
-    assert recognizer.calls == 2
-    assert tuple(item.text for item in result.evidence) == ("第二窗口",)
-    assert result.warnings == ("AUDIO_ASR_WINDOW_DEGRADED:1",)
+    with pytest.raises(VideoDemoError, match="模拟窗口失败"):
+        analyzer.analyze(
+            tmp_path / "audio.wav",
+            asset_sha256="c" * 64,
+            duration_ms=1_200_000,
+            config=AudioRunConfig(language_hints=("zh",)),
+            run_root=Path("runs/scope_001/run_audio_002"),
+            is_cancel_requested=lambda: False,
+        )
+
+    assert recognizer.calls <= 2
 
 
-def test_audio_asr_keeps_vad_and_language_change_boundaries(tmp_path: Path) -> None:
+def test_audio_asr_uses_sentence_and_language_boundaries_without_vad(tmp_path: Path) -> None:
     from video_demo.application.audio_pipeline import AudioSpeechAnalyzer
     from video_demo.application.audio_run_config import AudioRunConfig
     from video_demo.speech.asr_contracts import RawAsrSegment, WindowTranscriptionResult
-    from video_demo.speech.vad import SpeechInterval, VadResult
-
-    class Vad:
-        def detect(self, _audio: Path, *, duration_ms: int) -> VadResult:
-            return VadResult(
-                speech=(
-                    SpeechInterval(
-                        evidence_id="speech_one",
-                        start_ms=0,
-                        end_ms=60_000,
-                        confidence=0.9,
-                    ),
-                    SpeechInterval(
-                        evidence_id="speech_two",
-                        start_ms=63_000,
-                        end_ms=duration_ms,
-                        confidence=0.9,
-                    ),
-                ),
-                silence=(),
-                long_silence_boundaries_ms=(60_000, 63_000),
-            )
-
     class Slicer:
+        def __init__(self) -> None:
+            self.count = 0
+
         def create(self, _audio, _root, _slice_id, _range):
-            path = tmp_path / "audio-boundary-slice.wav"
+            self.count += 1
+            path = tmp_path / f"audio-boundary-slice-{self.count}.wav"
             path.write_bytes(b"slice")
             return path
 
@@ -243,7 +180,7 @@ def test_audio_asr_keeps_vad_and_language_change_boundaries(tmp_path: Path) -> N
         def __init__(self) -> None:
             self.calls = 0
 
-        def transcribe_window(self, _slice, *, language_hint, prompt):
+        def transcribe_window(self, _slice, *, language_hint, prompt, chunk_index=None):
             self.calls += 1
             language = "zh" if self.calls == 1 else "en"
             return WindowTranscriptionResult(
@@ -252,24 +189,83 @@ def test_audio_asr_keeps_vad_and_language_change_boundaries(tmp_path: Path) -> N
             )
 
     result = AudioSpeechAnalyzer(
-        Vad(),
         Recognizer(),
         Slicer(),
-        max_window_ms=60_000,
-        overlap_ms=0,
-        max_upload_bytes=2_000_000,
     ).analyze(
         tmp_path / "audio.wav",
-        duration_ms=120_000,
+        asset_sha256="d" * 64,
+        duration_ms=1_200_000,
         config=AudioRunConfig(),
         run_root=Path("runs/scope_001/run_audio_boundary"),
         is_cancel_requested=lambda: False,
     )
 
     assert {(item.timestamp_ms, item.source) for item in result.boundary_candidates} >= {
-        (60_000, "silence"),
-        (63_000, "language_change"),
+        (1_000, "sentence_end"),
     }
+    assert {item.source for item in result.boundary_candidates} <= {
+        "sentence_end",
+        "language_change",
+    }
+
+
+def test_audio_asr_does_not_send_und_as_explicit_language_hint(tmp_path: Path) -> None:
+    from video_demo.application.audio_pipeline import AudioSpeechAnalyzer
+    from video_demo.application.audio_run_config import AudioRunConfig
+    from video_demo.speech.asr_contracts import WindowTranscriptionResult
+
+    class Slicer:
+        def create(self, _audio, _root, _slice_id, _range):
+            path = tmp_path / "audio-und-slice.wav"
+            path.write_bytes(b"slice")
+            return path
+
+    class Recognizer:
+        def __init__(self) -> None:
+            self.language_hints = []
+
+        def transcribe_window(self, _slice, *, language_hint, prompt, chunk_index=None):
+            self.language_hints.append(language_hint)
+            return WindowTranscriptionResult(language="zh", segments=())
+
+    recognizer = Recognizer()
+    AudioSpeechAnalyzer(recognizer, Slicer()).analyze(
+        tmp_path / "audio.wav",
+        asset_sha256="e" * 64,
+        duration_ms=1_000,
+        config=AudioRunConfig(language_hints=("und",)),
+        run_root=Path("runs/scope_001/run_audio_und"),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert recognizer.language_hints == [None]
+
+
+def test_audio_asr_warns_when_fixed_windows_have_no_valid_segments(tmp_path: Path) -> None:
+    from video_demo.application.audio_pipeline import AudioSpeechAnalyzer
+    from video_demo.application.audio_run_config import AudioRunConfig
+    from video_demo.speech.asr_contracts import WindowTranscriptionResult
+
+    class Slicer:
+        def create(self, _audio, _root, _slice_id, _range):
+            path = tmp_path / "audio-empty-slice.wav"
+            path.write_bytes(b"slice")
+            return path
+
+    class Recognizer:
+        def transcribe_window(self, _slice, *, language_hint, prompt, chunk_index=None):
+            return WindowTranscriptionResult(language="zh", segments=())
+
+    result = AudioSpeechAnalyzer(Recognizer(), Slicer()).analyze(
+        tmp_path / "audio.wav",
+        asset_sha256="f" * 64,
+        duration_ms=1_000,
+        config=AudioRunConfig(),
+        run_root=Path("runs/scope_001/run_audio_empty"),
+        is_cancel_requested=lambda: False,
+    )
+
+    assert "AUDIO_ASR_NO_VALID_SEGMENTS" in result.warnings
 
 
 def _result() -> AudioUnderstandingResult:
@@ -370,12 +366,94 @@ def test_audio_result_contract_has_no_visual_or_rag_fields() -> None:
     assert "keyframe" not in serialized.lower()
 
 
-def test_media_worker_entrypoints_keep_video_job_type_isolated() -> None:
-    from video_demo.application.audio_composition import build_audio_worker
-    from video_demo.application.composition import build_image_worker
+def test_audio_transcription_checkpoint_round_trips_through_audio_payload() -> None:
+    from video_demo.application.audio_contracts import (
+        AudioStageMetric,
+        AudioTranscriptionCheckpoint,
+        audio_transcription_checkpoint_from_payload,
+        audio_transcription_checkpoint_to_payload,
+    )
+    from video_demo.domain.audio_plan import AudioBaseSegment
+    from video_demo.domain.evidence import SpeechSegment
 
-    assert callable(build_audio_worker)
-    assert callable(build_image_worker)
+    evidence = SpeechSegment(
+        evidence_id="asr_checkpoint_001",
+        start_ms=0,
+        end_ms=1_000,
+        text="音频片段",
+        language="zh",
+        confidence=0.9,
+        is_fully_evaluated_language=True,
+    )
+    checkpoint = AudioTranscriptionCheckpoint(
+        run_id="run_audio_checkpoint",
+        asset_sha256="c" * 64,
+        duration_ms=1_000,
+        title_hint="音频标题",
+        transcript_source="ASR",
+        transcript_evidence=(evidence,),
+        base_segments=(
+            AudioBaseSegment(
+                segment_id="audio_segment_checkpoint_001",
+                start_ms=0,
+                end_ms=1_000,
+                evidence_refs=(evidence.evidence_id,),
+                transcript_source="ASR",
+            ),
+        ),
+        stage_metrics=(AudioStageMetric("SPEECH_ASR", 12),),
+    )
+
+    payload = audio_transcription_checkpoint_to_payload(checkpoint)
+    restored = audio_transcription_checkpoint_from_payload(payload)
+
+    assert restored == checkpoint
+    assert set(payload) == {
+        "schema_version",
+        "run_id",
+        "asset_sha256",
+        "duration_ms",
+        "title_hint",
+        "transcript_source",
+        "transcript_evidence",
+        "base_segments",
+        "warnings",
+        "stage_metrics",
+    }
+
+
+def test_audio_transcription_checkpoint_rejects_unknown_evidence_kind() -> None:
+    from video_demo.application.audio_contracts import (
+        audio_transcription_checkpoint_from_payload,
+    )
+
+    payload = {
+        "schema_version": "1.0.0",
+        "run_id": "run_audio_checkpoint",
+        "asset_sha256": "d" * 64,
+        "duration_ms": 1_000,
+        "title_hint": "音频标题",
+        "transcript_source": "ASR",
+        "transcript_evidence": [
+            {"kind": "UNKNOWN", "payload": {}},
+        ],
+        "base_segments": [],
+        "warnings": [],
+        "stage_metrics": [],
+    }
+
+    import pytest
+
+    with pytest.raises(ValueError, match="未知音频证据类型"):
+        audio_transcription_checkpoint_from_payload(payload)
+
+
+def test_audio_uses_scheduler_entrypoint_without_legacy_entrypoint() -> None:
+    from pathlib import Path
+
+    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+    assert "video-demo-audio-worker" not in pyproject
+    assert not Path("src/video_demo/audio_worker_main.py").exists()
 
 
 def test_image_pipeline_binds_source_evidence_and_renders_three_sections(tmp_path: Path) -> None:

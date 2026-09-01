@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -14,11 +15,13 @@ from video_demo.application.audio_contracts import (
     AudioSpeechAnalysis,
     AudioSpeechBoundaryCandidate,
     AudioStageMetric,
+    AudioTranscriptionCheckpoint,
 )
 from video_demo.application.audio_document_writing import AudioDocumentWriter, AudioWritingContext
 from video_demo.application.audio_rendering import RenderedAudioDocument, render_audio_markdown
 from video_demo.application.audio_run_config import AudioRunConfig
 from video_demo.application.audio_segments import build_audio_segments
+from video_demo.application.audio_speech import discard_audio_slice
 from video_demo.domain.audio_document import AudioUnderstandingResult
 from video_demo.domain.audio_plan import AudioDocumentConfig
 from video_demo.domain.base import Sha256, stable_identifier
@@ -26,24 +29,25 @@ from video_demo.domain.evidence import SpeechSegment, SubtitleCue
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError, is_cancelled_error_code
 from video_demo.speech.asr_contracts import WindowRecognizerPort
-from video_demo.speech.audio_asr import (
-    build_cloud_asr_windows,
-    project_cloud_asr_window,
-    remove_adjacent_cloud_asr_duplicates,
+from video_demo.speech.audio_fixed_asr import (
+    AUDIO_ASR_CHUNK_DURATION_MS,
+    AUDIO_ASR_CONCURRENCY,
+    AudioFixedAsrProjection,
+    AudioFixedAsrWindow,
+    build_fixed_audio_asr_windows,
+    project_fixed_audio_asr_window,
+    remove_adjacent_audio_asr_duplicates,
 )
 from video_demo.speech.audio_snapshots import (
+    AudioAsrFingerprintInputs,
     AudioAsrWindowSnapshotPayload,
+    audio_asr_fingerprint,
     audio_asr_window_fingerprint,
 )
-from video_demo.speech.vad import VadResult
 from video_demo.storage.audio_snapshots import AudioAsrWindowSnapshotStore
 from video_demo.storage.document_cache import DocumentModelCache
 
 _LOGGER = logging.getLogger(__name__)
-
-
-class VadPort(Protocol):
-    def detect(self, audio: Path, *, duration_ms: int) -> VadResult: ...
 
 
 class AudioSlicerPort(Protocol):
@@ -70,6 +74,7 @@ class AudioSpeechPort:
         self,
         source: Path,
         *,
+        asset_sha256: Sha256,
         duration_ms: int,
         config: AudioRunConfig,
         run_root: Path,
@@ -79,162 +84,78 @@ class AudioSpeechPort:
 
 
 class AudioSpeechAnalyzer(AudioSpeechPort):
-    """独立音频 ASR：VAD 分窗、串行 Whisper 识别和窗口级失败隔离。"""
+    """独立音频 ASR：固定十分钟分块、串行识别和可恢复快照。"""
 
     def __init__(
         self,
-        vad: object,
         recognizer: object,
         slicer: object,
         *,
-        max_window_ms: int,
-        overlap_ms: int,
-        max_upload_bytes: int,
+        max_upload_bytes: int = 25 * 1024 * 1024,
         window_store: AudioAsrWindowSnapshotStore | None = None,
+        fingerprint_inputs: AudioAsrFingerprintInputs | None = None,
     ) -> None:
-        self._vad = cast(VadPort, vad)
         self._recognizer = cast(WindowRecognizerPort, recognizer)
         self._slicer = cast(AudioSlicerPort, slicer)
-        self._max_window_ms = max_window_ms
-        self._overlap_ms = overlap_ms
         self._max_upload_bytes = max_upload_bytes
         self._window_store = window_store
+        self._fingerprint_inputs = fingerprint_inputs or AudioAsrFingerprintInputs(
+            model_id="unspecified",
+            base_url="unspecified",
+            timeout_seconds=1,
+            max_attempts=1,
+            max_upload_bytes=max_upload_bytes,
+        )
 
     def analyze(
         self,
         source: Path,
         *,
+        asset_sha256: Sha256,
         duration_ms: int,
         config: AudioRunConfig,
         run_root: Path,
         is_cancel_requested: Callable[[], bool],
     ) -> AudioSpeechAnalysis:
         started_at = time.monotonic()
-        vad_started_at = time.monotonic()
-        vad_result = self._vad.detect(source, duration_ms=duration_ms)
-        windows = build_cloud_asr_windows(
-            vad_result.speech,
-            max_window_ms=self._max_window_ms,
-            overlap_ms=self._overlap_ms,
-            max_upload_bytes=self._max_upload_bytes,
-        )
+        windows = build_fixed_audio_asr_windows(duration_ms)
         _LOGGER.info(
-            "音频 ASR 分窗完成: windows=%d duration_ms=%d vad_elapsed=%.3fs",
+            "音频 ASR 固定分块完成: chunks=%d chunk_duration_ms=%d concurrency=%d",
             len(windows),
-            duration_ms,
-            time.monotonic() - vad_started_at,
+            AUDIO_ASR_CHUNK_DURATION_MS,
+            AUDIO_ASR_CONCURRENCY,
         )
-        transcript: list[SpeechSegment] = []
-        language_spans = []
-        warnings = list(vad_result.warnings)
-        language_hint = config.language_hints[0] if len(config.language_hints) == 1 else None
+        language_hint = _single_language_hint(config.language_hints)
         prompt = _audio_asr_prompt(config)
-        for index, window in enumerate(windows, start=1):
-            if is_cancel_requested():
-                raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
-            window_started_at = time.monotonic()
-            _LOGGER.info(
-                "音频 ASR 窗口开始: index=%d/%d upload=%d-%dms owned=%d-%dms",
-                index,
-                len(windows),
-                window.upload_range.start_ms,
-                window.upload_range.end_ms,
-                window.owned_range.start_ms,
-                window.owned_range.end_ms,
-            )
-            slice_id = stable_identifier(
-                "audio-slice",
-                {
-                    "run_root": run_root.as_posix(),
-                    "index": index,
-                    "start_ms": window.upload_range.start_ms,
-                },
-            )
-            try:
-                fingerprint = audio_asr_window_fingerprint(
-                    run_root=run_root.as_posix(),
-                    window=window,
-                    language_hint=language_hint,
-                    prompt=prompt,
-                    max_window_ms=self._max_window_ms,
-                    overlap_ms=self._overlap_ms,
-                    max_upload_bytes=self._max_upload_bytes,
-                )
-                cached = (
-                    self._window_store.load(run_root, fingerprint)
-                    if self._window_store is not None
-                    else None
-                )
-                if cached is not None:
-                    language_spans.append(cached[0].language_span)
-                    transcript.extend(cached[0].segments)
-                    warnings.extend(cached[0].warnings)
-                    _LOGGER.info(
-                        "音频 ASR 窗口命中快照: index=%d/%d segments=%d elapsed=%.3fs",
-                        index,
-                        len(windows),
-                        len(cached[0].segments),
-                        time.monotonic() - window_started_at,
-                    )
-                    continue
-                audio_slice = self._slicer.create(
-                    source,
-                    run_root,
-                    slice_id,
-                    window.upload_range,
-                )
-                try:
-                    result = self._recognizer.transcribe_window(
-                        audio_slice,
-                        language_hint=language_hint,
-                        prompt=prompt,
-                    )
-                    projection = project_cloud_asr_window(
-                        window,
-                        language=result.language,
-                        raw_segments=result.segments,
-                        warnings=result.warnings,
-                    )
-                    if self._window_store is not None:
-                        self._window_store.publish(
-                            run_root,
-                            fingerprint,
-                            AudioAsrWindowSnapshotPayload(
-                                upload_range=window.upload_range,
-                                owned_range=window.owned_range,
-                                speech_interval=window.speech_interval,
-                                source_intervals=window.source_intervals,
-                                language_span=projection.language_span,
-                                segments=projection.segments,
-                                warnings=projection.warnings,
-                            ),
-                        )
-                    language_spans.append(projection.language_span)
-                    transcript.extend(projection.segments)
-                    warnings.extend(projection.warnings)
-                    _LOGGER.info(
-                        "音频 ASR 窗口完成: index=%d/%d segments=%d elapsed=%.3fs",
-                        index,
-                        len(windows),
-                        len(projection.segments),
-                        time.monotonic() - window_started_at,
-                    )
-                finally:
-                    audio_slice.unlink(missing_ok=True)
-            except VideoDemoError as error:
-                if is_cancelled_error_code(error.code):
-                    if error.code == ErrorCode.JOB_CANCELLED:
-                        raise
-                    raise VideoDemoError(ErrorCode.JOB_CANCELLED, "音频分析已取消") from error
-                _LOGGER.warning(
-                    "音频 ASR 窗口降级: index=%d/%d code=%s elapsed=%.3fs",
-                    index,
-                    len(windows),
-                    error.code.value,
-                    time.monotonic() - window_started_at,
-                )
-                warnings.append(f"AUDIO_ASR_WINDOW_DEGRADED:{index}")
-        ordered = remove_adjacent_cloud_asr_duplicates(tuple(transcript))
+        parent_fingerprint = audio_asr_fingerprint(
+            asset_sha256=asset_sha256,
+            duration_ms=duration_ms,
+            language_hints=config.language_hints,
+            hotwords=config.hotwords,
+            core_context=config.core_context,
+            inputs=self._fingerprint_inputs,
+        )
+        results = self._recognize_windows_concurrently(
+            source,
+            run_root,
+            windows,
+            parent_fingerprint=parent_fingerprint,
+            language_hint=language_hint,
+            prompt=prompt,
+            is_cancel_requested=is_cancel_requested,
+        )
+        language_spans = tuple(item.language_span for item in results)
+        warnings = tuple(warning for item in results for warning in item.warnings)
+        ordered = remove_adjacent_audio_asr_duplicates(
+            tuple(
+                sorted(
+                    (segment for item in results for segment in item.segments),
+                    key=lambda item: (item.start_ms, item.end_ms, item.evidence_id),
+                ),
+            ),
+        )
+        if windows and not ordered:
+            warnings = (*warnings, "AUDIO_ASR_NO_VALID_SEGMENTS")
         ordered_language_spans = tuple(
             sorted(
                 language_spans,
@@ -244,7 +165,6 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
         transcript_source: Literal["ASR", "NONE"] = "ASR" if ordered else "NONE"
         boundaries = _boundary_candidates(
             duration_ms,
-            silence=vad_result.long_silence_boundaries_ms,
             sentence_ends=tuple(item.end_ms for item in ordered),
             language_changes=tuple(
                 current.start_ms
@@ -262,6 +182,141 @@ class AudioSpeechAnalyzer(AudioSpeechPort):
             ),
         )
 
+    def _recognize_windows_concurrently(
+        self,
+        source: Path,
+        run_root: Path,
+        windows: tuple[AudioFixedAsrWindow, ...],
+        *,
+        parent_fingerprint: Sha256,
+        language_hint: str | None,
+        prompt: str | None,
+        is_cancel_requested: Callable[[], bool],
+    ) -> tuple[AudioAsrWindowSnapshotPayload, ...]:
+        results: dict[int, AudioAsrWindowSnapshotPayload] = {}
+        futures: dict[Future[AudioAsrWindowSnapshotPayload], AudioFixedAsrWindow] = {}
+        first_error: Exception | None = None
+        with ThreadPoolExecutor(
+            max_workers=AUDIO_ASR_CONCURRENCY,
+            thread_name_prefix="audio-asr",
+        ) as executor:
+            for window in windows:
+                futures[executor.submit(
+                    self._recognize_window,
+                    source,
+                    run_root,
+                    window,
+                    parent_fingerprint=parent_fingerprint,
+                    total_chunks=len(windows),
+                    language_hint=language_hint,
+                    prompt=prompt,
+                    is_cancel_requested=is_cancel_requested,
+                )] = window
+            for future in as_completed(futures):
+                window = futures[future]
+                try:
+                    results[window.chunk_index] = future.result()
+                except Exception as error:
+                    first_error = error
+                    _LOGGER.warning(
+                        "音频 ASR 块失败 chunk=%d/%d error=%s",
+                        window.chunk_index + 1,
+                        len(windows),
+                        getattr(error, "code", type(error).__name__),
+                    )
+                    for pending in futures:
+                        if pending is not future:
+                            pending.cancel()
+                    break
+        if first_error is not None:
+            if isinstance(first_error, VideoDemoError) and is_cancelled_error_code(
+                first_error.code,
+            ):
+                raise VideoDemoError(ErrorCode.JOB_CANCELLED, "音频分析已取消") from first_error
+            raise first_error
+        if len(results) != len(windows):
+            raise VideoDemoError(ErrorCode.AUDIO_ASR_UNAVAILABLE, "音频 ASR 块结果不完整")
+        return tuple(results[index] for index in range(len(windows)))
+
+    def _recognize_window(
+        self,
+        source: Path,
+        run_root: Path,
+        window: AudioFixedAsrWindow,
+        *,
+        parent_fingerprint: Sha256,
+        total_chunks: int,
+        language_hint: str | None,
+        prompt: str | None,
+        is_cancel_requested: Callable[[], bool],
+    ) -> AudioAsrWindowSnapshotPayload:
+        if is_cancel_requested():
+            raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
+        fingerprint = audio_asr_window_fingerprint(
+            asr_fingerprint=parent_fingerprint,
+            window=window,
+        )
+        if self._window_store is not None:
+            cached = self._window_store.load(run_root, fingerprint)
+            if cached is not None:
+                _LOGGER.info(
+                    "音频 ASR 块命中快照 chunk=%d/%d segments=%d",
+                    window.chunk_index + 1,
+                    total_chunks,
+                    len(cached[0].segments),
+                )
+                return cached[0]
+        started_at = time.monotonic()
+        _LOGGER.info(
+            "音频 ASR 块开始 chunk=%d range=%d-%dms",
+            window.chunk_index + 1,
+            window.upload_range.start_ms,
+            window.upload_range.end_ms,
+        )
+        slice_id = stable_identifier(
+            "audio-slice",
+            {
+                "run_root": run_root.as_posix(),
+                "chunk_index": window.chunk_index,
+                "window_fingerprint": fingerprint,
+            },
+        )
+        audio_slice = self._slicer.create(source, run_root, slice_id, window.upload_range)
+        try:
+            if audio_slice.stat().st_size > self._max_upload_bytes:
+                raise VideoDemoError(ErrorCode.AUDIO_OUTPUT_TOO_LARGE, "ASR 音频切片超过大小限制")
+            result = self._recognizer.transcribe_window(
+                audio_slice,
+                language_hint=language_hint,
+                prompt=prompt,
+                chunk_index=window.chunk_index,
+            )
+            projection: AudioFixedAsrProjection = project_fixed_audio_asr_window(
+                window,
+                language=result.language,
+                raw_segments=result.segments,
+                warnings=result.warnings,
+            )
+            payload = AudioAsrWindowSnapshotPayload(
+                chunk_index=window.chunk_index,
+                upload_range=window.upload_range,
+                owned_range=window.owned_range,
+                language_span=projection.language_span,
+                segments=projection.segments,
+                warnings=projection.warnings,
+            )
+            if self._window_store is not None:
+                self._window_store.publish(run_root, fingerprint, payload)
+            _LOGGER.info(
+                "音频 ASR 块完成 chunk=%d segments=%d elapsed=%.3fs",
+                window.chunk_index + 1,
+                len(payload.segments),
+                time.monotonic() - started_at,
+            )
+            return payload
+        finally:
+            discard_audio_slice(audio_slice)
+
 
 def _audio_asr_prompt(config: AudioRunConfig) -> str | None:
     parts: list[str] = []
@@ -272,21 +327,21 @@ def _audio_asr_prompt(config: AudioRunConfig) -> str | None:
     return "\n".join(parts) or None
 
 
+def _single_language_hint(hints: tuple[str, ...]) -> str | None:
+    return hints[0] if len(hints) == 1 and hints[0] != "und" else None
+
+
 def _boundary_candidates(
     duration_ms: int,
     *,
-    silence: tuple[int, ...],
     sentence_ends: tuple[int, ...],
     language_changes: tuple[int, ...],
 ) -> tuple[AudioSpeechBoundaryCandidate, ...]:
-    candidates: set[tuple[int, Literal["silence", "sentence_end", "language_change"], float]] = {
-        (timestamp_ms, "silence", 1.0) for timestamp_ms in silence if 0 < timestamp_ms < duration_ms
-    }
-    candidates.update(
+    candidates: set[tuple[int, Literal["sentence_end", "language_change"], float]] = {
         (timestamp_ms, "sentence_end", 0.8)
         for timestamp_ms in sentence_ends
         if 0 < timestamp_ms < duration_ms
-    )
+    }
     candidates.update(
         (timestamp_ms, "language_change", 1.0)
         for timestamp_ms in language_changes
@@ -327,8 +382,38 @@ class AudioPipeline:
         cache: DocumentModelCache,
         is_cancel_requested: Callable[[], bool],
     ) -> AudioPipelineOutcome:
+        checkpoint = self.run_transcription(
+            run_id=run_id,
+            asset_sha256=asset_sha256,
+            source=source,
+            duration_ms=duration_ms,
+            title_hint=title_hint,
+            config=config,
+            run_root=run_root,
+            is_cancel_requested=is_cancel_requested,
+        )
+        return self.run_llm(
+            checkpoint,
+            config=config,
+            cache=cache,
+            is_cancel_requested=is_cancel_requested,
+        )
+
+    def run_transcription(
+        self,
+        *,
+        run_id: str,
+        asset_sha256: Sha256,
+        source: Path,
+        duration_ms: int,
+        title_hint: str,
+        config: AudioRunConfig,
+        run_root: Path,
+        is_cancel_requested: Callable[[], bool],
+    ) -> AudioTranscriptionCheckpoint:
         speech = self._speech.analyze(
             source,
+            asset_sha256=asset_sha256,
             duration_ms=duration_ms,
             config=config,
             run_root=run_root,
@@ -343,13 +428,34 @@ class AudioPipeline:
             speech.boundary_candidates,
             self._limits,
         )
+        return AudioTranscriptionCheckpoint(
+            run_id=run_id,
+            asset_sha256=asset_sha256,
+            duration_ms=duration_ms,
+            title_hint=title_hint,
+            transcript_source=speech.transcript_source,
+            transcript_evidence=speech.transcript_evidence,
+            base_segments=base_segments,
+            warnings=speech.warnings,
+            stage_metrics=speech.stage_metrics,
+        ).validate_consistency()
+
+    def run_llm(
+        self,
+        checkpoint: AudioTranscriptionCheckpoint,
+        *,
+        config: AudioRunConfig,
+        cache: DocumentModelCache,
+        is_cancel_requested: Callable[[], bool],
+    ) -> AudioPipelineOutcome:
+        checkpoint.validate_consistency()
         planning = self._planner.plan(
             cache=cache,
-            asset_sha256=asset_sha256,
-            title_hint=title_hint,
-            duration_ms=duration_ms,
-            segments=base_segments,
-            transcript_evidence=speech.transcript_evidence,
+            asset_sha256=checkpoint.asset_sha256,
+            title_hint=checkpoint.title_hint,
+            duration_ms=checkpoint.duration_ms,
+            segments=checkpoint.base_segments,
+            transcript_evidence=checkpoint.transcript_evidence,
             document_config=AudioDocumentConfig(
                 document_title=config.document_config.document_title,
                 detail_level=config.document_config.detail_level,
@@ -360,24 +466,26 @@ class AudioPipeline:
         )
         writing = self._writer.write(
             AudioWritingContext(
-                run_id=run_id,
-                asset_sha256=asset_sha256,
-                title_hint=title_hint,
-                duration_ms=duration_ms,
-                transcript_source=speech.transcript_source,
+                run_id=checkpoint.run_id,
+                asset_sha256=checkpoint.asset_sha256,
+                title_hint=checkpoint.title_hint,
+                duration_ms=checkpoint.duration_ms,
+                transcript_source=checkpoint.transcript_source,
                 document_config=config.document_config,
             ),
             planning.plans,
-            speech.transcript_evidence,
+            checkpoint.transcript_evidence,
             cache=cache,
             is_cancel_requested=is_cancel_requested,
         )
-        warnings = tuple(dict.fromkeys((*speech.warnings, *planning.warnings, *writing.warnings)))
+        warnings = tuple(
+            dict.fromkeys((*checkpoint.warnings, *planning.warnings, *writing.warnings))
+        )
         result = writing.result
         return AudioPipelineOutcome(
             result=result,
             document=render_audio_markdown(result),
-            evidence=speech.transcript_evidence,
+            evidence=checkpoint.transcript_evidence,
             warnings=warnings,
             status="PARTIAL_SUCCEEDED" if warnings else "SUCCEEDED",
         )

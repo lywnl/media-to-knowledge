@@ -64,3 +64,20 @@ def _sha256_file(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def discard_audio_slice(path: Path) -> None:
+    """安全清理可再生音频切片，拒绝符号链接且不吞掉清理失败。"""
+
+    try:
+        if path.is_symlink():
+            raise VideoDemoError(
+                ErrorCode.WORKSPACE_PATH_ESCAPE,
+                "云端 ASR 音频切片不能是符号链接",
+            )
+        path.unlink(missing_ok=True)
+    except OSError:
+        raise VideoDemoError(
+            ErrorCode.AUDIO_PROCESS_FAILED,
+            "云端 ASR 音频切片清理失败",
+        ) from None

@@ -1360,6 +1360,67 @@ class JobRepository:
         if result.rowcount != 1:  # type: ignore[attr-defined]
             raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "任务租约已丢失")
 
+    def release_audio_stage(
+        self,
+        job: ClaimedJob,
+        *,
+        status: JobStatus = JobStatus.PENDING,
+        current_stage: str | None = None,
+        error_code: ErrorCode | None = None,
+        retry_delay_seconds: int = 5,
+        now: datetime | None = None,
+    ) -> None:
+        """释放音频阶段租约，并原子更新音频运行阶段。"""
+
+        if status not in (JobStatus.PENDING, JobStatus.RETRY_WAIT, JobStatus.FAILED):
+            raise ValueError("音频阶段只能释放为可重试或失败状态")
+        if retry_delay_seconds < 0:
+            raise ValueError("任务重试延迟不能为负数")
+        current_time = now or datetime.now(UTC)
+        if current_stage is not None:
+            from video_demo.persistence.models import AudioUnderstandingRunModel
+
+            run = self._session.scalar(
+                select(AudioUnderstandingRunModel).where(
+                    AudioUnderstandingRunModel.tenant_id == job.scope.tenant_id,
+                    AudioUnderstandingRunModel.application_id == job.scope.application_id,
+                    AudioUnderstandingRunModel.knowledge_base_id == job.scope.knowledge_base_id,
+                    AudioUnderstandingRunModel.run_id == job.resource_id,
+                ),
+            )
+            if run is None:
+                raise VideoDemoError(ErrorCode.AUDIO_RUN_NOT_FOUND, "音频运行不存在")
+            run.current_stage = current_stage
+            run.status = (
+                RunStatusValue.FAILED if status == JobStatus.FAILED else RunStatusValue.PENDING
+            )
+            run.error_code = str(error_code) if error_code else None
+        result = self._session.execute(
+            update(JobModel).where(
+                JobModel.id == job.id,
+                JobModel.worker_id == job.worker_id,
+                JobModel.attempt_count == job.attempt_count,
+                JobModel.status == JobStatus.RUNNING,
+                JobModel.resource_type == "AUDIO_UNDERSTANDING_RUN",
+                JobModel.resource_id == job.resource_id,
+                JobModel.lease_expires_at > current_time,
+            ).values(
+                status=status,
+                worker_id=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                next_attempt_at=(
+                    current_time + timedelta(seconds=retry_delay_seconds)
+                    if status == JobStatus.RETRY_WAIT
+                    else current_time
+                ),
+                error_code=str(error_code) if error_code else None,
+                updated_at=current_time,
+            ).execution_options(synchronize_session=False),
+        )
+        if result.rowcount != 1:  # type: ignore[attr-defined]
+            raise VideoDemoError(ErrorCode.JOB_LEASE_LOST, "音频任务租约已丢失")
+
     def fail_unclaimed_video_run(
         self,
         scope: Scope,
@@ -1394,6 +1455,49 @@ class JobRepository:
                 VideoUnderstandingRunModel.knowledge_base_id == scope.knowledge_base_id,
                 VideoUnderstandingRunModel.run_id == run_id,
             )
+        )
+        if run is not None:
+            run.status = RunStatusValue.FAILED
+            run.current_stage = current_stage
+            run.error_code = str(error_code)
+        return bool(result.rowcount)  # type: ignore[attr-defined]
+
+    def fail_unclaimed_audio_run(
+        self,
+        scope: Scope,
+        run_id: str,
+        *,
+        error_code: ErrorCode,
+        current_stage: str,
+        now: datetime | None = None,
+    ) -> bool:
+        current_time = now or datetime.now(UTC)
+        result = self._session.execute(
+            update(JobModel)
+            .where(
+                JobModel.tenant_id == scope.tenant_id,
+                JobModel.application_id == scope.application_id,
+                JobModel.knowledge_base_id == scope.knowledge_base_id,
+                JobModel.resource_type == "AUDIO_UNDERSTANDING_RUN",
+                JobModel.resource_id == run_id,
+                JobModel.status.in_((JobStatus.PENDING, JobStatus.RETRY_WAIT)),
+            )
+            .values(
+                status=JobStatus.FAILED,
+                error_code=str(error_code),
+                updated_at=current_time,
+            )
+            .execution_options(synchronize_session=False),
+        )
+        from video_demo.persistence.models import AudioUnderstandingRunModel
+
+        run = self._session.scalar(
+            select(AudioUnderstandingRunModel).where(
+                AudioUnderstandingRunModel.tenant_id == scope.tenant_id,
+                AudioUnderstandingRunModel.application_id == scope.application_id,
+                AudioUnderstandingRunModel.knowledge_base_id == scope.knowledge_base_id,
+                AudioUnderstandingRunModel.run_id == run_id,
+            ),
         )
         if run is not None:
             run.status = RunStatusValue.FAILED

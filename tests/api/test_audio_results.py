@@ -16,7 +16,7 @@ def _wav() -> bytes:
     return stream.getvalue()
 
 
-def test_audio_result_is_not_ready_until_audio_worker_publishes(
+def test_audio_result_is_not_ready_until_audio_scheduler_publishes(
     client: TestClient,
     scope_headers: dict[str, str],
 ) -> None:

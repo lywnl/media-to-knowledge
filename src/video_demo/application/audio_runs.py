@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, Protocol
 
 from video_demo.application.audio_run_config import AudioRunConfig
 from video_demo.domain.audio_plan import AudioDocumentConfig
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.persistence.audio_stage_repository import AudioStageRepository
 from video_demo.persistence.database import Database
 from video_demo.persistence.media_repositories import MediaObjectRepository, MediaRunRepository
-from video_demo.persistence.models import AudioObjectModel, AudioUnderstandingRunModel
+from video_demo.persistence.models import (
+    AudioObjectModel,
+    AudioStageName,
+    AudioUnderstandingRunModel,
+    JobModel,
+    JobStatus,
+)
 from video_demo.persistence.repositories import JobRepository
 from video_demo.persistence.scope import Scope
 
@@ -26,11 +33,35 @@ class AudioRunView:
     error_code: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class AudioJobView:
+    job_id: str
+    resource_id: str
+    status: JobStatus
+    attempt_count: int
+    max_attempts: int
+    error_code: str | None
+
+
+class AudioSchedulerPort(Protocol):
+    def submit(
+        self,
+        scope: Scope,
+        run_id: str,
+        stage: AudioStageName,
+    ) -> Literal["accepted", "already_queued", "rejected"]: ...
+
+
 class AudioRunService:
     """只操作 audio_object 与 audio_understanding_run。"""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        scheduler: AudioSchedulerPort | None = None,
+    ) -> None:
         self._database = database
+        self._scheduler = scheduler
 
     def create(
         self,
@@ -87,7 +118,13 @@ class AudioRunService:
                 job_type="AUDIO_UNDERSTANDING",
                 resource_type="AUDIO_UNDERSTANDING_RUN",
             )
-            return _view(run, job_id)
+            AudioStageRepository(session).ensure(scope, run_id)
+            view = _view(run, job_id)
+        if self._scheduler is not None:
+            result = self._scheduler.submit(scope, run_id, AudioStageName.TRANSCRIPTION)
+            if result == "rejected":
+                raise VideoDemoError(ErrorCode.JOB_NOT_RETRYABLE, "音频调度器暂不可用")
+        return view
 
     def get(self, scope: Scope, run_id: str) -> AudioRunView:
         with self._database.session() as session:
@@ -100,6 +137,42 @@ class AudioRunService:
             if job is None:
                 raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "音频运行任务不存在")
             return _view(run, job.job_id)
+
+    def get_job(self, scope: Scope, job_id: str) -> AudioJobView:
+        with self._database.session() as session:
+            job = JobRepository(session).get(scope, job_id)
+            if job is None or job.resource_type != "AUDIO_UNDERSTANDING_RUN":
+                raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "音频任务不存在")
+            return _job_view(job)
+
+    def cancel_job(self, scope: Scope, job_id: str) -> AudioJobView:
+        with self._database.session() as session:
+            repository = JobRepository(session)
+            job = repository.get(scope, job_id)
+            if job is None or job.resource_type != "AUDIO_UNDERSTANDING_RUN":
+                raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "音频任务不存在")
+            if not repository.request_cancel(scope, job_id):
+                raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "音频任务不存在")
+            updated = repository.get(scope, job_id)
+            assert updated is not None
+            return _job_view(updated)
+
+    def retry_job(self, scope: Scope, job_id: str) -> AudioJobView:
+        stage_to_submit: AudioStageName | None = None
+        run_id: str | None = None
+        with self._database.session() as session:
+            repository = JobRepository(session)
+            job = repository.get(scope, job_id)
+            if job is None or job.resource_type != "AUDIO_UNDERSTANDING_RUN":
+                raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "音频任务不存在")
+            retried = repository.retry(scope, job_id)
+            run_id = retried.resource_id
+            reset = AudioStageRepository(session).reset_for_retry(scope, run_id)
+            stage_to_submit = reset[0] if reset else None
+            view = _job_view(retried)
+        if self._scheduler is not None and run_id is not None and stage_to_submit is not None:
+            self._scheduler.submit(scope, run_id, stage_to_submit)
+        return view
 
     def list_history(self, scope: Scope) -> tuple[dict[str, Any], ...]:
         with self._database.session() as session:
@@ -140,4 +213,15 @@ def _view(run: Any, job_id: str) -> AudioRunView:
         current_stage=run.current_stage,
         warning_codes=tuple(run.warning_codes),
         error_code=run.error_code,
+    )
+
+
+def _job_view(job: JobModel) -> AudioJobView:
+    return AudioJobView(
+        job_id=job.job_id,
+        resource_id=job.resource_id,
+        status=job.status,
+        attempt_count=job.attempt_count,
+        max_attempts=job.max_attempts,
+        error_code=job.error_code,
     )

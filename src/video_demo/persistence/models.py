@@ -77,6 +77,11 @@ class VideoStageName(StrEnum):
     LLM = "LLM"
 
 
+class AudioStageName(StrEnum):
+    TRANSCRIPTION = "TRANSCRIPTION"
+    LLM = "LLM"
+
+
 class ScopeColumns:
     tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
     application_id: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -435,6 +440,52 @@ class VideoPipelineStageModel(ScopeColumns, TimestampColumns, Base):
     run_id: Mapped[str] = mapped_column(String(128), nullable=False)
     stage_name: Mapped[VideoStageName] = mapped_column(
         Enum(VideoStageName, native_enum=False, length=32),
+        nullable=False,
+    )
+    status: Mapped[JobStatus] = mapped_column(
+        Enum(JobStatus, native_enum=False, length=32),
+        nullable=False,
+        default=JobStatus.PENDING,
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        UtcDateTime(), nullable=False, default=utc_now,
+    )
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    heartbeat_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    checkpoint_relative_path: Mapped[str | None] = mapped_column(String(1024))
+    checkpoint_sha256: Mapped[str | None] = mapped_column(String(64))
+    error_code: Mapped[str | None] = mapped_column(String(128))
+
+
+class AudioPipelineStageModel(ScopeColumns, TimestampColumns, Base):
+    """音频跨进程可恢复的阶段状态，与视频阶段表完全隔离。"""
+
+    __tablename__ = "audio_pipeline_stage"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "application_id",
+            "knowledge_base_id",
+            "run_id",
+            "stage_name",
+            name="uq_audio_stage_scope_run_name",
+        ),
+        Index(
+            "ix_audio_stage_recovery",
+            "stage_name",
+            "status",
+            "next_attempt_at",
+            "lease_expires_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    stage_name: Mapped[AudioStageName] = mapped_column(
+        Enum(AudioStageName, native_enum=False, length=32),
         nullable=False,
     )
     status: Mapped[JobStatus] = mapped_column(

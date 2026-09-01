@@ -40,7 +40,7 @@ def test_audio_segments_cover_timeline_without_scene_references() -> None:
         "a" * 64,
         60_000,
         transcript,
-        (AudioSpeechBoundaryCandidate(30_000, "silence"),),
+        (AudioSpeechBoundaryCandidate(30_000, "sentence_end", 1.0),),
         _limits(),
     )
 
@@ -97,7 +97,7 @@ def test_audio_segments_preserve_subtitle_boundaries_when_grid_crosses_a_cue() -
         "a" * 64,
         60_000,
         transcript,
-        (AudioSpeechBoundaryCandidate(30_000, "silence"),),
+        (AudioSpeechBoundaryCandidate(30_000, "sentence_end", 1.0),),
         _limits(),
     )
 
