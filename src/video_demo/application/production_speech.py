@@ -256,6 +256,7 @@ def _recognize_window(
             audio_slice,
             language_hint=language_hint,
             prompt=prompt,
+            chunk_index=window.chunk_index,
         )
         projection = project_fixed_asr_window(
             window,

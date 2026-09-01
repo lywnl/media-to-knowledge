@@ -192,6 +192,7 @@ class _Recognizer:
         *,
         language_hint: str | None,
         prompt: str | None,
+        chunk_index: int | None = None,
     ) -> WindowTranscriptionResult:
         with self._lock:
             self._count += 1

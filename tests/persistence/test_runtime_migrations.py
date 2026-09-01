@@ -14,7 +14,7 @@ from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
 
-HEAD_REVISION = "0007_video_stage_scheduler"
+HEAD_REVISION = "0008_audio_stage_scheduler"
 
 
 @pytest.fixture

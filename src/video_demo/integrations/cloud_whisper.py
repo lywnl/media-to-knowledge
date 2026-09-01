@@ -167,6 +167,7 @@ class CloudWhisperClient:
         *,
         language_hint: str | None,
         prompt: str | None,
+        chunk_index: int | None = None,
     ) -> WindowTranscriptionResult:
         path = _validated_audio_path(
             self._allowed_audio_root,
@@ -208,8 +209,9 @@ class CloudWhisperClient:
                     )
                 parsed = _parse_response(content)
                 _LOGGER.info(
-                    "云端 ASR 请求成功: file=%s attempt=%d status=%s elapsed=%.3fs",
+                    "云端 ASR 请求成功: file=%s chunk=%s attempt=%d status=%s elapsed=%.3fs",
                     path.name,
+                    _format_chunk_index(chunk_index),
                     attempt,
                     status_code if status_code is not None else "无响应",
                     time.monotonic() - started_at,
@@ -218,6 +220,7 @@ class CloudWhisperClient:
             except httpx.RequestError:
                 _log_request_failure(
                     path,
+                    chunk_index=chunk_index,
                     attempt=attempt,
                     status_code=status_code,
                     elapsed_seconds=time.monotonic() - started_at,
@@ -231,18 +234,22 @@ class CloudWhisperClient:
                 if error.code != ErrorCode.DEPENDENCY_TEMPORARY_FAILURE:
                     _log_request_failure(
                         path,
+                        chunk_index=chunk_index,
                         attempt=attempt,
                         status_code=status_code,
                         elapsed_seconds=time.monotonic() - started_at,
                         error_category="permanent_failure",
+                        provider_error_code=_provider_error_code_from_error(error),
                     )
                     raise
                 _log_request_failure(
                     path,
+                    chunk_index=chunk_index,
                     attempt=attempt,
                     status_code=status_code,
                     elapsed_seconds=time.monotonic() - started_at,
                     error_category="temporary_dependency",
+                    provider_error_code=_provider_error_code_from_error(error),
                 )
                 last_error = error
             if attempt < self._configuration.max_attempts:
@@ -250,8 +257,9 @@ class CloudWhisperClient:
                 if delay is None:
                     delay = float(2 ** (attempt - 1))
                 _LOGGER.info(
-                    "云端 ASR 请求重试: file=%s attempt=%d status=%s wait=%.3fs",
+                    "云端 ASR 请求重试: file=%s chunk=%s attempt=%d status=%s wait=%.3fs",
                     path.name,
+                    _format_chunk_index(chunk_index),
                     attempt,
                     status_code if status_code is not None else "无响应",
                     delay,
@@ -260,9 +268,12 @@ class CloudWhisperClient:
         if last_error is None:
             raise RuntimeError("云端语音识别重试状态非法")
         _LOGGER.error(
-            "云端 ASR 请求最终失败: file=%s attempts=%d category=temporary_dependency",
+            "云端 ASR 请求最终失败: file=%s chunk=%s attempts=%d "
+            "category=temporary_dependency provider_error_code=%s",
             path.name,
+            _format_chunk_index(chunk_index),
             self._configuration.max_attempts,
+            _provider_error_code_from_error(last_error) or "无",
         )
         raise last_error from None
 
@@ -333,19 +344,33 @@ def _parse_retry_after(value: str | None) -> float | None:
 def _log_request_failure(
     path: Path,
     *,
+    chunk_index: int | None,
     attempt: int,
     status_code: int | None,
     elapsed_seconds: float,
     error_category: str,
+    provider_error_code: str | None = None,
 ) -> None:
     _LOGGER.warning(
-        "云端 ASR 请求失败: file=%s attempt=%d status=%s elapsed=%.3fs category=%s",
+        "云端 ASR 请求失败: file=%s chunk=%s attempt=%d status=%s "
+        "elapsed=%.3fs category=%s provider_error_code=%s",
         path.name,
+        _format_chunk_index(chunk_index),
         attempt,
         status_code if status_code is not None else "无响应",
         elapsed_seconds,
         error_category,
+        provider_error_code or "无",
     )
+
+
+def _format_chunk_index(chunk_index: int | None) -> str:
+    return str(chunk_index + 1) if chunk_index is not None else "无"
+
+
+def _provider_error_code_from_error(error: VideoDemoError) -> str | None:
+    value = error.details.get("provider_error_code")
+    return value if isinstance(value, str) else None
 
 
 def _raise_for_status(

@@ -18,6 +18,45 @@ _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
+def test_client_logs_sanitized_chunk_diagnostics_without_provider_details(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    audio = _audio(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "message": "provider-secret-detail",
+                }
+            },
+            request=request,
+        )
+
+    client, _http_client = _client(tmp_path, handler, max_attempts=1)
+
+    with caplog.at_level("INFO"), pytest.raises(VideoDemoError):
+        client.transcribe_window(
+            audio,
+            language_hint=None,
+            prompt="private prompt",
+            chunk_index=1,
+        )
+
+    rendered = caplog.text
+    assert "chunk=2" in rendered
+    assert "attempt=1" in rendered
+    assert "status=429" in rendered
+    assert "category=temporary_dependency" in rendered
+    assert "provider_error_code=rate_limit_exceeded" in rendered
+    assert "provider-secret-detail" not in rendered
+    assert "private prompt" not in rendered
+    assert "test-openai-key" not in rendered
+
+
 def _configuration(
     *,
     max_attempts: int = 3,

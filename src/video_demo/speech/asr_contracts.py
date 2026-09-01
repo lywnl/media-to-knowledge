@@ -54,4 +54,5 @@ class WindowRecognizerPort(Protocol):
         *,
         language_hint: str | None,
         prompt: str | None,
+        chunk_index: int | None = None,
     ) -> WindowTranscriptionResult: ...
