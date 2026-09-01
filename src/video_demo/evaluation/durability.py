@@ -381,7 +381,7 @@ ProbeMedia = Callable[[Path, DurabilityManifestSample], DurabilityProbe]
 
 
 class DurabilityRunner:
-    """驱动唯一产品 API/Worker 链并发布 M1 性能证据。"""
+    """驱动唯一产品 API/阶段调度链并发布 M1 性能证据。"""
 
     def __init__(
         self,

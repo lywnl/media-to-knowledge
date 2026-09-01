@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, Protocol
 
 from video_demo.domain.document import DocumentGenerationConfig
 from video_demo.errors import ErrorCode, VideoDemoError
@@ -26,11 +26,24 @@ class MediaRunView:
     error_code: str | None
 
 
+class ImageSchedulerPort(Protocol):
+    def submit(
+        self,
+        scope: Scope,
+        run_id: str,
+    ) -> Literal["accepted", "already_queued", "rejected"]: ...
+
+
 class MediaRunService:
     """图片运行服务；音频运行由 AudioRunService 独立处理。"""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        scheduler: ImageSchedulerPort | None = None,
+    ) -> None:
         self._database = database
+        self._scheduler = scheduler
 
     def create(
         self,
@@ -89,7 +102,12 @@ class MediaRunService:
                 job_type="IMAGE_UNDERSTANDING",
                 resource_type="IMAGE_UNDERSTANDING_RUN",
             )
-            return _view(run, job_id)
+            view = _view(run, job_id)
+        if self._scheduler is not None:
+            result = self._scheduler.submit(scope, run_id)
+            if result == "rejected":
+                raise VideoDemoError(ErrorCode.JOB_NOT_RETRYABLE, "图片调度器暂不可用")
+        return view
 
     def get(self, scope: Scope, run_id: str) -> MediaRunView:
         with self._database.session() as session:
@@ -144,6 +162,45 @@ class MediaRunService:
                 ErrorCode.VIDEO_RESULT_NOT_READY,
                 "媒体理解结果尚未就绪",
             )
+        return view
+
+    def get_job(self, scope: Scope, job_id: str) -> Any:
+        from video_demo.application.runs import _job_view
+
+        with self._database.session() as session:
+            job = JobRepository(session).get(scope, job_id)
+            if job is None or job.resource_type != "IMAGE_UNDERSTANDING_RUN":
+                raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "图片任务不存在")
+            return _job_view(job)
+
+    def cancel_job(self, scope: Scope, job_id: str) -> Any:
+        from video_demo.application.runs import _job_view
+
+        with self._database.session() as session:
+            repository = JobRepository(session)
+            job = repository.get(scope, job_id)
+            if job is None or job.resource_type != "IMAGE_UNDERSTANDING_RUN":
+                raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "图片任务不存在")
+            repository.request_cancel(scope, job_id)
+            updated = repository.get(scope, job_id)
+            assert updated is not None
+            return _job_view(updated)
+
+    def retry_job(self, scope: Scope, job_id: str) -> Any:
+        from video_demo.application.runs import _job_view
+
+        with self._database.session() as session:
+            repository = JobRepository(session)
+            job = repository.get(scope, job_id)
+            if job is None or job.resource_type != "IMAGE_UNDERSTANDING_RUN":
+                raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "图片任务不存在")
+            retried = repository.retry(scope, job_id)
+            view = _job_view(retried)
+            run_id = retried.resource_id
+        if self._scheduler is not None:
+            result = self._scheduler.submit(scope, run_id)
+            if result == "rejected":
+                raise VideoDemoError(ErrorCode.JOB_NOT_RETRYABLE, "图片调度器暂不可用")
         return view
 
     def _object_not_found_code(self) -> ErrorCode:

@@ -44,7 +44,6 @@ from video_demo.storage.document_cache import DocumentModelCache, ModelInvocatio
 from video_demo.storage.object_store import LocalVideoObjectStore
 from video_demo.storage.snapshots import SnapshotStore
 from video_demo.visual.ffmpeg_frames import FFmpegFrameExtractor
-from video_demo.worker.runtime import ReliableWorker
 
 
 class Closable(Protocol):
@@ -328,7 +327,7 @@ def build_video_scheduler(
     object_store: LocalVideoObjectStore,
     queries: ResultQueryService,
 ) -> VideoTaskScheduler:
-    """构造 FastAPI 进程内视频总调度器；音频和图片仍走独立 Worker。"""
+    """构造 FastAPI 进程内视频总调度器。"""
 
     assert settings.runtime_root is not None
     pipeline = build_production_pipeline(settings, database, object_store)
@@ -345,14 +344,6 @@ def build_video_scheduler(
     )
     scheduler._owned_pipeline = pipeline
     return scheduler
-
-
-def build_image_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
-    """兼容历史调用方，转发到图片独立装配入口。"""
-
-    from video_demo.application.image_composition import build_image_worker as build_image
-
-    return build_image(settings, worker_id=worker_id)
 
 
 def production_tool_path(settings: Settings, name: str) -> Path:
@@ -523,7 +514,6 @@ def _speech_runtime_config(settings: Settings, ffmpeg: Path) -> SpeechRuntimeCon
 __all__ = [
     "ProductionModelIdentityReport",
     "ProductionPipeline",
-    "build_image_worker",
     "build_production_model_identity_report",
     "build_production_pipeline",
     "build_video_scheduler",

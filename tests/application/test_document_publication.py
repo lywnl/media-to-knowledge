@@ -354,7 +354,7 @@ def test_document_read_rejects_any_tampered_fact(
     assert raised.value.code == ErrorCode.ARTIFACT_SCHEMA_INVALID
 
 
-def test_stale_worker_cannot_overwrite_current_document_publication(
+def test_stale_lease_owner_cannot_overwrite_current_document_publication(
     publication: tuple[DocumentPublicationService, Database, Scope, ResultWriteFence, Path],
 ) -> None:
     service, database, scope, stale_fence, _ = publication
@@ -549,7 +549,7 @@ def test_current_run_orphan_recovery_rejects_invalid_or_cross_target_bundle(
     assert orphan.is_file()
 
 
-def test_published_attempt_accepts_worker_outer_idempotent_completion(
+def test_published_attempt_accepts_lease_owner_idempotent_completion(
     publication: tuple[DocumentPublicationService, Database, Scope, ResultWriteFence, Path],
 ) -> None:
     service, database, scope, fence, _ = publication

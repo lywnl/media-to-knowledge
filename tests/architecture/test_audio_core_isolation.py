@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import ast
 import re
 from pathlib import Path
-
-from video_demo.implementation import implementation_import_closure
 
 _WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 
@@ -16,7 +13,6 @@ def test_audio_business_modules_do_not_import_visual_or_video_core() -> None:
         Path("src/video_demo/application/audio_chapter_planning.py"),
         Path("src/video_demo/application/audio_document_writing.py"),
         Path("src/video_demo/application/audio_composition.py"),
-        Path("src/video_demo/application/audio_workers.py"),
         Path("src/video_demo/application/audio_publication.py"),
         Path("src/video_demo/application/audio_queries.py"),
         Path("src/video_demo/application/audio_speech.py"),
@@ -50,10 +46,10 @@ def test_audio_business_modules_do_not_import_visual_or_video_core() -> None:
             r"base_coverage_targets",
             r"keyframe",
             r"vlm",
+            r"\"silence\"",
             r"from video_demo\.domain\.document import",
             r"from video_demo\.application\.pipeline_contracts import",
             r"from video_demo\.application\.composition import",
-            r"from video_demo\.application\.media_workers import",
             r"from video_demo\.application\.media_publication import",
         )
     )
@@ -61,16 +57,6 @@ def test_audio_business_modules_do_not_import_visual_or_video_core() -> None:
         text = path.read_text(encoding="utf-8").lower()
         for marker in forbidden:
             assert marker.search(text) is None, f"{path} 包含禁止音频耦合字段 {marker.pattern}"
-
-
-def test_audio_worker_does_not_import_video_or_visual_assembly_modules() -> None:
-    source = Path("src/video_demo/application/audio_workers.py").read_text(encoding="utf-8")
-    forbidden_modules = (
-        "video_demo.application.production_media",
-        "video_demo.application.production_speech",
-        "video_demo.media.transcode",
-    )
-    assert not any(module in source for module in forbidden_modules)
 
 
 def test_audio_transcode_uses_audio_kernel_without_video_transcode_import() -> None:
@@ -98,60 +84,8 @@ def test_generic_image_services_do_not_keep_audio_dispatch_branches() -> None:
     assert "AudioObjectModel" not in upload_source
 
 
-def test_audio_worker_import_closure_excludes_video_and_visual_business_modules() -> None:
-    closure = set(
-        implementation_import_closure(
-            _WORKSPACE_ROOT,
-            (Path("src/video_demo/audio_worker_main.py"),),
-            extra_files=(),
-        ),
-    )
-    forbidden = {
-        Path("src/video_demo/application/chapter_planning.py"),
-        Path("src/video_demo/application/chapter_frames.py"),
-        Path("src/video_demo/application/chapter_vision.py"),
-        Path("src/video_demo/application/document_pipeline.py"),
-        Path("src/video_demo/application/document_writing.py"),
-        Path("src/video_demo/application/composition.py"),
-        Path("src/video_demo/integrations/qwen_vl.py"),
-        Path("src/video_demo/visual/keyframes.py"),
-        Path("src/video_demo/visual/scenes.py"),
-    }
-    assert closure.isdisjoint(forbidden)
-
-
-def test_image_worker_import_closure_excludes_video_and_audio_business_modules() -> None:
-    closure = set(
-        implementation_import_closure(
-            _WORKSPACE_ROOT,
-            (Path("src/video_demo/image_worker_main.py"),),
-            extra_files=(),
-        ),
-    )
-    forbidden = {
-        Path("src/video_demo/application/chapter_planning.py"),
-        Path("src/video_demo/application/chapter_frames.py"),
-        Path("src/video_demo/application/chapter_vision.py"),
-        Path("src/video_demo/application/document_pipeline.py"),
-        Path("src/video_demo/application/document_writing.py"),
-        Path("src/video_demo/application/audio_pipeline.py"),
-        Path("src/video_demo/application/audio_chapter_planning.py"),
-        Path("src/video_demo/application/audio_document_writing.py"),
-        Path("src/video_demo/application/composition.py"),
-        Path("src/video_demo/visual/keyframes.py"),
-        Path("src/video_demo/visual/scenes.py"),
-    }
-    assert closure.isdisjoint(forbidden)
-
-
-def test_audio_worker_uses_audio_publication_and_neutral_title_helper() -> None:
-    source = Path("src/video_demo/application/audio_workers.py").read_text(encoding="utf-8")
-    assert (
-        "from video_demo.application.audio_publication import AudioPublicationService"
-        in source
-    )
-    assert "from video_demo.application.media_publication import" not in source
-    assert "from video_demo.domain.title import sanitize_document_title" in source
+def test_image_external_entrypoint_is_removed() -> None:
+    assert not Path("src/video_demo/image_worker_main.py").exists()
 
 
 def test_audio_pipeline_does_not_name_video_cancellation_code() -> None:
@@ -167,25 +101,18 @@ def test_audio_asr_uses_audio_owned_algorithm_module() -> None:
         encoding="utf-8",
     )
     assert "video_demo.speech.asr import" not in pipeline_source
-    assert "video_demo.speech.audio_asr" in pipeline_source
+    assert "video_demo.speech.audio_fixed_asr" in pipeline_source
     assert "video_demo.speech.asr import" not in whisper_source
+
+
+def test_retired_audio_asr_module_is_removed() -> None:
+    assert not Path("src/video_demo/speech/audio_asr.py").exists()
 
 
 def test_audio_query_uses_published_audio_consistency_path() -> None:
     source = Path("src/video_demo/application/audio_queries.py").read_text(encoding="utf-8")
     assert "self.publication.get(scope, run_id)" in source
     assert "AudioResultRepository" not in source
-
-
-def test_audio_worker_imports_are_parseable_without_video_domain_import() -> None:
-    source = Path("src/video_demo/application/audio_workers.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    imported_modules = {
-        node.module
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.module is not None
-    }
-    assert "video_demo.domain.document" not in imported_modules
 
 
 def test_audio_api_routes_are_defined_in_an_independent_module() -> None:
@@ -204,10 +131,10 @@ def test_audio_publication_does_not_require_generic_media_constructor() -> None:
     assert "class AudioPublicationService" in source
 
 
-def test_video_tasks_use_fastapi_scheduler_and_keep_media_workers_independent() -> None:
+def test_media_tasks_use_fastapi_schedulers_without_external_entrypoints() -> None:
     composition = Path("src/video_demo/application/composition.py").read_text(encoding="utf-8")
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
     assert "def build_video_scheduler" in composition
     assert "video-demo-worker" not in pyproject
-    assert "video-demo-audio-worker" in pyproject
-    assert "video-demo-image-worker" in pyproject
+    assert "video-demo-audio-worker" not in pyproject
+    assert "video-demo-image-worker" not in pyproject

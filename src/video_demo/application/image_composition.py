@@ -1,32 +1,29 @@
-"""图片单图理解 Worker 的独立生产装配。"""
+"""图片理解进程内调度器的生产装配。"""
 
 from __future__ import annotations
 
 import httpx
 
+from video_demo.application.image_pipeline_executor import ImageStagePipelineExecutor
+from video_demo.application.image_pipeline_handler import ImageJobHandler
 from video_demo.application.image_rendering import render_image_markdown
+from video_demo.application.image_scheduler import ImageTaskScheduler
 from video_demo.application.media_publication import MediaPublicationService
-from video_demo.application.media_workers import ImageJobHandler
 from video_demo.config import Settings
 from video_demo.domain.image_document import ImageUnderstandingResult
 from video_demo.errors import ErrorCode
 from video_demo.integrations.image_vlm import ImageVlmClient
 from video_demo.persistence.database import Database
-from video_demo.persistence.migrations import upgrade_runtime_database
 from video_demo.persistence.models import ImageUnderstandingRunModel
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.image_object_store import ImageObjectStore
-from video_demo.worker.runtime import ReliableWorker
 
 
-def build_image_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
-    """构造只领取 IMAGE_UNDERSTANDING 的图片 Worker。"""
+def build_image_scheduler(settings: Settings, database: Database) -> ImageTaskScheduler:
+    """构造 FastAPI 进程内图片双并发调度器。"""
 
     assert settings.runtime_root is not None
     runtime_root = settings.runtime_root
-    database_url = f"sqlite+pysqlite:///{runtime_root / 'video-demo.db'}"
-    upgrade_runtime_database(settings.workspace_root, runtime_root, database_url)
-    database = Database(database_url)
     vision = settings.require_vlm_configuration()
     http = httpx.Client()
     analyzer = ImageVlmClient(
@@ -58,13 +55,13 @@ def build_image_worker(settings: Settings, *, worker_id: str) -> ReliableWorker:
         runtime_root=runtime_root,
         max_image_bytes=settings.max_image_bytes,
     )
-    return ReliableWorker(
+    executor = ImageStagePipelineExecutor(
         database,
-        worker_id,
         handler,
-        job_type="IMAGE_UNDERSTANDING",
+        runtime_root=runtime_root,
         owned_resources=(http,),
     )
+    return ImageTaskScheduler(executor)
 
 
-__all__ = ["build_image_worker"]
+__all__ = ["build_image_scheduler"]

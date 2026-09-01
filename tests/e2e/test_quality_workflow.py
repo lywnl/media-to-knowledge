@@ -5,8 +5,6 @@ import json
 import shutil
 from pathlib import Path
 
-from fastapi import FastAPI
-
 from video_demo.api.app import create_app
 from video_demo.application.document_publication import ResultWriteFence
 from video_demo.application.document_rendering import render_markdown
@@ -113,16 +111,19 @@ def _write_package(
     )
 
 
-def _worker_factory(app: FastAPI, calls: list[str]):
-    class Worker:
-        def run_once(self) -> bool:
-            calls.append("run_once")
+def _publish_fixture_result(app, calls: list[str], run_id: str) -> None:
+            calls.append("publish")
             container = app.state.container
             scope = Scope("evaluation", "video-demo", "evaluation")
             with container.database.session() as session:
-                claimed = JobRepository(session).claim("evaluation-worker", lease_seconds=60)
+                claimed = JobRepository(session).claim_video_run(
+                    scope,
+                    run_id,
+                    "evaluation-test",
+                    lease_seconds=60,
+                )
                 assert claimed is not None
-                run = VideoRunRepository(session).get(scope, claimed.resource_id)
+                run = VideoRunRepository(session).get(scope, run_id)
                 assert run is not None
                 media_sha = session.query(VideoAssetModel.source_sha256).filter(
                     VideoAssetModel.asset_id == run.asset_id
@@ -211,12 +212,7 @@ def _worker_factory(app: FastAPI, calls: list[str]):
                     claimed.id, claimed.worker_id, claimed.attempt_count
                 ),
             )
-            return True
-
-        def close(self) -> None:
-            calls.append("close")
-
-    return Worker
+            return None
 
 
 def test_prediction_quality_and_cleanup_workflow_uses_3_artifact_set(
@@ -224,8 +220,7 @@ def test_prediction_quality_and_cleanup_workflow_uses_3_artifact_set(
     cloud_asr_environment: None,
     monkeypatch,
 ) -> None:
-    # 评测工作流显式驱动受控 worker；关闭 API lifespan 内的生产调度器，
-    # 避免它先于测试 worker 抢占同一条任务。
+    # 评测工作流使用内置调度器；测试仅替换等待钩子以发布固定夹具结果。
     import video_demo.api.app as app_module
 
     monkeypatch.setattr(app_module, "build_video_scheduler", lambda *_args, **_kwargs: None)
@@ -244,19 +239,23 @@ def test_prediction_quality_and_cleanup_workflow_uses_3_artifact_set(
     )
     app = create_app(settings)
     calls: list[str] = []
-    worker = _worker_factory(app, calls)
-    report = PredictionRunner(
+    runner = PredictionRunner(
         settings,
         app_factory=lambda _settings: app,
-        worker_factory=lambda _settings, worker_id: worker(),
         preflight=lambda: None,
-    ).predict(package, evaluation_run_id="eval_001")
+    )
+    runner._wait_for_terminal_run = lambda _client, run_id: _publish_fixture_result(  # type: ignore[method-assign]
+        app,
+        calls,
+        run_id,
+    )
+    report = runner.predict(package, evaluation_run_id="eval_001")
 
     assert report.status.value == "PASS", [
         (item.failure_code, item.terminal_status, item.run_id)
         for item in report.predictions
     ]
-    assert calls == ["run_once", "close"]
+    assert calls == ["publish"]
     prediction_root = runtime_root / "eval/predictions/eval_001/sample_001"
     assert {
         "run.json",

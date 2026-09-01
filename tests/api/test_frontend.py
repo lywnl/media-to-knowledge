@@ -77,7 +77,7 @@ def test_create_app_upgrades_real_unversioned_0001_database(
     with create_engine(database_url).connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "0007_video_stage_scheduler"
+                == "0008_audio_stage_scheduler"
         )
     assert app.state.container.database is not None
 
@@ -102,7 +102,7 @@ def test_frontend_page_exposes_local_video_file_workflow(client: TestClient) -> 
     assert 'id="history-panel"' in html
     assert 'id="history-list"' in html
     assert response.headers["cache-control"] == "no-store"
-    assert "视频任务由 API 内置调度器自动处理" in html
+    assert "视频、音频和图片任务均由 API 内置阶段调度器自动处理" in html
     assert "请确认 API 与 Worker 已同时运行" not in html
 
 

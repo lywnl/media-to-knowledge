@@ -5,7 +5,7 @@ from typing import Any
 
 
 class ErrorCode(StrEnum):
-    """跨 API、Worker 和模型适配器共享的稳定错误码。"""
+    """跨 API、阶段调度器和模型适配器共享的稳定错误码。"""
 
     WORKSPACE_PATH_ESCAPE = "WORKSPACE_PATH_ESCAPE"
     INVALID_CONFIGURATION = "INVALID_CONFIGURATION"

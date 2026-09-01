@@ -1,8 +1,8 @@
 # 视频知识文档 Demo
 
-这是一个独立的 Python 3.11 + FastAPI 视频理解 Demo。目标是对独立视频执行音频和多模态理解，输出 Schema `4.2.0` 结构化知识文档和确定性 Markdown。
+这是一个独立的 Python 3.11 + FastAPI 媒体理解 Demo。目标是分别对视频、音频和图片执行理解，输出结构化知识文档和确定性 Markdown。
 
-当前状态：Demo 主链已完成。上传、可靠 Worker、ffprobe/FFmpeg、字幕优先、Silero VAD、云端 Whisper、章节时间点抽帧、章节多图 VLM 和结构化 Markdown 文档均已接通。FFmpeg 是唯一的视频抽帧组件，关键帧只作为 VLM 的内部输入，前端仅展示文本；项目不生成 RAG 检索文本，也不建立向量索引。生产链只使用云 ASR、文本 LLM 和章节视觉模型三套配置，结果 Schema 为 4.2.0。
+当前状态：Demo 主链已完成。上传、可靠任务、ffprobe/FFmpeg、字幕优先、云端 Whisper、章节时间点抽帧、章节多图 VLM 和结构化 Markdown 文档均已接通。视频、音频和图片任务均由 FastAPI 进程内的独立阶段调度器处理；音频链路只包含音频预检、固定十分钟窗口串行云端 ASR、音频章节规划和音频章节写作，不进入视频或视觉阶段。项目不生成 RAG 检索文本，也不建立向量索引。
 
 提交或验收时必须准确区分两类结论：
 
@@ -16,19 +16,19 @@
 
 PGS、DVD Subtitle 等位图字幕和直接烧录在画面里的字幕当前不作为文本字幕解析；存在音轨时自动提取 WAV 并进入 ASR，不能把“探测到字幕轨”误解为“字幕文本已识别”。字幕完整性门槛只用于决定是否启用 ASR，是工程启发式，不是字幕准确率或完整性的认证；字幕不合格、解码失败或缺失时会自动兜底，不需要重新创建 Run。
 
-ASR 是自动语音识别，即把音频中的语音转成文本，不是人声分离，也不负责区分谁在说话。无合格字幕时，Worker 提取单声道 16kHz PCM WAV，在一次性 ASR 子进程内执行 Silero VAD，然后通过 OpenAI 兼容接口严格串行上传本地派生 WAV。普通 VAD 区间各自成为独立窗口；只有单个连续语音区间超过 10 分钟时，才按 1 秒重叠均衡拆分。当前只输出段级 `SpeechSegment`，不提供词级对齐、说话人分析或音频事件。
+ASR 是自动语音识别，即把音频中的语音转成文本，不是人声分离，也不负责区分谁在说话。视频和音频生产链在没有可用字幕时，都会提取单声道 16kHz PCM WAV，并按固定十分钟窗口拆分；单个 Run 内的窗口严格串行执行，窗口完成后立即保存独立快照，全部窗口成功后才发布完整转写。当前只输出段级 `SpeechSegment`，不提供词级对齐、说话人分析或音频事件。生产 ASR 不依赖 VAD；Silero 仅供历史质量评测和诊断入口使用。
 
 创建 Run 时可提供热词和核心上下文。系统按“核心上下文在前、空格连接的热词在后”确定性合并为云端 Whisper `prompt`，只影响 ASR 兜底，不会改写已提取字幕。两者都是识别偏置而不是强制替换规则，错误提示可能降低准确率；prompt、API Key 和请求头不会写入日志、快照或评测报告。
 
-ASR 阶段仍在受监督的一次性子进程中执行，以隔离 FFmpeg、VAD 和网络调用故障。每个成功窗口会立即发布独立 JSON 缓存；同一 Run 重试时只补传失败窗口，全部成功后再发布整段 ASR 快照。云端最终失败会使整个 ASR 阶段失败，不会发布空转写或部分成功结果。上传 WAV 是可再生临时产物，窗口完成、失败、超时或取消后都会清理。
+视频 ASR 阶段仍在受监督的一次性子进程中执行，以隔离 FFmpeg 和网络调用故障；音频 ASR 在音频专用阶段执行器内运行。两条链路都会复用窗口快照，在同一 Run 重试时只补传未完成窗口；全部成功后再发布整段 ASR 快照。云端最终失败会使对应媒体的 ASR 阶段失败，不会发布空转写或部分成功结果。上传 WAV 是可再生临时产物，窗口完成、失败、超时或取消后都会清理。
 
-云端 ASR 只接受本地文件的 `multipart/form-data` 上传，不接受远程对象 URL。一个 ASR 阶段内窗口请求严格串行；单 Worker 部署下不会并发上传窗口，多 Worker 部署则不提供跨进程全局限流。
+云端 ASR 只接受本地文件的 `multipart/form-data` 上传，不接受远程对象 URL。生产视频和音频都将单个 Run 内窗口并发固定为 1；跨 Run 并发分别由视频和音频阶段调度器维护。
 
 质量评测会单独生成提示效果伴随报告，只比较同一授权媒体的 `NONE/CORRECT` 成对 ASR 结果，并报告术语召回率及 CER/WER 差值。它不进入现有发布硬门槛；失败预测、空术语、任一端不是 ASR 或没有合格配对时均为 `NOT_RUN`。字幕命中不能证明热词或核心上下文有效。
 
 ## 知识文档生产流程
 
-Worker 在本地完成媒体探测、音频转写和基础片段准备；章节时间点由 ASR 语义锚点与章节中点确定，FFmpeg 抽取 JPEG 后交给章节视觉模型，文本模型根据转写与视觉观察生成 Markdown 知识文档。关键帧和证据用于内部可追溯校验，不作为前端展示内容。生产结果只写入 Schema 4.2；读取旧 Run 时返回 `RESULT_SCHEMA_UNSUPPORTED`，需要重新创建 Run。
+阶段调度器在本地完成媒体探测、音频转写和基础片段准备；章节时间点由 ASR 语义锚点与章节中点确定，FFmpeg 抽取 JPEG 后交给章节视觉模型，文本模型根据转写与视觉观察生成 Markdown 知识文档。关键帧和证据用于内部可追溯校验，不作为前端展示内容。生产结果只写入 Schema 4.2；读取旧 Run 时返回 `RESULT_SCHEMA_UNSUPPORTED`，需要重新创建 Run。
 
 正式生产使用三套相互独立的模型配置：云端 ASR（`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL`）、文本 LLM（`VIDEO_DEMO_TEXT_LLM_*`）和章节视觉 VLM（`VIDEO_DEMO_VLM_*`）。章节 VLM 只接收本地授权章节的 2～4 张图片，最终文本制品和结果均为 Schema `4.2.0`。用户通过 `/document` 获取唯一 Markdown 文本制品；`/result`、`/evidence` 与关键帧内容接口仅供内部校验和诊断使用，前端不会调用后两类接口。
 
@@ -55,19 +55,19 @@ uv sync --extra dev
 .venv/bin/pytest
 ```
 
-语音与视觉可选依赖必须按实际组件显式安装；语音组只保留 Silero VAD、Torch 和 Torchaudio，不下载本地 Whisper 权重：
+语音与视觉可选依赖必须按实际组件显式安装；语音组仅供历史质量评测和诊断使用，不下载本地 Whisper 权重：
 
 ```bash
 uv sync --extra dev --extra speech --extra vision --extra evaluation
 ```
 
-生产 API、Worker、生产流水线和诊断入口启动时都要求完整的 `OPENAI_BASE_URL`、`OPENAI_API_KEY` 和 `OPENAI_MODEL`。Base URL 必须是 HTTPS 的 OpenAI 兼容 `/v1` 根路径，客户端会自行追加 `/audio/transcriptions`；不要把完整转写端点填入 Base URL。真实 API Key 只写入被 Git 忽略的本地 `.env`，不得提交到源码、示例、测试或报告。
+生产 API、阶段调度器、生产流水线和诊断入口启动时都要求完整的 `OPENAI_BASE_URL`、`OPENAI_API_KEY` 和 `OPENAI_MODEL`。Base URL 必须是 HTTPS 的 OpenAI 兼容 `/v1` 根路径，客户端会自行追加 `/audio/transcriptions`；不要把完整转写端点填入 Base URL。真实 API Key 只写入被 Git 忽略的本地 `.env`，不得提交到源码、示例、测试或报告。
 
 任何缺少模型、外部凭据或授权评测素材的质量项都必须报告 `NOT_RUN`，不能用 mock 结果冒充通过。
 
 ## 启动 API
 
-视频任务由 FastAPI 进程内的总调度器自动领取和处理；音频、图片任务仍可使用各自独立 Worker：
+视频、音频和图片任务由 FastAPI 进程内的独立阶段调度器自动领取和处理：
 
 ```bash
 .venv/bin/video-demo-api
@@ -87,7 +87,7 @@ macOS/Linux 的本地文件系统；运行目录和数据库不得放在 NFS 等
 如果页面长时间停留在等待状态，请先查看 API 日志中的调度器阶段状态。模型或外部服务凭据不完整时，
 调度器会按现有错误语义结束任务，页面只展示后端返回的结果，不会用前端模拟处理成功。
 
-缺少 ffmpeg/ffprobe、Silero 运行依赖或外部服务凭据时，视频任务会以稳定错误码失败关闭，真实媒体、五语质量与性能验收保持 `NOT_RUN`。当前工作区已包含 FFmpeg/ffprobe 6.0，无需重复下载。
+缺少 ffmpeg/ffprobe 或外部服务凭据时，视频、音频任务会以稳定错误码失败关闭；需要 Silero 的历史质量评测在缺少运行依赖时保持 `NOT_RUN`。当前工作区已包含 FFmpeg/ffprobe 6.0，无需重复下载。
 
 ## 唯一评测 CLI
 
@@ -106,7 +106,7 @@ EVALUATION_RUN_ID=eval_20260820_001
 
 退出码固定为：`0=全部 PASS`、`1=至少一项 FAIL`、`2=没有 FAIL 但存在 NOT_RUN`、`3=验收器配置或证据损坏`。stdout 只包含状态、工作区相对报告路径和稳定原因。
 
-质量评测分两阶段：`quality predict` 通过真实产品 API、Worker 和查询接口生成预测；人工审阅者在 `.codex/video-rag-demo/eval/judgments/<evaluation_run_id>/` 放置完整判断后，`quality score` 才会从已绑定预测和人工判断重算指标，评分阶段不调用模型。数据、授权和目录格式见 [.codex/video-rag-demo/eval/README.md](.codex/video-rag-demo/eval/README.md)。
+质量评测分两阶段：`quality predict` 通过真实产品 API、内置阶段调度器和查询接口生成预测；人工审阅者在 `.codex/video-rag-demo/eval/judgments/<evaluation_run_id>/` 放置完整判断后，`quality score` 才会从已绑定预测和人工判断重算指标，评分阶段不调用模型。数据、授权和目录格式见 [.codex/video-rag-demo/eval/README.md](.codex/video-rag-demo/eval/README.md)。
 
 清理命令是显式破坏性操作：
 

@@ -113,29 +113,25 @@ class PredictionRunReport(FrozenModel):
 
 
 class PredictionRunner:
-    """通过产品 HTTP/API、Worker 和查询接口导出可重验预测。"""
+    """通过产品 HTTP/API 和查询接口导出可重验预测。"""
 
     def __init__(
         self,
         settings: Settings,
         *,
         app_factory: Callable[[Settings], FastAPI] = create_app,
-        worker_factory: Callable[..., Any] | None = None,
         preflight: Callable[[], str | None] | None = None,
         scope_headers: Mapping[str, str] | None = None,
         knowledge_base_id: str = "evaluation",
-        worker_id: str = "evaluation-worker",
     ) -> None:
         self._settings = settings
         self._app_factory = app_factory
-        self._worker_factory = worker_factory
         self._preflight = preflight
         self._scope_headers = dict(scope_headers or _DEFAULT_SCOPE_HEADERS)
         self._knowledge_base_id = validate_path_component(
             knowledge_base_id,
             "knowledge_base_id",
         )
-        self._worker_id = validate_path_component(worker_id, "worker_id")
 
     def preflight_reason(self) -> str | None:
         if self._preflight is not None:
@@ -192,28 +188,16 @@ class PredictionRunner:
         try:
             app = self._app_factory(self._settings)
             with TestClient(app) as client:
-                worker = (
-                    self._worker_factory(self._settings, worker_id=self._worker_id)
-                    if self._worker_factory is not None
-                    else None
-                )
-                try:
-                    for sample in verified_package.dataset.samples:
-                        predictions.append(
-                            self._predict_sample(
-                                client,
-                                worker,
-                                sample,
-                                verified_package,
-                                evaluation_run_id,
-                                identity.models,
-                            )
+                for sample in verified_package.dataset.samples:
+                    predictions.append(
+                        self._predict_sample(
+                            client,
+                            sample,
+                            verified_package,
+                            evaluation_run_id,
+                            identity.models,
                         )
-                finally:
-                    if worker is not None:
-                        close = getattr(worker, "close", None)
-                        if callable(close):
-                            close()
+                    )
         except (OSError, ValueError, ValidationError, VideoDemoError):
             if not predictions:
                 predictions.append(
@@ -278,7 +262,6 @@ class PredictionRunner:
     def _predict_sample(
         self,
         client: TestClient,
-        worker: Any | None,
         sample: EvaluationSample,
         package: ValidatedEvaluationPackage,
         evaluation_run_id: str,
@@ -319,20 +302,7 @@ class PredictionRunner:
             created_payload = created.json()
             run_id = str(created_payload["run_id"])
             job_id = str(created_payload["job_id"])
-            if worker is not None:
-                if not worker.run_once():
-                    return self._failed_prediction(
-                        sample,
-                        evaluation_run_id,
-                        run_id,
-                        job_id,
-                        "WORKER_NO_JOB",
-                        models,
-                        started_at,
-                        eval_root=runtime_root / "eval",
-                    )
-            else:
-                self._wait_for_terminal_run(client, run_id)
+            self._wait_for_terminal_run(client, run_id)
             run_response = client.get(
                 f"/api/kb/knowledge-bases/{self._knowledge_base_id}/video-understanding-runs/{run_id}",
                 headers=self._scope_headers,

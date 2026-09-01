@@ -1,4 +1,4 @@
-"""Worker 启动时按 keyset 编排已发布视觉制品恢复。"""
+"""服务启动时按 keyset 编排已发布视觉制品恢复。"""
 
 from __future__ import annotations
 

@@ -953,6 +953,68 @@ class JobRepository:
                 JobModel.knowledge_base_id == scope.knowledge_base_id,
                 JobModel.resource_type == "VIDEO_UNDERSTANDING_RUN",
                 JobModel.resource_id == run_id,
+                or_(
+                    JobModel.status.in_((JobStatus.PENDING, JobStatus.RETRY_WAIT))
+                    & (JobModel.next_attempt_at <= current_time),
+                    (JobModel.status == JobStatus.RUNNING)
+                    & (JobModel.lease_expires_at <= current_time),
+                ),
+                JobModel.cancel_requested.is_(False),
+            ),
+        )
+        if candidate is None:
+            return None
+        result = self._session.execute(
+            update(JobModel).where(
+                JobModel.id == candidate.id,
+                JobModel.status == candidate.status,
+                JobModel.attempt_count == candidate.attempt_count,
+                JobModel.cancel_requested.is_(False),
+            ).values(
+                status=JobStatus.RUNNING,
+                worker_id=worker_id,
+                heartbeat_at=current_time,
+                lease_expires_at=current_time + timedelta(seconds=lease_seconds),
+                attempt_count=JobModel.attempt_count + 1,
+                updated_at=current_time,
+            ).execution_options(synchronize_session=False),
+        )
+        if result.rowcount != 1:  # type: ignore[attr-defined]
+            return None
+        self._session.expire_all()
+        claimed = self._session.get(JobModel, candidate.id)
+        assert claimed is not None and claimed.worker_id is not None
+        return ClaimedJob(
+            id=claimed.id,
+            job_id=claimed.job_id,
+            resource_id=claimed.resource_id,
+            worker_id=claimed.worker_id,
+            attempt_count=claimed.attempt_count,
+            max_attempts=claimed.max_attempts,
+            scope=scope,
+        )
+
+    def claim_audio_run(
+        self,
+        scope: Scope,
+        run_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: int = 120,
+        now: datetime | None = None,
+    ) -> ClaimedJob | None:
+        """为音频阶段领取指定音频总任务，避免转写和写作争抢同一租约。"""
+
+        if not worker_id.strip() or lease_seconds < 1:
+            raise ValueError("音频任务租约参数非法")
+        current_time = now or datetime.now(UTC)
+        candidate = self._session.scalar(
+            select(JobModel).where(
+                JobModel.tenant_id == scope.tenant_id,
+                JobModel.application_id == scope.application_id,
+                JobModel.knowledge_base_id == scope.knowledge_base_id,
+                JobModel.resource_type == "AUDIO_UNDERSTANDING_RUN",
+                JobModel.resource_id == run_id,
                 JobModel.status.in_((JobStatus.PENDING, JobStatus.RETRY_WAIT)),
                 JobModel.cancel_requested.is_(False),
                 JobModel.next_attempt_at <= current_time,
@@ -988,6 +1050,108 @@ class JobRepository:
             attempt_count=claimed.attempt_count,
             max_attempts=claimed.max_attempts,
             scope=scope,
+        )
+
+    def claim_image_run(
+        self,
+        scope: Scope,
+        run_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: int = 120,
+        now: datetime | None = None,
+    ) -> ClaimedJob | None:
+        """为图片理解运行领取指定租约，避免图片任务被其他类型消费。"""
+
+        if not worker_id.strip() or lease_seconds < 1:
+            raise ValueError("图片任务租约参数非法")
+        current_time = now or datetime.now(UTC)
+        candidate = self._session.scalar(
+            select(JobModel).where(
+                JobModel.tenant_id == scope.tenant_id,
+                JobModel.application_id == scope.application_id,
+                JobModel.knowledge_base_id == scope.knowledge_base_id,
+                JobModel.job_type == "IMAGE_UNDERSTANDING",
+                JobModel.resource_type == "IMAGE_UNDERSTANDING_RUN",
+                JobModel.resource_id == run_id,
+                JobModel.cancel_requested.is_(False),
+                or_(
+                    JobModel.status.in_((JobStatus.PENDING, JobStatus.RETRY_WAIT))
+                    & (JobModel.next_attempt_at <= current_time),
+                    (JobModel.status == JobStatus.RUNNING)
+                    & (JobModel.lease_expires_at <= current_time),
+                ),
+            ),
+        )
+        if candidate is None:
+            return None
+        claim_statement = update(JobModel).where(
+            JobModel.id == candidate.id,
+            JobModel.status == candidate.status,
+            JobModel.attempt_count == candidate.attempt_count,
+            JobModel.cancel_requested.is_(False),
+        )
+        if candidate.status == JobStatus.RUNNING:
+            claim_statement = claim_statement.where(JobModel.lease_expires_at <= current_time)
+        else:
+            claim_statement = claim_statement.where(JobModel.next_attempt_at <= current_time)
+        result = self._session.execute(
+            claim_statement
+            .values(
+                status=JobStatus.RUNNING,
+                worker_id=worker_id,
+                heartbeat_at=current_time,
+                lease_expires_at=current_time + timedelta(seconds=lease_seconds),
+                attempt_count=JobModel.attempt_count + 1,
+                updated_at=current_time,
+            )
+            .execution_options(synchronize_session=False),
+        )
+        if result.rowcount != 1:  # type: ignore[attr-defined]
+            return None
+        self._session.expire_all()
+        claimed = self._session.get(JobModel, candidate.id)
+        assert claimed is not None and claimed.worker_id is not None
+        return ClaimedJob(
+            id=claimed.id,
+            job_id=claimed.job_id,
+            resource_id=claimed.resource_id,
+            worker_id=claimed.worker_id,
+            attempt_count=claimed.attempt_count,
+            max_attempts=claimed.max_attempts,
+            scope=scope,
+        )
+
+    def list_recoverable_image_runs(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[tuple[Scope, str], ...]:
+        """返回可由图片进程内调度器恢复的任务标识。"""
+
+        current_time = now or datetime.now(UTC)
+        models = self._session.scalars(
+            select(JobModel)
+            .where(
+                JobModel.job_type == "IMAGE_UNDERSTANDING",
+                JobModel.resource_type == "IMAGE_UNDERSTANDING_RUN",
+                JobModel.cancel_requested.is_(False),
+                JobModel.attempt_count < JobModel.max_attempts,
+                or_(
+                    JobModel.status.in_((JobStatus.PENDING, JobStatus.RETRY_WAIT))
+                    & (JobModel.next_attempt_at <= current_time),
+                    (JobModel.status == JobStatus.RUNNING)
+                    & (JobModel.lease_expires_at <= current_time),
+                ),
+            )
+            .order_by(JobModel.id),
+        )
+        return tuple(
+            (
+                Scope(model.tenant_id, model.application_id, model.knowledge_base_id),
+                model.resource_id,
+            )
+            for model in models
         )
 
     def heartbeat(
@@ -1105,7 +1269,7 @@ class JobRepository:
         allow_cancel_requested: bool = False,
         now: datetime | None = None,
     ) -> None:
-        """仅允许仍持有有效租约的 Worker 修改对应运行。"""
+        """仅允许仍持有有效租约的执行器修改对应运行。"""
 
         current_time = now or datetime.now(UTC)
         owned_job = select(JobModel.id).where(
@@ -1158,7 +1322,7 @@ class JobRepository:
         run_model: type[object],
         resource_type: str,
     ) -> None:
-        """按 Worker 租约更新音频或图片运行，且拒绝跨资源类型写入。"""
+        """按执行器租约更新音频或图片运行，且拒绝跨资源类型写入。"""
 
         current_time = datetime.now(UTC)
         owned_job = select(JobModel.id).where(

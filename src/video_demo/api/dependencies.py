@@ -8,7 +8,9 @@ from fastapi import Header, Path, Request
 
 from video_demo.application.audio_queries import AudioQueryService
 from video_demo.application.audio_runs import AudioRunService
+from video_demo.application.audio_scheduler import AudioTaskScheduler
 from video_demo.application.audio_uploads import AudioUploadService
+from video_demo.application.image_scheduler import ImageTaskScheduler
 from video_demo.application.media_queries import MediaQueryService
 from video_demo.application.media_runs import MediaRunService
 from video_demo.application.media_uploads import MediaUploadService
@@ -36,6 +38,8 @@ class AppContainer:
     audio_run_service: AudioRunService
     audio_query_service: AudioQueryService
     video_scheduler: VideoTaskScheduler | None = None
+    audio_scheduler: AudioTaskScheduler | None = None
+    image_scheduler: ImageTaskScheduler | None = None
 
 
 def get_container(request: Request) -> AppContainer:

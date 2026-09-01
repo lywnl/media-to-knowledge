@@ -76,7 +76,7 @@ h1 span {
   font-size: 1.08rem;
 }
 
-.worker-note {
+.scheduler-note {
   display: inline-flex;
   align-items: center;
   gap: 9px;

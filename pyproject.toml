@@ -24,8 +24,6 @@ dependencies = [
 
 [project.scripts]
 video-demo-api = "video_demo.main:main"
-video-demo-audio-worker = "video_demo.audio_worker_main:main"
-video-demo-image-worker = "video_demo.image_worker_main:main"
 video-demo-eval = "video_demo.evaluation.cli:main"
 
 [project.optional-dependencies]

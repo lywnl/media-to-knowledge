@@ -13,11 +13,11 @@
         <p class="eyebrow">VIDEO UNDERSTANDING</p>
         <h1>看懂一段视频，<br><span>从选择文件开始。</span></h1>
         <p class="header-description">选择一个本地媒体，交给对应的后端流水线完成内容理解。</p>
-        <p class="worker-note">
+        <p class="scheduler-note">
           <svg aria-hidden="true" viewBox="0 0 24 24">
             <path d="M12 8v4m0 4h.01M10.3 3.7 2.8 17a2 2 0 0 0 1.7 3h15a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z"/>
           </svg>
-          视频任务由 API 内置调度器自动处理；音频和图片任务仍需启动对应 Worker。
+          视频、音频和图片任务均由 API 内置阶段调度器自动处理。
         </p>
       </header>
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -15,11 +16,13 @@ from video_demo.api.media_routes import build_media_router
 from video_demo.api.objects import router as objects_router
 from video_demo.api.runs import router as runs_router
 from video_demo.api.schemas import ErrorBody, ErrorResponse
+from video_demo.application.audio_composition import build_audio_scheduler
 from video_demo.application.audio_publication import AudioPublicationService
 from video_demo.application.audio_queries import AudioQueryService
 from video_demo.application.audio_runs import AudioRunService
 from video_demo.application.audio_uploads import AudioUploadService
 from video_demo.application.composition import build_video_scheduler
+from video_demo.application.image_composition import build_image_scheduler
 from video_demo.application.image_rendering import render_image_markdown
 from video_demo.application.media_publication import MediaPublicationService
 from video_demo.application.media_queries import MediaQueryService
@@ -31,13 +34,17 @@ from video_demo.application.uploads import UploadService
 from video_demo.config import ApiRuntimeConfig, Settings
 from video_demo.domain.image_document import ImageUnderstandingResult
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.persistence.audio_stage_repository import AudioStageRepository
 from video_demo.persistence.database import Database
 from video_demo.persistence.migrations import upgrade_runtime_database
 from video_demo.persistence.models import (
+    AudioStageName,
     ImageObjectModel,
     ImageUnderstandingRunModel,
+    VideoStageName,
 )
-from video_demo.persistence.repositories import VideoStageRepository
+from video_demo.persistence.repositories import JobRepository, VideoStageRepository
+from video_demo.persistence.scope import Scope
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.audio_object_store import AudioObjectStore
 from video_demo.storage.image_object_store import ImageObjectStore
@@ -103,6 +110,38 @@ def _has_model_configuration(settings: Settings) -> bool:
             settings.vlm_api_key,
         )
     )
+
+
+def _has_audio_configuration(settings: Settings) -> bool:
+    """判断音频调度器是否收到过显式模型配置。"""
+
+    return any(
+        value
+        for value in (
+            settings.openai_base_url,
+            settings.openai_api_key,
+            settings.openai_model,
+            settings.text_llm_base_url,
+            settings.text_llm_api_key,
+            settings.text_llm_model_id,
+        )
+    )
+
+
+def _has_video_configuration(settings: Settings) -> bool:
+    """视觉字段显式出现时才把配置视为视频链路配置。"""
+
+    return any(
+        value
+        for value in (
+            settings.vlm_base_url,
+            settings.vlm_api_key,
+        )
+    ) or "vlm_model_id" in settings.model_fields_set
+
+
+def _has_image_configuration(settings: Settings) -> bool:
+    return bool(settings.vlm_base_url or settings.vlm_api_key)
 
 
 def create_app(
@@ -184,41 +223,83 @@ def create_app(
         ),
     )
 
-    scheduler = None
-    try:
-        if settings_for_scheduler is not None:
-            scheduler = build_video_scheduler(
+    video_scheduler = None
+    audio_scheduler = None
+    image_scheduler = None
+    if settings_for_scheduler is not None:
+        try:
+            video_scheduler = build_video_scheduler(
                 settings_for_scheduler,
                 database,
                 object_store,
                 container.result_query_service,
             )
-            container = replace(
-                container,
-                run_service=RunService(database, scheduler),
-                video_scheduler=scheduler,
-            )
-    except VideoDemoError:
-        if settings_for_scheduler is not None and _has_model_configuration(settings_for_scheduler):
-            raise
-        scheduler = None
-    except AttributeError:
-        scheduler = None
+        except VideoDemoError:
+            if _has_video_configuration(settings_for_scheduler):
+                raise
+        except AttributeError:
+            video_scheduler = None
+        try:
+            audio_scheduler = build_audio_scheduler(settings_for_scheduler, database)
+        except VideoDemoError:
+            if _has_audio_configuration(settings_for_scheduler):
+                raise
+        except AttributeError:
+            audio_scheduler = None
+        try:
+            image_scheduler = build_image_scheduler(settings_for_scheduler, database)
+        except VideoDemoError:
+            if _has_image_configuration(settings_for_scheduler):
+                raise
+        except AttributeError:
+            image_scheduler = None
+        container = replace(
+            container,
+            run_service=RunService(database, video_scheduler),
+            audio_run_service=AudioRunService(database, audio_scheduler),
+            video_scheduler=video_scheduler,
+            audio_scheduler=audio_scheduler,
+            media_run_services={
+                **container.media_run_services,
+                "IMAGE": MediaRunService(database, image_scheduler),
+            },
+            image_scheduler=image_scheduler,
+        )
 
     @asynccontextmanager
-    async def lifespan(_app: FastAPI):
-        if scheduler is not None:
-            recoverable: list[tuple[object, str, object]] = []
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        if video_scheduler is not None:
+            recoverable: list[tuple[Scope, str, VideoStageName]] = []
             with database.session() as session:
-                for record in VideoStageRepository(session).list_recoverable():
-                    recoverable.append((record.scope, record.run_id, record.stage_name))
-            scheduler.recover(tuple(recoverable))
-            scheduler.start()
+                for video_record in VideoStageRepository(session).list_recoverable():
+                    recoverable.append(
+                        (video_record.scope, video_record.run_id, video_record.stage_name),
+                    )
+            video_scheduler.recover(tuple(recoverable))
+            video_scheduler.start()
+        if audio_scheduler is not None:
+            recoverable_audio: list[tuple[Scope, str, AudioStageName]] = []
+            with database.session() as session:
+                for audio_record in AudioStageRepository(session).list_recoverable():
+                    recoverable_audio.append(
+                        (audio_record.scope, audio_record.run_id, audio_record.stage_name),
+                    )
+            audio_scheduler.recover(tuple(recoverable_audio))
+            audio_scheduler.start()
+        if image_scheduler is not None:
+            with database.session() as session:
+                recoverable_image = JobRepository(session).list_recoverable_image_runs()
+            image_scheduler.recover(tuple(recoverable_image))
+            image_scheduler.start()
         try:
             yield
         finally:
-            if scheduler is not None:
-                scheduler.shutdown(wait=True, timeout=10)
+            if audio_scheduler is not None:
+                audio_scheduler.shutdown(wait=True, timeout=10)
+            if video_scheduler is not None:
+                video_scheduler.shutdown(wait=True, timeout=10)
+            if image_scheduler is not None:
+                image_scheduler.shutdown(wait=True, timeout=10)
 
     app = FastAPI(
         lifespan=lifespan,
@@ -228,7 +309,9 @@ def create_app(
     )
     web_root = Path(__file__).resolve().parent.parent / "web"
     app.state.container = container
-    app.state.video_scheduler = scheduler
+    app.state.video_scheduler = video_scheduler
+    app.state.audio_scheduler = audio_scheduler
+    app.state.image_scheduler = image_scheduler
     app.mount("/static", StaticFiles(directory=web_root), name="static")
 
     @app.get("/", include_in_schema=False)

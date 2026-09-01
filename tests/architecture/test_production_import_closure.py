@@ -33,7 +33,6 @@ _ENTRYPOINTS = (
         Path("src/video_demo/application/video_scheduler.py"),
         "video_demo.application.video_scheduler",
     ),
-    (Path("src/video_demo/worker/runtime.py"), "video_demo.worker.runtime"),
     (
         Path("src/video_demo/evaluation/prediction_runner.py"),
         "video_demo.evaluation.prediction_runner",

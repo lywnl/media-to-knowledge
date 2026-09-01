@@ -121,7 +121,6 @@ _LIVE_ONLY_PRODUCTION_ISOLATION_FILES = frozenset(
         Path("src/video_demo/speech/subprocess_protocol.py"),
         Path("src/video_demo/storage/artifacts.py"),
         Path("src/video_demo/storage/snapshots.py"),
-        Path("src/video_demo/worker/runtime.py"),
     }
 )
 _LIVE_IMPLEMENTATION_FILES: tuple[Path, ...] = implementation_import_closure(
@@ -168,20 +167,22 @@ FAILURE_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
         "tests/integrations/test_qwen_vl.py::test_qwen_request_rejection_is_not_response_content_invalid",
     ),
     "cancellation": (
-        "tests/worker/test_runtime.py::test_cancellation_after_handler_prevents_successful_completion",
-        "tests/worker/test_runtime.py::test_cancellation_during_handler_marks_job_cancelled",
+        "tests/application/test_video_scheduler.py::test_scheduler_skips_cancelled_pending_run",
+        "tests/application/test_image_pipeline_executor.py::test_executor_respects_cancellation_before_handler",
     ),
-    "retry": ("tests/worker/test_runtime.py::test_retryable_failure_stops_after_max_attempts",),
+    "retry": (
+        "tests/persistence/test_video_stage_repository.py::test_stage_repository_creates_claims_and_recovers_only_due_stages",
+    ),
     "restart_resume": (
-        "tests/worker/test_resume.py::test_new_stage_runner_reuses_verified_artifact_after_restart",
-        "tests/worker/test_resume.py::test_new_stage_runner_recomputes_corrupted_artifact_after_restart",
+        "tests/application/test_video_scheduler.py::test_scheduler_recovers_checkpointed_run_into_llm_queue",
+        "tests/persistence/test_video_stage_repository.py::test_stage_repository_creates_claims_and_recovers_only_due_stages",
     ),
     "disk_insufficient": (
         "tests/media/test_transcode.py::test_transcode_rejects_insufficient_disk_before_starting",
     ),
     "cross_tenant": (
         "tests/api/test_results.py::test_result_routes_are_scope_isolated",
-        "tests/worker/test_runtime.py::test_worker_completion_does_not_touch_same_job_id_in_another_scope",
+        "tests/api/test_objects.py::test_object_lookup_is_hidden_from_other_tenant",
     ),
     "redaction": (
         "tests/api/test_runs.py::test_run_status_does_not_expose_internal_paths_or_secret_fields",

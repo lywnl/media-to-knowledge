@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
@@ -8,7 +9,7 @@ from video_demo.application.document_publication import ResultWriteFence
 from video_demo.application.image_pipeline import ImageAnalyzer, run_image_pipeline
 from video_demo.application.media_publication import MediaPublicationService
 from video_demo.application.pipeline_contracts import PipelineRunConfig
-from video_demo.errors import ErrorCode, VideoDemoError, is_retryable_error_code
+from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.database import Database
 from video_demo.persistence.media_repositories import (
     MediaObjectRepository,
@@ -45,7 +46,7 @@ def _scope_key(scope: Scope) -> str:
 
 
 class ImageJobHandler:
-    """领取图片任务，执行单图 VLM 文档流水线并发布 Markdown。"""
+    """执行单图 VLM 文档流水线并发布 Markdown。"""
 
     def __init__(
         self,
@@ -64,39 +65,42 @@ class ImageJobHandler:
         self._runtime_root = runtime_root
         self._max_image_bytes = max_image_bytes
 
-    def __call__(self, job: ClaimedJob) -> None:
+    def process(
+        self,
+        job: ClaimedJob,
+        *,
+        is_cancel_requested: Callable[[], bool] = lambda: False,
+    ) -> None:
+        """执行图片业务；任务状态由进程内阶段执行器统一收口。"""
+
         self._mark_running(job)
-        try:
-            source, config, filename, asset_sha, relative_path, mime_type = self._load_input(job)
-            if source.stat().st_size > self._max_image_bytes:
-                raise VideoDemoError(ErrorCode.IMAGE_FILE_TOO_LARGE, "图片文件超过大小限制")
-            self._mark_stage(job, "VLM")
-            outcome = run_image_pipeline(
-                run_id=job.resource_id,
-                asset_sha256=asset_sha,
-                source=source,
-                relative_path=relative_path,
-                mime_type=mime_type,
-                title_hint=config.document_config.document_title or filename,
-                analyzer=self._analyzer_factory(),
-                runtime_root=self._runtime_root,
-                max_image_bytes=self._max_image_bytes,
-            )
-            self._publication.persist(
-                job.scope,
-                outcome.result,
-                document=outcome.document,
-                status="PARTIAL_SUCCEEDED" if outcome.warnings else "SUCCEEDED",
-                warnings=outcome.warnings,
-                fence=_fence(job),
-            )
-        except VideoDemoError as error:
-            self._mark_unsuccessful(job, error)
-            raise
-        except Exception as system_error:
-            failure = VideoDemoError(ErrorCode.SYSTEM_FAILURE, "图片任务发生未分类系统错误")
-            self._mark_unsuccessful(job, failure)
-            raise failure from system_error
+        source, config, filename, asset_sha, relative_path, mime_type = self._load_input(job)
+        if source.stat().st_size > self._max_image_bytes:
+            raise VideoDemoError(ErrorCode.IMAGE_FILE_TOO_LARGE, "图片文件超过大小限制")
+        if is_cancel_requested():
+            raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
+        self._mark_stage(job, "VLM")
+        outcome = run_image_pipeline(
+            run_id=job.resource_id,
+            asset_sha256=asset_sha,
+            source=source,
+            relative_path=relative_path,
+            mime_type=mime_type,
+            title_hint=config.document_config.document_title or filename,
+            analyzer=self._analyzer_factory(),
+            runtime_root=self._runtime_root,
+            max_image_bytes=self._max_image_bytes,
+        )
+        if is_cancel_requested():
+            raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
+        self._publication.persist(
+            job.scope,
+            outcome.result,
+            document=outcome.document,
+            status="PARTIAL_SUCCEEDED" if outcome.warnings else "SUCCEEDED",
+            warnings=outcome.warnings,
+            fence=_fence(job),
+        )
 
     def _load_input(
         self,
@@ -157,24 +161,4 @@ class ImageJobHandler:
                 values=values,
                 run_model=ImageUnderstandingRunModel,
                 resource_type="IMAGE_UNDERSTANDING_RUN",
-            )
-
-    def _mark_unsuccessful(self, job: ClaimedJob, error: VideoDemoError) -> None:
-        with self._database.session() as session:
-            repository = JobRepository(session)
-            if error.code == ErrorCode.JOB_CANCELLED:
-                repository.mark_cancelled(job.id, job.worker_id, attempt_count=job.attempt_count)
-                return
-            repository.update_owned_media_run(
-                job,
-                values={"status": RunStatusValue.FAILED, "error_code": error.code.value},
-                run_model=ImageUnderstandingRunModel,
-                resource_type="IMAGE_UNDERSTANDING_RUN",
-            )
-            repository.mark_failed(
-                job.id,
-                job.worker_id,
-                error_code=error.code,
-                retryable=is_retryable_error_code(error.code),
-                attempt_count=job.attempt_count,
             )

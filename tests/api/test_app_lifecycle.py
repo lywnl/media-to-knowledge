@@ -31,6 +31,37 @@ class _Scheduler:
         return "accepted"
 
 
+def test_fastapi_lifespan_starts_and_stops_audio_scheduler(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import shutil
+
+    import video_demo.api.app as app_module
+
+    shutil.copytree(Path.cwd() / "migrations", tmp_path / "migrations")
+
+    video_scheduler = _Scheduler()
+    audio_scheduler = _Scheduler()
+    monkeypatch.setattr(
+        app_module,
+        "build_video_scheduler",
+        lambda *_args, **_kwargs: video_scheduler,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "build_audio_scheduler",
+        lambda *_args, **_kwargs: audio_scheduler,
+    )
+    settings = Settings(workspace_root=tmp_path, _env_file=None)
+
+    with TestClient(create_app(settings)) as client:
+        assert client.app.state.audio_scheduler is audio_scheduler
+        assert client.app.state.container.audio_scheduler is audio_scheduler
+        assert audio_scheduler.started is True
+
+    assert audio_scheduler.shutdown_called is True
+
 def test_fastapi_lifespan_starts_and_stops_video_scheduler(
     tmp_path: Path,
     monkeypatch,
