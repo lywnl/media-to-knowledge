@@ -1207,7 +1207,7 @@ class FiveLanguageModelsRawReport(_LiveRawReport):
 
 class RealMediaFile(FrozenModel):
     role: Literal["SOURCE", "AUDIO", "KEYFRAME"]
-    format: Literal["MP4", "WAV", "JPEG"]
+    format: Literal["MP4", "MP3", "JPEG"]
     relative_path: str = Field(min_length=1, max_length=1024)
     sha256: Sha256
     size_bytes: StrictInt = Field(gt=0, le=_DEFAULT_MEDIA_BYTES)
@@ -1539,7 +1539,7 @@ class RealMediaRawReport(FrozenModel):
             raise ValueError("成功媒体样本文件角色与数量不符合 case 语义")
         expected_formats = {"SOURCE": "MP4", "KEYFRAME": "JPEG"}
         if "AUDIO" in expected_roles:
-            expected_formats["AUDIO"] = "WAV"
+            expected_formats["AUDIO"] = "MP3"
         if any(
             any(media_file.format != expected_formats[role] for media_file in files)
             for role, files in files_by_role.items()

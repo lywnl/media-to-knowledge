@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 
+from video_demo.application.checkpoint_contracts import CheckpointStaleError
 from video_demo.application.video_scheduler import VideoTaskScheduler
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.models import VideoStageName
@@ -16,6 +17,7 @@ class _Executor:
         self.llm_started = threading.Event()
         self.calls: list[tuple[str, str]] = []
         self.recovery_failures: list[tuple[str, str, str]] = []
+        self.stale_resets: list[str] = []
         self.cancelled: set[str] = set()
 
     def run_transcription(self, scope: Scope, run_id: str) -> object:
@@ -51,9 +53,42 @@ class _Executor:
     ) -> None:
         self.recovery_failures.append((run_id, stage, error.code.value))
 
+    def reset_stale_checkpoint(self, scope: Scope, run_id: str) -> None:
+        del scope
+        self.stale_resets.append(run_id)
+
 
 def _scope() -> Scope:
     return Scope("tenant", "application", "kb")
+
+
+def test_video_checkpoint_format_detection_requires_mp3_audio_path() -> None:
+    from video_demo.application.pipeline import _is_stale_video_checkpoint
+
+    current = {
+        "schema_version": "3.0.0",
+        "prepared": {
+            "audio_path": "runs/tenant_application_kb/run-001/media/audio.mp3",
+            "audio_format_version": "mp3-192k-v1",
+        },
+    }
+
+    assert _is_stale_video_checkpoint(current) is False
+    assert _is_stale_video_checkpoint(
+        {
+            **current,
+            "prepared": {
+                **current["prepared"],
+                "audio_path": "runs/tenant_application_kb/run-001/media/audio.m4a",
+            },
+        }
+    ) is True
+    assert _is_stale_video_checkpoint(
+        {
+            "schema_version": "3.0.0",
+            "prepared": {"audio_path": None, "audio_format_version": None},
+        }
+    ) is False
 
 
 def test_scheduler_limits_slots_and_handoffs_transcription_to_llm() -> None:
@@ -109,6 +144,38 @@ def test_scheduler_does_not_fallback_to_transcription_when_llm_checkpoint_is_mis
     ]
     snapshot = scheduler.snapshot()
     assert snapshot["queues"]["TRANSCRIPTION"]["pending"] == 0  # type: ignore[index]
+
+
+def test_scheduler_requeues_stale_checkpoint_into_transcription() -> None:
+    executor = _Executor()
+
+    def load_stale(_scope: Scope, _run_id: str) -> object:
+        raise CheckpointStaleError()
+
+    executor.load_checkpoint = load_stale  # type: ignore[method-assign]
+    scheduler = VideoTaskScheduler(executor)
+
+    assert scheduler.recover(((_scope(), "run-stale", VideoStageName.LLM),)) == 1
+    assert executor.stale_resets == ["run-stale"]
+    assert scheduler.snapshot()["queues"]["TRANSCRIPTION"]["pending"] == 1  # type: ignore[index]
+    assert executor.recovery_failures == []
+
+
+def test_scheduler_does_not_rerun_ordinary_corrupt_checkpoint() -> None:
+    executor = _Executor()
+
+    def load_corrupt(_scope: Scope, _run_id: str) -> object:
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "快照损坏")
+
+    executor.load_checkpoint = load_corrupt  # type: ignore[method-assign]
+    scheduler = VideoTaskScheduler(executor)
+
+    assert scheduler.recover(((_scope(), "run-corrupt", VideoStageName.LLM),)) == 0
+    assert executor.stale_resets == []
+    assert executor.recovery_failures == [
+        ("run-corrupt", "LLM", ErrorCode.ARTIFACT_SCHEMA_INVALID.value),
+    ]
+    assert scheduler.snapshot()["queues"]["TRANSCRIPTION"]["pending"] == 0  # type: ignore[index]
 
 
 def test_scheduler_does_not_leave_running_threads_after_shutdown() -> None:

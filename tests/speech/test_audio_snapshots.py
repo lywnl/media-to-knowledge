@@ -28,11 +28,11 @@ def _inputs() -> AudioAsrFingerprintInputs:
     )
 
 
-def test_audio_window_snapshot_schema_is_literal_v2() -> None:
+def test_audio_window_snapshot_schema_is_literal_v3() -> None:
     annotation = AudioAsrWindowSnapshotPayload.model_fields["schema_version"].annotation
 
     assert get_origin(annotation) is Literal
-    assert get_args(annotation) == ("2.0.0",)
+    assert get_args(annotation) == ("3.0.0",)
 
 
 def test_audio_asr_parent_fingerprint_binds_media_and_provider_inputs() -> None:

@@ -42,7 +42,7 @@ class AudioAsrWindowSnapshotStore:
             receipt, payload = inspect_artifact(
                 self._artifact_store,
                 path,
-                schema_version="2.0.0",
+                schema_version="3.0.0",
                 upstream_sha256=fingerprint,
                 max_bytes=16 * 1024 * 1024,
             )
@@ -66,7 +66,7 @@ class AudioAsrWindowSnapshotStore:
             return self._artifact_store.write_json(
                 path,
                 payload.model_dump(mode="json", exclude_computed_fields=True),
-                schema_version="2.0.0",
+                schema_version="3.0.0",
                 upstream_sha256=fingerprint,
                 exclusive=True,
             )

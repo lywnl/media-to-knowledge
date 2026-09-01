@@ -202,8 +202,8 @@ class _Slicer:
     ) -> Path:
         self._count += 1
         self._calls.append(f"slice-{self._count}")
-        path = self._root / f"slice-{self._count}.wav"
-        path.write_bytes(b"wav")
+        path = self._root / f"slice-{self._count}.mp3"
+        path.write_bytes(b"mp3")
         self._slices.append(path)
         return path
 
@@ -295,13 +295,13 @@ def _media(
     run_root = Path("runs/scope/run_001")
     source = tmp_path / run_root / "input/source.mp4"
     proxy = tmp_path / run_root / "media/proxy.mp4"
-    audio_path = tmp_path / run_root / "media/audio.wav"
+    audio_path = tmp_path / run_root / "media/audio.mp3"
     source.parent.mkdir(parents=True, exist_ok=True)
     proxy.parent.mkdir(parents=True, exist_ok=True)
     source.write_bytes(b"source")
     proxy.write_bytes(b"proxy")
     if audio:
-        audio_path.write_bytes(b"wav")
+        audio_path.write_bytes(b"mp3")
     asset = RegisteredAsset(
         source_path=source,
         source_sha256="a" * 64,

@@ -9,6 +9,7 @@ from pydantic import Field
 from video_demo.domain.base import FrozenModel
 from video_demo.domain.evidence import SpeechSegment
 from video_demo.domain.run import ModelIdentity, TimeRange
+from video_demo.media.audio_format import AUDIO_FORMAT_VERSION
 from video_demo.speech.language import LanguageSpan
 from video_demo.speech.video_asr import FixedAsrWindow
 
@@ -17,7 +18,7 @@ _VIDEO_ASR_WINDOW_STRATEGY_VERSION: Literal["fixed-10m-v1"] = "fixed-10m-v1"
 
 
 class AsrSnapshotPayload(FrozenModel):
-    schema_version: Literal["2.0.0"] = "2.0.0"
+    schema_version: Literal["3.0.0"] = "3.0.0"
     language_spans: tuple[LanguageSpan, ...]
     segments: tuple[SpeechSegment, ...]
     language_change_boundaries_ms: tuple[int, ...]
@@ -25,7 +26,7 @@ class AsrSnapshotPayload(FrozenModel):
 
 
 class AsrWindowSnapshotPayload(FrozenModel):
-    schema_version: Literal["2.0.0"] = "2.0.0"
+    schema_version: Literal["3.0.0"] = "3.0.0"
     chunk_index: int
     upload_range: TimeRange
     owned_range: TimeRange
@@ -57,6 +58,7 @@ def asr_fingerprint(
     return _canonical_sha256(
         {
             "schema_version": AsrSnapshotPayload.model_fields["schema_version"].default,
+            "audio_format_version": AUDIO_FORMAT_VERSION,
             "audio_sha256": audio_sha256,
             "duration_ms": duration_ms,
             "language_hints": language_hints,

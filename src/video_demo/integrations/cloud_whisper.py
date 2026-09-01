@@ -14,6 +14,7 @@ import httpx
 
 from video_demo.config import CloudAsrConfiguration
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.media.audio_format import AUDIO_OUTPUT_EXTENSION, AUDIO_OUTPUT_MIME
 from video_demo.speech.asr_contracts import RawAsrSegment, WindowTranscriptionResult
 from video_demo.storage.workspace import reject_symlink_components
 
@@ -193,7 +194,7 @@ class CloudWhisperClient:
                         language_hint=language_hint,
                         prompt=prompt,
                     ),
-                    files={"file": (path.name, stream, "audio/wav")},
+                    files={"file": (path.name, stream, AUDIO_OUTPUT_MIME)},
                     timeout=self._configuration.timeout_seconds,
                 ) as response:
                     status_code = response.status_code
@@ -315,6 +316,11 @@ def _validated_audio_path(
         raise VideoDemoError(
             ErrorCode.SPEECH_AUDIO_INVALID,
             "云端语音切片不是普通文件",
+        )
+    if path.suffix.casefold() != AUDIO_OUTPUT_EXTENSION:
+        raise VideoDemoError(
+            ErrorCode.SPEECH_AUDIO_INVALID,
+            "云端语音切片必须是 MP3",
         )
     size_bytes = path.stat().st_size
     if size_bytes < 1 or size_bytes > max_upload_bytes:

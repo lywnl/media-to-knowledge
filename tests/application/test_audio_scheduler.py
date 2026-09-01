@@ -4,6 +4,7 @@ import threading
 import time
 
 from video_demo.application.audio_scheduler import AudioTaskScheduler
+from video_demo.application.checkpoint_contracts import CheckpointStaleError
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.models import AudioStageName
 from video_demo.persistence.scope import Scope
@@ -16,6 +17,7 @@ class _Executor:
         self.llm_started = threading.Event()
         self.calls: list[tuple[str, str]] = []
         self.recovery_failures: list[tuple[str, str, str]] = []
+        self.stale_resets: list[str] = []
         self.cancelled: set[str] = set()
 
     def run_transcription(self, scope: Scope, run_id: str) -> object:
@@ -54,6 +56,10 @@ class _Executor:
     ) -> None:
         del scope
         self.recovery_failures.append((run_id, stage, error.code.value))
+
+    def reset_stale_checkpoint(self, scope: Scope, run_id: str) -> None:
+        del scope
+        self.stale_resets.append(run_id)
 
 
 def _scope() -> Scope:
@@ -109,5 +115,37 @@ def test_audio_scheduler_does_not_fallback_to_transcription_without_checkpoint()
     assert scheduler.recover(((_scope(), "run-missing", AudioStageName.LLM),)) == 0
     assert executor.recovery_failures == [
         ("run-missing", "LLM", ErrorCode.AUDIO_RESULT_NOT_READY.value),
+    ]
+    assert scheduler.snapshot()["queues"]["TRANSCRIPTION"]["pending"] == 0  # type: ignore[index]
+
+
+def test_audio_scheduler_requeues_stale_checkpoint_into_transcription() -> None:
+    executor = _Executor()
+
+    def load_stale(_scope: Scope, _run_id: str) -> object:
+        raise CheckpointStaleError()
+
+    executor.load_checkpoint = load_stale  # type: ignore[method-assign]
+    scheduler = AudioTaskScheduler(executor)
+
+    assert scheduler.recover(((_scope(), "run-stale", AudioStageName.LLM),)) == 1
+    assert executor.stale_resets == ["run-stale"]
+    assert scheduler.snapshot()["queues"]["TRANSCRIPTION"]["pending"] == 1  # type: ignore[index]
+    assert executor.recovery_failures == []
+
+
+def test_audio_scheduler_does_not_rerun_ordinary_corrupt_checkpoint() -> None:
+    executor = _Executor()
+
+    def load_corrupt(_scope: Scope, _run_id: str) -> object:
+        raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "快照损坏")
+
+    executor.load_checkpoint = load_corrupt  # type: ignore[method-assign]
+    scheduler = AudioTaskScheduler(executor)
+
+    assert scheduler.recover(((_scope(), "run-corrupt", AudioStageName.LLM),)) == 0
+    assert executor.stale_resets == []
+    assert executor.recovery_failures == [
+        ("run-corrupt", "LLM", ErrorCode.ARTIFACT_SCHEMA_INVALID.value),
     ]
     assert scheduler.snapshot()["queues"]["TRANSCRIPTION"]["pending"] == 0  # type: ignore[index]

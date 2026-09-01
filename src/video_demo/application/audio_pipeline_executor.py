@@ -16,9 +16,14 @@ from video_demo.application.audio_contracts import AudioTranscriptionCheckpoint
 from video_demo.application.audio_pipeline import AudioPipeline, AudioPipelineOutcome
 from video_demo.application.audio_publication import AudioPublicationService
 from video_demo.application.audio_run_config import AudioRunConfig
+from video_demo.application.checkpoint_contracts import (
+    CheckpointStaleError,
+    cleanup_stale_checkpoint_artifacts,
+)
 from video_demo.application.publication_contracts import ResultWriteFence, scope_key
 from video_demo.domain.title import sanitize_document_title
 from video_demo.errors import ErrorCode, VideoDemoError, is_retryable_error_code
+from video_demo.media.audio_format import AUDIO_FORMAT_VERSION
 from video_demo.persistence.audio_stage_repository import (
     AudioStageLease,
     AudioStageRepository,
@@ -250,6 +255,8 @@ class AudioStagePipelineExecutor:
             )
             if not isinstance(payload, dict):
                 raise ValueError("音频转写快照 payload 非法")
+            if _is_stale_audio_checkpoint(payload):
+                raise CheckpointStaleError()
             checkpoint = audio_transcription_checkpoint_from_payload(payload)
             self._validate_checkpoint(
                 checkpoint,
@@ -258,11 +265,24 @@ class AudioStagePipelineExecutor:
                 checkpoint.duration_ms,
             )
             return checkpoint
+        except CheckpointStaleError:
+            raise
         except (OSError, ValueError, TypeError, VideoDemoError) as error:
             raise VideoDemoError(
                 ErrorCode.ARTIFACT_SCHEMA_INVALID,
                 "音频转写快照无法恢复",
             ) from error
+
+    def reset_stale_checkpoint(self, scope: Scope, run_id: str) -> None:
+        with self._database.session() as session:
+            repository = AudioStageRepository(session)
+            record = repository.get(scope, run_id, AudioStageName.TRANSCRIPTION)
+            repository.reset_stale_checkpoint(scope, run_id)
+        cleanup_stale_checkpoint_artifacts(
+            self._runtime_root,
+            Path("runs") / scope_key(scope) / run_id,
+            record.checkpoint_relative_path if record is not None else None,
+        )
 
     def mark_recovery_failed(
         self,
@@ -573,6 +593,15 @@ def _duration_ms(probe: object) -> int:
     if not isinstance(value, int) or value < 1:
         raise VideoDemoError(ErrorCode.AUDIO_PROBE_INVALID, "音频预检时长非法")
     return value
+
+
+def _is_stale_audio_checkpoint(payload: dict[str, object]) -> bool:
+    if payload.get("schema_version") != "2.0.0":
+        return True
+    if payload.get("audio_format_version") != AUDIO_FORMAT_VERSION:
+        return True
+    audio_path = payload.get("audio_path")
+    return isinstance(audio_path, str) and not audio_path.casefold().endswith(".mp3")
 
 
 def _parse_config(snapshot: object) -> AudioRunConfig:

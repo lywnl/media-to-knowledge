@@ -208,8 +208,8 @@ class ImageTaskScheduler:
                 retry,
             )
         except Exception as system_error:
-            error = VideoDemoError(ErrorCode.SYSTEM_FAILURE, "图片阶段发生未分类系统错误")
-            retry = self._record_failure(scope, run_id, error)
+            failure = VideoDemoError(ErrorCode.SYSTEM_FAILURE, "图片阶段发生未分类系统错误")
+            retry = self._record_failure(scope, run_id, failure)
             self._logger.exception(
                 "image scheduler crashed run_id=%s",
                 run_id,

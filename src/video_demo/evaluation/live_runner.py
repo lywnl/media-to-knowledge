@@ -1207,7 +1207,7 @@ class LiveValidationRunner:
                         self._derived_path(
                             evaluation_run_id,
                             sample.sample_id,
-                            "audio.wav",
+                            "audio.mp3",
                         ),
                         max_bytes=self._settings.max_video_bytes,
                     )
@@ -1235,7 +1235,7 @@ class LiveValidationRunner:
         source = package.dataset.eval_root / dataset_sample.media_relative_path
         paths = (
             source,
-            self._derived_path(evaluation_run_id, dataset_sample.sample_id, "audio.wav"),
+            self._derived_path(evaluation_run_id, dataset_sample.sample_id, "audio.mp3"),
 
         )
         limits = (self._settings.max_video_bytes, self._settings.max_video_bytes)
@@ -1368,7 +1368,7 @@ class LiveValidationRunner:
             audio = self._derived_path(
                 evaluation_run_id,
                 sample.sample_id,
-                "audio.wav",
+                "audio.mp3",
             )
             if not _snapshot_available(
                 audio,

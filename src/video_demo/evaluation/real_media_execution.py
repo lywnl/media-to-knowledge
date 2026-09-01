@@ -32,6 +32,7 @@ from video_demo.evaluation.real_media_source import (
     open_case_execution_session,
     regular_file_size,
 )
+from video_demo.media.audio_format import AUDIO_FORMAT_VERSION
 from video_demo.media.probe import FFprobeClient, ProbeLimits
 from video_demo.media.process import SafeProcessRunner
 from video_demo.media.transcode import (
@@ -44,7 +45,7 @@ from video_demo.visual.candidate_artifacts import CandidateArtifactSession
 from video_demo.visual.ffmpeg_frames import FFmpegFrameExtractor, FrameCandidate, FrameSample
 
 MediaRole = Literal["SOURCE", "AUDIO", "KEYFRAME"]
-MediaFormat = Literal["MP4", "WAV", "JPEG"]
+MediaFormat = Literal["MP4", "MP3", "JPEG"]
 MediaPhase = Literal[
     "generate",
     "probe",
@@ -462,7 +463,7 @@ def _audio_phase(
 ) -> PreparedMedia:
     session.assert_registered_leaves(facts.registered_paths)
     source = facts.files[0].relative_path
-    expected_audio = probed.asset.run_relative_root / "media/audio.wav"
+    expected_audio = probed.asset.run_relative_root / "media/audio.mp3"
     outputs = (
         ()
         if not probed.manifest.audio_streams
@@ -481,7 +482,7 @@ def _audio_phase(
         source_descriptor = session.open_registered_leaf(Path("source.mp4"))
         staged = None
         try:
-            staged = session.stage_output(Path("media/audio.wav"))
+            staged = session.stage_output(Path("media/audio.mp3"))
             audio = client.extract_audio(
                 probed.asset.source_path,
                 probed.asset.run_relative_root,
@@ -531,6 +532,7 @@ def _audio_phase(
         audio_path=audio_path,
         audio_sha256=audio_sha256,
         warnings=tuple(dict.fromkeys(warnings)),
+        audio_format_version=AUDIO_FORMAT_VERSION if audio_path is not None else None,
     )
 
 
@@ -688,7 +690,7 @@ def _transfer_audio(
         case_id=case_id,
         path=store.runtime_root / audio.relative_path,
         role="AUDIO",
-        format_name="WAV",
+        format_name="MP3",
         store=store,
         journal=journal,
         max_bytes=max_bytes,

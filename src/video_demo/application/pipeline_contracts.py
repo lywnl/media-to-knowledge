@@ -5,7 +5,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, Self, cast
+from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 from pydantic import Field, StrictInt, model_validator
 
@@ -27,6 +27,7 @@ from video_demo.domain.evidence import (
 from video_demo.domain.manifest import VideoAssetManifest
 from video_demo.domain.speech_config import normalize_core_context, normalize_hotwords
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.media.audio_format import AUDIO_FORMAT_VERSION
 from video_demo.media.probe import ProbeLimits, SupportedMime
 
 if TYPE_CHECKING:
@@ -185,6 +186,7 @@ class PreparedMedia:
     audio_sha256: str | None
     subtitle: ParsedSubtitle | None = None
     warnings: tuple[str, ...] = ()
+    audio_format_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +204,11 @@ class TranscriptionCheckpoint:
     def __post_init__(self) -> None:
         if self.registered.source_sha256 != self.prepared.source.asset.source_sha256:
             raise ValueError("转写快照的原始视频摘要不一致")
+        if (
+            self.prepared.audio_path is not None
+            and self.prepared.audio_format_version != AUDIO_FORMAT_VERSION
+        ):
+            raise ValueError("转写快照音频格式版本不受支持")
 
 
 def transcription_checkpoint_to_payload(checkpoint: TranscriptionCheckpoint) -> dict[str, object]:
@@ -217,7 +224,7 @@ def transcription_checkpoint_to_payload(checkpoint: TranscriptionCheckpoint) -> 
         for item in speech.transcript_evidence
     ]
     return {
-        "schema_version": "2.0.0",
+        "schema_version": "3.0.0",
         "registered": {
             "source_path": str(checkpoint.registered.source_path),
             "source_sha256": checkpoint.registered.source_sha256,
@@ -239,6 +246,7 @@ def transcription_checkpoint_to_payload(checkpoint: TranscriptionCheckpoint) -> 
             "proxy_size_bytes": prepared.proxy_size_bytes,
             "audio_path": str(prepared.audio_path) if prepared.audio_path else None,
             "audio_sha256": prepared.audio_sha256,
+            "audio_format_version": prepared.audio_format_version,
             "subtitle": prepared.subtitle.model_dump(mode="json") if prepared.subtitle else None,
             "warnings": list(prepared.warnings),
         },
@@ -271,7 +279,7 @@ def transcription_checkpoint_from_payload(
 ) -> TranscriptionCheckpoint:
     """从 JSON 快照恢复转写事实，并重新执行领域校验。"""
 
-    if payload.get("schema_version") != "2.0.0":
+    if payload.get("schema_version") != "3.0.0":
         raise ValueError("转写快照版本不受支持")
     registered_payload = _mapping(payload, "registered")
     config = PipelineRunConfig.model_validate(_mapping(registered_payload, "config"))
@@ -290,7 +298,7 @@ def transcription_checkpoint_from_payload(
         asset=registered,
         manifest=manifest,
         limits=ProbeLimits(**dict(_mapping(probed_payload, "limits"))),
-        warnings=tuple(str(item) for item in probed_payload.get("warnings", [])),
+        warnings=tuple(str(item) for item in _sequence(probed_payload, "warnings")),
         timeline_duration_ms=(
             int(probed_payload["timeline_duration_ms"])
             if probed_payload.get("timeline_duration_ms") is not None
@@ -320,12 +328,19 @@ def transcription_checkpoint_from_payload(
             if prepared_payload.get("audio_sha256")
             else None
         ),
+        audio_format_version=(
+            str(prepared_payload["audio_format_version"])
+            if prepared_payload.get("audio_format_version") is not None
+            else None
+        ),
         subtitle=subtitle,
-        warnings=tuple(str(item) for item in prepared_payload.get("warnings", [])),
+        warnings=tuple(str(item) for item in _sequence(prepared_payload, "warnings")),
     )
+    if prepared.audio_path is not None and prepared.audio_format_version != AUDIO_FORMAT_VERSION:
+        raise ValueError("转写快照音频格式版本不受支持")
     speech_payload = _mapping(payload, "speech")
     evidence: list[SpeechSegment | SubtitleCue] = []
-    for item in speech_payload.get("evidence", []):
+    for item in _sequence(speech_payload, "evidence"):
         item_payload = _mapping(item, "evidence item")
         model_payload = _mapping(item_payload, "payload")
         if item_payload.get("kind") == "SUBTITLE_CUE":
@@ -340,11 +355,11 @@ def transcription_checkpoint_from_payload(
         warnings=tuple(str(item) for item in speech_payload.get("warnings", [])),
         boundary_candidates=tuple(
             SpeechBoundaryCandidate(**_mapping(item, "boundary candidate"))
-            for item in speech_payload.get("boundary_candidates", [])
+            for item in _sequence(speech_payload, "boundary_candidates")
         ),
         stage_metrics=tuple(
             StageMetric(**_mapping(item, "stage metric"))
-            for item in speech_payload.get("stage_metrics", [])
+            for item in _sequence(speech_payload, "stage_metrics")
         ),
         stage_cache_hits=tuple(str(item) for item in speech_payload.get("stage_cache_hits", [])),
     )
@@ -354,20 +369,27 @@ def transcription_checkpoint_from_payload(
         speech=speech,
         base_segments=tuple(
             BaseSegment.model_validate(item)
-            for item in payload.get("base_segments", [])
+            for item in _sequence(payload, "base_segments")
         ),
         stage_metrics={
             str(key): int(value)
             for key, value in _mapping(payload, "stage_metrics").items()
         },
-        stage_cache_hits=tuple(str(item) for item in payload.get("stage_cache_hits", [])),
+        stage_cache_hits=tuple(str(item) for item in _sequence(payload, "stage_cache_hits")),
     )
 
 
-def _mapping(value: object, name: str) -> Mapping[str, object]:
+def _mapping(value: object, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"转写快照字段 {name} 必须是对象")
     return value
+
+
+def _sequence(payload: Mapping[str, object], name: str) -> tuple[Any, ...]:
+    value = payload.get(name, ())
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"转写快照字段 {name} 必须是数组")
+    return tuple(value)
 
 
 @dataclass(frozen=True, slots=True)

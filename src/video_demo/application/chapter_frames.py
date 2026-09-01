@@ -26,6 +26,7 @@ from video_demo.visual.candidate_artifacts import CandidateArtifactSession
 from video_demo.visual.ffmpeg_frames import (
     ExactFrameSampleResult,
     FrameAdmissionTier,
+    FrameCandidate,
     FrameExtractor,
     FrameSample,
 )
@@ -223,7 +224,7 @@ class ChapterFrameSearcher:
         allowed_root: Path,
         asset_sha256: str,
     ) -> ChapterFrameSearchBatch:
-        grouped: dict[str, dict[str, tuple[object, set[str]]]] = {
+        grouped: dict[str, dict[str, tuple[FrameCandidate, set[str]]]] = {
             chapter.chapter_id: {} for chapter in chapters
         }
         failed: set[str] = set()

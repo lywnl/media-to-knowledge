@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import wave
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -155,24 +154,22 @@ class NativeSileroBackend:
     def load_audio(self, path: Path, sampling_rate: int) -> object:
         self._load()
         try:
-            with wave.open(str(path), "rb") as stream:
-                channels = stream.getnchannels()
-                source_rate = stream.getframerate()
-                sample_width = stream.getsampwidth()
-                compression = stream.getcomptype()
-                frames = stream.readframes(stream.getnframes())
-            if (
-                channels != 1
-                or source_rate != sampling_rate
-                or sample_width != 2
-                or compression != "NONE"
-                or not frames
-                or len(frames) % sample_width != 0
-            ):
-                raise ValueError("Silero VAD 仅接受非空单声道 PCM16 WAV")
+            if path.suffix.casefold() != ".mp3":
+                raise ValueError("Silero VAD 仅接受 MP3")
+            torchaudio: Any = self._importer("torchaudio")
             torch: Any = self._importer("torch")
-            waveform = torch.frombuffer(bytearray(frames), dtype=torch.int16)
-            return waveform.to(dtype=torch.float32).div_(32_768)
+            waveform, source_rate = torchaudio.load(str(path))
+            shape: tuple[int, ...] = tuple(getattr(waveform, "shape", ()))
+            if len(shape) != 2 or int(shape[0]) != 1 or int(source_rate) != sampling_rate:
+                raise ValueError("Silero VAD 仅接受非空单声道 16 kHz MP3")
+            if int(waveform.numel()) <= 0 or int(shape[1]) <= 0:
+                raise ValueError("Silero VAD 音频不能为空")
+            return waveform[0].to(dtype=torch.float32)
+        except (ModuleNotFoundError, ImportError):
+            raise VideoDemoError(
+                ErrorCode.SPEECH_DEPENDENCY_UNAVAILABLE,
+                "未安装 torchaudio/torch 可选依赖",
+            ) from None
         except Exception:
             raise VideoDemoError(
                 ErrorCode.SPEECH_MODEL_UNAVAILABLE,

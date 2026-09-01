@@ -195,7 +195,7 @@ class _MediaExecutionJournal:
         expected_file: dict[_MediaPhase, tuple[str, str] | None] = {
             "generate": ("SOURCE", "MP4"),
             "probe": None,
-            "audio": ("AUDIO", "WAV"),
+            "audio": ("AUDIO", "MP3"),
             "ffmpeg_frame_extract": ("KEYFRAME", "JPEG"),
         }
         artifact_role: ArtifactRole = (

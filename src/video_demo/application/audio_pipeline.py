@@ -28,6 +28,7 @@ from video_demo.domain.base import Sha256, stable_identifier
 from video_demo.domain.evidence import SpeechSegment, SubtitleCue
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError, is_cancelled_error_code
+from video_demo.media.audio_format import AUDIO_FORMAT_VERSION
 from video_demo.speech.asr_contracts import WindowRecognizerPort
 from video_demo.speech.audio_fixed_asr import (
     AUDIO_ASR_CHUNK_DURATION_MS,
@@ -431,6 +432,7 @@ class AudioPipeline:
         return AudioTranscriptionCheckpoint(
             run_id=run_id,
             asset_sha256=asset_sha256,
+            audio_format_version=AUDIO_FORMAT_VERSION,
             duration_ms=duration_ms,
             title_hint=title_hint,
             transcript_source=speech.transcript_source,

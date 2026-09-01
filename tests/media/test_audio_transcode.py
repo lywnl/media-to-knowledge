@@ -78,6 +78,6 @@ def test_audio_transcoder_writes_audio_artifact_without_video_kernel(
         duration_ms=1_000,
     )
 
-    assert artifact.relative_path == "runs/run_audio/media/audio.wav"
-    assert artifact.codec == "pcm_s16le"
+    assert artifact.relative_path == "runs/run_audio/media/audio.mp3"
+    assert artifact.codec == "mp3"
     assert runner.calls

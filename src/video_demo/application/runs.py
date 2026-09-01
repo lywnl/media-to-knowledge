@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Protocol
 
 from pydantic import ValidationError
 
@@ -18,6 +18,7 @@ from video_demo.persistence.models import (
     JobModel,
     JobStatus,
     RunStatusValue,
+    VideoStageName,
     VideoUnderstandingRunModel,
 )
 from video_demo.persistence.repositories import (
@@ -27,6 +28,15 @@ from video_demo.persistence.repositories import (
     VideoStageRepository,
 )
 from video_demo.persistence.scope import Scope
+
+
+class _VideoScheduler(Protocol):
+    def submit(
+        self,
+        scope: Scope,
+        run_id: str,
+        stage: VideoStageName = VideoStageName.TRANSCRIPTION,
+    ) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +75,7 @@ class JobView:
 
 
 class RunService:
-    def __init__(self, database: Database, scheduler: object | None = None) -> None:
+    def __init__(self, database: Database, scheduler: _VideoScheduler | None = None) -> None:
         self._database = database
         self._scheduler = scheduler
 

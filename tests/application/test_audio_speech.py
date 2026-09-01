@@ -7,9 +7,9 @@ from video_demo.errors import ErrorCode, VideoDemoError
 
 
 def test_discard_audio_slice_rejects_symlink(tmp_path: Path) -> None:
-    target = tmp_path / "target.wav"
+    target = tmp_path / "target.mp3"
     target.write_bytes(b"audio")
-    link = tmp_path / "slice.wav"
+    link = tmp_path / "slice.mp3"
     link.symlink_to(target)
 
     with pytest.raises(VideoDemoError) as raised:

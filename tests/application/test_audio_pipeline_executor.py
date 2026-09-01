@@ -9,6 +9,7 @@ from video_demo.application.audio_contracts import (
 from video_demo.application.audio_run_config import AudioRunConfig
 from video_demo.domain.audio_plan import AudioBaseSegment
 from video_demo.domain.evidence import SpeechSegment
+from video_demo.media.audio_format import AUDIO_FORMAT_VERSION
 from video_demo.persistence.audio_stage_repository import AudioStageRepository
 from video_demo.persistence.database import Database
 from video_demo.persistence.media_repositories import MediaRunRepository
@@ -21,6 +22,21 @@ from video_demo.persistence.models import (
 )
 from video_demo.persistence.repositories import JobRepository
 from video_demo.persistence.scope import Scope
+
+
+def test_audio_checkpoint_format_detection_distinguishes_mp3_and_legacy_wav() -> None:
+    from video_demo.application.audio_pipeline_executor import _is_stale_audio_checkpoint
+
+    current = {
+        "schema_version": "2.0.0",
+        "audio_format_version": AUDIO_FORMAT_VERSION,
+    }
+
+    assert _is_stale_audio_checkpoint(current) is False
+    assert _is_stale_audio_checkpoint({**current, "schema_version": "1.0.0"}) is True
+    assert _is_stale_audio_checkpoint({**current, "audio_format_version": None}) is True
+    assert _is_stale_audio_checkpoint({**current, "audio_path": "media/audio.wav"}) is True
+    assert _is_stale_audio_checkpoint({**current, "audio_path": "media/audio.m4a"}) is True
 
 
 def test_audio_stage_executor_runs_transcription_and_persists_checkpoint(tmp_path: Path) -> None:
@@ -90,16 +106,16 @@ def test_audio_stage_executor_runs_transcription_and_persists_checkpoint(tmp_pat
             heartbeat_state["transcoder"] = heartbeat_state["active"]
             assert has_audio is True
             assert duration_ms == 1_000
-            relative = run_relative_root / "media" / "audio.wav"
+            relative = run_relative_root / "media" / "audio.mp3"
             output = runtime_root / relative
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_bytes(b"wav")
+            output.write_bytes(b"mp3")
             return type(
                 "AudioArtifact",
                 (),
                 {
                     "relative_path": relative.as_posix(),
-                    "sha256": hashlib.sha256(b"wav").hexdigest(),
+                    "sha256": hashlib.sha256(b"mp3").hexdigest(),
                     "size_bytes": 3,
                 },
             )()
@@ -116,6 +132,7 @@ def test_audio_stage_executor_runs_transcription_and_persists_checkpoint(tmp_pat
     checkpoint = AudioTranscriptionCheckpoint(
         run_id=run_id,
         asset_sha256=digest,
+        audio_format_version=AUDIO_FORMAT_VERSION,
         duration_ms=1_000,
         title_hint="sample",
         transcript_source="ASR",
@@ -169,6 +186,7 @@ def test_audio_stage_executor_runs_transcription_and_persists_checkpoint(tmp_pat
     restored = executor.run_transcription(scope, run_id)
 
     assert restored == checkpoint
+    assert executor.load_checkpoint(scope, run_id) == checkpoint
     assert heartbeat_state["probe"] is True
     assert heartbeat_state["transcoder"] is True
     assert len(factory_callbacks) == 1

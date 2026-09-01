@@ -197,6 +197,84 @@ class VideoStageRepository:
         )
         return bool(result.rowcount)  # type: ignore[attr-defined]
 
+    def reset_stale_checkpoint(
+        self,
+        scope: Scope,
+        run_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """清理已退役音频格式的转写快照，并从转写阶段重新开始。"""
+
+        current_time = now or datetime.now(UTC)
+        self._session.execute(
+            update(VideoPipelineStageModel)
+            .where(
+                VideoPipelineStageModel.tenant_id == scope.tenant_id,
+                VideoPipelineStageModel.application_id == scope.application_id,
+                VideoPipelineStageModel.knowledge_base_id == scope.knowledge_base_id,
+                VideoPipelineStageModel.run_id == run_id,
+                VideoPipelineStageModel.stage_name.in_(
+                    (VideoStageName.TRANSCRIPTION, VideoStageName.LLM),
+                ),
+            )
+            .values(
+                status=JobStatus.PENDING,
+                attempt_count=0,
+                next_attempt_at=current_time,
+                worker_id=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                checkpoint_relative_path=None,
+                checkpoint_sha256=None,
+                error_code=None,
+                updated_at=current_time,
+            )
+            .execution_options(synchronize_session=False),
+        )
+        self._session.execute(
+            update(JobModel)
+            .where(
+                JobModel.tenant_id == scope.tenant_id,
+                JobModel.application_id == scope.application_id,
+                JobModel.knowledge_base_id == scope.knowledge_base_id,
+                JobModel.resource_type == "VIDEO_UNDERSTANDING_RUN",
+                JobModel.resource_id == run_id,
+                JobModel.status.in_((JobStatus.PENDING, JobStatus.RUNNING, JobStatus.RETRY_WAIT)),
+            )
+            .values(
+                status=JobStatus.PENDING,
+                attempt_count=0,
+                next_attempt_at=current_time,
+                worker_id=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                error_code=None,
+                updated_at=current_time,
+            )
+            .execution_options(synchronize_session=False),
+        )
+        self._session.execute(
+            update(VideoUnderstandingRunModel)
+            .where(
+                VideoUnderstandingRunModel.tenant_id == scope.tenant_id,
+                VideoUnderstandingRunModel.application_id == scope.application_id,
+                VideoUnderstandingRunModel.knowledge_base_id == scope.knowledge_base_id,
+                VideoUnderstandingRunModel.run_id == run_id,
+                VideoUnderstandingRunModel.status.not_in(
+                    (RunStatusValue.SUCCEEDED, RunStatusValue.PARTIAL_SUCCEEDED)
+                ),
+            )
+            .values(
+                status=RunStatusValue.PENDING,
+                current_stage=VideoStageName.TRANSCRIPTION.value,
+                warning_codes=[],
+                error_code=None,
+                updated_at=current_time,
+            )
+            .execution_options(synchronize_session=False),
+        )
+
     def list_recoverable(self, *, now: datetime | None = None) -> tuple[VideoStageRecord, ...]:
         current_time = now or datetime.now(UTC)
         transcription = aliased(VideoPipelineStageModel)

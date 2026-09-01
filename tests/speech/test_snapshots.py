@@ -20,7 +20,7 @@ def test_asr_snapshot_uses_video_schema_and_rejects_retired_vad_fields() -> None
         language_spans=(), segments=(), language_change_boundaries_ms=()
     )
 
-    assert payload.schema_version == "2.0.0"
+    assert payload.schema_version == "3.0.0"
     with pytest.raises(ValueError):
         AsrSnapshotPayload.model_validate({**payload.model_dump(), "vad_warnings": []})
     with pytest.raises(ValueError):
@@ -67,7 +67,7 @@ def test_asr_window_snapshot_has_fixed_chunk_contract() -> None:
         ),
     )
 
-    assert payload.schema_version == "2.0.0"
+    assert payload.schema_version == "3.0.0"
     assert payload.chunk_index == 1
     with pytest.raises(ValueError):
         AsrWindowSnapshotPayload.model_validate({**payload.model_dump(), "speech_interval": {}})

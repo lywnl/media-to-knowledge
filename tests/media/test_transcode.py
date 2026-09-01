@@ -140,11 +140,11 @@ def test_extract_subtitle_rejects_destination_parent_symlink(
     assert not (outside / "2.vtt").exists()
 
 
-def test_extract_audio_builds_16khz_mono_pcm_command(
+def test_extract_audio_builds_16khz_mono_mp3_command(
     tmp_path: Path,
     source: Path,
 ) -> None:
-    runner = WritingRunner(output=b"wav")
+    runner = WritingRunner(output=b"mp3")
     transcoder = _transcoder(tmp_path, runner)
 
     artifact = transcoder.extract_audio(
@@ -160,18 +160,23 @@ def test_extract_audio_builds_16khz_mono_pcm_command(
     assert command[command.index("-map") : command.index("-map") + 2] == ["-map", "0:a:0"]
     assert command[command.index("-ac") : command.index("-ac") + 2] == ["-ac", "1"]
     assert command[command.index("-ar") : command.index("-ar") + 2] == ["-ar", "16000"]
-    assert command[
-        command.index("-c:a") : command.index("-c:a") + 2
-    ] == ["-c:a", "pcm_s16le"]
+    assert command[command.index("-c:a") : command.index("-c:a") + 2] == [
+        "-c:a",
+        "libmp3lame",
+    ]
+    assert command[command.index("-b:a") : command.index("-b:a") + 2] == [
+        "-b:a",
+        "192k",
+    ]
     assert command[command.index("-t") : command.index("-t") + 2] == [
         "-t",
         "921.400",
     ]
     assert "asetpts=PTS-STARTPTS" in command
-    assert artifact.relative_path == "runs/run_001/media/audio.wav"
+    assert artifact.relative_path == "runs/run_001/media/audio.mp3"
     assert artifact.sample_rate_hz == 16_000
     assert artifact.channels == 1
-    assert (tmp_path / "runtime" / artifact.relative_path).read_bytes() == b"wav"
+    assert (tmp_path / "runtime" / artifact.relative_path).read_bytes() == b"mp3"
 
 
 def test_extract_audio_without_track_returns_explicit_no_audio(
@@ -196,9 +201,9 @@ def test_extract_audio_applies_timeline_to_preopened_output(
     tmp_path: Path,
     source: Path,
 ) -> None:
-    runner = WritingRunner(output=b"wav")
+    runner = WritingRunner(output=b"mp3")
     source_descriptor = os.open(source, os.O_RDONLY)
-    output_path = tmp_path / "audio-output.wav"
+    output_path = tmp_path / "audio-output.mp3"
     output_descriptor = os.open(
         output_path,
         os.O_RDWR | os.O_CREAT | os.O_EXCL,
@@ -222,7 +227,7 @@ def test_extract_audio_applies_timeline_to_preopened_output(
         "-t",
         "302.101",
     ]
-    assert output_path.read_bytes() == b"wav"
+    assert output_path.read_bytes() == b"mp3"
 
 
 def test_duration_aware_timeout_uses_base_duration_and_hard_cap() -> None:
@@ -272,11 +277,11 @@ def test_create_clip_uses_exact_millisecond_half_open_range(
     assert artifact.end_ms == 3_750
 
 
-def test_create_audio_slice_is_scoped_pcm_and_uses_exact_millisecond_range(
+def test_create_audio_slice_is_scoped_mp3_and_uses_exact_millisecond_range(
     tmp_path: Path,
     source: Path,
 ) -> None:
-    runner = WritingRunner(output=b"wav-slice")
+    runner = WritingRunner(output=b"mp3-slice")
 
     artifact = _transcoder(tmp_path, runner).create_audio_slice(
         source,
@@ -291,9 +296,10 @@ def test_create_audio_slice_is_scoped_pcm_and_uses_exact_millisecond_range(
     assert command[command.index("-t") + 1] == "2.500"
     assert command[command.index("-ac") + 1] == "1"
     assert command[command.index("-ar") + 1] == "16000"
-    assert command[command.index("-c:a") + 1] == "pcm_s16le"
+    assert command[command.index("-c:a") + 1] == "libmp3lame"
+    assert command[command.index("-b:a") + 1] == "192k"
     assert command[-3:-1] == ["-fs", "1024"]
-    assert artifact.relative_path == "runs/run_001/speech/slices/lid_vad_001.wav"
+    assert artifact.relative_path == "runs/run_001/speech/slices/lid_vad_001.mp3"
     assert artifact.start_ms == 1_250
     assert artifact.end_ms == 3_750
 
@@ -357,10 +363,10 @@ def test_create_audio_slice_requires_declared_audio_duration(
 
 def test_create_audio_slice_rejects_symlink_source_before_starting(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
-    target = runtime / "runs/run_001/media/audio.wav"
+    target = runtime / "runs/run_001/media/audio.mp3"
     target.parent.mkdir(parents=True)
-    target.write_bytes(b"wav")
-    source = target.with_name("audio-link.wav")
+    target.write_bytes(b"mp3")
+    source = target.with_name("audio-link.mp3")
     source.symlink_to(target)
     runner = WritingRunner()
 
@@ -378,9 +384,9 @@ def test_create_audio_slice_rejects_symlink_source_before_starting(tmp_path: Pat
 
 
 def test_create_audio_slice_rejects_source_from_another_run(tmp_path: Path) -> None:
-    source = tmp_path / "runtime/runs/run_002/media/audio.wav"
+    source = tmp_path / "runtime/runs/run_002/media/audio.mp3"
     source.parent.mkdir(parents=True)
-    source.write_bytes(b"wav")
+    source.write_bytes(b"mp3")
     runner = WritingRunner()
 
     with pytest.raises(VideoDemoError) as raised:
@@ -402,9 +408,9 @@ def test_create_audio_slice_rejects_destination_parent_symlink_before_runner(
     linked_component: str,
 ) -> None:
     runtime = tmp_path / "runtime"
-    source = runtime / "runs/run_001/media/audio.wav"
+    source = runtime / "runs/run_001/media/audio.mp3"
     source.parent.mkdir(parents=True)
-    source.write_bytes(b"wav")
+    source.write_bytes(b"mp3")
     other_speech = runtime / "runs/run_002/speech"
     other_slices = other_speech / "slices"
     other_slices.mkdir(parents=True)
@@ -428,7 +434,7 @@ def test_create_audio_slice_rejects_destination_parent_symlink_before_runner(
 
     assert raised.value.code == ErrorCode.WORKSPACE_PATH_ESCAPE
     assert runner.calls == []
-    assert not (other_slices / "lid_vad_001.wav").exists()
+    assert not (other_slices / "lid_vad_001.mp3").exists()
 
 
 def test_transcode_applies_process_output_limit_to_every_ffmpeg_output(

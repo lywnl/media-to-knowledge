@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from threading import Condition, Thread, current_thread
 from typing import Literal, Protocol
 
+from video_demo.application.checkpoint_contracts import CheckpointStaleError
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.models import VideoStageName
 from video_demo.persistence.scope import Scope
@@ -23,6 +24,8 @@ class VideoStageExecutor(Protocol):
     def run_llm(self, scope: Scope, run_id: str, checkpoint: object) -> None: ...
 
     def load_checkpoint(self, scope: Scope, run_id: str) -> object | None: ...
+
+    def reset_stale_checkpoint(self, scope: Scope, run_id: str) -> None: ...
 
     def is_cancelled(self, scope: Scope, run_id: str) -> bool: ...
 
@@ -88,6 +91,7 @@ class VideoTaskScheduler:
         self._completed: dict[str, str] = {}
         self._checkpoints: dict[str, object] = {}
         self._retry_delay_seconds = 5.0
+        self._owned_pipeline: object | None = None
 
     def start(self) -> None:
         with self._condition:
@@ -169,6 +173,20 @@ class VideoTaskScheduler:
                         )
                         self._mark_recovery_failed(scope, run_id, requested_stage, error)
                         continue
+                except CheckpointStaleError:
+                    self._executor.reset_stale_checkpoint(scope, run_id)
+                    with self._condition:
+                        if not self._contains_locked(key):
+                            self._transcription.pending.append((scope, run_id))
+                            self._transcription.pending_ids.add(key)
+                            recovered += 1
+                            self._condition.notify_all()
+                    self._logger.info(
+                        "video scheduler stale checkpoint reset run_id=%s stage=%s",
+                        run_id,
+                        requested_stage or "UNKNOWN",
+                    )
+                    continue
                 except VideoDemoError as error:
                     self._mark_recovery_failed(scope, run_id, requested_stage, error)
                     self._logger.error(
@@ -367,6 +385,12 @@ class VideoTaskScheduler:
                     self._completed[key] = queue.name
             if hasattr(self._executor, "stage_succeeded"):
                 self._executor.stage_succeeded(scope, run_id, queue.name, result)
+        except CheckpointStaleError:
+            self._executor.reset_stale_checkpoint(scope, run_id)
+            with self._condition:
+                self._enqueue_locked(self._transcription, scope, run_id)
+                self._condition.notify_all()
+            self._logger.info("video scheduler stale checkpoint requeued run_id=%s", run_id)
         except VideoDemoError as error:
             retry = self._record_failure(scope, run_id, queue.name, error)
             self._logger.warning(
@@ -377,9 +401,8 @@ class VideoTaskScheduler:
                 retry,
             )
         except Exception:
-            error = VideoDemoError(ErrorCode.SYSTEM_FAILURE, "视频阶段发生未分类系统错误")
-            retry = False
-            retry = self._record_failure(scope, run_id, queue.name, error)
+            system_error = VideoDemoError(ErrorCode.SYSTEM_FAILURE, "视频阶段发生未分类系统错误")
+            retry = self._record_failure(scope, run_id, queue.name, system_error)
             self._logger.exception(
                 "video scheduler stage crashed run_id=%s stage=%s retry=%s",
                 run_id,

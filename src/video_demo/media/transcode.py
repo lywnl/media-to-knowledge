@@ -17,6 +17,14 @@ from video_demo.domain.base import FrozenModel, LanguageCode, Sha256
 from video_demo.domain.manifest import SubtitleStream
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.media.audio_format import (
+    AUDIO_BITRATE,
+    AUDIO_CHANNELS,
+    AUDIO_CODEC,
+    AUDIO_ENCODER,
+    AUDIO_OUTPUT_EXTENSION,
+    AUDIO_SAMPLE_RATE_HZ,
+)
 from video_demo.media.process import ProcessResult, SafeProcessRunner
 from video_demo.storage.workspace import atomic_replace, safe_runtime_path, validate_path_component
 
@@ -98,9 +106,9 @@ class AudioSliceArtifact(TimeRange):
     relative_path: str
     sha256: Sha256
     size_bytes: int
-    sample_rate_hz: int = 16_000
-    channels: int = 1
-    codec: str = "pcm_s16le"
+    sample_rate_hz: int = AUDIO_SAMPLE_RATE_HZ
+    channels: int = AUDIO_CHANNELS
+    codec: str = AUDIO_CODEC
 
 
 class SubtitleArtifact(FrozenModel):
@@ -220,7 +228,7 @@ class FFmpegTranscoder:
         if not has_audio:
             return NoAudioArtifact(warning_code="NO_AUDIO_TRACK")
         source = self._trusted_input(source, input_fd)
-        relative_path = run_relative_root / "media" / "audio.wav"
+        relative_path = run_relative_root / "media" / f"audio{AUDIO_OUTPUT_EXTENSION}"
         # 容器允许音轨略长于视频轨；ASR 音频必须截断到统一主视频时间轴。
         if input_fd is not None or output_fd is not None:
             input_descriptor, output_descriptor = _require_descriptor_pair(
@@ -235,18 +243,20 @@ class FFmpegTranscoder:
                 "0:a:0",
                 "-vn",
                 "-ac",
-                "1",
+                str(AUDIO_CHANNELS),
                 "-ar",
-                "16000",
+                str(AUDIO_SAMPLE_RATE_HZ),
                 "-c:a",
-                "pcm_s16le",
+                AUDIO_ENCODER,
+                "-b:a",
+                AUDIO_BITRATE,
                 "-af",
                 "asetpts=PTS-STARTPTS",
             ]
             size_bytes, sha256 = self._produce_to_fd(
                 args,
                 output_descriptor,
-                "wav",
+                "mp3",
                 (input_descriptor, output_descriptor),
                 timeout_seconds=self._timeout_for(duration_ms),
             )
@@ -254,9 +264,9 @@ class FFmpegTranscoder:
                 relative_path=relative_path.as_posix(),
                 sha256=sha256,
                 size_bytes=size_bytes,
-                sample_rate_hz=16_000,
-                channels=1,
-                codec="pcm_s16le",
+                sample_rate_hz=AUDIO_SAMPLE_RATE_HZ,
+                channels=AUDIO_CHANNELS,
+                codec=AUDIO_CODEC,
             )
         final_path = self._destination_path(relative_path)
         args = [
@@ -267,11 +277,13 @@ class FFmpegTranscoder:
             "0:a:0",
             "-vn",
             "-ac",
-            "1",
+            str(AUDIO_CHANNELS),
             "-ar",
-            "16000",
+            str(AUDIO_SAMPLE_RATE_HZ),
             "-c:a",
-            "pcm_s16le",
+            AUDIO_ENCODER,
+            "-b:a",
+            AUDIO_BITRATE,
             "-af",
             "asetpts=PTS-STARTPTS",
         ]
@@ -284,9 +296,9 @@ class FFmpegTranscoder:
             relative_path=relative_path.as_posix(),
             sha256=sha256,
             size_bytes=size_bytes,
-            sample_rate_hz=16_000,
-            channels=1,
-            codec="pcm_s16le",
+            sample_rate_hz=AUDIO_SAMPLE_RATE_HZ,
+            channels=AUDIO_CHANNELS,
+            codec=AUDIO_CODEC,
         )
 
     def create_clip(
@@ -356,7 +368,12 @@ class FFmpegTranscoder:
             )
         if time_range.end_ms > source_duration_ms:
             raise VideoDemoError(ErrorCode.VIDEO_INPUT_INVALID, "音频切片时间范围越界")
-        relative_path = run_relative_root / "speech" / "slices" / f"{slice_id}.wav"
+        relative_path = (
+            run_relative_root
+            / "speech"
+            / "slices"
+            / f"{slice_id}{AUDIO_OUTPUT_EXTENSION}"
+        )
         final_path = self._destination_path(relative_path)
         args = [
             str(self._executable),
@@ -374,11 +391,13 @@ class FFmpegTranscoder:
             "0:a:0",
             "-vn",
             "-ac",
-            "1",
+            str(AUDIO_CHANNELS),
             "-ar",
-            "16000",
+            str(AUDIO_SAMPLE_RATE_HZ),
             "-c:a",
-            "pcm_s16le",
+            AUDIO_ENCODER,
+            "-b:a",
+            AUDIO_BITRATE,
             "-af",
             "asetpts=PTS-STARTPTS",
         ]

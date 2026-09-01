@@ -20,6 +20,7 @@ from video_demo.application.pipeline_contracts import (
 )
 from video_demo.domain.manifest import SubtitleStream
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.media.audio_format import AUDIO_FORMAT_VERSION, estimate_audio_output_bytes
 from video_demo.media.probe import FFprobeClient, ProbeLimits, ProbeResult, SupportedMime
 from video_demo.media.subtitles import (
     ParsedSubtitle,
@@ -85,7 +86,7 @@ class DocumentCapacityProfile:
 
     proxy_output_bytes: int
     proxy_temporary_bytes: int
-    pcm_audio_bytes: int
+    audio_output_bytes: int
     max_asr_slice_bytes: int
     candidate_frame_bytes: int
     published_keyframe_bytes: int
@@ -99,7 +100,7 @@ class DocumentCapacityProfile:
         components = (
             self.proxy_output_bytes,
             self.proxy_temporary_bytes,
-            self.pcm_audio_bytes,
+            self.audio_output_bytes,
             self.max_asr_slice_bytes,
             self.candidate_frame_bytes,
             self.published_keyframe_bytes,
@@ -162,19 +163,19 @@ def build_document_capacity_profile(
         if proxy_transcode_required
         else 0
     )
-    pcm_audio_bytes = duration_seconds * 32_000
-    max_asr_slice_bytes = ((max_asr_window_ms + 999) // 1_000) * 32_000
+    audio_output_bytes = estimate_audio_output_bytes(duration_ms)
+    max_asr_slice_bytes = estimate_audio_output_bytes(max_asr_window_ms)
     parts = (
         proxy_output_bytes,
         proxy_output_bytes,
-        pcm_audio_bytes,
+        audio_output_bytes,
         max_asr_slice_bytes,
         *byte_budgets.values(),
     )
     return DocumentCapacityProfile(
         proxy_output_bytes=proxy_output_bytes,
         proxy_temporary_bytes=proxy_output_bytes,
-        pcm_audio_bytes=pcm_audio_bytes,
+        audio_output_bytes=audio_output_bytes,
         max_asr_slice_bytes=max_asr_slice_bytes,
         candidate_frame_bytes=candidate_frame_bytes,
         published_keyframe_bytes=published_keyframe_bytes,
@@ -337,6 +338,7 @@ class ProductionMediaTranscoder:
             proxy_size_bytes=proxy_size_bytes,
             audio_path=audio_path,
             audio_sha256=audio_sha256,
+            audio_format_version=AUDIO_FORMAT_VERSION if audio_path is not None else None,
             subtitle=subtitle,
             warnings=tuple(dict.fromkeys(warnings)),
         )

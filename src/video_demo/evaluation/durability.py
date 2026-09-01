@@ -623,13 +623,6 @@ class DurabilityRunner:
         if self._probe_media is None:
             capabilities = probe_runtime_capabilities(self._settings)
             issues.extend(issue.code for issue in capabilities.issues)
-            for module in ():
-                try:
-                    available = importlib.util.find_spec(module) is not None
-                except (ImportError, ModuleNotFoundError, ValueError):
-                    available = False
-                if not available:
-                    issues.append(ErrorCode.VISUAL_DEPENDENCY_UNAVAILABLE)
             issues.extend(
                 _collect_active_production_environment_issues(self._settings, self._store)
             )

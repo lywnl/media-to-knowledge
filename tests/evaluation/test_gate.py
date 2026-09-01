@@ -47,3 +47,8 @@ def test_gate_check_requires_evidence_for_pass() -> None:
 def test_gate_check_requires_reason_for_not_run() -> None:
     with pytest.raises(ValueError):
         GateCheck(check_id="chapter_vlm_live", status=GateStatus.NOT_RUN)
+
+
+def test_mp3_magic_rejects_truncated_id3_header() -> None:
+    assert gate_module._has_mp3_signature(b"ID3x", 4) is False
+    assert gate_module._has_mp3_signature(b"ID3\x04\x00\x00\x00\x00\x00\x00", 10) is True

@@ -16,6 +16,14 @@ from video_demo.capabilities import resolve_workspace_binary
 from video_demo.domain.base import FrozenModel, Sha256
 from video_demo.domain.run import TimeRange
 from video_demo.errors import ErrorCode, VideoDemoError
+from video_demo.media.audio_format import (
+    AUDIO_BITRATE,
+    AUDIO_CHANNELS,
+    AUDIO_CODEC,
+    AUDIO_ENCODER,
+    AUDIO_OUTPUT_EXTENSION,
+    AUDIO_SAMPLE_RATE_HZ,
+)
 from video_demo.media.process import ProcessErrorCodes, ProcessResult, SafeProcessRunner
 from video_demo.storage.workspace import atomic_replace, safe_runtime_path, validate_path_component
 
@@ -76,13 +84,13 @@ class AudioSliceArtifact(TimeRange):
     relative_path: str
     sha256: Sha256
     size_bytes: int
-    sample_rate_hz: int = 16_000
-    channels: int = 1
-    codec: str = "pcm_s16le"
+    sample_rate_hz: int = AUDIO_SAMPLE_RATE_HZ
+    channels: int = AUDIO_CHANNELS
+    codec: str = AUDIO_CODEC
 
 
 class AudioTranscoder:
-    """只生成 PCM 音频和 ASR 音频切片，不承担其他媒体处理。"""
+    """只生成 MP3 音频和 ASR 音频切片，不承担其他媒体处理。"""
 
     def __init__(
         self,
@@ -148,13 +156,13 @@ class AudioTranscoder:
         if not has_audio:
             return NoAudioArtifact(warning_code="NO_AUDIO_TRACK")
         source = self._trusted_input(source, input_fd)
-        relative_path = run_relative_root / "media" / "audio.wav"
+        relative_path = run_relative_root / "media" / f"audio{AUDIO_OUTPUT_EXTENSION}"
         args = [
             *self._base_args(source),
             "-t", _seconds(duration_ms),
             "-map", "0:a:0",
-            "-vn", "-ac", "1", "-ar", "16000",
-            "-c:a", "pcm_s16le", "-af", "asetpts=PTS-STARTPTS",
+            "-vn", "-ac", str(AUDIO_CHANNELS), "-ar", str(AUDIO_SAMPLE_RATE_HZ),
+            "-c:a", AUDIO_ENCODER, "-b:a", AUDIO_BITRATE, "-af", "asetpts=PTS-STARTPTS",
         ]
         if input_fd is not None or output_fd is not None:
             input_descriptor, output_descriptor = _require_descriptor_pair(input_fd, output_fd)
@@ -162,8 +170,8 @@ class AudioTranscoder:
                 *self._base_args(Path(f"/dev/fd/{input_descriptor}")),
                 "-t", _seconds(duration_ms),
                 "-map", "0:a:0",
-                "-vn", "-ac", "1", "-ar", "16000",
-                "-c:a", "pcm_s16le", "-af", "asetpts=PTS-STARTPTS",
+                "-vn", "-ac", str(AUDIO_CHANNELS), "-ar", str(AUDIO_SAMPLE_RATE_HZ),
+                "-c:a", AUDIO_ENCODER, "-b:a", AUDIO_BITRATE, "-af", "asetpts=PTS-STARTPTS",
             ]
             size_bytes, sha256 = self._produce_to_fd(
                 args,
@@ -182,9 +190,9 @@ class AudioTranscoder:
             relative_path=relative_path.as_posix(),
             sha256=sha256,
             size_bytes=size_bytes,
-            sample_rate_hz=16_000,
-            channels=1,
-            codec="pcm_s16le",
+            sample_rate_hz=AUDIO_SAMPLE_RATE_HZ,
+            channels=AUDIO_CHANNELS,
+            codec=AUDIO_CODEC,
         )
 
     def create_audio_slice(
@@ -206,14 +214,20 @@ class AudioTranscoder:
             )
         if time_range.end_ms > source_duration_ms:
             raise VideoDemoError(ErrorCode.AUDIO_INPUT_INVALID, "音频切片时间范围越界")
-        relative_path = run_relative_root / "speech" / "slices" / f"{slice_id}.wav"
+        relative_path = (
+            run_relative_root
+            / "speech"
+            / "slices"
+            / f"{slice_id}{AUDIO_OUTPUT_EXTENSION}"
+        )
         final_path = self._destination_path(relative_path)
         args = [
             *self._base_args(source),
             "-ss", _seconds(time_range.start_ms),
             "-t", _seconds(time_range.duration_ms),
-            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
-            "-c:a", "pcm_s16le", "-af", "asetpts=PTS-STARTPTS",
+            "-map", "0:a:0", "-vn", "-ac", str(AUDIO_CHANNELS),
+            "-ar", str(AUDIO_SAMPLE_RATE_HZ), "-c:a", AUDIO_ENCODER,
+            "-b:a", AUDIO_BITRATE, "-af", "asetpts=PTS-STARTPTS",
         ]
         size_bytes, sha256 = self._produce(
             args,
@@ -296,7 +310,7 @@ class AudioTranscoder:
                 "-fs",
                 str(self._limits.max_output_bytes),
                 "-f",
-                "wav",
+                "mp3",
                 f"/dev/fd/{output_fd}",
             ],
             timeout_seconds=timeout_seconds,

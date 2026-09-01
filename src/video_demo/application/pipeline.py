@@ -8,6 +8,10 @@ from threading import Event, Thread
 
 from sqlalchemy import select
 
+from video_demo.application.checkpoint_contracts import (
+    CheckpointStaleError,
+    cleanup_stale_checkpoint_artifacts,
+)
 from video_demo.application.document_pipeline import (
     VideoUnderstandingPipeline as VideoUnderstandingPipeline,
 )
@@ -50,6 +54,7 @@ from video_demo.application.pipeline_contracts import (
 from video_demo.application.queries import ResultQueryService
 from video_demo.domain.title import sanitize_document_title
 from video_demo.errors import ErrorCode, VideoDemoError, is_retryable_error_code
+from video_demo.media.audio_format import AUDIO_FORMAT_VERSION
 from video_demo.persistence.database import Database
 from video_demo.persistence.models import (
     JobStatus,
@@ -177,11 +182,26 @@ class VideoStagePipelineExecutor:
             )
             if not isinstance(payload, dict):
                 raise ValueError("转写快照 payload 非法")
+            if _is_stale_video_checkpoint(payload):
+                raise CheckpointStaleError()
             checkpoint = transcription_checkpoint_from_payload(payload)
             self._validate_checkpoint(scope, run_id, checkpoint)
             return checkpoint
+        except CheckpointStaleError:
+            raise
         except (OSError, ValueError, TypeError, VideoDemoError) as error:
             raise VideoDemoError(ErrorCode.ARTIFACT_SCHEMA_INVALID, "转写快照无法恢复") from error
+
+    def reset_stale_checkpoint(self, scope: Scope, run_id: str) -> None:
+        with self._database.session() as session:
+            repository = VideoStageRepository(session)
+            record = repository.get(scope, run_id, VideoStageName.TRANSCRIPTION)
+            repository.reset_stale_checkpoint(scope, run_id)
+        cleanup_stale_checkpoint_artifacts(
+            self._runtime_root,
+            Path("runs") / scope_key(scope) / run_id,
+            record.checkpoint_relative_path if record is not None else None,
+        )
 
     def mark_recovery_failed(
         self,
@@ -553,3 +573,17 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _is_stale_video_checkpoint(payload: dict[str, object]) -> bool:
+    if payload.get("schema_version") != "3.0.0":
+        return True
+    prepared = payload.get("prepared")
+    if not isinstance(prepared, dict):
+        return False
+    audio_path = prepared.get("audio_path")
+    if audio_path is None:
+        return False
+    return prepared.get("audio_format_version") != AUDIO_FORMAT_VERSION or not str(
+        audio_path,
+    ).casefold().endswith(".mp3")

@@ -11,8 +11,8 @@ from video_demo.media.process import ProcessResult
 
 def _result(duration: str = "12.5") -> ProcessResult:
     payload = {
-        "format": {"duration": duration, "format_name": "wav"},
-        "streams": [{"codec_name": "pcm_s16le", "sample_rate": "16000", "channels": 1}],
+        "format": {"duration": duration, "format_name": "mp3"},
+        "streams": [{"codec_name": "mp3", "sample_rate": "16000", "channels": 1}],
     }
     return ProcessResult(returncode=0, stdout=json.dumps(payload).encode(), stderr=b"")
 
@@ -22,7 +22,7 @@ def test_parse_audio_probe_payload_returns_duration_and_stream_properties() -> N
     assert result.duration_ms == 12_500
     assert result.sample_rate_hz == 16_000
     assert result.channels == 1
-    assert result.codec_name == "pcm_s16le"
+    assert result.codec_name == "mp3"
 
 
 def test_parse_audio_probe_payload_rejects_duration_over_limit() -> None:

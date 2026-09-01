@@ -348,8 +348,8 @@ def test_document_capacity_profile_uses_duration_and_bounded_proxy_estimate(
         (
             expected_proxy,
             expected_proxy,
-            duration_seconds * 32_000,
-            600 * 32_000,
+            duration_seconds * 24_000 + 64 * 1024,
+            600 * 24_000 + 64 * 1024,
             512 * 1024 * 1024,
             256 * 1024 * 1024,
             256 * 1024 * 1024,
@@ -361,7 +361,8 @@ def test_document_capacity_profile_uses_duration_and_bounded_proxy_estimate(
 
     assert profile.proxy_output_bytes == expected_proxy
     assert profile.proxy_temporary_bytes == expected_proxy
-    assert profile.max_asr_slice_bytes == 19_200_000
+    assert profile.audio_output_bytes == duration_seconds * 24_000 + 64 * 1024
+    assert profile.max_asr_slice_bytes == 14_400_000 + 64 * 1024
     assert profile.required_free_bytes == expected_total
 
 
@@ -382,15 +383,15 @@ def test_short_video_capacity_does_not_reserve_four_gib_proxy() -> None:
     assert profile == DocumentCapacityProfile(
         proxy_output_bytes=1_000,
         proxy_temporary_bytes=1_000,
-        pcm_audio_bytes=320_000,
-        max_asr_slice_bytes=19_232_000,
+        audio_output_bytes=240_000 + 64 * 1024,
+            max_asr_slice_bytes=14_400_024 + 64 * 1024,
         candidate_frame_bytes=10,
         published_keyframe_bytes=20,
         model_cache_bytes=30,
         result_bundle_bytes=40,
         document_bytes=50,
         reserve_bytes=60,
-        required_free_bytes=19_554_210,
+        required_free_bytes=14_773_306,
     )
 
 
@@ -411,7 +412,7 @@ def test_source_visual_bypass_does_not_reserve_proxy_space() -> None:
 
     assert profile.proxy_output_bytes == 0
     assert profile.proxy_temporary_bytes == 0
-    assert profile.required_free_bytes == 19_552_210
+    assert profile.required_free_bytes == 14_771_306
 
 
 def test_document_capacity_check_rejects_insufficient_space(tmp_path: Path) -> None:
@@ -735,8 +736,8 @@ class _RecordingTranscoder:
         self.extract_audio_calls.append((has_audio, duration_ms))
         if not has_audio:
             return NoAudioArtifact(warning_code="NO_AUDIO_TRACK")
-        payload = b"wav"
-        relative = root / "media/audio.wav"
+        payload = b"mp3"
+        relative = root / "media/audio.mp3"
         output = self._runtime_root / relative
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(payload)
@@ -746,7 +747,7 @@ class _RecordingTranscoder:
             size_bytes=len(payload),
             sample_rate_hz=16_000,
             channels=1,
-            codec="pcm_s16le",
+            codec="mp3",
         )
 
 

@@ -74,8 +74,8 @@ def _configuration(
     )
 
 
-def _audio(tmp_path: Path, content: bytes = b"RIFF-test-wav") -> Path:
-    path = tmp_path / "runs/scope/run_001/speech/slices/window.wav"
+def _audio(tmp_path: Path, content: bytes = b"ID3-test-mp3") -> Path:
+    path = tmp_path / "runs/scope/run_001/speech/slices/window.mp3"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return path
@@ -147,8 +147,8 @@ def test_client_posts_verbose_json_multipart_and_converts_segments(
         _assert_text_part(body, "temperature", "0")
         _assert_text_part(body, "language", "en")
         _assert_text_part(body, "prompt", "产品术语\n核心背景")
-        assert b'name="file"; filename="window.wav"' in body
-        assert b"Content-Type: audio/wav" in body
+        assert b'name="file"; filename="window.mp3"' in body
+        assert b"Content-Type: audio/mpeg" in body
         assert audio.read_bytes() in body
         return httpx.Response(200, json=_valid_payload(), request=request)
 
@@ -608,8 +608,8 @@ def test_client_uses_http_date_retry_after(tmp_path: Path) -> None:
 def test_client_retries_transport_errors_and_reopens_file_from_start(
     tmp_path: Path,
 ) -> None:
-    wav = b"RIFF-reopened-on-every-attempt"
-    audio = _audio(tmp_path, wav)
+    mp3 = b"ID3-reopened-on-every-attempt"
+    audio = _audio(tmp_path, mp3)
     bodies: list[bytes] = []
     sleeps: list[float] = []
 
@@ -627,7 +627,7 @@ def test_client_retries_transport_errors_and_reopens_file_from_start(
 
     assert result.segments[0].text == "Hello world"
     assert len(bodies) == 3
-    assert all(wav in body for body in bodies)
+    assert all(mp3 in body for body in bodies)
     assert sleeps == [1, 2]
 
 
@@ -711,7 +711,7 @@ def test_client_rejects_empty_upload_before_network(tmp_path: Path, content: byt
 def test_client_rejects_audio_outside_allowed_root(tmp_path: Path) -> None:
     allowed = tmp_path / "allowed"
     allowed.mkdir()
-    outside = tmp_path / "outside.wav"
+    outside = tmp_path / "outside.mp3"
     outside.write_bytes(b"RIFF-outside")
     client = CloudWhisperClient(
         httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(200))),
@@ -727,7 +727,7 @@ def test_client_rejects_audio_outside_allowed_root(tmp_path: Path) -> None:
 
 def test_client_rejects_symlink_audio(tmp_path: Path) -> None:
     target = _audio(tmp_path)
-    link = target.parent / "linked.wav"
+    link = target.parent / "linked.mp3"
     link.symlink_to(target)
     client, _http_client = _client(
         tmp_path,
@@ -738,3 +738,18 @@ def test_client_rejects_symlink_audio(tmp_path: Path) -> None:
         client.transcribe_window(link, language_hint=None, prompt=None)
 
     assert raised.value.code == ErrorCode.WORKSPACE_PATH_ESCAPE
+
+
+def test_client_rejects_wav_internal_slice(tmp_path: Path) -> None:
+    audio = tmp_path / "runs/scope/run_001/speech/slices/window.wav"
+    audio.parent.mkdir(parents=True, exist_ok=True)
+    audio.write_bytes(b"RIFF-test-wav")
+    client, _http_client = _client(
+        tmp_path,
+        lambda request: httpx.Response(200, json=_valid_payload(), request=request),
+    )
+
+    with pytest.raises(VideoDemoError) as raised:
+        client.transcribe_window(audio, language_hint=None, prompt=None)
+
+    assert raised.value.code == ErrorCode.SPEECH_AUDIO_INVALID

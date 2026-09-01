@@ -72,12 +72,12 @@ def _media(tmp_path: Path, *, subtitle: ParsedSubtitle | None = None) -> Prepare
     run_root = Path("runs/scope/run_001")
     source = tmp_path / run_root / "input/source.mp4"
     proxy = tmp_path / run_root / "media/proxy.mp4"
-    audio = tmp_path / run_root / "media/audio.wav"
+    audio = tmp_path / run_root / "media/audio.mp3"
     source.parent.mkdir(parents=True, exist_ok=True)
     proxy.parent.mkdir(parents=True, exist_ok=True)
     source.write_bytes(b"source")
     proxy.write_bytes(b"proxy")
-    audio.write_bytes(b"wav")
+    audio.write_bytes(b"mp3")
     asset = RegisteredAsset(
         source_path=source,
         source_sha256=hashlib.sha256(b"source").hexdigest(),
@@ -112,7 +112,7 @@ def _media(tmp_path: Path, *, subtitle: ParsedSubtitle | None = None) -> Prepare
         proxy_sha256="b" * 64,
         proxy_size_bytes=5,
         audio_path=None if subtitle is not None else audio,
-        audio_sha256=None if subtitle is not None else hashlib.sha256(b"wav").hexdigest(),
+        audio_sha256=None if subtitle is not None else hashlib.sha256(b"mp3").hexdigest(),
         subtitle=subtitle,
     )
 
@@ -158,8 +158,8 @@ class _Slicer:
         self._root = root
 
     def create(self, *_args: object) -> Path:
-        path = self._root / "slice.wav"
-        path.write_bytes(b"wav")
+        path = self._root / "slice.mp3"
+        path.write_bytes(b"mp3")
         return path
 
 

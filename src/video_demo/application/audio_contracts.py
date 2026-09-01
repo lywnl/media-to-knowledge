@@ -16,6 +16,7 @@ from video_demo.domain.audio_plan import (
 )
 from video_demo.domain.base import FrozenModel, Sha256
 from video_demo.domain.evidence import SpeechSegment, SubtitleCue
+from video_demo.media.audio_format import AUDIO_FORMAT_VERSION
 
 
 class AudioEvidencePreparationLimits(FrozenModel):
@@ -81,7 +82,8 @@ class AudioSpeechAnalysis:
 class AudioTranscriptionCheckpoint(FrozenModel):
     """音频转写阶段唯一可恢复契约，不包含任何其他媒体业务字段。"""
 
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["2.0.0"] = "2.0.0"
+    audio_format_version: Literal["mp3-192k-v1"]
     run_id: str
     asset_sha256: Sha256
     duration_ms: int = Field(gt=0, le=7_200_000)
@@ -93,6 +95,8 @@ class AudioTranscriptionCheckpoint(FrozenModel):
     stage_metrics: tuple[AudioStageMetric, ...] = ()
 
     def validate_consistency(self) -> AudioTranscriptionCheckpoint:
+        if self.audio_format_version != AUDIO_FORMAT_VERSION:
+            raise ValueError("音频转写快照格式版本不受支持")
         if not self.transcript_evidence or self.transcript_source == "NONE":
             raise ValueError("音频转写快照必须包含转写证据")
         if not self.base_segments:
@@ -129,6 +133,7 @@ def audio_transcription_checkpoint_to_payload(
     ]
     return {
         "schema_version": checkpoint.schema_version,
+        "audio_format_version": checkpoint.audio_format_version,
         "run_id": checkpoint.run_id,
         "asset_sha256": checkpoint.asset_sha256,
         "duration_ms": checkpoint.duration_ms,
@@ -152,14 +157,17 @@ def audio_transcription_checkpoint_from_payload(
 ) -> AudioTranscriptionCheckpoint:
     """从音频 JSON 快照恢复事实并重新执行一致性校验。"""
 
-    if payload.get("schema_version") != "1.0.0":
+    if payload.get("schema_version") != "2.0.0":
         raise ValueError("音频转写快照版本不受支持")
+    if payload.get("audio_format_version") != AUDIO_FORMAT_VERSION:
+        raise ValueError("音频转写快照格式版本不受支持")
     evidence = tuple(
         _audio_evidence_from_payload(item)
         for item in _sequence(payload, "transcript_evidence")
     )
     checkpoint = AudioTranscriptionCheckpoint(
         run_id=str(payload.get("run_id", "")),
+        audio_format_version=cast(Literal["mp3-192k-v1"], payload["audio_format_version"]),
         asset_sha256=str(payload.get("asset_sha256", "")),
         duration_ms=_integer(payload.get("duration_ms"), "duration_ms"),
         title_hint=str(payload.get("title_hint", "")),

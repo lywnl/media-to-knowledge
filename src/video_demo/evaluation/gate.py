@@ -8,6 +8,7 @@ import sys
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from xml.etree import ElementTree
@@ -1737,7 +1738,7 @@ def _verify_derived_paths(sample: LiveSample, evaluation_run_id: str) -> None:
     expected_parent = (
         PurePosixPath(".codex/video-rag-demo/eval/live") / evaluation_run_id / sample.sample_id
     )
-    expected = {"AUDIO": (sample.audio_relative_path, "audio.wav")}
+    expected = {"AUDIO": (sample.audio_relative_path, "audio.mp3")}
     for relative_path, filename in expected.values():
         path = PurePosixPath(relative_path)
         if path.parent != expected_parent or path.name != filename:
@@ -2060,109 +2061,6 @@ def _verify_real_media_files(
 @dataclass(frozen=True)
 class _RealMediaSnapshot:
     snapshot: FileSnapshot
-    wave_valid: bool
-
-
-class _WaveChunkWalker:
-    def __init__(self, actual_size: int) -> None:
-        self._actual_size = actual_size
-        self._buffer = bytearray()
-        self._position = 0
-        self._riff_end: int | None = None
-        self._chunk_id: bytes | None = None
-        self._chunk_remaining = 0
-        self._needs_padding = False
-        self._fmt_size: int | None = None
-        self._fmt_tag = bytearray()
-        self._has_fmt = False
-        self._has_data = False
-        self._invalid = False
-
-    def feed(self, chunk: bytes) -> None:
-        if self._invalid:
-            return
-        self._buffer.extend(chunk)
-        if self._riff_end is None:
-            if len(self._buffer) < 12:
-                return
-            header = bytes(self._take(12))
-            if header[:4] != b"RIFF" or header[8:12] != b"WAVE":
-                self._invalid = True
-                return
-            self._riff_end = int.from_bytes(header[4:8], byteorder="little") + 8
-            if self._riff_end != self._actual_size:
-                self._invalid = True
-                return
-        self._consume_chunks()
-
-    def is_valid(self) -> bool:
-        return (
-            not self._invalid
-            and self._riff_end == self._actual_size
-            and self._position == self._actual_size
-            and self._chunk_id is None
-            and not self._needs_padding
-            and self._has_fmt
-            and self._has_data
-        )
-
-    def _consume_chunks(self) -> None:
-        while not self._invalid:
-            if self._needs_padding:
-                if not self._buffer:
-                    return
-                self._take(1)
-                self._needs_padding = False
-                continue
-            if self._chunk_id is not None:
-                if not self._buffer:
-                    return
-                amount = min(self._chunk_remaining, len(self._buffer))
-                payload = bytes(self._take(amount))
-                if self._chunk_id == b"fmt " and len(self._fmt_tag) < 2:
-                    self._fmt_tag.extend(payload[: 2 - len(self._fmt_tag)])
-                self._chunk_remaining -= amount
-                if self._chunk_remaining:
-                    return
-                self._finish_chunk()
-                continue
-            if self._position == self._actual_size:
-                return
-            if len(self._buffer) < 8:
-                return
-            header = bytes(self._take(8))
-            size = int.from_bytes(header[4:8], byteorder="little")
-            padded_size = size + (size % 2)
-            if self._position + padded_size > self._actual_size:
-                self._invalid = True
-                return
-            self._chunk_id = header[:4]
-            self._chunk_remaining = size
-            self._needs_padding = size % 2 == 1
-            self._fmt_size = size if self._chunk_id == b"fmt " else None
-            self._fmt_tag.clear()
-            if size == 0:
-                self._finish_chunk()
-
-    def _finish_chunk(self) -> None:
-        if self._chunk_id == b"fmt ":
-            tag = (
-                int.from_bytes(self._fmt_tag, byteorder="little") if len(self._fmt_tag) == 2 else -1
-            )
-            minimum = 40 if tag == 0xFFFE else 16
-            if self._fmt_size is None or self._fmt_size < minimum:
-                self._invalid = True
-                return
-            self._has_fmt = True
-        elif self._chunk_id == b"data":
-            self._has_data = True
-        self._chunk_id = None
-
-    def _take(self, length: int) -> bytes:
-        value = bytes(self._buffer[:length])
-        del self._buffer[:length]
-        self._position += length
-        return value
 
 
 def _snapshot_real_media_file(path: Path, *, max_bytes: int | None) -> _RealMediaSnapshot:
@@ -2174,14 +2072,12 @@ def _snapshot_real_media_file(path: Path, *, max_bytes: int | None) -> _RealMedi
         digest = hashlib.sha256()
         head = bytearray()
         tail = bytearray()
-        wave_walker = _WaveChunkWalker(before.st_size)
         total = 0
         while chunk := os.read(descriptor, _CHUNK_BYTES):
             total += len(chunk)
             if max_bytes is not None and total > max_bytes:
                 raise ValueError("真实媒体产物超过大小上限")
             digest.update(chunk)
-            wave_walker.feed(chunk)
             if len(head) < 64:
                 head.extend(chunk[: 64 - len(head)])
             tail.extend(chunk)
@@ -2211,7 +2107,6 @@ def _snapshot_real_media_file(path: Path, *, max_bytes: int | None) -> _RealMedi
                 sha256=digest.hexdigest(),
                 content=bytes(head) + bytes(tail),
             ),
-            wave_valid=wave_walker.is_valid(),
         )
     finally:
         os.close(descriptor)
@@ -2221,8 +2116,8 @@ def _verify_real_media_magic(snapshot: _RealMediaSnapshot, media_file: RealMedia
     head = snapshot.snapshot.content or b""
     if media_file.format == "MP4":
         valid = _has_iso_bmff_ftyp(head[:32], snapshot.snapshot.identity.size)
-    elif media_file.format == "WAV":
-        valid = snapshot.wave_valid
+    elif media_file.format == "MP3":
+        valid = _has_mp3_signature(head, snapshot.snapshot.identity.size)
     else:
         valid = (
             snapshot.snapshot.identity.size >= 5
@@ -2232,6 +2127,35 @@ def _verify_real_media_magic(snapshot: _RealMediaSnapshot, media_file: RealMedia
         )
     if not valid:
         raise ValueError("真实媒体文件 magic 不匹配")
+
+
+def _has_mp3_signature(header: bytes, actual_size: int) -> bool:
+    if actual_size <= 0:
+        return False
+    if header.startswith(b"ID3"):
+        return _has_valid_id3_header(header, actual_size)
+    return any(
+        first == 0xFF and (second & 0xE0) == 0xE0
+        for first, second in pairwise(header)
+    )
+
+
+def _has_valid_id3_header(header: bytes, actual_size: int) -> bool:
+    if actual_size < 10 or len(header) < 10:
+        return False
+    major_version = header[3]
+    revision = header[4]
+    flags = header[5]
+    if major_version not in (2, 3, 4) or revision == 0xFF:
+        return False
+    allowed_flags = 0xE0 if major_version in (2, 3) else 0xF0
+    if flags & ~allowed_flags:
+        return False
+    size_bytes = header[6:10]
+    if any(value & 0x80 for value in size_bytes):
+        return False
+    tag_size = sum(value << (7 * (3 - index)) for index, value in enumerate(size_bytes))
+    return 10 + tag_size <= actual_size
 
 
 def _has_iso_bmff_ftyp(header: bytes, actual_size: int) -> bool:
