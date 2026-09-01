@@ -148,7 +148,7 @@ def test_run_asr_stage_uses_single_language_hint_and_exact_prompt(tmp_path: Path
     assert recognizer.inputs == [("zh", "向量数据库课程\nMilvus Qwen")]
 
 
-def test_direct_speech_analyzer_runs_in_worker_and_reuses_parent_snapshot(
+def test_direct_speech_analyzer_runs_in_stage_executor_and_reuses_parent_snapshot(
     tmp_path: Path,
 ) -> None:
     media = _media(tmp_path, duration_ms=30_000)

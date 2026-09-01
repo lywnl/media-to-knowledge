@@ -373,21 +373,6 @@ def test_probe_facts_must_match_manifest_before_execution(
     assert executed == []
 
 
-def test_non_cpu_int8_single_worker_is_not_run_before_execution(tmp_path: Path) -> None:
-    manifest = _write_manifest(tmp_path, [_row("a"), _row("b")])
-    settings = Settings(workspace_root=tmp_path, worker_concurrency=2)
-    executed: list[str] = []
-
-    check = DurabilityRunner(
-        settings,
-        EvidenceStore(tmp_path, settings.runtime_root),
-        execute_sample=lambda sample: executed.append(sample.sample_id),  # type: ignore[arg-type,return-value]
-    ).run(manifest, evaluation_run_id="durability_wrong_settings")
-
-    assert check.status == GateStatus.NOT_RUN
-    assert executed == []
-
-
 def test_sample_gate_is_evaluated_independently_and_sampler_errors_are_not_swallowed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

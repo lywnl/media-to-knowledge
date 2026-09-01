@@ -611,8 +611,6 @@ class DurabilityRunner:
         )
 
     def _append_runtime_issues(self, issues: list[ErrorCode]) -> None:
-        if self._settings.worker_concurrency != 1:
-            issues.append(ErrorCode.INVALID_CONFIGURATION)
         if psutil is None:
             issues.append(ErrorCode.M1_PSUTIL_UNAVAILABLE)
         try:

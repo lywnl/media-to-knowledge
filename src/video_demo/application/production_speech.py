@@ -70,7 +70,7 @@ AsrComponentFactory = Callable[[PreparedMedia, Callable[[], bool]], AsrComponent
 
 
 class DirectSpeechAnalyzer:
-    """在视频 Worker 内直接执行 ASR，不经过 Python 子进程或 IPC 文件。"""
+    """在视频阶段执行器内直接执行 ASR，不经过 Python 子进程或 IPC 文件。"""
 
     def __init__(
         self,

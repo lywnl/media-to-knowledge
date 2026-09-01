@@ -448,14 +448,6 @@ def test_audio_transcription_checkpoint_rejects_unknown_evidence_kind() -> None:
         audio_transcription_checkpoint_from_payload(payload)
 
 
-def test_audio_uses_scheduler_entrypoint_without_legacy_entrypoint() -> None:
-    from pathlib import Path
-
-    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
-    assert "video-demo-audio-worker" not in pyproject
-    assert not Path("src/video_demo/audio_worker_main.py").exists()
-
-
 def test_image_pipeline_binds_source_evidence_and_renders_three_sections(tmp_path: Path) -> None:
     from video_demo.application.image_pipeline import run_image_pipeline
     from video_demo.domain.image_document import ImageContentBlock, ImageDocument

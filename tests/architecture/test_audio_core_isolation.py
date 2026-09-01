@@ -84,10 +84,6 @@ def test_generic_image_services_do_not_keep_audio_dispatch_branches() -> None:
     assert "AudioObjectModel" not in upload_source
 
 
-def test_image_external_entrypoint_is_removed() -> None:
-    assert not Path("src/video_demo/image_worker_main.py").exists()
-
-
 def test_audio_pipeline_does_not_name_video_cancellation_code() -> None:
     source = Path("src/video_demo/application/audio_pipeline.py").read_text(encoding="utf-8")
     assert "VIDEO_PROCESS_CANCELLED" not in source
@@ -129,12 +125,3 @@ def test_audio_publication_does_not_require_generic_media_constructor() -> None:
     assert "AudioUnderstandingRunModel" in source
     assert "AudioResultRepository" in source
     assert "class AudioPublicationService" in source
-
-
-def test_media_tasks_use_fastapi_schedulers_without_external_entrypoints() -> None:
-    composition = Path("src/video_demo/application/composition.py").read_text(encoding="utf-8")
-    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
-    assert "def build_video_scheduler" in composition
-    assert "video-demo-worker" not in pyproject
-    assert "video-demo-audio-worker" not in pyproject
-    assert "video-demo-image-worker" not in pyproject

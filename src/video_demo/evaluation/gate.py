@@ -2605,8 +2605,6 @@ def _verify_performance(
         raise ValueError("旧版 M1 性能 Schema 缺少可信运行绑定")
     if settings is None:
         raise ValueError("M1 性能重验必须提供当前 Settings")
-    if settings.worker_concurrency != 1:
-        raise ValueError("M1 性能当前设置不是 CPU/int8/单并发")
     raw_reports = artifacts.get("PERFORMANCE_REPORT", ())
     aggregate = tuple(
         artifact

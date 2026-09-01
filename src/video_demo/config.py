@@ -190,7 +190,6 @@ class Settings(BaseSettings):
     ffmpeg_path: Path | None = None
     ffprobe_path: Path | None = None
 
-    worker_concurrency: int = Field(default=1, ge=1, le=4)
     process_timeout_seconds: int = Field(default=600, ge=1, le=14_400)
     max_video_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
     max_video_duration_ms: int = Field(default=7_200_000, ge=1, le=7_200_000)

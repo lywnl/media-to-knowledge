@@ -393,7 +393,6 @@ class SettingsTest(unittest.TestCase):
                     "huggingface_token",
                 }.isdisjoint(Settings.model_fields)
             )
-            self.assertEqual(settings.worker_concurrency, 1)
             self.assertEqual(settings.max_video_duration_ms, 7_200_000)
             self.assertFalse(settings.demo_degraded_mode)
 
