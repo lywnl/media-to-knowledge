@@ -394,11 +394,10 @@ class SettingsTest(unittest.TestCase):
                 }.isdisjoint(Settings.model_fields)
             )
             self.assertEqual(settings.worker_concurrency, 1)
-            self.assertEqual(settings.speech_subprocess_timeout_seconds, 3_600)
             self.assertEqual(settings.max_video_duration_ms, 7_200_000)
             self.assertFalse(settings.demo_degraded_mode)
 
-    def test_video_duration_and_subprocess_timeout_hard_limits_are_validated(self) -> None:
+    def test_video_duration_and_process_timeout_hard_limits_are_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
 
@@ -406,7 +405,6 @@ class SettingsTest(unittest.TestCase):
                 workspace_root=workspace,
                 max_video_duration_ms=7_200_000,
                 process_timeout_seconds=14_400,
-                speech_subprocess_timeout_seconds=14_400,
                 _env_file=None,
             )
 
@@ -414,7 +412,6 @@ class SettingsTest(unittest.TestCase):
             for values in (
                 {"max_video_duration_ms": 7_200_001},
                 {"process_timeout_seconds": 14_401},
-                {"speech_subprocess_timeout_seconds": 14_401},
             ):
                 with self.subTest(values=values), self.assertRaises(ValidationError):
                     Settings(workspace_root=workspace, _env_file=None, **values)  # type: ignore[arg-type]

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from pathlib import Path
 from typing import Protocol
@@ -13,6 +14,7 @@ from video_demo.application.pipeline_contracts import (
     PreparedMedia,
     SpeechAnalysis,
     SpeechBoundaryCandidate,
+    StageMetric,
 )
 from video_demo.domain.base import StableId
 from video_demo.domain.run import TimeRange
@@ -25,6 +27,8 @@ from video_demo.speech.asr import (
 from video_demo.speech.snapshots import (
     AsrSnapshotPayload,
     AsrWindowSnapshotPayload,
+    SpeechFingerprintInputs,
+    asr_fingerprint,
     asr_window_fingerprint,
 )
 from video_demo.speech.video_asr import (
@@ -34,10 +38,14 @@ from video_demo.speech.video_asr import (
     build_fixed_asr_windows,
     project_fixed_asr_window,
 )
-from video_demo.storage.snapshots import AsrWindowSnapshotStore
+from video_demo.storage.snapshots import AsrWindowSnapshotStore, SnapshotStore
 from video_demo.storage.workspace import safe_runtime_path
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, round((time.monotonic() - started_at) * 1000))
 
 
 class AudioSlicer(Protocol):
@@ -59,6 +67,69 @@ class AsrComponents:
 
 
 AsrComponentFactory = Callable[[PreparedMedia, Callable[[], bool]], AsrComponents]
+
+
+class DirectSpeechAnalyzer:
+    """在视频 Worker 内直接执行 ASR，不经过 Python 子进程或 IPC 文件。"""
+
+    def __init__(
+        self,
+        *,
+        snapshot_store: SnapshotStore,
+        window_store: AsrWindowSnapshotStore,
+        component_factory: AsrComponentFactory,
+        fingerprint_inputs: SpeechFingerprintInputs,
+    ) -> None:
+        self._snapshot_store = snapshot_store
+        self._window_store = window_store
+        self._component_factory = component_factory
+        self._fingerprint_inputs = fingerprint_inputs
+
+    def analyze(
+        self,
+        media: PreparedMedia,
+        *,
+        is_cancel_requested: Callable[[], bool] = lambda: False,
+    ) -> SpeechAnalysis:
+        shortcut = transcript_shortcut(media)
+        if shortcut is not None:
+            return shortcut
+        if media.audio_path is None or media.audio_sha256 is None:
+            raise VideoDemoError(ErrorCode.SPEECH_AUDIO_INVALID, "视频 ASR 缺少音频")
+        started_at = time.monotonic()
+        config = media.source.asset.config
+        fingerprint = asr_fingerprint(
+            audio_sha256=media.audio_sha256,
+            duration_ms=media.source.duration_ms,
+            language_hints=config.language_hints,
+            hotwords=config.hotwords,
+            core_context=config.core_context,
+            inputs=self._fingerprint_inputs,
+        )
+        run_root = media.source.asset.run_relative_root
+        cached = self._snapshot_store.load(run_root, "asr", fingerprint, AsrSnapshotPayload)
+        if cached is not None:
+            analysis = analysis_from_asr_snapshot(media, cached[0])
+            return replace(
+                analysis,
+                stage_metrics=(StageMetric("SPEECH_ASR", 0),),
+                stage_cache_hits=("SPEECH_ASR",),
+            )
+        if is_cancel_requested():
+            raise VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已请求取消")
+        components = self._component_factory(media, is_cancel_requested)
+        payload = run_asr_stage(
+            media,
+            components,
+            window_store=self._window_store,
+            asr_fingerprint=fingerprint,
+        )
+        self._snapshot_store.publish(run_root, "asr", fingerprint, payload)
+        analysis = analysis_from_asr_snapshot(media, payload)
+        return replace(
+            analysis,
+            stage_metrics=(StageMetric("SPEECH_ASR", _elapsed_ms(started_at)),),
+        )
 
 
 def transcript_shortcut(media: PreparedMedia) -> SpeechAnalysis | None:
@@ -204,7 +275,7 @@ def _recognize_windows_concurrently(
     if first_error is not None:
         raise first_error
     if len(results) != len(windows):
-        raise VideoDemoError(ErrorCode.SPEECH_SUBPROCESS_RESPONSE_INVALID, "视频 ASR 块结果不完整")
+        raise VideoDemoError(ErrorCode.SPEECH_MODEL_UNAVAILABLE, "视频 ASR 块结果不完整")
     return tuple(results[index] for index in range(len(windows)))
 
 

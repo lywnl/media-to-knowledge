@@ -115,10 +115,7 @@ _REAL_MEDIA_IMPLEMENTATION_FILES: tuple[Path, ...] = implementation_import_closu
 
 _LIVE_ONLY_PRODUCTION_ISOLATION_FILES = frozenset(
     {
-        Path("src/video_demo/speech/isolated.py"),
         Path("src/video_demo/speech/snapshots.py"),
-        Path("src/video_demo/speech/subprocess_main.py"),
-        Path("src/video_demo/speech/subprocess_protocol.py"),
         Path("src/video_demo/storage/artifacts.py"),
         Path("src/video_demo/storage/snapshots.py"),
     }

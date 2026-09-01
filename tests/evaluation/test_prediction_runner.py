@@ -22,7 +22,6 @@ from video_demo.evaluation.report import GateStatus
     "changed_path",
     (
         Path("src/video_demo/media/subtitles.py"),
-        Path("src/video_demo/speech/isolated.py"),
         Path("src/video_demo/evaluation/quality_runner.py"),
         Path("pyproject.toml"),
         Path("uv.lock"),

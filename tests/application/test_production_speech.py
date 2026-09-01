@@ -14,6 +14,7 @@ from video_demo.application.pipeline import (
 )
 from video_demo.application.production_speech import (
     AsrComponents,
+    DirectSpeechAnalyzer,
     analysis_from_asr_snapshot,
     cloud_asr_prompt,
     run_asr_stage,
@@ -26,7 +27,7 @@ from video_demo.media.subtitles import ParsedSubtitle, SubtitleArtifact
 from video_demo.speech.asr import RawAsrSegment, WindowTranscriptionResult
 from video_demo.speech.snapshots import AsrSnapshotPayload
 from video_demo.storage.artifacts import AtomicArtifactStore
-from video_demo.storage.snapshots import AsrWindowSnapshotStore
+from video_demo.storage.snapshots import AsrWindowSnapshotStore, SnapshotStore
 
 
 def test_transcript_shortcut_returns_subtitle_without_constructing_components(
@@ -145,6 +146,44 @@ def test_run_asr_stage_uses_single_language_hint_and_exact_prompt(tmp_path: Path
     )
 
     assert recognizer.inputs == [("zh", "向量数据库课程\nMilvus Qwen")]
+
+
+def test_direct_speech_analyzer_runs_in_worker_and_reuses_parent_snapshot(
+    tmp_path: Path,
+) -> None:
+    media = _media(tmp_path, duration_ms=30_000)
+    recognizer = _Recognizer([])
+    components = AsrComponents(
+        recognizer=recognizer,
+        slicer=_Slicer(tmp_path, [], []),
+        slice_namespace="direct_video_asr",
+    )
+    store = AtomicArtifactStore(tmp_path)
+    analyzer = DirectSpeechAnalyzer(
+        snapshot_store=SnapshotStore(store),
+        window_store=AsrWindowSnapshotStore(store),
+        component_factory=lambda _media, _cancel: components,
+        fingerprint_inputs=_fingerprint_inputs(),
+    )
+
+    first = analyzer.analyze(media)
+    second = analyzer.analyze(media)
+
+    assert first.transcript_source == "ASR"
+    assert second.stage_cache_hits == ("SPEECH_ASR",)
+    assert len(recognizer.inputs) == 1
+
+
+def _fingerprint_inputs():
+    from video_demo.domain.run import ModelIdentity
+    from video_demo.speech.snapshots import SpeechFingerprintInputs
+
+    return SpeechFingerprintInputs(
+        model_identities=(
+            ModelIdentity(component="cloud_whisper", provider="test", model_id="test"),
+        ),
+        cloud_asr_base_url="https://example.test/v1",
+    )
 
 
 class _Slicer:

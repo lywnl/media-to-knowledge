@@ -23,26 +23,26 @@ from video_demo.application.production_media import (
     build_ffmpeg_factory,
     build_ffprobe_factory,
 )
+from video_demo.application.production_speech import DirectSpeechAnalyzer
 from video_demo.application.queries import ResultQueryService
 from video_demo.application.video_scheduler import VideoTaskScheduler
 from video_demo.config import Settings
 from video_demo.domain.base import FrozenModel, Sha256
 from video_demo.domain.document import PromptVersions
 from video_demo.domain.run import ModelIdentity
+from video_demo.integrations.cloud_whisper import CloudWhisperClient
 from video_demo.integrations.openai_document import OpenAIDocumentClient
 from video_demo.integrations.qwen_vl import QwenVisionClient
 from video_demo.media.probe import ProbeLimits
 from video_demo.persistence.database import Database
-from video_demo.speech.isolated import IsolatedSpeechAnalyzer
-from video_demo.speech.snapshots import SpeechFingerprintInputs
-from video_demo.speech.subprocess_protocol import (
-    SpeechRuntimeConfig,
-    SpeechSubprocessCredentials,
+from video_demo.speech.runtime import (
+    build_speech_component_factory,
 )
+from video_demo.speech.snapshots import SpeechFingerprintInputs
 from video_demo.storage.artifacts import AtomicArtifactStore
 from video_demo.storage.document_cache import DocumentModelCache, ModelInvocationIdentity
 from video_demo.storage.object_store import LocalVideoObjectStore
-from video_demo.storage.snapshots import SnapshotStore
+from video_demo.storage.snapshots import AsrWindowSnapshotStore, SnapshotStore
 from video_demo.visual.ffmpeg_frames import FFmpegFrameExtractor
 
 
@@ -153,6 +153,8 @@ def build_production_pipeline(
     with ExitStack() as resources:
         text_http = httpx.Client()
         resources.callback(text_http.close)
+        speech_http = httpx.Client()
+        resources.callback(speech_http.close)
         vision_http = httpx.Client()
         resources.callback(vision_http.close)
         text_client = OpenAIDocumentClient(
@@ -180,6 +182,17 @@ def build_production_pipeline(
             max_encoded_request_bytes=vision.max_encoded_request_bytes,
             max_response_bytes=settings.model_max_response_bytes,
         )
+        speech_recognizer = CloudWhisperClient(
+            speech_http,
+            cloud_asr,
+            allowed_audio_root=runtime_root,
+        )
+        speech_components = build_speech_component_factory(
+            settings,
+            ffmpeg_factory,
+            recognizer=speech_recognizer,
+        )
+        speech_artifacts = AtomicArtifactStore(runtime_root)
         pipeline = ProductionPipeline(
             ProductionAssetRegistrar(database, object_store),
             ProductionAssetProbe(
@@ -190,14 +203,11 @@ def build_production_pipeline(
                 runtime_root,
                 ffmpeg_factory,
             ),
-            IsolatedSpeechAnalyzer(
-                workspace_root=settings.workspace_root,
-                runtime_root=runtime_root,
-                snapshot_store=SnapshotStore(AtomicArtifactStore(runtime_root)),
-                artifact_store=AtomicArtifactStore(runtime_root),
-                speech_runtime=_speech_runtime_config(settings, ffmpeg),
-                credentials=SpeechSubprocessCredentials(openai_api_key=cloud_asr.api_key),
-                asr_timeout_seconds=settings.speech_subprocess_timeout_seconds,
+            DirectSpeechAnalyzer(
+                snapshot_store=SnapshotStore(speech_artifacts),
+                window_store=AsrWindowSnapshotStore(speech_artifacts),
+                component_factory=speech_components,
+                fingerprint_inputs=_speech_fingerprint_inputs(settings),
             ),
             ChapterPlanner(
                 text_client,
@@ -315,7 +325,7 @@ def build_production_pipeline(
             runtime_root=runtime_root,
             evidence_preparation_limits=_evidence_limits(settings),
             max_result_evidence_items=settings.max_result_evidence_items,
-            owned_resources=(text_http, vision_http),
+            owned_resources=(text_http, speech_http, vision_http),
         )
         resources.pop_all()
         return pipeline
@@ -492,22 +502,6 @@ def _speech_fingerprint_inputs(settings: Settings) -> SpeechFingerprintInputs:
         chunk_duration_ms=600_000,
         chunk_concurrency=1,
         max_upload_bytes=configuration.max_upload_bytes,
-    )
-
-
-def _speech_runtime_config(settings: Settings, ffmpeg: Path) -> SpeechRuntimeConfig:
-    configuration = settings.require_cloud_asr_configuration()
-    inputs = _speech_fingerprint_inputs(settings)
-    return SpeechRuntimeConfig(
-        base_url=configuration.base_url,
-        model=configuration.model,
-        timeout_seconds=configuration.timeout_seconds,
-        max_attempts=configuration.max_attempts,
-        chunk_duration_ms=600_000,
-        chunk_concurrency=1,
-        model_identities=inputs.model_identities,
-        max_upload_bytes=configuration.max_upload_bytes,
-        ffmpeg_relative_path=ffmpeg.relative_to(settings.workspace_root).as_posix(),
     )
 
 

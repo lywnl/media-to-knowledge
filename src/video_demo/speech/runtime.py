@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import cast
 
 import httpx
 
 from video_demo.application.pipeline_contracts import PreparedMedia
-from video_demo.application.production_media import TranscodeClient, build_ffmpeg_factory
+from video_demo.application.production_media import TranscodeClient
 from video_demo.application.production_speech import (
     AsrComponents,
     AudioSliceClient,
@@ -48,7 +47,7 @@ def build_speech_component_factory(
     settings: Settings,
     ffmpeg_factory: object,
     *,
-    models: ProductionSpeechModels,
+    recognizer: WindowRecognizerPort,
 ) -> Callable[[PreparedMedia, Callable[[], bool]], AsrComponents]:
     assert settings.runtime_root is not None
     runtime_root = settings.runtime_root
@@ -61,7 +60,7 @@ def build_speech_component_factory(
         assert callable(factory)
         ffmpeg_client: TranscodeClient = factory(is_cancel_requested)
         return AsrComponents(
-            recognizer=models.recognizer,
+            recognizer=recognizer,
             slicer=VerifiedAudioSlicer(
                 runtime_root,
                 cast(AudioSliceClient, ffmpeg_client),
@@ -72,29 +71,3 @@ def build_speech_component_factory(
         )
 
     return build
-
-
-def build_subprocess_asr_components(
-    media: PreparedMedia,
-    *,
-    workspace_root: Path,
-    runtime_root: Path,
-    ffmpeg_path: Path,
-    recognizer: WindowRecognizerPort,
-    slice_namespace: str,
-    is_cancel_requested: Callable[[], bool] = lambda: False,
-) -> AsrComponents:
-    """构造单次视频 ASR 子进程使用的切片器和云端识别端口。"""
-
-    ffmpeg_factory = build_ffmpeg_factory(workspace_root, runtime_root, ffmpeg_path)
-    ffmpeg_client: TranscodeClient = ffmpeg_factory(is_cancel_requested)
-    return AsrComponents(
-        recognizer=recognizer,
-        slicer=VerifiedAudioSlicer(
-            runtime_root,
-            cast(AudioSliceClient, ffmpeg_client),
-            media.source.duration_ms,
-        ),
-        slice_namespace=slice_namespace,
-        is_cancel_requested=is_cancel_requested,
-    )

@@ -25,6 +25,7 @@ _RETIRED_LOCAL_MODEL_DOTENV_KEYS = frozenset(
         "video_demo_whisper_compute_type",
         "video_demo_whisper_model_id",
         "video_demo_speech_enrichment_timeout_seconds",
+        "video_demo_speech_subprocess_timeout_seconds",
         "video_demo_huggingface_token",
     },
 )
@@ -191,7 +192,6 @@ class Settings(BaseSettings):
 
     worker_concurrency: int = Field(default=1, ge=1, le=4)
     process_timeout_seconds: int = Field(default=600, ge=1, le=14_400)
-    speech_subprocess_timeout_seconds: int = Field(default=3_600, ge=1, le=14_400)
     max_video_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
     max_video_duration_ms: int = Field(default=7_200_000, ge=1, le=7_200_000)
     max_audio_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
