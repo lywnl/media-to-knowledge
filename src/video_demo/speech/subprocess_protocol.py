@@ -44,7 +44,7 @@ class SpeechRuntimeConfig(FrozenModel):
     timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
     max_attempts: int = Field(ge=1, le=5)
     chunk_duration_ms: int = Field(default=600_000, gt=0)
-    chunk_concurrency: Literal[2] = 2
+    chunk_concurrency: Literal[1] = 1
     max_upload_bytes: int = Field(default=25 * 1024 * 1024, gt=44)
     model_identities: tuple[ModelIdentity, ...]
     ffmpeg_relative_path: str = ".codex/video-rag-demo/tools/ffmpeg"

@@ -99,7 +99,7 @@ def run_asr_stage(
     if media.audio_path is None:
         raise VideoDemoError(ErrorCode.SPEECH_AUDIO_INVALID, "云端 ASR 缺少音频")
     if concurrency != VIDEO_ASR_CONCURRENCY:
-        raise ValueError("视频 ASR 并发数必须固定为 2")
+        raise ValueError("视频 ASR 并发数必须固定为 1")
     windows = build_fixed_asr_windows(
         media.source.duration_ms,
         chunk_duration_ms=chunk_duration_ms,

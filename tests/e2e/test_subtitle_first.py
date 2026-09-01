@@ -464,7 +464,7 @@ def _speech_runtime() -> SpeechRuntimeConfig:
         model_identities=(),
         cloud_asr_base_url="https://ai-proxy.example/v1",
         chunk_duration_ms=600_000,
-        chunk_concurrency=2,
+        chunk_concurrency=1,
         max_upload_bytes=25 * 1024 * 1024,
     )
     return SpeechRuntimeConfig(

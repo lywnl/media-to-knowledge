@@ -128,7 +128,7 @@ def test_asr_fingerprint_binds_fixed_strategy_and_cloud_inputs() -> None:
     base = asr_fingerprint(**arguments)  # type: ignore[arg-type]
 
     assert inputs.chunk_duration_ms == 600_000
-    assert inputs.chunk_concurrency == 2
+    assert inputs.chunk_concurrency == 1
     assert inputs.window_strategy_version == "fixed-10m-v1"
     assert base != asr_fingerprint(**{**arguments, "hotwords": ("Qwen",)})  # type: ignore[arg-type]
     assert base != asr_fingerprint(

@@ -15,7 +15,7 @@ from video_demo.speech.asr_contracts import (
 from video_demo.speech.language import LanguageSpan
 
 VIDEO_ASR_CHUNK_DURATION_MS = 600_000
-VIDEO_ASR_CONCURRENCY = 2
+VIDEO_ASR_CONCURRENCY = 1
 
 
 @dataclass(frozen=True, slots=True)

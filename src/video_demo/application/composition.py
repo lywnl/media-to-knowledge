@@ -430,7 +430,7 @@ def _settings_payload(settings: Settings) -> dict[str, object]:
             "timeout_seconds": cloud.timeout_seconds,
             "max_attempts": cloud.max_attempts,
             "chunk_duration_ms": 600_000,
-            "chunk_concurrency": 2,
+            "chunk_concurrency": 1,
         },
         "text": {
             "base_url": text.base_url,
@@ -499,7 +499,7 @@ def _speech_fingerprint_inputs(settings: Settings) -> SpeechFingerprintInputs:
         ),
         cloud_asr_base_url=configuration.base_url,
         chunk_duration_ms=600_000,
-        chunk_concurrency=2,
+        chunk_concurrency=1,
         max_upload_bytes=configuration.max_upload_bytes,
     )
 
@@ -513,7 +513,7 @@ def _speech_runtime_config(settings: Settings, ffmpeg: Path) -> SpeechRuntimeCon
         timeout_seconds=configuration.timeout_seconds,
         max_attempts=configuration.max_attempts,
         chunk_duration_ms=600_000,
-        chunk_concurrency=2,
+        chunk_concurrency=1,
         model_identities=inputs.model_identities,
         max_upload_bytes=configuration.max_upload_bytes,
         ffmpeg_relative_path=ffmpeg.relative_to(settings.workspace_root).as_posix(),

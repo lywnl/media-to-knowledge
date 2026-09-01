@@ -77,7 +77,7 @@ def test_cloud_asr_prompt_combines_context_then_hotwords_without_rewriting() -> 
     assert cloud_asr_prompt(("Milvus",), None) == "Milvus"
 
 
-def test_run_asr_stage_uses_two_concurrent_fixed_windows_and_resumes_cached_chunks(
+def test_run_asr_stage_uses_one_serial_fixed_window_and_resumes_cached_chunks(
     tmp_path: Path,
 ) -> None:
     media = _media(tmp_path, duration_ms=1_800_000)
@@ -113,7 +113,7 @@ def test_run_asr_stage_uses_two_concurrent_fixed_windows_and_resumes_cached_chun
         asr_fingerprint="a" * 64,
     )
 
-    assert recognizer.max_active_calls == 2
+    assert recognizer.max_active_calls == 1
     assert [segment.start_ms for segment in payload.segments] == sorted(
         segment.start_ms for segment in payload.segments
     )

@@ -38,7 +38,7 @@ class SpeechFingerprintInputs(FrozenModel):
     model_identities: tuple[ModelIdentity, ...]
     cloud_asr_base_url: str = Field(min_length=1, max_length=2048)
     chunk_duration_ms: int = Field(default=600_000, gt=0)
-    chunk_concurrency: Literal[2] = 2
+    chunk_concurrency: Literal[1] = 1
     window_strategy_version: Literal["fixed-10m-v1"] = _VIDEO_ASR_WINDOW_STRATEGY_VERSION
     max_upload_bytes: int = 25 * 1024 * 1024
 
