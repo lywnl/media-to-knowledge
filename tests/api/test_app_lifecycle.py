@@ -82,3 +82,26 @@ def test_fastapi_lifespan_starts_and_stops_video_scheduler(
         assert scheduler.started is True
 
     assert scheduler.shutdown_called is True
+
+
+def test_fastapi_lifespan_recovers_and_stops_image_scheduler(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import shutil
+
+    import video_demo.api.app as app_module
+
+    shutil.copytree(Path.cwd() / "migrations", tmp_path / "migrations")
+
+    scheduler = _Scheduler()
+    monkeypatch.setattr(app_module, "build_image_scheduler", lambda *_args, **_kwargs: scheduler)
+    settings = Settings(workspace_root=tmp_path, _env_file=None)
+
+    with TestClient(create_app(settings)) as client:
+        assert client.app.state.image_scheduler is scheduler
+        assert client.app.state.container.image_scheduler is scheduler
+        assert scheduler.started is True
+        assert scheduler.recovered == ()
+
+    assert scheduler.shutdown_called is True

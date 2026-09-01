@@ -11,6 +11,7 @@ from video_demo.persistence.media_repositories import MediaObjectRepository, Med
 from video_demo.persistence.models import (
     ImageObjectModel,
     ImageUnderstandingRunModel,
+    JobStatus,
 )
 from video_demo.persistence.repositories import JobRepository
 from video_demo.persistence.scope import Scope
@@ -64,6 +65,9 @@ class MediaRunService:
             core_context=core_context,
             document_config=document_config or DocumentGenerationConfig(),
         )
+        run_id: str
+        view: MediaRunView
+        should_submit = False
         with self._database.session() as session:
             objects = MediaObjectRepository(session, ImageObjectModel)
             if objects.get_ready(scope, object_ref) is None:
@@ -84,26 +88,30 @@ class MediaRunService:
                 )
                 if job is None:
                     raise VideoDemoError(ErrorCode.JOB_NOT_FOUND, "媒体运行任务不存在")
-                return _view(existing, job.job_id)
-            config_snapshot = config.model_dump(mode="json")
-            run_id = f"run_{uuid.uuid4().hex}"
-            job_id = f"job_{uuid.uuid4().hex}"
-            run = runs.add(
-                scope=scope,
-                run_id=run_id,
-                object_ref=object_ref,
-                idempotency_key=idempotency_key,
-                config_snapshot=config_snapshot,
-            )
-            JobRepository(session).enqueue_media_run(
-                scope=scope,
-                job_id=job_id,
-                resource_id=run_id,
-                job_type="IMAGE_UNDERSTANDING",
-                resource_type="IMAGE_UNDERSTANDING_RUN",
-            )
-            view = _view(run, job_id)
-        if self._scheduler is not None:
+                run_id = existing.run_id
+                view = _view(existing, job.job_id)
+                should_submit = job.status in (JobStatus.PENDING, JobStatus.RETRY_WAIT)
+            else:
+                config_snapshot = config.model_dump(mode="json")
+                run_id = f"run_{uuid.uuid4().hex}"
+                job_id = f"job_{uuid.uuid4().hex}"
+                run = runs.add(
+                    scope=scope,
+                    run_id=run_id,
+                    object_ref=object_ref,
+                    idempotency_key=idempotency_key,
+                    config_snapshot=config_snapshot,
+                )
+                JobRepository(session).enqueue_media_run(
+                    scope=scope,
+                    job_id=job_id,
+                    resource_id=run_id,
+                    job_type="IMAGE_UNDERSTANDING",
+                    resource_type="IMAGE_UNDERSTANDING_RUN",
+                )
+                view = _view(run, job_id)
+                should_submit = True
+        if self._scheduler is not None and should_submit:
             result = self._scheduler.submit(scope, run_id)
             if result == "rejected":
                 raise VideoDemoError(ErrorCode.JOB_NOT_RETRYABLE, "图片调度器暂不可用")

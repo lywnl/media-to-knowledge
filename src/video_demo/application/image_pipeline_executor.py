@@ -147,6 +147,16 @@ class ImageStagePipelineExecutor:
                 except VideoDemoError as error:
                     errors.append(error)
                     return
+                except Exception:
+                    # 心跳线程不能把第三方数据库异常直接抛出到线程顶层；
+                    # 转换为统一系统错误，交由阶段执行器和调度器收口。
+                    errors.append(
+                        VideoDemoError(
+                            ErrorCode.SYSTEM_FAILURE,
+                            "图片任务心跳续租失败",
+                        ),
+                    )
+                    return
 
         thread = Thread(target=heartbeat, name=f"image-heartbeat-{job.resource_id}", daemon=True)
         thread.start()

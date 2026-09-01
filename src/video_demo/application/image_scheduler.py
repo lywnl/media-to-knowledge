@@ -50,8 +50,8 @@ class ImageTaskScheduler:
         concurrency: int = IMAGE_CONCURRENCY,
         logger: logging.Logger | None = None,
     ) -> None:
-        if concurrency < 1:
-            raise ValueError("图片并发数必须大于 0")
+        if concurrency != IMAGE_CONCURRENCY:
+            raise ValueError("图片并发数必须固定为 2")
         self._executor = executor
         self._queue = _ImageQueue(int(concurrency))
         self._condition = Condition()
@@ -264,6 +264,14 @@ class ImageTaskScheduler:
         try:
             return self._executor.is_cancelled(scope, run_id)
         except VideoDemoError:
+            return False
+        except Exception:
+            # 取消预检是调度边界，数据库瞬时故障不能让 dispatcher 线程退出；
+            # 执行器后续仍会在领取租约和业务处理边界再次校验状态。
+            self._logger.exception(
+                "image scheduler cancel check failed run_id=%s",
+                run_id,
+            )
             return False
 
 

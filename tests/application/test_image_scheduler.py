@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 from video_demo.application.image_scheduler import ImageTaskScheduler
 from video_demo.errors import ErrorCode, VideoDemoError
 from video_demo.persistence.scope import Scope
@@ -83,6 +85,21 @@ class _SequenceExecutor:
         return None
 
 
+class _CancellableExecutor(_SequenceExecutor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.cancel_requested = threading.Event()
+
+    def run(self, scope: Scope, run_id: str) -> None:
+        super().run(scope, run_id)
+        self.started.set()
+        self.release.wait(2)
+        if self.cancel_requested.is_set():
+            raise VideoDemoError(ErrorCode.JOB_CANCELLED, "测试任务已取消")
+
+
 def _wait_until(predicate, timeout: float = 2.0) -> None:
     deadline = time.monotonic() + timeout
     while not predicate() and time.monotonic() < deadline:
@@ -122,6 +139,11 @@ def test_image_scheduler_rejects_after_shutdown() -> None:
     scheduler.shutdown(wait=True, timeout=1)
 
     assert scheduler.submit(_scope(), "run-closed") == "rejected"
+
+
+def test_image_scheduler_rejects_concurrency_above_fixed_limit() -> None:
+    with pytest.raises(ValueError, match="图片并发数必须固定为 2"):
+        ImageTaskScheduler(_Executor(), concurrency=3)
 
 
 def test_image_failure_does_not_block_another_run() -> None:
@@ -187,6 +209,47 @@ def test_cancelled_pending_image_is_never_executed() -> None:
         scheduler.shutdown(wait=True, timeout=2)
 
 
+def test_recover_requeues_without_marking_completed_and_keeps_duplicate_out() -> None:
+    executor = _SequenceExecutor()
+    scheduler = ImageTaskScheduler(executor)
+
+    assert scheduler.recover(((_scope(), "run-recover"), (_scope(), "run-recover"))) == 1
+    snapshot = scheduler.snapshot()
+    assert snapshot["pending"] == 1
+    assert snapshot["running"] == 0
+    assert snapshot["completed"] == {}
+
+    scheduler.start()
+    try:
+        _wait_until(lambda: executor.calls == ["run-recover"])
+        _wait_until(lambda: scheduler.snapshot()["running"] == 0)
+        assert scheduler.snapshot()["completed"]
+    finally:
+        scheduler.shutdown(wait=True, timeout=2)
+
+
+def test_running_image_cancellation_isolated_and_slot_is_released() -> None:
+    executor = _CancellableExecutor()
+    scheduler = ImageTaskScheduler(executor)
+    scheduler.start()
+    try:
+        assert scheduler.submit(_scope(), "run-cancel-running") == "accepted"
+        assert executor.started.wait(1)
+        executor.cancel_requested.set()
+        executor.release.set()
+        _wait_until(lambda: scheduler.snapshot()["running"] == 0)
+        assert executor.failure_records == [
+            ("run-cancel-running", ErrorCode.JOB_CANCELLED),
+        ]
+
+        assert scheduler.submit(_scope(), "run-after-cancel") == "accepted"
+        _wait_until(lambda: executor.calls[-1] == "run-after-cancel")
+        _wait_until(lambda: scheduler.snapshot()["running"] == 0)
+        assert executor.calls == ["run-cancel-running", "run-after-cancel"]
+    finally:
+        scheduler.shutdown(wait=True, timeout=2)
+
+
 def test_scheduler_survives_failure_recording_exception() -> None:
     class _BrokenFailureExecutor(_SequenceExecutor):
         def stage_failed(self, scope: Scope, run_id: str, error: VideoDemoError) -> bool:
@@ -204,5 +267,30 @@ def test_scheduler_survives_failure_recording_exception() -> None:
         assert scheduler.submit(_scope(), "run-after-broken") == "accepted"
         _wait_until(lambda: scheduler.snapshot()["completed"])
         assert executor.calls[-1] == "run-after-broken"
+    finally:
+        scheduler.shutdown(wait=True, timeout=2)
+
+
+def test_scheduler_survives_system_error_during_cancel_check() -> None:
+    class _CancelCheckErrorExecutor(_SequenceExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self._check_count = 0
+
+        def is_cancelled(self, scope: Scope, run_id: str) -> bool:
+            del scope, run_id
+            self._check_count += 1
+            if self._check_count == 1:
+                raise RuntimeError("数据库暂时不可用")
+            return False
+
+    executor = _CancelCheckErrorExecutor()
+    scheduler = ImageTaskScheduler(executor)
+    scheduler.start()
+    try:
+        assert scheduler.submit(_scope(), "run-after-cancel-check-error") == "accepted"
+        _wait_until(lambda: executor.calls == ["run-after-cancel-check-error"])
+        _wait_until(lambda: scheduler.snapshot()["running"] == 0)
+        assert scheduler.snapshot()["dispatch_threads"] == 1
     finally:
         scheduler.shutdown(wait=True, timeout=2)

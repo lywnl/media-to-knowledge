@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -181,3 +182,108 @@ def test_retry_exhaustion_marks_image_run_failed(tmp_path: Path) -> None:
         assert current_job.status == JobStatus.FAILED
         assert current_run is not None
         assert current_run.status.value == "FAILED"
+
+
+def test_cancelled_image_lease_is_idempotently_closed(tmp_path: Path) -> None:
+    database = Database(f"sqlite+pysqlite:///{tmp_path / 'image-cancel-idempotent.db'}")
+    database.create_schema()
+    scope = Scope("tenant", "application", "kb")
+    run_id = "run_image_cancel_idempotent"
+    with database.session() as session:
+        MediaRunRepository(session, ImageUnderstandingRunModel).add(
+            scope=scope,
+            run_id=run_id,
+            object_ref="obj_image",
+            idempotency_key="image-cancel-idempotent",
+            config_snapshot={},
+        )
+        JobRepository(session).enqueue_media_run(
+            scope=scope,
+            job_id="job_image_cancel_idempotent",
+            resource_id=run_id,
+            job_type="IMAGE_UNDERSTANDING",
+            resource_type="IMAGE_UNDERSTANDING_RUN",
+        )
+        claimed = JobRepository(session).claim_image_run(
+            scope,
+            run_id,
+            "image-owner",
+            lease_seconds=60,
+        )
+        assert claimed is not None
+        assert JobRepository(session).request_cancel(scope, claimed.job_id)
+
+    executor = ImageStagePipelineExecutor(
+        database,
+        object(),
+        runtime_root=tmp_path,
+    )
+
+    assert executor.stage_failed(
+        scope,
+        run_id,
+        VideoDemoError(ErrorCode.JOB_CANCELLED, "任务已取消"),
+        job=claimed,
+    ) is False
+
+
+def test_image_heartbeat_renews_active_lease(tmp_path: Path, monkeypatch) -> None:
+    heartbeat_seen = __import__("threading").Event()
+
+    class _HeartbeatRepository:
+        def __init__(self, session) -> None:
+            del session
+
+        def heartbeat(self, *args, **kwargs) -> None:
+            del args, kwargs
+            heartbeat_seen.set()
+
+    monkeypatch.setattr(
+        "video_demo.application.image_pipeline_executor.JobRepository",
+        _HeartbeatRepository,
+    )
+    executor = ImageStagePipelineExecutor(
+        _Database(),
+        object(),
+        runtime_root=tmp_path,
+        lease_seconds=1,
+    )
+    job = ClaimedJob(1, "job-heartbeat", "run-heartbeat", "owner", 1, 3, Scope("t", "a", "k"))
+
+    executor._run_with_heartbeat(job, lambda: heartbeat_seen.wait(2))  # type: ignore[attr-defined]
+    assert heartbeat_seen.is_set()
+
+
+def test_image_heartbeat_system_error_fails_stage(tmp_path: Path, monkeypatch) -> None:
+    class _BrokenHeartbeatRepository:
+        def __init__(self, session) -> None:
+            del session
+
+        def heartbeat(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise RuntimeError("数据库暂时不可用")
+
+    monkeypatch.setattr(
+        "video_demo.application.image_pipeline_executor.JobRepository",
+        _BrokenHeartbeatRepository,
+    )
+    executor = ImageStagePipelineExecutor(
+        _Database(),
+        object(),
+        runtime_root=tmp_path,
+        lease_seconds=1,
+    )
+    job = ClaimedJob(
+        1,
+        "job-heartbeat-error",
+        "run-heartbeat-error",
+        "owner",
+        1,
+        3,
+        Scope("t", "a", "k"),
+    )
+
+    with pytest.raises(VideoDemoError) as error:
+        executor._run_with_heartbeat(job, lambda: time.sleep(0.7))  # type: ignore[attr-defined]
+
+    assert error.value.code == ErrorCode.SYSTEM_FAILURE

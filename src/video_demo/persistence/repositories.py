@@ -1075,6 +1075,7 @@ class JobRepository:
                 JobModel.resource_type == "IMAGE_UNDERSTANDING_RUN",
                 JobModel.resource_id == run_id,
                 JobModel.cancel_requested.is_(False),
+                JobModel.attempt_count < JobModel.max_attempts,
                 or_(
                     JobModel.status.in_((JobStatus.PENDING, JobStatus.RETRY_WAIT))
                     & (JobModel.next_attempt_at <= current_time),
@@ -1232,6 +1233,9 @@ class JobRepository:
             resource_type=resource.resource_type,
             resource_id=resource.resource_id,
         )
+        # 取消通过 synchronize_session=False 的条件更新完成；清除身份缓存，
+        # 让同一事务随后读取任务时看到数据库中的 CANCELLED 状态。
+        self._session.expire_all()
         return True
 
     def is_cancel_requested(
