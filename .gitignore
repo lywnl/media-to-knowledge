@@ -8,17 +8,12 @@ __pycache__/
 *.py[cod]
 runtime/
 
-# 模型、媒体、运行产物和真实评测素材不得进入 Git；报告结构是版本化契约。
-.codex/video-rag-demo/*
-!.codex/video-rag-demo/eval/
-.codex/video-rag-demo/eval/*
-!.codex/video-rag-demo/eval/report.schema.json
-.codex/reports/
-.codex/research/
-.codex/tmp/
-.codex/hint-debug/
-.codex/pytest-*/
+# Codex 计划、诊断、运行产物和本地历史备份均不得进入公开仓库。
+.codex/
 
-# 设计和实施状态是项目交付物，保留在版本控制范围内。
-!.codex/specs/
-!.codex/plans/
+# 本地数据库及其事务日志。
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
