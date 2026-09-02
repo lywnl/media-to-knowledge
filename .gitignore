@@ -11,6 +11,9 @@ runtime/
 # Codex 计划、诊断、运行产物和本地历史备份均不得进入公开仓库。
 .codex/
 
+# 本地任务规划与执行进度。
+.superpowers/sdd/
+
 # 本地数据库及其事务日志。
 *.db
 *.db-shm
